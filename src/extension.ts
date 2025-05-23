@@ -10,7 +10,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	console.log('Activating the C# Test Explorer extension');
 
 	// Create and register our test controller
-	new CSharpTestController(context);
+	const csharpTestController = new CSharpTestController();
 }
 
 // This method is called when your extension is deactivated
