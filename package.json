@@ -6,6 +6,7 @@
     "url": "https://github.com/reginaldFerland/testy",
     "type": "git"
   },
+  "publisher": "reginaldFerland",
   "version": "0.0.1",
   "icon": "testy.png",
   "engines": {
