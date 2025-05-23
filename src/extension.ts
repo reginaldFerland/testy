@@ -8,6 +8,25 @@ export function activate(context: vscode.ExtensionContext): void {
 	// Log activation
 	console.log('Activating the testy extension');
 
+	// Get configuration settings
+	const config = vscode.workspace.getConfiguration('testy');
+	const startupDelay = config.get<number>('startupDelay', 10000);
+
+	console.log(`Delaying extension initialization for ${startupDelay}ms to allow other extensions to initialize`);
+
+	// Delay the initialization to give other extensions time to get ready
+	setTimeout(() => {
+		initializeExtension(context);
+	}, startupDelay);
+}
+
+/**
+ * Initialize the extension after the startup delay
+ * @param context The extension context
+ */
+function initializeExtension(context: vscode.ExtensionContext): void {
+	console.log('Initializing extension functionality after startup delay');
+
 	// Check if the required extension is installed
 	checkRequiredExtension(context);
 
@@ -79,7 +98,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	});
 
 	// Register a command to manually trigger a test run
-	const refreshCommand = vscode.commands.registerCommand('testy.triggerTestRun', () => {
+	const refreshCommand = vscode.commands.registerCommand('testy.refreshTests', () => {
 		triggerTestRun();
 	});
 	context.subscriptions.push(refreshCommand);

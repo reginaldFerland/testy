@@ -55,6 +55,11 @@
           "type": "boolean",
           "default": true,
           "description": "Whether to run tests with coverage"
+        },
+        "testy.startupDelay": {
+          "type": "number",
+          "default": 10000,
+          "description": "Delay in milliseconds before initializing the extension, to give other extensions time to get ready"
         }
       }
     }
