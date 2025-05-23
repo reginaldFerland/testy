@@ -55,10 +55,50 @@ export class CSharpTestController {
         this.testController.items.replace([]);
         this.testItems.clear();
 
+        // Create temporary root items for workspace folders
+        const tempRootItems: vscode.TestItem[] = [];
+
         // Scan all workspace folders for tests
         for (const workspaceFolder of vscode.workspace.workspaceFolders) {
-            await this.discoverTestsInFolder(workspaceFolder.uri);
+            // Create a temporary root item for this workspace folder
+            const rootItem = this.testController.createTestItem(
+                workspaceFolder.uri.toString(),
+                workspaceFolder.name,
+                workspaceFolder.uri
+            );
+            tempRootItems.push(rootItem);
+
+            // Discover tests in this workspace folder
+            await this.discoverTestsInFolder(workspaceFolder.uri, rootItem);
         }
+
+        // Filter root items to only keep those with children
+        const validRootItems = tempRootItems.filter(item => item.children.size > 0);
+
+        // If there are no root items with tests, nothing to display
+        if (validRootItems.length === 0) {
+            return;
+        }
+
+        // Find the first level with multiple items, or the deepest possible level
+        let currentLevelItems: vscode.TestItem[] = validRootItems;
+
+        // Keep going deeper while we only have one item at the current level
+        while (currentLevelItems.length === 1) {
+            const singleItem = currentLevelItems[0];
+            const children = Array.from(singleItem.children);
+
+            // If this single item has no children, we've reached the end
+            if (children.length === 0) {
+                break;
+            }
+
+            // If this single item has children, go one level deeper
+            currentLevelItems = children.map(([_, testItem]) => testItem);
+        }
+
+        // Register the items at the current level to provide the best UX
+        this.testController.items.replace(currentLevelItems);
     }
 
     /**
@@ -145,7 +185,7 @@ export class CSharpTestController {
      */
     private async discoverTestsInFolder(
         folderUri: vscode.Uri,
-        parent?: vscode.TestItem
+        parent: vscode.TestItem
     ): Promise<void> {
         try {
             const entries = await vscode.workspace.fs.readDirectory(folderUri);
@@ -168,8 +208,7 @@ export class CSharpTestController {
 
                     // Only keep folder items if they have children
                     if (folderItem.children.size === 0) {
-                        const parentCollection = parent ? parent.children : this.testController.items;
-                        parentCollection.delete(folderItem.id);
+                        parent.children.delete(folderItem.id);
                         this.testItems.delete(folderItem.id);
                     }
                 } else if (type === vscode.FileType.File && name.endsWith('.cs')) {
