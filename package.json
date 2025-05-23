@@ -3,6 +3,7 @@
   "displayName": "testy",
   "description": "C# test helper that integrates with VS Code Test Explorer",
   "version": "0.0.1",
+  "icon": "testy.png",
   "engines": {
     "vscode": "^1.99.0"
   },
