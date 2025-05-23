@@ -9,7 +9,11 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "workspaceContains:**/*.csproj",
+    "workspaceContains:**/*.sln",
+    "workspaceContains:**/*.cs"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
