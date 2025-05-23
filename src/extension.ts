@@ -1,23 +1,64 @@
 // The module 'vscode' contains the VS Code extensibility API
 // Import the module and reference it with the alias vscode in your code below
 import * as vscode from 'vscode';
-import { CSharpTestController } from './test-explorer/csharp-test-controller';
 
 // This method is called when your extension is activated
 // Your extension is activated the very first time the command is executed
 export function activate(context: vscode.ExtensionContext): void {
 	// Log activation
-	console.log('Activating the C# Test Explorer extension');
+	console.log('Activating the testy extension');
 
-	// Create and register our test controller
-	const csharpTestController = new CSharpTestController();
+	// Create a file system watcher for .cs files
+	const csFileWatcher = vscode.workspace.createFileSystemWatcher('**/*.cs');
+	context.subscriptions.push(csFileWatcher);
 
-	// Add the controller to the subscriptions to ensure it is disposed when the extension is deactivated
-	context.subscriptions.push(csharpTestController);
+	// Set up a debounce mechanism to prevent triggering tests too frequently
+	let debounceTimer: NodeJS.Timeout | undefined;
+	const debounceDelay = 1000; // 1 second delay
+
+	// Function to trigger the VS Code test runner
+	const triggerTestRun = () => {
+		// Clear any pending debounce timer
+		if (debounceTimer) {
+			clearTimeout(debounceTimer);
+		}
+
+		// Set a new debounce timer
+		debounceTimer = setTimeout(async () => {
+			console.log('File change detected, triggering test run');
+
+			// Execute the VS Code testing: Run All Tests command
+			await vscode.commands.executeCommand('testing.runAll');
+		}, debounceDelay);
+	};
+
+	// Watch for file changes and trigger test runs
+	csFileWatcher.onDidChange(uri => {
+		console.log(`C# file changed: ${uri.fsPath}`);
+		triggerTestRun();
+	});
+
+	// Also watch for new files
+	csFileWatcher.onDidCreate(uri => {
+		console.log(`C# file created: ${uri.fsPath}`);
+		triggerTestRun();
+	});
+
+	// Also watch for deleted files
+	csFileWatcher.onDidDelete(uri => {
+		console.log(`C# file deleted: ${uri.fsPath}`);
+		triggerTestRun();
+	});
+
+	// Register a command to manually trigger a test run
+	const refreshCommand = vscode.commands.registerCommand('testy.triggerTestRun', () => {
+		triggerTestRun();
+	});
+	context.subscriptions.push(refreshCommand);
 }
 
 // This method is called when your extension is deactivated
 export function deactivate(): void {
 	// Clean up resources when the extension is deactivated
-	console.log('C# Test Explorer extension deactivated');
+	console.log('testy deactivated');
 }
