@@ -85,17 +85,39 @@ function initializeExtension(context: vscode.ExtensionContext): void {
 	const fileWatcher = vscode.workspace.createFileSystemWatcher(fileWatcherPattern);
 	context.subscriptions.push(fileWatcher);
 
+	// Flag to track if tests are currently running
+	let testsRunning = false;
+
 	// Create an efficient debounced test runner with the configurable delay
 	let debouncedTestRun = debounce(async () => {
 		console.log(`File change detected, triggering test run${runWithCoverage ? ' with coverage' : ''}`);
 
-		// Execute the appropriate VS Code testing command based on coverage setting
-		if (runWithCoverage) {
-			await vscode.commands.executeCommand('testing.coverageAll');
-		} else {
-			await vscode.commands.executeCommand('testing.runAll');
+		// Set the flag to indicate tests are running
+		testsRunning = true;
+
+		try {
+			// Execute the appropriate VS Code testing command based on coverage setting
+			if (runWithCoverage) {
+				await vscode.commands.executeCommand('testing.coverageAll');
+			} else {
+				await vscode.commands.executeCommand('testing.runAll');
+			}
+		} finally {
+			// Reset the flag when tests are done
+			testsRunning = false;
 		}
 	}, debounceDelay);
+
+	// Function to cancel running tests
+	const cancelRunningTests = async (): Promise<void> => {
+		if (testsRunning) {
+			console.log('Cancelling running tests due to new file changes');
+			testsRunning = false;
+			await vscode.commands.executeCommand('testing.cancelRun');
+			// Small delay to ensure cancellation is processed
+			await new Promise(resolve => setTimeout(resolve, 100));
+		}
+	};
 
 	// Watch for configuration changes
 	context.subscriptions.push(
@@ -108,10 +130,18 @@ function initializeExtension(context: vscode.ExtensionContext): void {
 				debouncedTestRun = debounce(async () => {
 					console.log(`File change detected, triggering test run${runWithCoverage ? ' with coverage' : ''}`);
 
-					if (runWithCoverage) {
-						await vscode.commands.executeCommand('testing.coverageAll');
-					} else {
-						await vscode.commands.executeCommand('testing.runAll');
+					// Set the flag to indicate tests are running
+					testsRunning = true;
+
+					try {
+						if (runWithCoverage) {
+							await vscode.commands.executeCommand('testing.coverageAll');
+						} else {
+							await vscode.commands.executeCommand('testing.runAll');
+						}
+					} finally {
+						// Reset the flag when tests are done
+						testsRunning = false;
 					}
 				}, debounceDelay);
 			}
@@ -124,23 +154,31 @@ function initializeExtension(context: vscode.ExtensionContext): void {
 	);
 
 	// Set up a single handler for all file system events
-	fileWatcher.onDidChange(uri => {
+	fileWatcher.onDidChange(async uri => {
 		console.log(`File changed: ${uri.fsPath}`);
+		// Cancel any running tests before starting a new test run
+		await cancelRunningTests();
 		debouncedTestRun();
 	});
 
-	fileWatcher.onDidCreate(uri => {
+	fileWatcher.onDidCreate(async uri => {
 		console.log(`File created: ${uri.fsPath}`);
+		// Cancel any running tests before starting a new test run
+		await cancelRunningTests();
 		debouncedTestRun();
 	});
 
-	fileWatcher.onDidDelete(uri => {
+	fileWatcher.onDidDelete(async uri => {
 		console.log(`File deleted: ${uri.fsPath}`);
+		// Cancel any running tests before starting a new test run
+		await cancelRunningTests();
 		debouncedTestRun();
 	});
 
 	// Register a command to manually trigger a test run
-	const refreshCommand = vscode.commands.registerCommand('testy.refreshTests', () => {
+	const refreshCommand = vscode.commands.registerCommand('testy.refreshTests', async () => {
+		// Cancel any running tests before starting a new test run
+		await cancelRunningTests();
 		debouncedTestRun();
 	});
 	context.subscriptions.push(refreshCommand);
