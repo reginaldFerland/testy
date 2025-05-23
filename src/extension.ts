@@ -11,13 +11,28 @@ export function activate(context: vscode.ExtensionContext): void {
 	// Check if the required extension is installed
 	checkRequiredExtension(context);
 
-	// Create a file system watcher for .cs files
-	const csFileWatcher = vscode.workspace.createFileSystemWatcher('**/*.cs');
-	context.subscriptions.push(csFileWatcher);
+	// Get configuration settings
+	const config = vscode.workspace.getConfiguration('testy');
+	const fileWatcherPattern = config.get<string>('fileWatcherPattern', '**/*.cs');
+	let debounceDelay = config.get<number>('debounceTime', 1000);
+
+	// Create a file system watcher using the configured pattern
+	const fileWatcher = vscode.workspace.createFileSystemWatcher(fileWatcherPattern);
+	context.subscriptions.push(fileWatcher);
 
 	// Set up a debounce mechanism to prevent triggering tests too frequently
 	let debounceTimer: NodeJS.Timeout | undefined;
-	const debounceDelay = 1000; // 1 second delay
+
+	// Watch for configuration changes
+	context.subscriptions.push(
+		vscode.workspace.onDidChangeConfiguration(event => {
+			if (event.affectsConfiguration('testy.debounceTime')) {
+				// Update debounce time if changed
+				debounceDelay = vscode.workspace.getConfiguration('testy').get<number>('debounceTime', 1000);
+				console.log(`Debounce delay updated to ${debounceDelay}ms`);
+			}
+		})
+	);
 
 	// Function to trigger the VS Code test runner
 	const triggerTestRun = () => {
@@ -36,20 +51,20 @@ export function activate(context: vscode.ExtensionContext): void {
 	};
 
 	// Watch for file changes and trigger test runs
-	csFileWatcher.onDidChange(uri => {
-		console.log(`C# file changed: ${uri.fsPath}`);
+	fileWatcher.onDidChange(uri => {
+		console.log(`File changed: ${uri.fsPath}`);
 		triggerTestRun();
 	});
 
 	// Also watch for new files
-	csFileWatcher.onDidCreate(uri => {
-		console.log(`C# file created: ${uri.fsPath}`);
+	fileWatcher.onDidCreate(uri => {
+		console.log(`File created: ${uri.fsPath}`);
 		triggerTestRun();
 	});
 
 	// Also watch for deleted files
-	csFileWatcher.onDidDelete(uri => {
-		console.log(`C# file deleted: ${uri.fsPath}`);
+	fileWatcher.onDidDelete(uri => {
+		console.log(`File deleted: ${uri.fsPath}`);
 		triggerTestRun();
 	});
 

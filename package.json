@@ -37,6 +37,21 @@
           "group": "navigation"
         }
       ]
+    },
+    "configuration": {
+      "title": "Testy",
+      "properties": {
+        "testy.fileWatcherPattern": {
+          "type": "string",
+          "default": "**/*.cs",
+          "description": "Glob pattern for files to watch for changes that trigger test runs"
+        },
+        "testy.debounceTime": {
+          "type": "number",
+          "default": 1000,
+          "description": "Delay in milliseconds before triggering tests after a file change"
+        }
+      }
     }
   },
   "scripts": {
