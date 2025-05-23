@@ -8,6 +8,9 @@ export function activate(context: vscode.ExtensionContext): void {
 	// Log activation
 	console.log('Activating the testy extension');
 
+	// Check if the required extension is installed
+	checkRequiredExtension(context);
+
 	// Create a file system watcher for .cs files
 	const csFileWatcher = vscode.workspace.createFileSystemWatcher('**/*.cs');
 	context.subscriptions.push(csFileWatcher);
@@ -55,6 +58,30 @@ export function activate(context: vscode.ExtensionContext): void {
 		triggerTestRun();
 	});
 	context.subscriptions.push(refreshCommand);
+}
+
+/**
+ * Check if the required C# Dev Kit extension is installed
+ * @param context The extension context
+ */
+async function checkRequiredExtension(context: vscode.ExtensionContext): Promise<void> {
+	const csDevKitExtId = 'ms-dotnettools.csdevkit';
+
+	// Check if the extension is already installed
+	const extension = vscode.extensions.getExtension(csDevKitExtId);
+
+	// If not installed, prompt the user to install it
+	if (!extension) {
+		const installButton = 'Install';
+		const message = 'The C# Dev Kit extension is required for full functionality of this extension.';
+
+		const selection = await vscode.window.showInformationMessage(message, installButton);
+
+		if (selection === installButton) {
+			// Open the extension in the marketplace
+			await vscode.commands.executeCommand('extension.open', csDevKitExtId);
+		}
+	}
 }
 
 // This method is called when your extension is deactivated

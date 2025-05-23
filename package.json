@@ -14,6 +14,12 @@
     "workspaceContains:**/*.sln",
     "workspaceContains:**/*.cs"
   ],
+  "extensionPack": [
+    "ms-dotnettools.csdevkit"
+  ],
+  "extensionDependencies": [
+    "ms-dotnettools.csdevkit"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
