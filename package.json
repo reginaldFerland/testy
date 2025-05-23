@@ -18,10 +18,6 @@
   "contributes": {
     "commands": [
       {
-        "command": "testy.helloWorld",
-        "title": "Hello World"
-      },
-      {
         "command": "testy.refreshTests",
         "title": "Refresh C# Tests",
         "icon": "$(refresh)"
