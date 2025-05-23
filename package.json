@@ -1,13 +1,13 @@
 {
   "name": "testy",
   "displayName": "testy",
-  "description": "",
+  "description": "C# test helper that integrates with VS Code Test Explorer",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.99.0"
   },
   "categories": [
-    "Other"
+    "Testing"
   ],
   "activationEvents": [
     "workspaceContains:**/*.csproj",
@@ -20,8 +20,22 @@
       {
         "command": "testy.helloWorld",
         "title": "Hello World"
+      },
+      {
+        "command": "testy.refreshTests",
+        "title": "Refresh C# Tests",
+        "icon": "$(refresh)"
       }
-    ]
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "testy.refreshTests",
+          "when": "view == testing",
+          "group": "navigation"
+        }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "pnpm run compile",
