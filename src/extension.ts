@@ -11,6 +11,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
 	// Create and register our test controller
 	const csharpTestController = new CSharpTestController();
+
+	// Add the controller to the subscriptions to ensure it is disposed when the extension is deactivated
+	context.subscriptions.push(csharpTestController);
 }
 
 // This method is called when your extension is deactivated
