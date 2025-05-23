@@ -15,6 +15,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	const config = vscode.workspace.getConfiguration('testy');
 	const fileWatcherPattern = config.get<string>('fileWatcherPattern', '**/*.cs');
 	let debounceDelay = config.get<number>('debounceTime', 1000);
+	let runWithCoverage = config.get<boolean>('runWithCoverage', false);
 
 	// Create a file system watcher using the configured pattern
 	const fileWatcher = vscode.workspace.createFileSystemWatcher(fileWatcherPattern);
@@ -31,6 +32,11 @@ export function activate(context: vscode.ExtensionContext): void {
 				debounceDelay = vscode.workspace.getConfiguration('testy').get<number>('debounceTime', 1000);
 				console.log(`Debounce delay updated to ${debounceDelay}ms`);
 			}
+			if (event.affectsConfiguration('testy.runWithCoverage')) {
+				// Update coverage setting if changed
+				runWithCoverage = vscode.workspace.getConfiguration('testy').get<boolean>('runWithCoverage', true);
+				console.log(`Run with coverage set to: ${runWithCoverage}`);
+			}
 		})
 	);
 
@@ -43,10 +49,14 @@ export function activate(context: vscode.ExtensionContext): void {
 
 		// Set a new debounce timer
 		debounceTimer = setTimeout(async () => {
-			console.log('File change detected, triggering test run');
+			console.log(`File change detected, triggering test run${runWithCoverage ? ' with coverage' : ''}`);
 
-			// Execute the VS Code testing: Run All Tests command
-			await vscode.commands.executeCommand('testing.runAll');
+			// Execute the appropriate VS Code testing command based on coverage setting
+			if (runWithCoverage) {
+				await vscode.commands.executeCommand('testing.coverageAll');
+			} else {
+				await vscode.commands.executeCommand('testing.runAll');
+			}
 		}, debounceDelay);
 	};
 

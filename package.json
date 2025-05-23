@@ -50,6 +50,11 @@
           "type": "number",
           "default": 1000,
           "description": "Delay in milliseconds before triggering tests after a file change"
+        },
+        "testy.runWithCoverage": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether to run tests with coverage"
         }
       }
     }
