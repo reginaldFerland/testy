@@ -118,6 +118,7 @@ export class CSharpTestController {
     ): Promise<void> {
         const run = this.testController.createTestRun(request);
         const queue: vscode.TestItem[] = [];
+        const testLeafNodes: vscode.TestItem[] = [];
 
         // Build a queue of test items to run
         if (request.include) {
@@ -127,8 +128,8 @@ export class CSharpTestController {
             this.testController.items.forEach(test => queue.push(test));
         }
 
-        // Process queue
-        while (queue.length > 0 && !token.isCancellationRequested) {
+        // First identify all leaf nodes to run in parallel
+        while (queue.length > 0) {
             const test = queue.shift()!;
 
             // Skip tests that should be excluded
@@ -142,13 +143,19 @@ export class CSharpTestController {
                 continue;
             }
 
-            // It's a leaf node (test method), so run it
+            // It's a leaf node (test method), so add it to our leaf nodes array
+            testLeafNodes.push(test);
+        }
+
+        // Start each test and collect promises
+        const runPromises = testLeafNodes.map(async (test) => {
+            // Mark the test as started
             run.started(test);
 
             try {
                 if (!test.uri) {
                     run.skipped(test);
-                    continue;
+                    return;
                 }
 
                 // Find the project file (csproj)
@@ -156,7 +163,7 @@ export class CSharpTestController {
                 if (!projectInfo) {
                     run.skipped(test);
                     run.appendOutput(`Could not find project for test: ${test.id}\n`);
-                    continue;
+                    return;
                 }
 
                 // Extract test method name from the test id
@@ -183,6 +190,14 @@ export class CSharpTestController {
                 run.failed(test, new vscode.TestMessage(error.message));
                 run.appendOutput(`Error running test ${test.id}: ${error.message}\n`);
             }
+        });
+
+        // Wait for all tests to complete
+        if (token.isCancellationRequested) {
+            // Early termination if cancellation is requested
+            run.appendOutput(`Test run was cancelled\n`);
+        } else {
+            await Promise.all(runPromises);
         }
 
         run.end();
