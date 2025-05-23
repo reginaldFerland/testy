@@ -10,6 +10,9 @@ export class CSharpTestController {
     private readonly disposables: vscode.Disposable[] = [];
     private readonly testItems = new Map<string, vscode.TestItem>();
 
+    // Folders to ignore when scanning for tests
+    private readonly ignoredFolders = ['bin', 'obj', 'node_modules', '.git'];
+
     constructor() {
         // Create the test controller
         this.testController = vscode.tests.createTestController('csharpTestController', 'C# Test Explorer');
@@ -192,8 +195,9 @@ export class CSharpTestController {
 
             // Process all entries in the folder
             for (const [name, type] of entries) {
-                // Skip hidden folders and files
-                if (name.startsWith('.')) {
+                // Skip hidden folders/files and ignored folders
+                if (name.startsWith('.') ||
+                    (type === vscode.FileType.Directory && this.ignoredFolders.includes(name.toLowerCase()))) {
                     continue;
                 }
 
