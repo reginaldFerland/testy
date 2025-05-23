@@ -1,55 +1,56 @@
-# C# Test Helper
+# Testy - C# Test Helper
 
-A Visual Studio Code extension that integrates C# tests into the VS Code Test Explorer interface. This extension helps you discover, view, run, and debug your C# tests directly from the VS Code Test Explorer.
+A Visual Studio Code extension that enhances the test experience for C# projects, by automatically triggering test runs when files change and providing integration with VS Code's built-in Test Explorer.
 
 ## Features
 
-- **Automatic Test Discovery**: Finds C# test files in your workspace based on naming patterns
-- **Real-time Updates**: Monitors file changes to keep the test explorer up-to-date
-- **Run Tests**: Run individual tests or test files directly from the test explorer
-- **Debug Tests**: Debug tests with full VS Code debugger integration
-- **Test Framework Support**: Compatible with popular .NET test frameworks:
-  - xUnit ([Fact], [Theory])
-  - MSTest ([TestMethod])
-  - NUnit ([Test])
+- **Auto Test Execution**: Automatically runs tests when C# files are changed
+- **Test Explorer Integration**: Leverages VS Code's built-in Test Explorer
+- **Coverage Support**: Option to run tests with code coverage
+- **File Watching**: Monitors file changes to keep test results up-to-date
+- **Manual Refresh**: Refresh tests anytime with a single click
 
 ## Requirements
 
 - Visual Studio Code 1.99.0+
-- .NET SDK 6.0 or higher installed on your system
-- C# extension for debugging support
+- C# Dev Kit extension (automatically prompted for installation)
+- .NET SDK installed on your system
 
 ## Usage
 
 1. Open a C# project containing tests
-2. The extension automatically discovers test files and populates the Test Explorer
+2. The extension will automatically watch for file changes and trigger test runs
 3. Click the test icon in the Activity Bar to open the Test Explorer view
-4. Run or debug tests using the buttons in the Test Explorer
+4. Use the refresh button in the Test Explorer header to manually trigger a test run
 
 ### Running Tests
 
-- Click the play button next to a test to run it
-- Click the play button at the Test Explorer header to run all tests
-- Use the "Run Tests" option in the context menu of a test or test file
+- Tests run automatically when C# files change
+- Click the refresh button in Test Explorer for manual test execution
+- Use standard Test Explorer features to run individual tests or groups of tests
 
-### Debugging Tests
+### Test Coverage
 
-- Click the debug icon next to a test to start debugging
-- Set breakpoints in your test code before debugging
-- Use the "Debug Tests" option in the context menu
+- Coverage is enabled by default and can be configured in settings
 
 ## Extension Settings
 
-This extension does not currently add any VS Code settings.
+This extension contributes the following settings:
+
+* `testy.fileWatcherPattern`: Glob pattern for files to watch for changes (default: `**/*.cs`)
+* `testy.debounceTime`: Delay in milliseconds before triggering tests after file changes (default: `1000`)
+* `testy.runWithCoverage`: Whether to run tests with coverage (default: `true`)
+* `testy.startupDelay`: Delay in milliseconds before initializing the extension (default: `10000`)
 
 ## Known Issues
 
-- Test discovery is based on file naming patterns and may not find all tests if non-standard naming is used
+None at this time.
 
 ## Release Notes
 
 ### 0.0.1
 
 - Initial release
-- Basic test discovery and execution
-- Support for running and debugging tests
+- Automatic test execution on file changes
+- Test Explorer integration
+- Coverage support
