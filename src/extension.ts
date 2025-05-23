@@ -8,16 +8,24 @@ export function activate(context: vscode.ExtensionContext): void {
 	// Log activation
 	console.log('Activating the testy extension');
 
-	// Get configuration settings
-	const config = vscode.workspace.getConfiguration('testy');
-	const startupDelay = config.get<number>('startupDelay', 10000);
+	// Check if the required extension is installed first
+	checkRequiredExtension(context).then(hasExtension => {
+		// Only proceed with normal initialization if the dependency check passes
+		if (hasExtension) {
+			// Get configuration settings
+			const config = vscode.workspace.getConfiguration('testy');
+			const startupDelay = config.get<number>('startupDelay', 10000);
 
-	console.log(`Delaying extension initialization for ${startupDelay}ms to allow other extensions to initialize`);
+			console.log(`Delaying extension initialization for ${startupDelay}ms to allow other extensions to initialize`);
 
-	// Delay the initialization to give other extensions time to get ready
-	setTimeout(() => {
-		initializeExtension(context);
-	}, startupDelay);
+			// Delay the initialization to give other extensions time to get ready
+			setTimeout(() => {
+				initializeExtension(context);
+			}, startupDelay);
+		} else {
+			console.log('Required extension not installed. Some functionality may not work.');
+		}
+	});
 }
 
 /**
@@ -26,9 +34,6 @@ export function activate(context: vscode.ExtensionContext): void {
  */
 function initializeExtension(context: vscode.ExtensionContext): void {
 	console.log('Initializing extension functionality after startup delay');
-
-	// Check if the required extension is installed
-	checkRequiredExtension(context);
 
 	// Get configuration settings
 	const config = vscode.workspace.getConfiguration('testy');
@@ -107,25 +112,40 @@ function initializeExtension(context: vscode.ExtensionContext): void {
 /**
  * Check if the required C# Dev Kit extension is installed
  * @param context The extension context
+ * @returns Promise<boolean> True if the extension is installed or user dismisses the prompt
  */
-async function checkRequiredExtension(context: vscode.ExtensionContext): Promise<void> {
+async function checkRequiredExtension(context: vscode.ExtensionContext): Promise<boolean> {
 	const csDevKitExtId = 'ms-dotnettools.csdevkit';
 
 	// Check if the extension is already installed
 	const extension = vscode.extensions.getExtension(csDevKitExtId);
 
-	// If not installed, prompt the user to install it
-	if (!extension) {
-		const installButton = 'Install';
-		const message = 'The C# Dev Kit extension is required for full functionality of this extension.';
-
-		const selection = await vscode.window.showInformationMessage(message, installButton);
-
-		if (selection === installButton) {
-			// Open the extension in the marketplace
-			await vscode.commands.executeCommand('extension.open', csDevKitExtId);
-		}
+	// If already installed, return true
+	if (extension) {
+		return true;
 	}
+
+	// If not installed, prompt the user to install it
+	const installButton = 'Install';
+	const dismissButton = 'Not Now';
+	const message = 'The C# Dev Kit extension is required for full functionality of this extension.';
+
+	const selection = await vscode.window.showInformationMessage(
+		message,
+		{ modal: false },
+		installButton,
+		dismissButton
+	);
+
+	if (selection === installButton) {
+		// Open the extension in the marketplace
+		await vscode.commands.executeCommand('extension.open', csDevKitExtId);
+		// Return false since the extension is still not installed
+		return false;
+	}
+
+	// User dismissed the prompt, return true to continue initialization
+	return true;
 }
 
 // This method is called when your extension is deactivated
