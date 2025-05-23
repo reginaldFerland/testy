@@ -29,6 +29,46 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 /**
+ * Creates a debounced function that delays invoking the provided function
+ * until after the specified wait time has elapsed since the last time it was invoked.
+ * @param func The function to debounce
+ * @param wait The number of milliseconds to delay
+ * @returns A debounced function that can be called repeatedly, but will only execute once per wait period
+ */
+function debounce<T extends (...args: any[]) => Promise<void> | void>(
+	func: T,
+	wait: number
+): (...args: Parameters<T>) => void {
+	let timeout: NodeJS.Timeout | undefined;
+	let pendingPromise: Promise<void> | undefined;
+
+	return function (this: any, ...args: Parameters<T>): void {
+		// Clear the timeout on each call
+		if (timeout) {
+			clearTimeout(timeout);
+		}
+
+		// Set a new timeout
+		timeout = setTimeout(async () => {
+			timeout = undefined;
+
+			try {
+				// Execute the function and store any returned promise
+				const result = func.apply(this, args);
+				if (result instanceof Promise) {
+					pendingPromise = result;
+					await result;
+					pendingPromise = undefined;
+				}
+			} catch (error) {
+				console.error('Error in debounced function:', error);
+				pendingPromise = undefined;
+			}
+		}, wait);
+	};
+}
+
+/**
  * Initialize the extension after the startup delay
  * @param context The extension context
  */
@@ -45,8 +85,17 @@ function initializeExtension(context: vscode.ExtensionContext): void {
 	const fileWatcher = vscode.workspace.createFileSystemWatcher(fileWatcherPattern);
 	context.subscriptions.push(fileWatcher);
 
-	// Set up a debounce mechanism to prevent triggering tests too frequently
-	let debounceTimer: NodeJS.Timeout | undefined;
+	// Create an efficient debounced test runner with the configurable delay
+	let debouncedTestRun = debounce(async () => {
+		console.log(`File change detected, triggering test run${runWithCoverage ? ' with coverage' : ''}`);
+
+		// Execute the appropriate VS Code testing command based on coverage setting
+		if (runWithCoverage) {
+			await vscode.commands.executeCommand('testing.coverageAll');
+		} else {
+			await vscode.commands.executeCommand('testing.runAll');
+		}
+	}, debounceDelay);
 
 	// Watch for configuration changes
 	context.subscriptions.push(
@@ -55,6 +104,16 @@ function initializeExtension(context: vscode.ExtensionContext): void {
 				// Update debounce time if changed
 				debounceDelay = vscode.workspace.getConfiguration('testy').get<number>('debounceTime', 1000);
 				console.log(`Debounce delay updated to ${debounceDelay}ms`);
+				// Recreate the debounced function with the new delay
+				debouncedTestRun = debounce(async () => {
+					console.log(`File change detected, triggering test run${runWithCoverage ? ' with coverage' : ''}`);
+
+					if (runWithCoverage) {
+						await vscode.commands.executeCommand('testing.coverageAll');
+					} else {
+						await vscode.commands.executeCommand('testing.runAll');
+					}
+				}, debounceDelay);
 			}
 			if (event.affectsConfiguration('testy.runWithCoverage')) {
 				// Update coverage setting if changed
@@ -64,47 +123,25 @@ function initializeExtension(context: vscode.ExtensionContext): void {
 		})
 	);
 
-	// Function to trigger the VS Code test runner
-	const triggerTestRun = () => {
-		// Clear any pending debounce timer
-		if (debounceTimer) {
-			clearTimeout(debounceTimer);
-		}
-
-		// Set a new debounce timer
-		debounceTimer = setTimeout(async () => {
-			console.log(`File change detected, triggering test run${runWithCoverage ? ' with coverage' : ''}`);
-
-			// Execute the appropriate VS Code testing command based on coverage setting
-			if (runWithCoverage) {
-				await vscode.commands.executeCommand('testing.coverageAll');
-			} else {
-				await vscode.commands.executeCommand('testing.runAll');
-			}
-		}, debounceDelay);
-	};
-
-	// Watch for file changes and trigger test runs
+	// Set up a single handler for all file system events
 	fileWatcher.onDidChange(uri => {
 		console.log(`File changed: ${uri.fsPath}`);
-		triggerTestRun();
+		debouncedTestRun();
 	});
 
-	// Also watch for new files
 	fileWatcher.onDidCreate(uri => {
 		console.log(`File created: ${uri.fsPath}`);
-		triggerTestRun();
+		debouncedTestRun();
 	});
 
-	// Also watch for deleted files
 	fileWatcher.onDidDelete(uri => {
 		console.log(`File deleted: ${uri.fsPath}`);
-		triggerTestRun();
+		debouncedTestRun();
 	});
 
 	// Register a command to manually trigger a test run
 	const refreshCommand = vscode.commands.registerCommand('testy.refreshTests', () => {
-		triggerTestRun();
+		debouncedTestRun();
 	});
 	context.subscriptions.push(refreshCommand);
 }
