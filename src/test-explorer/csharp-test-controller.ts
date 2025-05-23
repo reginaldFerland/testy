@@ -74,18 +74,16 @@ interface FolderNode {
 
 class Workspace {
     async scanWorkspace(): Promise<FolderNode> {
-        const wsFolders = vscode.workspace.workspaceFolders;
+        const wsFolders = vscode.workspace.workspaceFolders ?? [];
 
-        const nodePromises = wsFolders?.map(async (folder) => {
-            return this.scanFolder(folder.uri);
-        });
-
-        const nodeResults = (await Promise.all(nodePromises || [])).flat();
+        const nodes = await Promise.all(
+            wsFolders.map(async (folder) => this.scanFolder(folder.uri))
+        ).then((results) => results.flat());
 
         const rootNode: FolderNode = {
             name: 'Workspace',
-            children: nodeResults,
-            hasTests: nodeResults.some((child) => { return child.hasTests; }),
+            children: nodes,
+            hasTests: nodes.some(child => child.hasTests)
         };
 
         return rootNode;
@@ -94,12 +92,13 @@ class Workspace {
 
     async scanFolder(folder: vscode.Uri): Promise<(FolderNode | FileNode)[]> {
         // Assume this is returning children for the folder
+        const files = await vscode.workspace.fs.readDirectory(folder);
 
-        return vscode.workspace.fs.readDirectory(folder).then(async (files) => {
-            const result = files.map(async ([name, fileType]) => {
+        return Promise.all(
+            files.map(async ([name, fileType]) => {
                 switch (fileType) {
                     case vscode.FileType.Directory:
-                        var children = await this.scanFolder(vscode.Uri.joinPath(folder, name));
+                        const children = await this.scanFolder(vscode.Uri.joinPath(folder, name));
                         return {
                             name: name,
                             children: children,
@@ -116,51 +115,36 @@ class Workspace {
                         console.log(`Found unknown type: ${name}`);
                         throw new Error(`Unknown file type: ${name}`);
                 }
-            });
-            return await Promise.all(result);
-        });
+            })
+        ).then((results) => results.flat());
     }
 
-    async fileHasTests(filePath: string, fileName: string): Promise<boolean> {
-        // Check if file is .cs first
-        if (!fileName.endsWith('.cs')) {
-            return Promise.resolve(false);
+    extractTestItems = (text: string): TestItem[] => {
+        const testItems: TestItem[] = [];
+        const testMethodRegex = /\[\s*(Test|TestMethod|Fact|Theory)\s*\][^\{]*?public\s+(?:async\s+)?(?:void|Task)\s+(\w+)/g;
+
+        let match;
+        while ((match = testMethodRegex.exec(text)) !== null) {
+            testItems.push({ name: match[2] });
         }
-        return Promise.resolve(true); // Placeholder logic
-    }
 
+        return testItems;
+    };
+
+    // Then in your class
     async getTestItems(filePath: string): Promise<TestItem[]> {
-        try {
-            // Skip non-C# files
-            if (!filePath.endsWith('.cs')) {
-                return [];
-            }
+        if (!filePath.endsWith('.cs')) {
+            return [];
+        }
 
-            // Read the file content
+        try {
             const fileUri = vscode.Uri.file(filePath);
             const fileContent = await vscode.workspace.fs.readFile(fileUri);
             const text = Buffer.from(fileContent).toString('utf8');
-            const testItems: TestItem[] = [];
 
-            // Look for test class indicators
             const hasTestClass = /\[\s*Test(Class|Fixture)\s*\]|\[\s*Fact\s*\]|Microsoft\.VisualStudio\.TestTools|NUnit\.Framework|Xunit/i.test(text);
 
-            if (!hasTestClass) {
-                return [];
-            }
-
-            // Find test methods - supports NUnit, MSTest, and xUnit patterns
-            const testMethodRegex = /\[\s*(Test|TestMethod|Fact|Theory)\s*\][^\{]*?public\s+(?:async\s+)?(?:void|Task)\s+(\w+)/g;
-
-            let match;
-            while ((match = testMethodRegex.exec(text)) !== null) {
-                const methodName = match[2];
-                testItems.push({
-                    name: methodName
-                });
-            }
-
-            return testItems;
+            return hasTestClass ? this.extractTestItems(text) : [];
         } catch (error) {
             console.error(`Error parsing file ${filePath}:`, error);
             return [];
