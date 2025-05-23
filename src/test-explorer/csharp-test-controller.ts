@@ -411,10 +411,14 @@ export class CSharpTestController {
                     }
                 }
 
-                // Create a range for the test method
+                // Find the method declaration line (which is where we want the test checkmark to appear)
+                // The method declaration line is usually the line below the attribute line
+                const methodLineNumber = lineNumber + 2;
+
+                // Create a range for the test method on the actual method declaration line
                 const range = new vscode.Range(
-                    new vscode.Position(lineNumber, 0),
-                    new vscode.Position(lineNumber + 1, 0)
+                    new vscode.Position(methodLineNumber, 0),
+                    new vscode.Position(methodLineNumber + 1, 0)
                 );
 
                 testMethods.push({ name: methodName, range });
