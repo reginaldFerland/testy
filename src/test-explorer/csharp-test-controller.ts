@@ -58,9 +58,13 @@ export class CSharpTestController {
 
 
 // Class to represent the project structure
+interface TestItem {
+    name: string;
+}
 interface FileNode {
     name: string;
     hasTests: boolean;
+    children: TestItem[];
 }
 interface FolderNode {
     name: string;
@@ -102,9 +106,11 @@ class Workspace {
                             hasTests: children.some((child) => { return child.hasTests; }),
                         } as FolderNode;
                     case vscode.FileType.File:
+                        const tests = await this.getTestItems(vscode.Uri.joinPath(folder, name).fsPath);
                         return {
                             name: name,
-                            hasTests: await this.fileHasTests(folder.path, name),
+                            hasTests: tests.length > 0,
+                            children: tests
                         } as FileNode;
                     default:
                         console.log(`Found unknown type: ${name}`);
@@ -121,5 +127,43 @@ class Workspace {
             return Promise.resolve(false);
         }
         return Promise.resolve(true); // Placeholder logic
+    }
+
+    async getTestItems(filePath: string): Promise<TestItem[]> {
+        try {
+            // Skip non-C# files
+            if (!filePath.endsWith('.cs')) {
+                return [];
+            }
+
+            // Read the file content
+            const fileUri = vscode.Uri.file(filePath);
+            const fileContent = await vscode.workspace.fs.readFile(fileUri);
+            const text = Buffer.from(fileContent).toString('utf8');
+            const testItems: TestItem[] = [];
+
+            // Look for test class indicators
+            const hasTestClass = /\[\s*Test(Class|Fixture)\s*\]|\[\s*Fact\s*\]|Microsoft\.VisualStudio\.TestTools|NUnit\.Framework|Xunit/i.test(text);
+
+            if (!hasTestClass) {
+                return [];
+            }
+
+            // Find test methods - supports NUnit, MSTest, and xUnit patterns
+            const testMethodRegex = /\[\s*(Test|TestMethod|Fact|Theory)\s*\][^\{]*?public\s+(?:async\s+)?(?:void|Task)\s+(\w+)/g;
+
+            let match;
+            while ((match = testMethodRegex.exec(text)) !== null) {
+                const methodName = match[2];
+                testItems.push({
+                    name: methodName
+                });
+            }
+
+            return testItems;
+        } catch (error) {
+            console.error(`Error parsing file ${filePath}:`, error);
+            return [];
+        }
     }
 }
