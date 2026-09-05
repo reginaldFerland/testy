@@ -25,6 +25,21 @@ export interface SourceShape {
     readonly excludedTypes: readonly string[];
 }
 
+/** Parse global aliases with the same C# syntax rules as declaration analysis. */
+export async function sourceAliases(dotnet: string, analyzer: string, contents: readonly string[], storage: string, options: ProcessOptions): Promise<readonly string[]> {
+    if (!contents.length) {return [];}
+    await fs.mkdir(storage, { recursive: true });
+    const directory = await fs.mkdtemp(path.join(storage, 'aliases-'));
+    try {
+        const input = path.join(directory, 'input.json');
+        await fs.writeFile(input, JSON.stringify({ aliasSources: contents }));
+        const result = requireSuccess(await runProcess(dotnet, [analyzer, input], { ...options, output: undefined }), 'Analyzing global C# aliases');
+        const aliases: unknown = JSON.parse(result.stdout);
+        if (!Array.isArray(aliases) || !aliases.every(alias => typeof alias === 'string')) {throw new Error('Invalid C# alias response.');}
+        return aliases;
+    } finally {await fs.rm(directory, { recursive: true, force: true });}
+}
+
 /** Resolve cross-file exclusions using incremental syntax records, not rereads. */
 export function resolveShapes(analyses: ReadonlyMap<string, SourceShape | null>, projects?: readonly Pick<Project, 'sourceFiles'>[]): ReadonlyMap<string, string | null> {
     const bodies = new Set<string>();

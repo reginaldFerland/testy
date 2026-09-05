@@ -18,6 +18,8 @@ Coverage collection is enabled by default. On first use, Testy installs a pinned
 
 Testy prepares an isolated, instrumented output once per project and target framework, then runs each selected test file in a separate process. Files mutated by tests are restored from a pristine template before reuse. Testy records the workspace source files that execution reaches, including indirect calls, and keeps a separate coverage contribution for that test file. Later changes select every test file known to have exercised the changed code.
 
+When target frameworks share an output directory, Testy snapshots each target immediately after building it. Discovery, test execution, and portable symbols use that target's copy.
+
 New or unknown source files, project/configuration changes, missing coverage, and incomplete or failing traces use a conservative fallback: all test files in the affected project and its dependent test projects. A bundled Roslyn analyzer also detects declaration changes, including constants, signatures, attributes, and initializers that can affect consumers without appearing in runtime coverage. Edits in coverage-excluded methods or hidden regions also force fallback. Recorded runtime dependencies and workspace binary references are included even without a `ProjectReference`. Evaluated imports, resources and additional build inputs are tracked across consuming projects. MSBuild applies reference-specific properties when building dependencies. Ordinary method-body edits use the recorded traces. Choose `testy.runMode: "all"` to always run the complete suite.
 
 The first baseline takes longer than a single suite invocation because attribution requires separate test-file runs. Complete projects in run-all mode, and runs without collection, batch tests by project. Subsequent runs build once per affected project and execute only selected test files. Source files with hidden or remapped `#line` regions use conservative project selection because coverage may not identify their physical methods. For unobserved external dependencies, changes to databases, services, environment variables, or data outside the watched files require a full refresh.
@@ -58,7 +60,7 @@ Test failures include their messages and stack traces in Test Explorer. The stat
 | `testy.timeoutSeconds` | `600` | Limit for each build, discovery, or test-file run. |
 | `testy.coverageToolPath` | Automatic | Optional existing `dotnet-coverage` executable. |
 
-Generated files and build outputs (`bin`, `obj`, `TestResults`, `*.g.cs`, `*.generated.cs`, `*.designer.cs`, and files with an auto-generated header in the first 2,048 bytes) do not trigger test runs. Header-marked outputs are also excluded from input hashes, so a generator that rewrites them during a build does not restart the baseline. Evaluated generator inputs remain tracked. VS Code file renames and deletions are handled in both trigger modes.
+Generated files and build outputs (`bin`, `obj`, `TestResults`, `*.g.cs`, `*.generated.cs`, `*.designer.cs`, and files with an auto-generated header in the first 2,048 bytes) do not trigger test runs. Observed generated headers remain recognized through deletion and rename. Header-marked outputs and configured `testy.exclude` patterns are also excluded from input hashes, so a generator that rewrites them during a build does not restart the baseline. Ignored Compile inputs can still supply global coverage-exclusion aliases for conservative source analysis. Evaluated generator inputs remain tracked unless explicitly excluded. VS Code file renames and deletions are handled in both trigger modes.
 
 Filesystem mode also watches evaluated source files and build inputs linked from outside the workspace, including known inputs outside the usual file-pattern extensions. Excluding a referenced project from discovery does not prevent MSBuild from building that required dependency.
 
@@ -72,6 +74,8 @@ Filesystem mode also watches evaluated source files and build inputs linked from
 Test discovery is scoped to projects inside the opened workspace folders. Referenced projects outside those folders are built as dependencies, but their tests are not discovered. A build failure stops the current batch, including independent projects.
 
 Testy cleans up owned test processes after completion, cancellation, and extension-host failure. On Windows, a Job Object contains descendants. On macOS and Linux, an independent supervisor watches the extension host’s control pipe and combines process groups with an inherited ownership marker to find detached children. The supervisor uses VS Code’s bundled runtime; no separate Node installation is required. Programs that deliberately remove that marker and detach, or launch work through an external service, must manage that work's lifetime themselves.
+
+Private run output carries process ownership metadata. Startup and subsequent runs reclaim output left by dead hosts while preserving live windows' output. Unmarked directories created by older versions are preserved because their ownership cannot be verified.
 
 Testy does not migrate VSTest projects or edit their package references. A project using VSTest gets an actionable setup error. If your workspace uses a `global.json`, it must select a supported SDK. Microsoft documents [MTP setup](https://learn.microsoft.com/en-us/dotnet/core/testing/microsoft-testing-platform-intro) and the [.NET 10 CLI integration](https://learn.microsoft.com/en-us/dotnet/core/tools/dotnet-test-mtp).
 
@@ -88,6 +92,7 @@ npm run benchmark
 # Optional report parsing, output reuse, identity lookup, and UI publication probes:
 npm run benchmark:responsiveness
 node test/performance/cache-and-results.cjs
+node test/performance/cache-membership.cjs
 ```
 
 Compilation builds TypeScript, the bundled .NET source analyzer, and the Windows process owner. Integration tests copy the sample workspace into a temporary directory, build it, modify its source, and assert the selected test identities, failure results, retained coverage, constant-change fallback, and cancellation. Set `TESTY_COVERAGE_TOOL` to an existing collector executable to reuse it in tests. The extension-host suite downloads an isolated VS Code build and exercises actual saves, pause/resume, refresh, and external linked-file events. Set `TESTY_VSCODE_PATH` to use an existing VS Code executable instead.

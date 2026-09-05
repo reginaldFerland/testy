@@ -31,6 +31,11 @@ export async function readCache(directory: string, signal?: AbortSignal): Promis
             sources.push({ ...source, lines });
         }
         for (const trace of snapshot.traces) {
+            const sourceIds: string[] = [];
+            for (const index of trace.sourceIds) {
+                if (++converted % 4096 === 0) {await yieldTurn(); signal?.throwIfAborted();}
+                sourceIds.push(sources[index].id);
+            }
             const coverage = [];
             for (const file of trace.coverage) {
                 const lines: CoveredLine[] = [];
@@ -40,7 +45,7 @@ export async function readCache(directory: string, signal?: AbortSignal): Promis
                 }
                 coverage.push({ file: file.file, hash: file.hash, lines });
             }
-            traces.push({ ...trace, coverage });
+            traces.push({ ...trace, sourceIds, coverage });
         }
         signal?.throwIfAborted();
         return { sources, traces, warnings: snapshot.warnings, complete: snapshot.complete };

@@ -2,12 +2,13 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DiscoveredTest, FileCoverage, Project, TestFile, TestResult, Trace } from '../core/model';
-import { contentHash, normalizePath, testFileId } from '../core/paths';
+import { contentHash, normalizePath, testFileId, testTargetKey } from '../core/paths';
 import { discoveredTest, requestTests, TestNode, testResult } from './mtp';
 import { ProcessOptions, requireSuccess, runProcess } from './process';
 import { CoverageReader } from './coverageReader';
 import { copyOutput, PreparedOutput, removeOutput } from './output';
 import { sourceLocations } from './analysis';
+import { claimRunOutputs, RunOutputLease } from './runOutputs';
 
 export interface RunnerOptions extends ProcessOptions {
     readonly dotnet: string;
@@ -19,6 +20,8 @@ export interface RunnerOptions extends ProcessOptions {
     readonly analyzer?: string;
     /** Stable within an engine, isolated from every other extension instance. */
     readonly identity?: string;
+    readonly outputRoot?: string;
+    readonly snapshots?: ReadonlyMap<string, string>;
     readonly onResult?: (group: TestFile, result: TestResult) => void;
     readonly onStarted?: (group: TestFile, id: string) => void;
     readonly onPrepared?: (project: string) => void;
@@ -95,19 +98,21 @@ async function workspaceOutputs(directory: string, names: ReadonlySet<string>, s
 export class RunnerSession {
     private readonly prepared = new Map<string, Preparation>();
     private readonly coverageReader = new CoverageReader();
+    private outputLease?: RunOutputLease;
     constructor(private readonly options: RunnerOptions) {}
 
     async discover(project: Project): Promise<readonly TestFile[]> {
         const preparation = await this.prepare({ id: testFileId(project.file, project.framework), project: project.file,
             assembly: project.assembly, framework: project.framework, tests: [] });
-        const groups = await discover(project, this.options, preparation.nodes);
+        const groups = (await discover({ ...project, assembly: path.join(preparation.output.directory, path.basename(project.assembly)) }, this.options, preparation.nodes))
+            .map(group => ({ ...group, assembly: project.assembly }));
         preparation.groups = groups;
         return groups;
     }
 
     async run(groups: readonly TestFile[], hashes: ReadonlyMap<string, string>): Promise<FileRun> {
         const group = groups[0];
-        if (!group || groups.some(item => item.assembly !== group.assembly)) {throw new Error('A test batch must belong to one project and target framework.');}
+        if (!group || groups.some(item => item.assembly !== group.assembly || item.project !== group.project || item.framework !== group.framework)) {throw new Error('A test batch must belong to one project and target framework.');}
         const options = { ...this.options, cwd: path.dirname(group.project) };
         const preparation = await this.prepare(group);
         if (preparation.runs++) {await preparation.output.restore(options.signal);}
@@ -201,21 +206,22 @@ export class RunnerSession {
         await this.coverageReader.dispose();
         for (const preparation of this.prepared.values()) {await removeOutput(preparation.root);}
         this.prepared.clear();
-        if (this.options.identity) {await fs.rmdir(path.join(this.options.storage, this.options.identity)).catch(() => undefined);}
+        await this.outputLease?.dispose();
     }
 
     private async prepare(group: TestFile): Promise<Preparation> {
-        const existing = this.prepared.get(group.assembly); if (existing) {return existing;}
+        const key = testTargetKey(group.project, group.framework);
+        const existing = this.prepared.get(key); if (existing) {return existing;}
         const options = { ...this.options, cwd: path.dirname(group.project) };
-        await fs.mkdir(options.storage, { recursive: true });
-        const root = options.identity ? path.join(options.storage, options.identity, contentHash(group.assembly))
-            : await fs.mkdtemp(path.join(options.storage, 'run-'));
-        if (options.identity) {await removeOutput(root); await fs.mkdir(root, { recursive: true });}
+        if (!options.outputRoot && !this.outputLease) {this.outputLease = await claimRunOutputs(options.storage, options.identity, options.signal);}
+        const root = path.join(options.outputRoot ?? this.outputLease!.directory, contentHash(key));
+        await fs.mkdir(root, { recursive: true });
+        const source = options.snapshots?.get(key) ?? path.dirname(group.assembly);
         const template = path.join(root, 'template');
         const session = randomUUID();
         let coverage = !!options.coverageTool;
         try {
-            await copyOutput(path.dirname(group.assembly), template, options.signal);
+            await copyOutput(source, template, options.signal);
             if (coverage) {
                 const assemblies = new Set((options.assemblies ?? [group.assembly]).map(assemblyName));
                 for (const assembly of await workspaceOutputs(template, assemblies, options.signal)) {
@@ -226,7 +232,7 @@ export class RunnerSession {
                         options.output?.(`Coverage preparation failed; running tests without collection. ${String(error)}\n`);
                         // Never execute partially instrumented output without its collector.
                         await removeOutput(template);
-                        await copyOutput(path.dirname(group.assembly), template, options.signal); break;
+                        await copyOutput(source, template, options.signal); break;
                     }
                 }
             }
@@ -239,7 +245,7 @@ export class RunnerSession {
             const byKey = new Map<string, TestNode[]>();
             for (const node of nodes) {const key = nodeKey(node); const matching = byKey.get(key) ?? []; matching.push(node); byKey.set(key, matching);}
             const prepared = { root, output, session, coverage, nodes, nativeById, byKey, runs: 0 };
-            this.prepared.set(group.assembly, prepared); options.onPrepared?.(group.project);
+            this.prepared.set(key, prepared); options.onPrepared?.(group.project);
             return prepared;
         } catch (error) {await removeOutput(root); throw error;}
     }

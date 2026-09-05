@@ -19,6 +19,67 @@ async function fixture(t) {
  return {root,temp,config,state,engine,file:relative=>normalizePath(path.join(root,relative)),run:(files=[],full=false,manual)=>engine.run({files,full},new AbortController().signal,manual)};
 }
 
+test('shared target output paths preserve each framework through discovery and batching',{timeout:180000},async t=>{
+ const f=await fixture(t), project=f.file('ImpactDemo.Tests/ImpactDemo.Tests.csproj'), greeting=f.file('ImpactDemo.Tests/GreetingTests.cs');
+ await fs.writeFile(project,(await fs.readFile(project,'utf8')).replace('<TargetFramework>net10.0</TargetFramework>',
+  '<TargetFrameworks>net10.0;net10.0-windows</TargetFrameworks><AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>'));
+ await fs.writeFile(greeting,(await fs.readFile(greeting,'utf8')).replace('Assert.AreEqual(3, Arithmetic.Expected);',
+  'Assert.AreEqual(3, Arithmetic.Expected);\n#if WINDOWS\nAssert.Fail("Windows-specific failure");\n#endif\n'));
+ for(const [mode,coverage] of [['affected',true],['all',true],['affected',false]]) {
+  f.config.mode=mode;f.config.coverage=coverage;f.state.results=[];
+  const result=await f.run([],true);
+  assert.equal(result.tests,6);assert.equal(result.passed,5);assert.equal(result.failed,1,`${mode}, coverage=${coverage}`);
+  assert.equal(f.engine.groups.length,4);assert.equal(f.state.prepared%2,0);
+  assert.deepEqual(await fs.readdir(path.join(f.temp,'state/runs')),[],'normal completion removes snapshots and owner metadata');
+ }
+});
+
+for(const [name,alias,declaration,fileName] of [
+ ['commented','Blind','global /* comment */ using Blind /* alias */ = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute;','Aliases.cs'],
+ ['unicode','隠す','global using 隠す = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute;','Aliases.cs'],
+ ['generated','Blind','global using Blind = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute;','Aliases.g.cs']
+]) test(`${name} global exclusion aliases preserve affected callers`,{timeout:90000},async t=>{
+ const f=await fixture(t), arithmetic=f.file('ImpactDemo/Arithmetic.cs'),greeting=f.file('ImpactDemo.Tests/GreetingTests.cs');
+ await fs.writeFile(f.file(`ImpactDemo/${fileName}`),declaration);
+ const source=(await fs.readFile(arithmetic,'utf8')).replace('    public static int Sum',`    [${alias}] public static int Hidden(int x) => x;\n    public static int Sum`);
+ await fs.writeFile(arithmetic,source);
+ await fs.writeFile(greeting,(await fs.readFile(greeting,'utf8')).replace('Assert.AreEqual(3, Arithmetic.Expected);','Assert.AreEqual(3, Arithmetic.Expected); Assert.AreEqual(7, Arithmetic.Hidden(7));'));
+ assert.equal((await f.run([],true)).passed,3);
+ await fs.writeFile(arithmetic,source.replace('Hidden(int x) => x;','Hidden(int x) => x + 1;'));
+ const affected=await f.run([arithmetic]);assert.equal(affected.tests,3);assert.equal(affected.failed,1);
+ assert.ok(f.state.selected.includes('GreetingTests.cs'));
+});
+
+test('configured exclusions omit build-generated timestamps from freshness checks',{timeout:90000},async t=>{
+ const f=await fixture(t);f.config.coverage=false;f.config.excludes=['**/Stamped.cs'];
+ const file=f.file('ImpactDemo/Stamped.cs'),project=f.file('ImpactDemo/ImpactDemo.csproj');
+ await fs.writeFile(file,'// initial stamp');
+ await fs.writeFile(project,(await fs.readFile(project,'utf8')).replace('</Project>',
+  '<Target Name="GeneratedStamp" BeforeTargets="CoreCompile"><PropertyGroup><GeneratedStamp>$([System.DateTime]::UtcNow.Ticks)</GeneratedStamp></PropertyGroup><WriteLinesToFile File="$(MSBuildProjectDirectory)/Stamped.cs" Lines="// $(GeneratedStamp)" Overwrite="true" /></Target></Project>'));
+ const invalidated=[];f.engine.options.events.invalidated=files=>invalidated.push(...files);
+ for(let i=0;i<2;i++) {assert.equal((await f.run([],true)).passed,3);assert.equal(f.engine.hashes.has(file),false);}
+ assert.deepEqual(invalidated,[]);assert.ok(f.engine.hashes.has(f.file('ImpactDemo/Arithmetic.cs')));
+});
+
+test('a fresh engine reclaims private MTP output after its previous host dies',{timeout:90000},async t=>{
+ const {spawn}=require('node:child_process'),{setTimeout:delay}=require('node:timers/promises');
+ const f=await fixture(t);f.config.coverage=false;
+ const source=f.file('ImpactDemo/Arithmetic.cs'),ready=path.join(f.temp,'started'),storage=path.join(f.temp,'state');
+ await fs.writeFile(source,(await fs.readFile(source,'utf8')).replace('=> a + b;',
+  '{ if (System.Environment.GetEnvironmentVariable("TESTY_CRASH_SLOW") == "1") System.Threading.Thread.Sleep(30000); return a + b; }'));
+ const script=`const fs=require('node:fs');const {TestEngine}=require(${JSON.stringify(path.resolve('out/services/engine.js'))});const engine=new TestEngine({roots:[${JSON.stringify(f.root)}],storage:${JSON.stringify(storage)},tools:${JSON.stringify(path.join(f.temp,'tools'))},analyzer:${JSON.stringify(path.resolve('dist/analyzer/Testy.Analysis.dll'))},configuration:()=>(${JSON.stringify(f.config)}),events:{output:()=>{},phase:()=>{},discovered:()=>{},selected:()=>{},result:()=>{},coverage:()=>{},invalidated:()=>{},started:()=>fs.writeFileSync(${JSON.stringify(ready)},'started')}});engine.run({files:[],full:true},new AbortController().signal).catch(error=>{console.error(error);process.exitCode=1;});`;
+ const child=spawn(process.execPath,['-e',script],{stdio:['ignore','ignore','pipe'],env:{...process.env,TESTY_CRASH_SLOW:'1'}});
+ let error='';child.stderr.on('data',text=>error+=text);const closed=new Promise(resolve=>child.once('close',resolve));
+ try {
+  let started=false;
+  for(let i=0;i<1200;i++){try{await fs.access(ready);started=true;break;}catch{if(child.exitCode!==null||child.signalCode!==null)break;await delay(25);}}
+  assert.ok(started,error||'MTP never started');
+  assert.ok((await fs.readdir(path.join(storage,'runs'))).some(name=>name.endsWith('.owner.json')));
+  child.kill('SIGKILL');await closed;
+  assert.equal((await f.run([],true)).passed,3);assert.deepEqual(await fs.readdir(path.join(storage,'runs')),[]);
+ }finally{if(child.exitCode===null&&child.signalCode===null)child.kill('SIGKILL');await closed;}
+});
+
 test('execution-time rows preserve a failure followed by a pass under one UID',{timeout:90000},async t=>{
  const f=await fixture(t), file=f.file('ImpactDemo.Tests/CalculatorTests.cs');
  await fs.writeFile(file,(await fs.readFile(file,'utf8')).replace('[DataRow(1, 2, 3)]','[DataRow(1, 2, 4)]').replace('namespace ImpactDemo.Tests;','[assembly: TestDataSourceDiscovery(TestDataSourceDiscoveryOption.DuringExecution)]\nnamespace ImpactDemo.Tests;'));

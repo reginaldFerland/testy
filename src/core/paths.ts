@@ -55,6 +55,11 @@ export function testFileId(project: string, framework: string, file?: string): s
     return contentHash(`${normalizePath(project)}\0${framework}\0${file ? normalizePath(file) : '<unknown>'}`);
 }
 
+/** Inputs are already canonical paths from project evaluation. */
+export function testTargetKey(project: string, framework: string): string {
+    return `${project}\0${framework}`;
+}
+
 export function isConfigurationFile(file: string): boolean {
     return /\.(csproj|sln|slnx|props|targets|runsettings|json|config|resx)$/i.test(file);
 }

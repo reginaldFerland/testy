@@ -80,6 +80,7 @@ export async function evaluateProject(dotnet: string, file: string, configuratio
             if (project.isTestProject && Number(/^net(\d+)\./.exec(project.framework)?.[1] ?? 0) < 10) {throw new Error(`${path.basename(project.file)} targets ${project.framework}. Testy requires test projects targeting .NET 10 or later.`);}
             const paths = (files: readonly string[]): string[] => [...new Set(files.map(normalizePath))];
             return { ...project, file: normalizePath(project.file), assembly: normalizePath(project.assembly), runner: 'mtp',
+                analysisFiles: paths(project.sourceFiles),
                 sourceFiles: paths(project.sourceFiles).filter(file => !isExcluded(file)), inputs: paths(project.inputs ?? []).filter(file => !isExcluded(file)),
                 references: paths(project.references), binaryReferences: paths(project.binaryReferences ?? []) };
         });
@@ -98,6 +99,7 @@ export function mergeProjects(projects: readonly Project[]): readonly Project[] 
             contexts: [...previous.contexts ?? [previous], ...project.contexts ?? [project]],
             assemblies: union(previous.assemblies ?? [previous.assembly], project.assemblies ?? [project.assembly]),
             sourceFiles: union(previous.sourceFiles, project.sourceFiles), inputs: union(previous.inputs ?? [], project.inputs ?? []),
+            analysisFiles: union(previous.analysisFiles ?? previous.sourceFiles, project.analysisFiles ?? project.sourceFiles),
             references: union(previous.references, project.references), binaryReferences: union(previous.binaryReferences ?? [], project.binaryReferences ?? []) });
     }
     return [...merged.values()];

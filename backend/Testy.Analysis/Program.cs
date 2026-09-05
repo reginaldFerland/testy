@@ -8,6 +8,12 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 try
 {
     using var request = JsonDocument.Parse(await File.ReadAllTextAsync(args.Single()));
+    if (request.RootElement.TryGetProperty("aliasSources", out var aliasSources))
+    {
+        var names = aliasSources.Deserialize<string[]>()!.SelectMany(GlobalAliases).Distinct().Order().ToArray();
+        Console.WriteLine(JsonSerializer.Serialize(names));
+        return 0;
+    }
     if (request.RootElement.TryGetProperty("assembly", out var assembly))
     {
         Console.WriteLine(JsonSerializer.Serialize(SourceLocations.Read(assembly.GetString()!)));
@@ -34,10 +40,10 @@ try
         // An excluded method can share a file with instrumented code. In that
         // case a hit elsewhere in this file cannot prove its callers are known.
         var localAliases = root.DescendantNodes().OfType<UsingDirectiveSyntax>()
-            .Where(directive => directive.Alias is not null && IsExcluded(directive.Name?.ToString() ?? ""))
-            .Select(directive => directive.Alias!.Name.Identifier.ValueText);
+            .Where(directive => directive.Alias is not null && IsExcluded(Name(directive.Name)))
+            .SelectMany(directive => AliasNames(directive.Alias!.Name.Identifier.ValueText));
         var excludedAliases = aliases.Concat(localAliases).ToHashSet(StringComparer.Ordinal);
-        bool Excluded(AttributeSyntax attribute) => IsExcluded(attribute.Name.ToString()) || excludedAliases.Contains(attribute.Name.ToString().TrimStart('@'));
+        bool Excluded(AttributeSyntax attribute) => IsExcluded(Name(attribute.Name)) || excludedAliases.Contains(Name(attribute.Name));
         var attributes = root.DescendantNodes().OfType<AttributeSyntax>().Where(Excluded).ToArray();
         var blind = attributes.Length > 0 || localAliases.Any()
             // Mapped documents/line numbers cannot reliably be joined to the
@@ -69,6 +75,22 @@ catch (Exception exception)
 
 static bool IsExcluded(string name) => new[] { "ExcludeFromCodeCoverage", "DebuggerHidden", "DebuggerNonUserCode", "GeneratedCode", "CompilerGenerated" }
     .Any(attribute => name.EndsWith(attribute, StringComparison.Ordinal) || name.EndsWith(attribute + "Attribute", StringComparison.Ordinal));
+
+static string Name(SyntaxNode? node) => node is null ? "" : string.Concat(node.DescendantTokens().Select(token => token.ValueText));
+
+static IEnumerable<string> AliasNames(string name) => name.EndsWith("Attribute", StringComparison.Ordinal) ? [name, name[..^9]] : [name];
+
+static IEnumerable<string> GlobalAliases(string content)
+{
+    var root = CSharpSyntaxTree.ParseText(content).GetRoot();
+    // Without each compilation's symbols, include aliases from either branch.
+    var roots = new[] { root }.Concat(root.DescendantTrivia(descendIntoTrivia: true)
+        .Where(trivia => trivia.IsKind(SyntaxKind.DisabledTextTrivia))
+        .Select(trivia => CSharpSyntaxTree.ParseText(trivia.ToFullString()).GetRoot()));
+    return roots.SelectMany(node => node.DescendantNodes().OfType<UsingDirectiveSyntax>())
+        .Where(directive => directive.GlobalKeyword.IsKind(SyntaxKind.GlobalKeyword) && directive.Alias is not null && IsExcluded(Name(directive.Name)))
+        .SelectMany(directive => AliasNames(directive.Alias!.Name.Identifier.ValueText));
+}
 
 static bool HasExcludedName(string text) => new[] { "ExcludeFromCodeCoverage", "DebuggerHidden", "DebuggerNonUserCode", "GeneratedCode", "CompilerGenerated" }
     .Any(name => text.Contains(name, StringComparison.Ordinal));

@@ -27,19 +27,20 @@ interface SourceRecord {
 
 /** Line geometry is shared; each test file stores only its positive hits. */
 export class CoverageStore {
-    private readonly records = new Map<string, StoredTrace>();
-    private readonly sources = new Map<string, SourceRecord>();
-    private readonly byFile = new Map<string, Set<string>>();
-    private readonly byDependency = new Map<string, Set<string>>();
-    private readonly summaries = new Map<string, CoverageSummary>();
-    private readonly dirtyFiles = new Set<string>();
-    private readonly changedSources = new Set<string>();
-    private readonly changedTraces = new Set<string>();
-    private readonly removedSources = new Set<string>();
-    private readonly removedTraces = new Set<string>();
+    private records = new Map<string, StoredTrace>();
+    private sources = new Map<string, SourceRecord>();
+    private byFile = new Map<string, Set<string>>();
+    private byDependency = new Map<string, Set<string>>();
+    private summaries = new Map<string, CoverageSummary>();
+    private dirtyFiles = new Set<string>();
+    private changedSources = new Set<string>();
+    private changedTraces = new Set<string>();
+    private removedSources = new Set<string>();
+    private removedTraces = new Set<string>();
     private hashes: ReadonlyMap<string, string> = new Map();
     private cached: readonly CoverageSummary[] | undefined;
     private version = 0;
+    get revision(): number { return this.version; }
 
     get traces(): ReadonlyMap<string, StoredTrace> { return this.records; }
 
@@ -141,7 +142,47 @@ export class CoverageStore {
             if (trace.sourceIds.every(id => this.sources.has(id))) {this.install({ ...trace, reliable: false, stale: true });}
         }
         this.pruneSources();
-        this.takeDelta();
+        this.clearDelta();
+    }
+
+    /** Stage the entire restored checkpoint before publishing any of its indexes. */
+    async restorePackedAsync(sources: readonly CoverageSource[], traces: readonly StoredTrace[], signal?: AbortSignal, version = this.version): Promise<void> {
+        if (version !== this.version) {return;}
+        const staged = new CoverageStore();
+        function* prepare(): Generator<void, void> {
+            let count = 0;
+            for (const source of sources) {
+                staged.registerSource(source, true);
+                if (++count % 512 === 0) {yield;}
+            }
+            for (const trace of traces) {
+                let valid = true;
+                for (const id of trace.sourceIds) {
+                    valid &&= staged.sources.has(id);
+                    if (++count % 512 === 0) {yield;}
+                }
+                if (valid) {yield* staged.installation({ ...trace, reliable: false, stale: true });}
+            }
+            for (const [id, source] of staged.sources) {
+                if (!source.groups.size) {staged.sources.delete(id); staged.byFile.get(source.source.file)?.delete(id);}
+                if (++count % 512 === 0) {yield;}
+            }
+        }
+        await finishAsync(prepare(), signal);
+        signal?.throwIfAborted();
+        // A live run or invalidation that arrived during restoration takes
+        // precedence over an older disk snapshot.
+        if (version !== this.version) {return;}
+        this.records = staged.records; this.sources = staged.sources;
+        this.byFile = staged.byFile; this.byDependency = staged.byDependency;
+        this.summaries = staged.summaries; this.dirtyFiles = staged.dirtyFiles;
+        this.changedSources = new Set(); this.changedTraces = new Set();
+        this.removedSources = new Set(); this.removedTraces = new Set();
+        this.cached = undefined; this.version++;
+    }
+
+    private clearDelta(): void {
+        this.changedSources.clear(); this.changedTraces.clear(); this.removedSources.clear(); this.removedTraces.clear();
     }
 
     takeDelta(): CoverageDelta {
@@ -150,7 +191,7 @@ export class CoverageStore {
             traces: [...this.changedTraces].map(id => this.records.get(id)).filter((trace): trace is StoredTrace => !!trace),
             removedSources: [...this.removedSources], removedTraces: [...this.removedTraces]
         };
-        this.changedSources.clear(); this.changedTraces.clear(); this.removedSources.clear(); this.removedTraces.clear();
+        this.clearDelta();
         return delta;
     }
 
@@ -221,17 +262,25 @@ export class CoverageStore {
         this.changedSources.add(source.id); this.removedSources.delete(source.id); this.dirtyFiles.add(source.file); this.cached = undefined; this.version++;
     }
 
-    private install(trace: StoredTrace): void {
+    private install(trace: StoredTrace): void { finish(this.installation(trace)); }
+
+    private *installation(trace: StoredTrace): Generator<void, void> {
+        let count = 0;
         this.remove(trace.groupId);
         this.records.set(trace.groupId, trace); this.changedTraces.add(trace.groupId); this.removedTraces.delete(trace.groupId);
         for (const file of trace.dependencies) {
             const groups = this.byDependency.get(file) ?? new Set<string>(); groups.add(trace.groupId); this.byDependency.set(file, groups);
+            if (++count % 512 === 0) {yield;}
         }
         for (const id of trace.sourceIds) {
             const source = this.sources.get(id)!;
             source.groups.add(trace.groupId); this.dirtyFiles.add(source.source.file);
+            if (++count % 512 === 0) {yield;}
         }
-        for (const file of trace.coverage) {this.sources.get(contentHash(`${file.file}\0${file.hash}`))?.hits.set(trace.groupId, file.lines);}
+        for (const file of trace.coverage) {
+            this.sources.get(contentHash(`${file.file}\0${file.hash}`))?.hits.set(trace.groupId, file.lines);
+            if (++count % 512 === 0) {yield;}
+        }
         this.cached = undefined; this.version++;
     }
 

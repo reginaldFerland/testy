@@ -1,7 +1,7 @@
 import * as fs from 'node:fs/promises';
 import { contentHash, isGeneratedSource } from '../core/paths';
 
-interface SourceState { readonly stamp: string; readonly hash?: string; readonly generated: boolean; readonly excludedAliases: readonly string[]; }
+interface SourceState { readonly stamp: string; readonly hash?: string; readonly generated: boolean; readonly aliasSource?: string; }
 
 /** Reads changed content only; all expensive work belongs to the scheduled batch. */
 export class SourceTracker {
@@ -9,22 +9,24 @@ export class SourceTracker {
     private readonly dirty = new Set<string>();
     private current: ReadonlyMap<string, string> = new Map();
     private known = new Set<string>();
+    private tracked = new Set<string>();
     revision = 0;
 
     get hashes(): ReadonlyMap<string, string> { return this.current; }
     get files(): readonly string[] { return [...this.known]; }
     isGenerated(file: string): boolean { return this.states.get(file)?.generated ?? false; }
-    get excludedAliases(): readonly string[] { return [...new Set([...this.states.values()].flatMap(state => [...state.excludedAliases]))]; }
+    get aliasSources(): ReadonlyMap<string, string> { return new Map([...this.states].filter(([, state]) => state.aliasSource !== undefined).map(([file, state]) => [file, state.aliasSource!])); }
 
-    setFiles(files: readonly string[]): void {
-        const next = new Set(files);
+    setFiles(files: readonly string[], analysisFiles: readonly string[] = []): void {
+        const tracked = new Set(files), next = new Set([...files, ...analysisFiles]);
         const hashes = new Map(this.current);
         let changed = false;
         for (const file of this.known) {
             if (!next.has(file)) {this.states.delete(file); hashes.delete(file); this.dirty.delete(file); changed = true;}
         }
-        for (const file of next) {if (!this.known.has(file)) {this.dirty.add(file);}}
+        for (const file of next) {if (!this.known.has(file) || tracked.has(file) !== this.tracked.has(file)) {this.dirty.add(file);}}
         this.known = next;
+        this.tracked = tracked;
         if (changed) {this.current = hashes; this.revision++;}
     }
 
@@ -51,11 +53,11 @@ export class SourceTracker {
                     if (previous?.stamp === stamp && !this.dirty.has(file)) {continue;}
                     const bytes = await fs.readFile(file, { signal });
                     const content = /\.cs$/i.test(file) ? bytes.toString('utf8') : '';
-                    const excludedAliases = [...content.matchAll(/\bglobal\s+using\s+(@?\w+)\s*=([^;]+);/g)]
-                        .filter(match => /\b(ExcludeFromCodeCoverage|DebuggerHidden|DebuggerNonUserCode|GeneratedCode|CompilerGenerated)(Attribute)?\b/.test(match[2]))
-                        .flatMap(match => {const name = match[1].replace(/^@/, ''); return [name, name.replace(/Attribute$/, '')];});
                     const generated = isGeneratedSource(file, bytes);
-                    updates.set(file, { stamp, hash: generated ? undefined : contentHash(bytes), generated, excludedAliases });
+                    // This is only a cheap candidate check. Roslyn interprets
+                    // comments, escapes, Unicode and disabled branches later.
+                    const aliasSource = /\bglobal(?=\s|\/)/.test(content) ? content : undefined;
+                    updates.set(file, { stamp, hash: this.tracked.has(file) && !generated ? contentHash(bytes) : undefined, generated, aliasSource });
                 } catch (error) {
                     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {throw error;}
                     updates.set(file, undefined);
@@ -70,7 +72,9 @@ export class SourceTracker {
                 changed.push(file); hashes ??= new Map(this.current);
                 if (state?.hash) {hashes.set(file, state.hash);} else {hashes.delete(file);}
             }
-            if (state) {this.states.set(file, state);} else {this.states.delete(file);}
+            if (state) {this.states.set(file, state);}
+            else if (this.states.get(file)?.generated) {this.states.set(file, { stamp: '', generated: true });}
+            else {this.states.delete(file);}
         }
         if (revision === this.revision) {for (const file of queue) {this.dirty.delete(file);}}
         if (hashes) {this.current = hashes;}

@@ -25,6 +25,51 @@ function trace(groupId='one',hash='v1') {
   coverage:[{file:'/code.cs',hash,lines:[{line:1,hits:1},{line:2,hits:0}]}]};
 }
 
+test('cache membership restoration yields, publishes atomically and respects concurrent changes',async t=>{
+ const {contentHash}=require('../../out/core/paths'),{setImmediate:turn}=require('node:timers/promises');
+ const sources=Array.from({length:1000},(_,i)=>({file:`/Source${i}.cs`,hash:'v1',id:contentHash(`/Source${i}.cs\0v1`),lines:[1,2]}));
+ const sourceIds=sources.map(source=>source.id);
+ const traces=Array.from({length:200},(_,i)=>({groupId:`group${i}`,sourceIds,dependencies:[`/Source${i}.cs`],inputs:{[`/Source${i}.cs`]:'v1'},reliable:true,stale:false,timestamp:1,
+  coverage:[{file:`/Source${i}.cs`,hash:'v1',lines:[{line:1,hits:1}]}]}));
+ const store=new CoverageStore();store.replace([trace()],new Set(['one']));
+ const abort=new AbortController(),pending=store.restorePackedAsync(sources,traces,abort.signal);
+ await turn();assert.equal(store.traces.size,1);assert.ok(store.traces.has('one'),'no partial restored state is visible');
+ abort.abort();await assert.rejects(pending,{name:'AbortError'});assert.ok(store.traces.has('one'));
+ const competing=store.restorePackedAsync(sources,traces);await turn();store.replace([trace('live')],new Set(['live']));await competing;
+ assert.deepEqual([...store.traces.keys()],['live'],'new live state takes precedence over restored history');
+ const root=await temporary(t);await new CoverageCache(root,()=>{}).save({sources,traces,removedSources:[],removedTraces:[]});
+ let beats=0;const timer=setInterval(()=>beats++,1);
+ try {await new CoverageCache(root,()=>{}).restore(store);}finally{clearInterval(timer);}
+ assert.ok(beats>1);assert.equal(store.traces.size,200);assert.equal(store.traces.has('live'),false);
+ assert.deepEqual([...store.dependentGroups(['/Source199.cs'])],['group199']);
+ const summary=store.summary('/Source999.cs',new Map([['/Source999.cs','v1']]));
+ assert.equal(summary.groupIds.length,200);assert.equal(summary.total,2);assert.equal(summary.covered,0);assert.equal(summary.stale,true);
+ assert.deepEqual(store.takeDelta(),{sources:[],traces:[],removedSources:[],removedTraces:[]});
+ let release,acquired;
+ const gate=new Promise(resolve=>release=resolve),ready=new Promise(resolve=>acquired=resolve);
+ const lock=withLock(path.join(root,'coverage-v2.lock'),undefined,async()=>{acquired();await gate;});await ready;
+ const waiting=new CoverageCache(root,()=>{}).restore(store);
+ try {store.replace([trace('newer')],new Set(['newer']));}finally{release();await lock;}
+ await waiting;assert.deepEqual([...store.traces.keys()],['newer'],'changes during disk I/O or lock waits also take precedence');
+});
+
+test('run output leases reclaim dead hosts and preserve live or unknown ownership',async t=>{
+ const {claimRunOutputs,reclaimRunOutputs}=require('../../out/services/runOutputs'),{randomUUID}=require('node:crypto'),{spawn}=require('node:child_process');
+ const root=await temporary(t),storage=path.join(root,'runs'),ready=path.join(root,'ready');
+ const live=await claimRunOutputs(storage),unknown=path.join(storage,randomUUID());await fs.mkdir(unknown);
+ const script=`const fs=require('node:fs/promises');const {claimRunOutputs}=require(${JSON.stringify(path.resolve('out/services/runOutputs.js'))});(async()=>{const lease=await claimRunOutputs(${JSON.stringify(storage)});await fs.writeFile(lease.directory+'/asset','output');await fs.writeFile(${JSON.stringify(ready)},lease.directory);setInterval(()=>{},1000);})();`;
+ const child=spawn(process.execPath,['-e',script],{stdio:'ignore'});
+ t.after(()=>{if(child.exitCode===null&&child.signalCode===null)child.kill('SIGKILL');});
+ let abandoned;
+ for(let i=0;i<200;i++){try{abandoned=await fs.readFile(ready,'utf8');break;}catch{await delay(10);}}
+ assert.ok(abandoned);await reclaimRunOutputs(storage);await fs.access(abandoned);await fs.access(live.directory);
+ const closed=new Promise(resolve=>child.once('close',resolve));child.kill('SIGKILL');await closed;
+ await reclaimRunOutputs(storage);await assert.rejects(fs.access(abandoned),{code:'ENOENT'});await fs.access(live.directory);await fs.access(unknown);
+ await assert.rejects(claimRunOutputs(storage,path.basename(live.directory)),{code:'EEXIST'});await fs.access(live.directory);
+ const abort=new AbortController();abort.abort();await assert.rejects(claimRunOutputs(storage,undefined,abort.signal),{name:'AbortError'});
+ await live.dispose();await live.dispose();assert.deepEqual(await fs.readdir(storage),[path.basename(unknown)]);
+});
+
 test('coverage caches summaries and shares zero-hit geometry; changed test inputs mark production stale',()=>{
  const store=new CoverageStore(); store.replace([trace(),trace('two')],new Set(['one','two']));
  const hashes=new Map([['/code.cs','v1'],['/tests.cs','test1']]);
@@ -134,7 +179,7 @@ test('source refresh reuses unchanged hashes, includes aliases and accepts cance
  await fs.writeFile(file,'global using Blind = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute;');
  source.setFiles([file]);assert.deepEqual(await source.refresh([file]),[file]);
  const hashes=source.hashes;await source.refresh([file]);assert.equal(source.hashes,hashes);
- assert.deepEqual(source.excludedAliases,['Blind']);
+ assert.equal(source.aliasSources.get(file),await fs.readFile(file,'utf8'));
  await fs.writeFile(file,'changed');source.mark([file]);
  const abort=new AbortController();abort.abort();
  await assert.rejects(source.refresh([file],abort.signal),{name:'AbortError'});

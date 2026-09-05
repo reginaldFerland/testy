@@ -39,6 +39,7 @@ class Testy implements vscode.Disposable {
     private renderTimer: NodeJS.Timeout | undefined;
     private rendering = false;
     private readonly pendingEditors = new Set<vscode.TextEditor>();
+    private readonly generatedFiles = new Set<string>();
     private productionSources = new Set<string>();
     private coverageSuffix = '';
     private passed = 0;
@@ -188,7 +189,10 @@ class Testy implements vscode.Disposable {
                 try {handle = await fs.open(file, 'r'); const buffer = Buffer.alloc(2048); const { bytesRead } = await handle.read(buffer); content = buffer.toString('utf8', 0, bytesRead);}
                 catch { /* Deleted file. */ } finally {await handle?.close();}
             }
-            if (isGeneratedSource(file, content ?? '')) {return;}
+            if (content !== undefined) {
+                if (isGeneratedSource(file, content)) {this.generatedFiles.add(file); return;}
+                this.generatedFiles.delete(file);
+            } else if (this.generatedFiles.has(file) || this.engine.sources?.isGenerated(file)) {return;}
         }
         if (this.disposed) {return;}
         const files = [...descendants, file];

@@ -6,6 +6,18 @@ const path=require('node:path');
 const {sourceShapes,sourceAnalyses,resolveShapes}=require('../../out/services/analysis');
 const {normalizePath}=require('../../out/core/paths');
 
+test('Roslyn parses global alias comments, escapes, attribute suffixes and conditional branches',async t=>{
+ const {sourceAliases}=require('../../out/services/analysis');
+ const directory=await fs.mkdtemp(path.join(os.tmpdir(),'testy-aliases-'));t.after(()=>fs.rm(directory,{recursive:true,force:true}));
+ const aliases=await sourceAliases('dotnet',path.resolve('dist/analyzer/Testy.Analysis.dll'),[
+  'global /* c */ using \\u0042lind /* c */ = global::System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute;',
+  'global using 隠すAttribute = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute;',
+  '#if CUSTOM\nglobal using Conditional = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute;\n#endif',
+  '/* global using Fake = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute; */'
+ ],directory,{cwd:directory});
+ assert.deepEqual(new Set(aliases),new Set(['Blind','隠す','隠すAttribute','Conditional']));
+});
+
 test('declaration analysis distinguishes executable edits from compile-time dependencies',async t=>{
  const directory=await fs.mkdtemp(path.join(os.tmpdir(),'testy-shapes-'));
  t.after(()=>fs.rm(directory,{recursive:true,force:true}));

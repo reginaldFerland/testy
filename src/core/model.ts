@@ -6,6 +6,8 @@ export interface Project {
     readonly isTestProject: boolean;
     readonly runner: 'mtp';
     readonly sourceFiles: readonly string[];
+    /** Compile inputs retained for semantic analysis, including ignored outputs. */
+    readonly analysisFiles?: readonly string[];
     readonly references: readonly string[];
     readonly binaryReferences?: readonly string[];
     /** Evaluated imports, resources and other build inputs across reference contexts. */

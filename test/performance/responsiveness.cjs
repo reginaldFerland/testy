@@ -35,7 +35,7 @@ const {normalizePath}=require('../../out/core/paths');
   const assembly=path.join(root,'Tests.dll'),preparedRoot=path.join(root,'prepared');await fs.mkdir(preparedRoot);
   const nativeById=new Map(nodes.map(node=>[node.uid,node])),byKey=new Map();
   for(const node of nodes)byKey.set(JSON.stringify(['display-name','location.type','location.method','location.method-arity'].map(key=>node[key]??null)),[node]);
-  session.prepared.set(assembly,{root:preparedRoot,output:{directory:preparedRoot,restore:async()=>{}},session:'benchmark',coverage:false,nodes,nativeById,byKey,runs:0});
+  session.prepared.set(`${path.join(root,'Tests.csproj')}\0net10.0`,{root:preparedRoot,output:{directory:preparedRoot,restore:async()=>{}},session:'benchmark',coverage:false,nodes,nativeById,byKey,runs:0});
   const durations=[];start=performance.now();
   for(let i=0;i<100;i++){
    const group={id:`group${i}`,project:path.join(root,'Tests.csproj'),assembly,framework:'net10.0',file:path.join(root,`Tests${i}.cs`),tests:nodes.slice(i*500,(i+1)*500).map(node=>({id:node.uid,name:node['display-name'],node,line:1}))};

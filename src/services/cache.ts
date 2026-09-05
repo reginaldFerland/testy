@@ -20,13 +20,14 @@ export class CoverageCache {
     constructor(storage: string, private readonly output: (text: string) => void) { this.directory = path.join(storage, 'coverage-v2'); }
 
     async restore(store: CoverageStore, signal?: AbortSignal): Promise<void> {
+        const revision = store.revision;
         await withLock(`${this.directory}.lock`, signal, async () => {
             await this.beginWrite(signal);
             const snapshot = await readCache(this.directory, signal);
             for (const warning of snapshot.warnings) {this.output(`${warning}\n`);}
             for (const source of snapshot.sources) {this.knownSources.set(source.id, source);}
             signal?.throwIfAborted();
-            store.restorePacked(snapshot.sources, snapshot.traces, true);
+            await store.restorePackedAsync(snapshot.sources, snapshot.traces, signal, revision);
             if (snapshot.complete) {await this.prune(snapshot.traces, signal);}
         });
     }
@@ -76,7 +77,13 @@ export class CoverageCache {
     }
 
     private async prune(traces: readonly StoredTrace[], signal?: AbortSignal): Promise<void> {
-        const live = new Set(traces.flatMap(trace => [...trace.sourceIds]));
+        const live = new Set<string>();
+        await finishAsync((function* () {
+            let count = 0;
+            for (const trace of traces) {for (const id of trace.sourceIds) {
+                live.add(id); if (++count % 4096 === 0) {yield;}
+            }}
+        })(), signal);
         const directory = path.join(this.directory, 'sources');
         for (const name of await fs.readdir(directory).catch(() => [] as string[])) {
             signal?.throwIfAborted();
