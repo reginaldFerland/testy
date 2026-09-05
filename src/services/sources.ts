@@ -1,7 +1,7 @@
 import * as fs from 'node:fs/promises';
-import { contentHash } from '../core/paths';
+import { contentHash, isGeneratedSource } from '../core/paths';
 
-interface SourceState { readonly stamp: string; readonly hash: string; readonly excludedAliases: readonly string[]; }
+interface SourceState { readonly stamp: string; readonly hash?: string; readonly generated: boolean; readonly excludedAliases: readonly string[]; }
 
 /** Reads changed content only; all expensive work belongs to the scheduled batch. */
 export class SourceTracker {
@@ -13,6 +13,7 @@ export class SourceTracker {
 
     get hashes(): ReadonlyMap<string, string> { return this.current; }
     get files(): readonly string[] { return [...this.known]; }
+    isGenerated(file: string): boolean { return this.states.get(file)?.generated ?? false; }
     get excludedAliases(): readonly string[] { return [...new Set([...this.states.values()].flatMap(state => [...state.excludedAliases]))]; }
 
     setFiles(files: readonly string[]): void {
@@ -49,11 +50,12 @@ export class SourceTracker {
                     const previous = this.states.get(file);
                     if (previous?.stamp === stamp && !this.dirty.has(file)) {continue;}
                     const bytes = await fs.readFile(file, { signal });
-                    const content = file.endsWith('.cs') ? bytes.toString('utf8') : '';
+                    const content = /\.cs$/i.test(file) ? bytes.toString('utf8') : '';
                     const excludedAliases = [...content.matchAll(/\bglobal\s+using\s+(@?\w+)\s*=([^;]+);/g)]
                         .filter(match => /\b(ExcludeFromCodeCoverage|DebuggerHidden|DebuggerNonUserCode|GeneratedCode|CompilerGenerated)(Attribute)?\b/.test(match[2]))
                         .flatMap(match => {const name = match[1].replace(/^@/, ''); return [name, name.replace(/Attribute$/, '')];});
-                    updates.set(file, { stamp, hash: contentHash(bytes), excludedAliases });
+                    const generated = isGeneratedSource(file, bytes);
+                    updates.set(file, { stamp, hash: generated ? undefined : contentHash(bytes), generated, excludedAliases });
                 } catch (error) {
                     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {throw error;}
                     updates.set(file, undefined);
@@ -66,7 +68,7 @@ export class SourceTracker {
         for (const [file, state] of updates) {
             if (this.current.get(file) !== state?.hash) {
                 changed.push(file); hashes ??= new Map(this.current);
-                if (state) {hashes.set(file, state.hash);} else {hashes.delete(file);}
+                if (state?.hash) {hashes.set(file, state.hash);} else {hashes.delete(file);}
             }
             if (state) {this.states.set(file, state);} else {this.states.delete(file);}
         }

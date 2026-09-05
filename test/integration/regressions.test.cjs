@@ -281,3 +281,84 @@ test('manual file and project containers discover new tests and files while auto
  const project=await f.run([],false,{groups:new Set(),projects:new Set([group.project]),coverage:false});assert.equal(project.tests,5);assert.equal(project.failed,2);
  const workspace=await f.run([],false,{groups:new Set(),all:true,exclude:{groups:new Set([group.id])},coverage:false});assert.equal(workspace.tests,2);assert.equal(workspace.failed,1);
 });
+
+test('manual workspace discovery removes deleted test projects',{timeout:90000},async t=>{
+ const f=await fixture(t);f.config.coverage=false;
+ assert.equal((await f.run([],true)).passed,3);
+ await fs.rm(f.file('ImpactDemo.Tests'),{recursive:true,force:true});
+ assert.equal((await f.run([],false,{all:true,groups:new Set(),coverage:false})).tests,0);
+ assert.equal(f.engine.groups.length,0);assert.equal(f.engine.projects.some(project=>project.isTestProject),false);
+});
+
+test('manual file discovery replaces reversed dependency edges and obsolete inputs',{timeout:90000},async t=>{
+ const f=await fixture(t);f.config.coverage=false;
+ const project=reference=>`<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>${reference?`<ItemGroup><ProjectReference Include="${reference}"/></ItemGroup>`:''}</Project>`;
+ await fs.mkdir(f.file('A'));await fs.mkdir(f.file('B'));
+ await fs.writeFile(f.file('A/A.csproj'),project('../B/B.csproj'));await fs.writeFile(f.file('B/B.csproj'),project());
+ const tests=f.file('ImpactDemo.Tests/ImpactDemo.Tests.csproj');
+ await fs.writeFile(tests,(await fs.readFile(tests,'utf8')).replace('</ItemGroup>','<ProjectReference Include="../A/A.csproj"/></ItemGroup>'));
+ assert.equal((await f.run([],true)).passed,3);const group=f.engine.groups[0];
+ await fs.writeFile(f.file('A/A.csproj'),project());await fs.writeFile(f.file('B/B.csproj'),project('../A/A.csproj'));
+ await fs.writeFile(tests,(await fs.readFile(tests,'utf8')).replace('../A/A.csproj','../B/B.csproj'));
+ assert.equal((await f.run([],false,{groups:new Set([group.id]),coverage:false})).passed,group.tests.length);
+ assert.deepEqual(f.engine.projects.find(project=>project.file===f.file('A/A.csproj')).references,[]);
+});
+
+test('binary consumers build contextual producers first from clean and stale outputs',{timeout:90000},async t=>{
+ const f=await fixture(t);f.config.coverage=false;
+ await fs.cp(f.file('ImpactDemo.Tests'),f.file('AConsumer.Tests'),{recursive:true});
+ const consumer=f.file('AConsumer.Tests/ImpactDemo.Tests.csproj'),producer=f.file('ImpactDemo.Tests/ImpactDemo.Tests.csproj');
+ await fs.writeFile(consumer,(await fs.readFile(consumer,'utf8')).replace('<ProjectReference Include="../ImpactDemo/ImpactDemo.csproj" />','<Reference Include="Special"><HintPath>../ImpactDemo/bin/Debug/net10.0/Special.dll</HintPath></Reference>'));
+ await fs.writeFile(producer,(await fs.readFile(producer,'utf8')).replace('Include="../ImpactDemo/ImpactDemo.csproj"','Include="../ImpactDemo/ImpactDemo.csproj" AdditionalProperties="AssemblyName=Special"'));
+ assert.equal((await f.run([],true)).passed,6);
+ const source=f.file('ImpactDemo/Arithmetic.cs');
+ await fs.writeFile(source,(await fs.readFile(source,'utf8')).replace('a + b','a + b + 1'));
+ const changed=await f.run([source]);assert.equal(changed.tests,6);assert.equal(changed.failed,4);
+});
+
+test('mapped source methods sharing a physical file with observed code cannot hide failing callers',{timeout:90000},async t=>{
+ const f=await fixture(t),arithmetic=f.file('ImpactDemo/Arithmetic.cs'),greeting=f.file('ImpactDemo.Tests/GreetingTests.cs');
+ const source=(await fs.readFile(arithmetic,'utf8')).replace('    public static int Sum','#line 200 "VirtualArithmetic.cs"\n    public static int Mapped(int value) => value;\n#line default\n    public static int Sum');
+ await fs.writeFile(arithmetic,source);
+ await fs.writeFile(greeting,(await fs.readFile(greeting,'utf8')).replace('Assert.AreEqual(3, Arithmetic.Expected);','Assert.AreEqual(3, Arithmetic.Expected); Assert.AreEqual(7, Arithmetic.Mapped(7));'));
+ assert.equal((await f.run([],true)).passed,3);
+ await fs.writeFile(arithmetic,source.replace('Mapped(int value) => value;','Mapped(int value) => value + 1;'));
+ const affected=await f.run([arithmetic]);assert.equal(affected.tests,3);assert.equal(affected.failed,1);
+ assert.ok(f.state.selected.includes('GreetingTests.cs'));
+});
+
+test('build-generated header rewrites do not cancel baselines and generator data stays tracked',{timeout:90000},async t=>{
+ const f=await fixture(t);f.config.coverage=false;
+ const generated=f.file('ImpactDemo/Stamped.cs'),project=f.file('ImpactDemo/ImpactDemo.csproj'),input=f.file('ImpactDemo/generator.data');
+ await fs.writeFile(generated,'// Placeholder: the build adds the generated header');await fs.writeFile(input,'initial generator input');
+ const target='<ItemGroup><AdditionalFiles Include="generator.data"/></ItemGroup><Target Name="GeneratedStamp" BeforeTargets="CoreCompile"><PropertyGroup><GeneratedStamp>$([System.DateTime]::UtcNow.Ticks)</GeneratedStamp></PropertyGroup><WriteLinesToFile File="$(MSBuildProjectDirectory)/Stamped.cs" Lines="// &lt;auto-generated/&gt; $(GeneratedStamp)" Overwrite="true" /></Target>';
+ await fs.writeFile(project,(await fs.readFile(project,'utf8')).replace('</Project>',target+'</Project>'));
+ const invalidated=[];f.engine.options.events.invalidated=files=>invalidated.push(...files);
+ assert.equal((await f.run([],true)).passed,3);assert.equal((await f.run([],true)).passed,3);
+ assert.deepEqual(invalidated,[]);assert.equal(f.engine.hashes.has(generated),false);assert.equal(f.engine.hashes.has(input),true);
+ await fs.writeFile(input,'changed generator input');assert.equal((await f.run([input])).passed,3);
+});
+
+test('fresh conditional MSBuild contexts form a valid build chain through the same project twice',{timeout:90000},async t=>{
+ const f=await fixture(t);f.config.coverage=false;
+ await fs.mkdir(f.file('A'));await fs.mkdir(f.file('B'));
+ await fs.writeFile(f.file('A/A.csproj'),`<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup><ItemGroup Condition="'$(Flavor)' != 'Leaf'"><ProjectReference Include="../B/B.csproj" AdditionalProperties="Flavor=Middle"/></ItemGroup></Project>`);
+ await fs.writeFile(f.file('B/B.csproj'),`<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup><ItemGroup Condition="'$(Flavor)' == 'Middle'"><ProjectReference Include="../A/A.csproj" AdditionalProperties="Flavor=Leaf"/></ItemGroup></Project>`);
+ const tests=f.file('ImpactDemo.Tests/ImpactDemo.Tests.csproj');
+ await fs.writeFile(tests,(await fs.readFile(tests,'utf8')).replace('</ItemGroup>','<ProjectReference Include="../A/A.csproj"/></ItemGroup>'));
+ assert.equal((await f.run([],true)).passed,3);
+ const order=require('../../out/services/projects').buildOrder(f.engine.projects,new Set([tests]));
+ const a=order.filter(project=>project.file===f.file('A/A.csproj'));assert.ok(a.length>=2);assert.ok(a.some(project=>project.properties.Flavor==='Leaf'));
+});
+
+test('an unchanged manual leaf evaluates only its root in a shared solution',{timeout:90000},async t=>{
+ const f=await fixture(t);f.config.coverage=false;
+ for(let i=1;i<4;i++){await fs.cp(f.file('ImpactDemo.Tests'),f.file(`Tests${i}`),{recursive:true});}
+ assert.equal((await f.run([],true)).passed,12);
+ const group=f.engine.groups[0],projects=require('../../out/services/projects'),evaluate=projects.evaluateProject,evaluated=[];
+ projects.evaluateProject=async(...args)=>{evaluated.push(args[1]);return evaluate(...args);};
+ try{
+  const result=await f.run([],false,{groups:new Set([group.id]),tests:new Map([[group.id,new Set([group.tests[0].id])]]),coverage:false});
+  assert.equal(result.tests,1);assert.deepEqual(evaluated,[group.project]);
+ }finally{projects.evaluateProject=evaluate;}
+});

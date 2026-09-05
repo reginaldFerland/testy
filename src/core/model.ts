@@ -12,6 +12,11 @@ export interface Project {
     readonly inputs?: readonly string[];
     readonly entryPoint?: boolean;
     readonly properties?: Readonly<Record<string, string>>;
+    /** SDK graph node identity and exact edges, before merging file ownership. */
+    readonly contextId?: string;
+    readonly contextReferences?: readonly string[];
+    /** Individual evaluated producers retained when ownership is merged. */
+    readonly contexts?: readonly Project[];
 }
 
 export interface DiscoveredTest {
@@ -31,6 +36,8 @@ export interface TestFile {
     readonly assembly: string;
     readonly file?: string;
     readonly tests: readonly DiscoveredTest[];
+    /** Explicit manual exclusions must also constrain runtime identity fallback. */
+    readonly excludedTestIds?: readonly string[];
 }
 
 export interface CoveredLine {

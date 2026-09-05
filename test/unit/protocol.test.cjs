@@ -48,10 +48,10 @@ test('watchers cover external sources, reuse unchanged roots and dispose removed
  const proto=uiPrototype({RelativePattern:class {constructor(base,pattern){Object.assign(this,{base,pattern});}},workspace:{createFileSystemWatcher:pattern=>{
   patterns.push(pattern);return{dispose(){disposed++;},onDidChange(){},onDidCreate(){},onDidDelete(){}};
  }}});
- const context={watchers:[],roots:['/workspace'],config:{trigger:'fileSystem',pattern:'**/*.cs'},engine:{knownFiles:[],directories:['/workspace/Tests','/linked/src','/linked','/other']}};
+ const context={watchers:[],roots:['/workspace'],config:{trigger:'fileSystem',pattern:'**/*.cs'},engine:{inputVersion:0,knownFiles:[],directories:['/workspace/Tests','/linked/src','/linked','/other']}};
  proto.watch.call(context);assert.equal(patterns.length,3);assert.deepEqual(patterns.slice(1).map(p=>p.base),['/other','/linked']);
  proto.watch.call(context);assert.equal(patterns.length,3,'unchanged discovery must not recreate watchers');
- context.engine.directories=['/workspace/Tests','/linked'];proto.watch.call(context);assert.equal(disposed,3);assert.equal(patterns.length,5);
+ context.engine.inputVersion++;context.engine.directories=['/workspace/Tests','/linked'];proto.watch.call(context);assert.equal(disposed,3);assert.equal(patterns.length,5);
  context.config.trigger='save';proto.watch.call(context);assert.equal(disposed,5);assert.equal(context.watchers.length,0);
 });
 
@@ -131,7 +131,7 @@ test('Windows fallback cancellation waits for taskkill completion before releasi
   const child=new EventEmitter();Object.assign(child,{pid:100,stdout:new EventEmitter(),stderr:new EventEmitter(),kill:()=>{}});
   processes.push({command,args,child});return child;
  }
- vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:name=>name==='node:child_process'?{spawn}:require(name),__dirname:path.dirname(file),process:{platform:'win32',env:{}},setTimeout,clearTimeout});
+ vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:name=>name==='node:child_process'?{spawn}:createRequire(file)(name),__dirname:path.dirname(file),process:{platform:'win32',env:{}},setTimeout,clearTimeout});
  const abort=new AbortController(), owned=exports.startProcess('dotnet',['test'],{cwd:'.',signal:abort.signal});
  let settled=false;const done=owned.done.catch(error=>{settled=true;assert.equal(error.name,'AbortError');});
  abort.abort();assert.equal(processes[1].command,'taskkill');assert.ok(processes[1].args.includes('/T'));
@@ -145,7 +145,7 @@ test('Windows owned processes receive cancellation through the job host before f
   const child=new EventEmitter();const stdin=new EventEmitter();Object.assign(stdin,{writable:true,write:value=>writes.push(value)});
   Object.assign(child,{pid:100,stdin,stdout:new EventEmitter(),stderr:new EventEmitter(),kill(){}});processes.push({command,args,child});return child;
  }
- vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:name=>name==='node:child_process'?{spawn}:require(name),__dirname:path.dirname(file),process:{platform:'win32',env:{}},setTimeout,clearTimeout});
+ vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:name=>name==='node:child_process'?{spawn}:createRequire(file)(name),__dirname:path.dirname(file),process:{platform:'win32',env:{}},setTimeout,clearTimeout});
  const abort=new AbortController(),owned=exports.startProcess('a tool.exe',['argument with spaces'],{cwd:'.',signal:abort.signal,dotnetHost:'custom-dotnet.exe'});
  assert.equal(processes[0].command,'custom-dotnet.exe');assert.match(processes[0].args[0],/Testy.ProcessHost.dll$/);
  assert.deepEqual([...processes[0].args.slice(1)],['a tool.exe','argument with spaces']);
@@ -185,4 +185,83 @@ test('manual UI captures containers without freezing their old child IDs',async(
  assert.equal(selection.groups.has('g'),true);assert.equal(selection.tests.has('g'),false);assert.equal(selection.exclude.tests.get('g').has('old'),true);
  await proto.manual.call(context,{include:[project]}, {},false);assert.equal(selection.projects.has('/Tests.csproj'),true);
  await proto.manual.call(context,{}, {},false);assert.equal(selection.all,true);
+});
+
+test('save mode never plans watchers and unchanged filesystem discovery never reads input paths',()=>{
+ let reads=0,created=0;
+ const proto=uiPrototype({RelativePattern:class {},workspace:{createFileSystemWatcher(){created++;return{dispose(){},onDidChange(){},onDidCreate(){},onDidDelete(){}};}}});
+ const engine={inputVersion:1,get knownFiles(){reads++;return ['/workspace/Tests.cs'];},get directories(){reads++;return ['/workspace'];}};
+ const context={watchers:[],roots:['/workspace'],config:{trigger:'save',pattern:'**/*.cs'},engine};
+ for(let i=0;i<10;i++)proto.watch.call(context);
+ assert.equal(reads,0);assert.equal(created,0);
+ context.config.trigger='fileSystem';proto.watch.call(context);assert.equal(reads,2);assert.equal(created,1);
+ for(let i=0;i<10;i++)proto.watch.call(context);assert.equal(reads,2);assert.equal(created,1);
+ engine.inputVersion++;proto.watch.call(context);assert.equal(reads,4);assert.equal(created,2);
+});
+
+test('status context commands are emitted only for pause state changes',()=>{
+ const values=[],proto=uiPrototype({commands:{executeCommand:(_command,_key,value)=>values.push(value)}});
+ const context={engine:{groups:[]},scheduler:{isPaused:false},passed:0,failed:0,status:{}};
+ for(let i=0;i<20000;i++)proto.updateStatus.call(context);
+ context.scheduler.isPaused=true;proto.updateStatus.call(context);proto.updateStatus.call(context);
+ assert.deepEqual(values,[false,true]);
+});
+
+test('MTP output is published once across metadata updates while preserving rows, retries and pre-terminal output',async()=>{
+ const output=[],proto=uiPrototype();
+ const context={testIds:new Map(),items:new Map([['g:row',{}]]),setOutcome(){},updateStatus(){},activeRun:{passed(){},appendOutput:text=>output.push(text)}};
+ const updates=[{uid:'row','execution-state':'in-progress',standardOutput:'before '},
+  {uid:'row','execution-state':'passed',standardOutput:'done\n'}, {uid:'row','time.duration-ms':12},
+  {uid:'row','execution-state':'passed',standardOutput:'same row text\n'},
+  {uid:'row','execution-state':'passed','retry.attempt':2,standardOutput:'same row text\n'},
+  {uid:'row','time.duration-ms':25}];
+ await requestTests({dotnet:process.execPath,assembly:path.resolve('test/fixtures/mtp-peer.cjs'),cwd:process.cwd(),timeoutMs:5000,
+  env:{TESTY_UPDATES:JSON.stringify(updates)},onNode:node=>{const result=testResult(node);if(result)proto.publishResult.call(context,{id:'g'},result);}},'run');
+ assert.deepEqual(output,['before done\r\n','same row text\r\n','same row text\r\n']);
+});
+
+test('runtime fallback honors explicit exclusions and rejects unselectable runtime exclusions',async()=>{
+ const file=path.resolve('out/services/runner.js'),realRequire=createRequire(file),exports={},mtp=realRequire('./mtp');let sent;
+ const nodes=[{uid:'parent','display-name':'Theory'},{uid:'excluded','display-name':'Other'}];
+ vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:name=>name==='./mtp'?{...mtp,requestTests:async(_options,_operation,selected)=>{
+  sent=selected??nodes;return sent.map(node=>({...node,'execution-state':'passed'}));
+ }}:realRequire(name)});
+ const group={id:'g',project:'/Tests.csproj',assembly:'/Tests.dll',framework:'net10.0',file:'/Tests.cs',tests:nodes.map(mtp.discoveredTest)};
+ const runtime=mtp.discoveredTest({uid:'runtime','display-name':'Theory(1)'});
+ const {selectManual}=require('../../out/services/engine');
+ const session=new exports.RunnerSession({dotnet:'dotnet',storage:'.',testArguments:[]});
+ session.prepared.set(group.assembly,{root:'.',output:{directory:'.',restore:async()=>{}},session:'fake',coverage:false,nodes,
+  nativeById:new Map(nodes.map(node=>[node.uid,node])),byKey:new Map(),groups:[group],runs:0});
+ const select=id=>selectManual([group],{groups:new Set(['g']),exclude:{groups:new Set(['g']),tests:new Map([['g',new Set([id])]])}},()=>[...group.tests,runtime]);
+ const result=await session.run(select('excluded'),new Map());
+ assert.deepEqual([...sent].map(node=>node.uid),['parent']);assert.equal(result.executedGroups[0].tests.length,1);
+ sent=undefined;await assert.rejects(session.run(select('runtime'),new Map()),/cannot honor an exclusion/);assert.equal(sent,undefined);
+ session.prepared.clear();await session.dispose();
+});
+
+test('startup schedules its baseline after optional cache failure, but never after cancellation',async()=>{
+ const {TestEngine}=require('../../out/services/engine'),proto=uiPrototype(),requested=[];
+ const warnings=[],engine=new TestEngine({roots:[],storage:'.',events:{output:text=>warnings.push(text)}});
+ engine.cache.restore=async()=>{throw new Error('unavailable cache worker');};
+ const lifetime=new AbortController(),context={engine,lifetime,config:{enabled:true},watch(){},scheduler:{setPaused(){},request:(...args)=>requested.push(args)}};
+ await proto.start.call(context);assert.equal(requested.length,1);assert.equal(requested[0][1],true);assert.match(warnings[0],/fresh baseline/);
+ lifetime.abort();await assert.rejects(proto.start.call(context),{name:'AbortError'});assert.equal(requested.length,1);
+});
+
+test('editor coverage refresh yields during shared-file aggregation and never falls back to synchronous reads',async()=>{
+ const {CoverageStore}=require('../../out/core/coverage'),{normalizePath}=require('../../out/core/paths');
+ const store=new CoverageStore(),file=normalizePath('/Common.cs'),hashes=new Map([[file,'v1']]);
+ const lines=Array.from({length:1000},(_,i)=>({line:i+1,hits:1}));
+ const traces=Array.from({length:1000},(_,i)=>({groupId:`g${i}`,dependencies:[file],inputs:{[file]:'v1'},timestamp:1,reliable:true,coverage:[{file,hash:'v1',lines}]}));
+ const live=new Set(traces.map(trace=>trace.groupId));await store.replaceAsync(traces,live);await store.summarizeAsync(hashes);store.markStale(live);
+ store.summary=()=>assert.fail('editor must not calculate synchronously');
+ const proto=uiPrototype({Range:class{}}),calls=[];
+ const editor={document:{uri:{fsPath:file},lineCount:1000,isDirty:false},setDecorations:(kind,lines)=>calls.push([kind,lines.length])};
+ const context={config:{showCoverage:true},engine:{coverage:store,hashes},decorations:{covered:'covered',uncovered:'uncovered',stale:'stale'},lifetime:new AbortController()};
+ const aggregation=store.summarizeAsync(hashes);let beats=0;const timer=setInterval(()=>beats++,1);
+ try{await proto.decorate.call(context,[editor]);await aggregation;}finally{clearInterval(timer);}
+ assert.ok(beats>0,'the editor path must let timers run');assert.deepEqual(calls,[['covered',0],['uncovered',0],['stale',1000]]);
+ store.markStale(live);calls.length=0;context.engine.coverage={summarizeAsync:async(_hashes,signal)=>{await new Promise(resolve=>setImmediate(resolve));signal.throwIfAborted();return[];}};
+ const pending=proto.decorate.call(context,[editor]);context.disposed=true;context.lifetime.abort();
+ await assert.rejects(pending,{name:'AbortError'});assert.equal(calls.length,0,'disposing must prevent late editor writes');
 });

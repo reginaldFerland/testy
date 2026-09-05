@@ -6,7 +6,7 @@ import { Project, TestFile, TestResult, Trace } from '../core/model';
 import { ChangeBatch } from '../core/scheduler';
 import { ProjectIndex, selectTests, Selection } from '../core/selection';
 import { contentHash, defaultExcludes, isConfigurationFile, isExcluded, normalizePath } from '../core/paths';
-import { buildOrder, buildRoots, mergeProjects, evaluateProject, findProjects } from './projects';
+import { buildOrder, buildRoots, buildProperties, mergeProjects, evaluateProject, findProjects, refreshProjectSnapshots } from './projects';
 import { Cancelled, ProcessOptions, requireSuccess, runProcess } from './process';
 import { projectCoverageId, RunnerOptions, RunnerSession } from './runner';
 import { resolveShapes, sourceAnalyses, SourceShape } from './analysis';
@@ -69,7 +69,9 @@ export function selectManual(groups: readonly TestFile[], manual: ManualSelectio
         const excludesGroup = excluded && matches(excluded, group);
         const excludedTests = excluded?.tests?.get(group.id);
         const excludesEntire = excludesGroup && (excluded.all || excluded.projects?.has(group.project) || !excludedTests);
-        return { ...group, tests: known(group).filter(test => !excludesEntire && (entire || requested?.has(test.id)) && (!excludesGroup || !excludedTests?.has(test.id))) };
+        const available = known(group);
+        return { ...group, excludedTestIds: excludesGroup ? [...excludedTests ?? []] : undefined,
+            tests: available.filter(test => !excludesEntire && (entire || requested?.has(test.id)) && (!excludesGroup || !excludedTests?.has(test.id))) };
     }).filter(group => group.tests.length);
 }
 
@@ -95,6 +97,10 @@ export class TestEngine {
     private readonly cache: CoverageCache;
     private readonly identity = randomUUID();
     private readonly pendingChanges = new Set<string>();
+    private projectSnapshots: ReadonlyMap<string, readonly Project[]> = new Map();
+    private inputTopology = 0;
+    private inputs: readonly string[] = [];
+    private inputDirectories: readonly string[] = [];
 
     constructor(private readonly options: EngineOptions) {
         this.roots = options.roots.map(normalizePath);
@@ -102,8 +108,9 @@ export class TestEngine {
     }
 
     get hashes(): ReadonlyMap<string, string> { return this.sources.hashes; }
-    get knownFiles(): readonly string[] { return [...this.sources.files, ...this.projects.map(project => project.file)]; }
-    get directories(): readonly string[] { return [...new Set(this.knownFiles.map(file => path.dirname(file)))]; }
+    get inputVersion(): number { return this.inputTopology; }
+    get knownFiles(): readonly string[] { return this.inputs; }
+    get directories(): readonly string[] { return this.inputDirectories; }
     get baselineProgress(): { completed: number; total: number } | undefined {
         return this.baseline ? { completed: this.baseline.completed.size, total: this.groups.length } : undefined;
     }
@@ -128,10 +135,17 @@ export class TestEngine {
         this.sources.mark(files);
         const selected = this.select(files, true);
         this.coverage.markStale(new Set([...selected.groups.map(group => group.id), ...this.coverage.dependentGroups(files)]));
-        this.options.events.coverage();
+        await this.publishCoverage();
     }
 
-    async restore(signal?: AbortSignal): Promise<void> { await this.cache.restore(this.coverage, signal); }
+    async restore(signal?: AbortSignal): Promise<void> {
+        try {await this.cache.restore(this.coverage, signal);}
+        catch (error) {
+            signal?.throwIfAborted();
+            if ((error as Error)?.name === 'AbortError') {throw error;}
+            this.options.events.output(`Coverage cache unavailable; starting a fresh baseline. ${String(error)}\n`);
+        }
+    }
 
     async run(batch: ChangeBatch, signal: AbortSignal, manual?: ManualSelection, manualOperation = false): Promise<RunSummary> {
         const began = Date.now(), events = this.options.events, topology = this.topology;
@@ -156,12 +170,10 @@ export class TestEngine {
         if (structural) {
             events.phase('Preparing projects');
             if (newBaseline || changes.some(isConfigurationFile)) {this.sdkContexts.clear(); this.restored.clear();}
-            const queue = manual && !manual.all ? [...new Set([...manual.projects ?? [], ...this.groups.filter(group => manual.groups.has(group.id)).map(group => group.project)])]
-                : [...await findProjects(rootSnapshot, [...defaultExcludes, ...config.excludes], signal)];
-            const seen = new Set<string>(), projects: Project[] = [];
-            for (let index = 0; index < queue.length; index++) {
+            const selected = manual && !manual.all ? [...new Set([...manual.projects ?? [], ...this.groups.filter(group => manual.groups.has(group.id)).map(group => group.project)])] : undefined;
+            const entryPoints = await findProjects(rootSnapshot, [...defaultExcludes, ...config.excludes], signal);
+            const snapshots = await refreshProjectSnapshots(this.projectSnapshots, entryPoints, selected, async file => {
                 signal.throwIfAborted();
-                const file = queue[index]; if (seen.has(file)) {continue;} seen.add(file);
                 const options = { ...processOptions, cwd: path.dirname(file) };
                 await this.ensureSdk(config.dotnet, options);
                 const restoreKey = `${config.dotnet}\0${config.configuration}\0${file}`;
@@ -170,17 +182,21 @@ export class TestEngine {
                     this.restored.add(restoreKey);
                 }
                 const targets = await evaluateProject(config.dotnet, file, config.configuration, options, this.options.analyzer);
-                projects.push(...targets.filter(project => !isExcluded(project.file, config.excludes, rootSnapshot)));
-
-            }
+                return targets.filter(project => !isExcluded(project.file, config.excludes, rootSnapshot));
+            });
             if (topology !== this.topology) {throw new Cancelled();}
-            this.projects = mergeProjects(manual ? [...this.projects.filter(project => !seen.has(project.file)), ...projects] : projects);
+            this.projectSnapshots = snapshots;
+            this.projects = mergeProjects([...snapshots.values()].flat());
             this.index = new ProjectIndex(this.projects); this.structureDirty = !!manual;
             this.sources.setFiles(this.projects.flatMap(project => [...project.sourceFiles, ...project.inputs ?? []]));
+            const inputs = new Set([...this.sources.files, ...this.projects.map(project => project.file)]);
+            if (inputs.size !== this.inputs.length || this.inputs.some(file => !inputs.has(file))) {
+                this.inputs = [...inputs]; this.inputDirectories = [...new Set(this.inputs.map(file => path.dirname(file)))]; this.inputTopology++;
+            }
             await this.sources.refresh(this.sources.files, signal);
         }
-        const before = this.hashes;
-        events.coverage();
+        const beforeBuild = this.hashes;
+        await this.publishCoverage(signal);
         const relevant = manual ? new Set(manual.all ? this.projects.map(project => project.file) : [...manual.projects ?? [], ...this.groups.filter(group => manual.groups.has(group.id)).map(group => group.project)])
             : newBaseline || config.mode === 'all' ? new Set(this.projects.map(project => project.file)) : this.index.affected(changes);
         if (!manual) {for (const project of previousIndex.affected(changes)) {relevant.add(project);}}
@@ -197,11 +213,15 @@ export class TestEngine {
             const options = { ...processOptions, cwd: path.dirname(project.file) };
             await this.ensureSdk(config.dotnet, options);
             requireSuccess(await runProcess(config.dotnet, ['build', project.file, '--framework', project.framework, '--configuration', config.configuration,
-                '--no-restore', '--nologo'], options), `Building ${path.basename(project.file)}`);
+                '--no-restore', '--nologo', ...buildProperties(project)], options), `Building ${path.basename(project.file)}`);
         }
         const changedDuringBuild = await this.sources.refresh(builtInputs, signal);
-        const obsoleteBuild = changedDuringBuild.some(file => before.get(file) !== this.hashes.get(file));
+        const obsoleteBuild = changedDuringBuild.some(file => !this.sources.isGenerated(file) && beforeBuild.get(file) !== this.hashes.get(file));
         if (obsoleteBuild && !manual && !manualOperation) {events.invalidated(changedDuringBuild); throw new Cancelled();}
+        // A target can add a generated header to a pre-existing placeholder.
+        // Exclude its old hash from analysis and coverage attribution as well.
+        const before = changedDuringBuild.some(file => this.sources.isGenerated(file))
+            ? new Map([...beforeBuild].filter(([file]) => !this.sources.isGenerated(file))) : beforeBuild;
         const previousShapes = baseline?.shapes ?? this.shapes;
         const shapeFiles = [...before.keys()].filter(file => file.endsWith('.cs') && (newBaseline || !previousShapes.has(file) || changes.includes(file)));
         let nextAnalyses: ReadonlyMap<string, SourceShape | null>;
@@ -234,7 +254,7 @@ export class TestEngine {
         const sessions = new RunnerSession(runnerOptions);
         try {
             events.phase('Discovering tests');
-            const testBuilds = builds.filter(project => project.isTestProject);
+            const testBuilds = builds.filter(project => project.isTestProject && project.entryPoint !== false);
             const next = this.groups.filter(group => !testBuilds.some(project => project.file === group.project && project.framework === group.framework)
                 && this.projects.some(project => project.file === group.project && project.framework === group.framework));
             for (const project of testBuilds) {next.push(...await sessions.discover(project));}
@@ -279,7 +299,7 @@ export class TestEngine {
             const fresh = new Set([...this.coverage.traces].filter(([id, trace]) => !selectedIds.has(id)
                 && Object.entries(trace.inputs ?? {}).every(([file, hash]) => before.get(file) === hash)).map(([id]) => id));
             this.coverage.markStale(fresh, false);
-            events.selected(selection); events.coverage();
+            events.selected(selection); await this.publishCoverage(signal);
             const batches: TestFile[][] = [];
             const originalGroups = new Map(this.groups.map(group => [group.id, group]));
             const projectGroups = new Map<string, TestFile[]>();
@@ -333,7 +353,8 @@ export class TestEngine {
                         // Retain it as history while publishing the new file trace.
                         this.coverage.markHistorical(new Set([projectCoverageId(groups[0])]));
                     }
-                    this.coverage.replace([run.trace], liveIds);
+                    await this.coverage.replaceAsync([run.trace], liveIds, signal);
+                    if (revision !== this.sources.revision) {this.coverage.markStale(new Set([run.trace.groupId]));}
                     const aggregate = projectCoverageId(groups[0]);
                     if (groups.length === 1 && this.coverage.traces.has(aggregate)
                         && projectGroups.get(groups[0].assembly)!.every(group => {
@@ -350,7 +371,7 @@ export class TestEngine {
                     }
                 }
                 if (complete && (!manual || !configured.coverage || run.coverageAvailable)) {for (const group of groups) {baseline?.completed.add(group.id);}}
-                events.coverage(); await this.save(signal);
+                await this.publishCoverage(signal); await this.save(signal);
             }
             signal.throwIfAborted();
             if (!manual) {
@@ -360,7 +381,7 @@ export class TestEngine {
                     for (const file of changes) {this.pendingChanges.delete(file);}
                 }
             }
-            events.coverage(); await this.save(signal);
+            await this.publishCoverage(signal); await this.save(signal);
             return { files: selection.groups.length, tests: results.length, passed: results.filter(result => result.outcome === 'passed').length,
                 failed: results.filter(result => result.outcome === 'failed' || result.outcome === 'errored').length,
                 skipped: results.filter(result => result.outcome === 'skipped').length, duration: Date.now() - began, coverageAvailable: available };
@@ -378,6 +399,15 @@ export class TestEngine {
         if (config.coverageTool) {await fs.access(config.coverageTool); return config.coverageTool;}
         this.options.events.phase('Setting up coverage');
         return installCoverageTool(config.dotnet, this.options.tools, options);
+    }
+
+    private async publishCoverage(signal?: AbortSignal): Promise<void> {
+        for (;;) {
+            const hashes = this.hashes;
+            await this.coverage.summarizeAsync(hashes, signal);
+            if (hashes === this.hashes) {break;}
+        }
+        this.options.events.coverage();
     }
 
     private async save(signal?: AbortSignal): Promise<void> {

@@ -67,7 +67,9 @@ test('excluded attributes, local/global aliases, and hidden regions keep body ch
   'using Blind = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute; [Blind] public class C { public int M()=>1; }',
   '[ExternalBlind] public class C { public int M()=>1; }',
   'public class C { [System.Diagnostics.DebuggerHidden] public int M()=>1; }',
-  'public class C {\n#line hidden\npublic int M()=>1;\n#line default\n}'
+  'public class C {\n#line hidden\npublic int M()=>1;\n#line default\n}',
+  'public class C {\n#line 200 "Virtual.cs"\npublic int M()=>1;\n#line default\n}',
+  'public class C {\n#line (1, 1) - (1, 30) 1 "Virtual.cs"\npublic int M()=>1;\n#line default\n}'
  ];
  for(const [index,source] of variants.entries()) {
   const file=normalizePath(path.join(directory,`${index}.cs`));

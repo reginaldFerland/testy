@@ -8,6 +8,8 @@ import { withLock } from './lock';
 export { validSource, validTrace } from './cacheFormat';
 import { validSource } from './cacheFormat';
 import { readCache } from './cacheReader';
+import { finishAsync, sortedUnion } from '../core/work';
+import { jsonChunks } from './jsonWriter';
 
 /** Immutable source records and independently atomic traces avoid full-cache rewrites. */
 export class CoverageCache {
@@ -37,14 +39,18 @@ export class CoverageCache {
             await this.beginWrite(signal);
             for (const source of delta.sources) {
                 signal?.throwIfAborted();
-                let previous: unknown = this.knownSources.get(source.id);
+                let previous = this.knownSources.get(source.id);
                 if (!previous) {
-                    try {previous = JSON.parse(await fs.readFile(path.join(this.directory, 'sources', `${source.id}.json`), { encoding: 'utf8', signal }));}
+                    try {
+                        const value: unknown = JSON.parse(await fs.readFile(path.join(this.directory, 'sources', `${source.id}.json`), { encoding: 'utf8', signal }));
+                        if (validSource(value)) {previous = value;}
+                    }
                     catch {signal?.throwIfAborted(); /* Missing or corrupt. */}
                 }
-                const lines = validSource(previous) ? [...new Set([...previous.lines, ...source.lines])].sort((a, b) => a - b) : source.lines;
-                const merged = { ...source, lines };
-                if (!validSource(previous) || lines.length !== previous.lines.length) {await this.write('sources', source.id, merged, signal);}
+                if (previous === source) {continue;}
+                const lines = previous ? await finishAsync(sortedUnion(previous.lines, source.lines), signal) : source.lines;
+                const merged = lines.length === source.lines.length ? source : { ...source, lines };
+                if (!previous || lines.length !== previous.lines.length) {await this.write('sources', source.id, merged, signal);}
                 this.knownSources.set(source.id, merged);
             }
             for (const trace of delta.traces) {await this.write('traces', contentHash(trace.groupId), trace, signal);}
@@ -84,8 +90,14 @@ export class CoverageCache {
         signal?.throwIfAborted();
         const destination = path.join(this.directory, kind, `${id}.json`);
         const temporary = `${destination}.${randomUUID()}.tmp`;
-        try { await fs.writeFile(temporary, JSON.stringify(value), { signal }); signal?.throwIfAborted(); await fs.rename(temporary, destination); }
-        finally { await fs.rm(temporary, { force: true }); }
+        let handle: fs.FileHandle | undefined;
+        try {
+            handle = await fs.open(temporary, 'w');
+            for (const chunk of jsonChunks(value)) {signal?.throwIfAborted(); await handle.writeFile(chunk);}
+            await handle.close(); handle = undefined;
+            signal?.throwIfAborted(); await fs.rename(temporary, destination);
+        }
+        finally { await handle?.close(); await fs.rm(temporary, { force: true }); }
     }
 
 }

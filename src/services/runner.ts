@@ -117,20 +117,30 @@ export class RunnerSession {
         const { nativeById, byKey } = preparation;
         const originals = new Map<string, TestNode>();
         const selectedNodes = new Map<string, TestNode>();
+        const forbidden = new Set<string>();
+        for (const item of groups) {for (const id of item.excludedTestIds ?? []) {
+            const native = nativeById.get(id);
+            if (!native) {throw new Error('The provider cannot honor an exclusion for a runtime or changed test identity. Select tests using the refreshed discovery identities.');}
+            forbidden.add(native.uid);
+        }}
         let expanded = false;
         for (const item of groups) {for (const test of item.tests) {
             let native = nativeById.get(test.id);
             if (!native) {const matching = byKey.get(nodeKey(test.node as TestNode)); if (matching?.length === 1) {native = matching[0];}}
-            if (native) {originals.set(native.uid, test.node as TestNode); selectedNodes.set(native.uid, native); continue;}
+            if (native) {
+                if (!forbidden.has(native.uid)) {originals.set(native.uid, test.node as TestNode); selectedNodes.set(native.uid, native);}
+                continue;
+            }
             // Runtime-only rows may not be individually selectable. Use the
             // freshly discovered containing file; never send an unresolved UID
             // from an old path or guess between indistinguishable row names.
             const containing = preparation.groups?.find(group => group.id === item.id);
             if (!containing) {throw new Error('The selected test identity is unavailable. Rediscover the project before rerunning it.');}
-            for (const candidate of containing.tests) {const node = nativeById.get(candidate.id); if (node) {selectedNodes.set(node.uid, node);}}
+            for (const candidate of containing.tests) {const node = nativeById.get(candidate.id); if (node && !forbidden.has(node.uid)) {selectedNodes.set(node.uid, node);}}
             expanded = true;
         }}
         const selected = [...selectedNodes.values()];
+        if (!selected.length) {throw new Error('No selectable tests remain after applying exclusions.');}
         const executedGroups = expanded ? preparation.groups!.map(item => ({ ...item, tests: item.tests.filter(test => selectedNodes.has(test.id)) }))
             .filter(item => item.tests.length) : groups;
         if (expanded) {

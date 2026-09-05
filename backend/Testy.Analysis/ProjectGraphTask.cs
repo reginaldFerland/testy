@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
+using System.Security.Cryptography;
+using System.Text;
 using Microsoft.Build.Evaluation;
 using Microsoft.Build.Execution;
 using Microsoft.Build.Framework;
@@ -35,6 +37,17 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
             var roots = graph.EntryPointNodes.SelectMany(node => string.IsNullOrEmpty(node.ProjectInstance.GetPropertyValue("TargetFramework"))
                 ? node.ProjectReferences.Where(child => child.ProjectInstance.FullPath == node.ProjectInstance.FullPath)
                 : new[] { node }).ToHashSet();
+            static IEnumerable<ProjectGraphNode> Targets(ProjectGraphNode node) => string.IsNullOrEmpty(node.ProjectInstance.GetPropertyValue("TargetFramework"))
+                ? node.ProjectReferences.Where(child => child.ProjectInstance.FullPath == node.ProjectInstance.FullPath).SelectMany(Targets)
+                : [node];
+            static string Identity(ProjectGraphNode node)
+            {
+                var project = node.ProjectInstance;
+                var file = OperatingSystem.IsWindows() ? project.FullPath.ToUpperInvariant() : project.FullPath;
+                var properties = project.GlobalProperties.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                    .Select(pair => new[] { pair.Key.ToUpperInvariant(), pair.Value });
+                return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { file, properties }))));
+            }
             var result = graph.ProjectNodes.Where(node => !string.IsNullOrEmpty(node.ProjectInstance.GetPropertyValue("TargetFramework")))
                 .Select(node =>
                 {
@@ -50,6 +63,8 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
                         isMtp = project.GetPropertyValue("IsTestingPlatformApplication").Equals("true", StringComparison.OrdinalIgnoreCase),
                         entryPoint = roots.Contains(node),
                         properties = project.GlobalProperties,
+                        contextId = Identity(node),
+                        contextReferences = node.ProjectReferences.SelectMany(Targets).Select(Identity).Distinct().ToArray(),
                         sourceFiles = Items("Compile"),
                         inputs = inputs[project].Concat(Items("Content")).Concat(Items("None")).Concat(Items("EmbeddedResource"))
                             .Concat(Items("AdditionalFiles")).Where(input => !input.StartsWith(project.GetPropertyValue("MSBuildToolsPath") + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)).Distinct().ToArray(),

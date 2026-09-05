@@ -74,15 +74,27 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
         void exited.catch(() => undefined);
         const request = <T>(method: string, parameters: object): Promise<T> => Promise.race([rpc!.sendRequest<T>(method, parameters), exited]);
         const nodes = new Map<string, TestNode>();
+        const pendingOutput = new Map<string, { stdout: string[]; stderr: string[] }>();
         const runId = randomUUID();
         let completed = false;
         rpc.onNotification('testing/testUpdates/tests', (update: TestUpdates) => {
             if (update.runId !== runId) {return;}
             if (update.changes === null) { completed = true; return; }
             for (const { node } of update.changes ?? []) {
-                const merged = operation === 'run' ? mergeTestUpdate(nodes.get(node.uid), node) : { ...nodes.get(node.uid), ...node };
+                const previous = nodes.get(node.uid);
+                const merged = operation === 'run' ? mergeTestUpdate(previous, node) : { ...previous, ...node };
                 nodes.set(node.uid, merged);
-                options.onNode?.(merged);
+                if (merged === previous) {continue;} // An older retry update.
+                const output = pendingOutput.get(node.uid) ?? { stdout: [], stderr: [] };
+                if (typeof node.standardOutput === 'string') {output.stdout.push(node.standardOutput);}
+                if (typeof node.standardError === 'string') {output.stderr.push(node.standardError);}
+                pendingOutput.set(node.uid, output);
+                const terminal = !!testResult(merged);
+                // Keep complete snapshots for result accounting, but publish
+                // output only once. Preserve output received before completion.
+                options.onNode?.({ ...merged, standardOutput: terminal ? output.stdout.join('') : undefined,
+                    standardError: terminal ? output.stderr.join('') : undefined });
+                if (terminal) {pendingOutput.delete(node.uid);}
             }
         });
         rpc.onNotification('client/log', (message: { level?: string | number; message?: string }) => {
@@ -171,6 +183,6 @@ export function testResult(node: TestNode): TestResult | undefined {
         duration: Number(node['time.duration-ms'] ?? 0),
         message: typeof node['error.message'] === 'string' ? node['error.message'] : undefined,
         stack: typeof node['error.stacktrace'] === 'string' ? node['error.stacktrace'] : undefined,
-        output: [node.standardOutput, node.standardError].filter(value => typeof value === 'string').join('\n'), node
+        output: [node.standardOutput, node.standardError].filter(value => typeof value === 'string' && value.length).join('\n'), node
     };
 }

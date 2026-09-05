@@ -1,5 +1,7 @@
 import { ChildProcess, spawn } from 'node:child_process';
 import * as path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { cleanupPosixOwner } from './posixProcesses';
 
 export class Cancelled extends Error {
     constructor() { super('Run cancelled'); this.name = 'AbortError'; }
@@ -33,12 +35,16 @@ export interface OwnedProcess {
 export function startProcess(command: string, args: readonly string[], options: ProcessOptions): OwnedProcess {
     options.signal?.throwIfAborted();
     const windowsOwner = process.platform === 'win32' && options.cleanupDescendants !== false;
-    const executable = windowsOwner ? options.dotnetHost ?? 'dotnet' : command;
-    const arguments_ = windowsOwner ? [path.join(__dirname, '../../dist/processhost/Testy.ProcessHost.dll'), command, ...args] : [...args];
+    const posixOwner = process.platform !== 'win32';
+    const owner = randomUUID();
+    const env: NodeJS.ProcessEnv = { ...process.env, DOTNET_CLI_TELEMETRY_OPTOUT: '1', TESTINGPLATFORM_TELEMETRY_OPTOUT: '1', DOTNET_NOLOGO: '1', ...options.env, TESTY_PROCESS_OWNER: owner };
+    const executable = windowsOwner ? options.dotnetHost ?? 'dotnet' : posixOwner ? process.execPath : command;
+    const arguments_ = windowsOwner ? [path.join(__dirname, '../../dist/processhost/Testy.ProcessHost.dll'), command, ...args]
+        : posixOwner ? [path.join(__dirname, 'posixOwner.js')] : [...args];
     const child = spawn(executable, arguments_, {
         cwd: options.cwd, shell: false, detached: process.platform !== 'win32',
-        windowsHide: true, stdio: [windowsOwner ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-        env: { ...process.env, DOTNET_CLI_TELEMETRY_OPTOUT: '1', TESTINGPLATFORM_TELEMETRY_OPTOUT: '1', DOTNET_NOLOGO: '1', ...options.env }
+        windowsHide: true, stdio: [windowsOwner || posixOwner ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+        env: posixOwner ? { ...env, TESTY_PROCESS_OWNER: undefined, ELECTRON_RUN_AS_NODE: '1' } : env
     });
     let cancelled = false;
     let timedOut = false;
@@ -50,6 +56,9 @@ export function startProcess(command: string, args: readonly string[], options: 
     let windowsKillStarted = false;
     const limit = 8 * 1024 * 1024;
     child.stdin?.on('error', () => undefined);
+    if (posixOwner) {
+        child.stdin!.write(JSON.stringify({ command, args, owner, cleanupDescendants: options.cleanupDescendants !== false, electronRunAsNode: env.ELECTRON_RUN_AS_NODE }) + '\n');
+    }
     const killTree = (force: boolean): void => {
         if (!child.pid) {return;}
         try {
@@ -66,7 +75,12 @@ export function startProcess(command: string, args: readonly string[], options: 
                     killer.once('close', code => {if (code !== 0 && !closed) {child.kill();} resolve();});
                 }));
             } else {
+                if (!force && child.stdin?.writable) {child.stdin.write('cancel\n'); return;}
                 process.kill(-child.pid, force ? 'SIGKILL' : 'SIGTERM');
+                if (force) {
+                    const cleanup = cleanupPosixOwner(owner);
+                    void cleanup.catch(() => undefined); teardowns.push(cleanup);
+                }
             }
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {child.kill(force ? 'SIGKILL' : 'SIGTERM');}
@@ -76,7 +90,7 @@ export function startProcess(command: string, args: readonly string[], options: 
         if (closed || cancelled) {return;}
         cancelled = true;
         killTree(false);
-        killTimer = setTimeout(() => killTree(true), 1500);
+        killTimer = setTimeout(() => killTree(true), posixOwner ? 5000 : 1500);
         killTimer.unref();
     };
     const timeout = setTimeout(() => { timedOut = true; stop(); }, options.timeoutMs ?? 600_000);
@@ -89,22 +103,29 @@ export function startProcess(command: string, args: readonly string[], options: 
             const text = data.toString(); stderr = (stderr + text).slice(-limit); options.output?.(text);
         });
         child.once('error', reject);
-        child.once('exit', () => {
-            // Close inherited pipes and stop workers even after a successful
-            // parent exit. Windows' owner performs the same cleanup in its job.
-            if (process.platform !== 'win32' && (cancelled || options.cleanupDescendants !== false)) {killTree(true);}
+        child.once('exit', (_code, signal) => {
+            // If the independent owner itself is killed, the surviving host
+            // makes a final ownership scan. Ordinary exits clean up in the owner.
+            if (posixOwner && signal) {
+                const cleanup = cleanupPosixOwner(owner);
+                void cleanup.catch(() => undefined); teardowns.push(cleanup);
+            }
         });
         child.once('close', async code => {
             closed = true;
             clearTimeout(timeout);
             // Kill any remaining descendants of our own detached process group
             // before reporting cancellation complete.
-            if (cancelled && !windowsOwner) {killTree(true);}
+            if (cancelled && !windowsOwner && !posixOwner) {killTree(true);}
             if (killTimer) {clearTimeout(killTimer);}
             options.signal?.removeEventListener('abort', stop);
-            await Promise.all(teardowns);
+            let cleanupError: unknown;
+            try {await Promise.all(teardowns);} catch (error) {
+                cleanupError = error; options.output?.(`Process cleanup failed: ${String(error)}\n`);
+            }
             if (timedOut) {reject(new Error(`The command exceeded its time limit: ${command}`));}
             else if (cancelled) {reject(new Cancelled());}
+            else if (cleanupError) {reject(cleanupError);}
             else {resolve({ code: code ?? -1, stdout, stderr });}
         });
     });

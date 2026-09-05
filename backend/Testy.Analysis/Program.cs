@@ -40,7 +40,9 @@ try
         bool Excluded(AttributeSyntax attribute) => IsExcluded(attribute.Name.ToString()) || excludedAliases.Contains(attribute.Name.ToString().TrimStart('@'));
         var attributes = root.DescendantNodes().OfType<AttributeSyntax>().Where(Excluded).ToArray();
         var blind = attributes.Length > 0 || localAliases.Any()
-            || root.DescendantTrivia(descendIntoTrivia: true).Any(trivia => trivia.GetStructure() is LineDirectiveTriviaSyntax line && line.Line.IsKind(SyntaxKind.HiddenKeyword));
+            // Mapped documents/line numbers cannot reliably be joined to the
+            // physical file in a coverage report. Include these bodies too.
+            || root.DescendantTrivia(descendIntoTrivia: true).Any(trivia => trivia.GetStructure() is LineDirectiveTriviaSyntax or LineSpanDirectiveTriviaSyntax);
         var declarations = (blind ? root : new DeclarationSignature().Visit(root)!).NormalizeWhitespace().ToFullString();
         var partialTypes = root.DescendantNodes().OfType<TypeDeclarationSyntax>()
             .Where(type => type.Modifiers.Any(SyntaxKind.PartialKeyword)).Select(TypeKey).Distinct().ToArray();
