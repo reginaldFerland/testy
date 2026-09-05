@@ -50,8 +50,8 @@ test('MTP baseline, affected-file rerun, failure details, retained coverage and 
  await fs.writeFile(added,'namespace ImpactDemo; public class NewFeature { public int Value => 42; }');
  const fallback=await engine.run({files:[added],full:false},signal);
  assert.equal(fallback.tests,3);assert.equal(selection.fallback,true);
- const snapshot=JSON.parse(await fs.readFile(path.join(directory,'state/coverage.json'),'utf8'));
- assert.equal(snapshot.version,1);assert.equal(snapshot.traces.length,2);
+ const snapshot=await fs.readdir(path.join(directory,'state/coverage-v2/traces'));
+ assert.equal(snapshot.length,2);
  const calculatorGroup=engine.groups.find(group=>group.file.endsWith('/CalculatorTests.cs'));
  const beforeManual=JSON.stringify([...engine.coverage.traces.values()]);
  const manual=await engine.run({files:[],full:false},signal,{
@@ -66,7 +66,8 @@ test('MTP baseline, affected-file rerun, failure details, retained coverage and 
  const cancellationStarted=Date.now();
  await assert.rejects(engine.run({files:[testFile],full:false},cancelOnStart.signal),()=>cancelOnStart.signal.aborted);
  assert.ok(Date.now()-cancellationStarted<8000,'cancelled test processes should exit promptly');
- assert.equal(JSON.stringify([...engine.coverage.traces.values()]),beforeManual,'cancellation must not replace dependency or coverage data');
+ assert.deepEqual([...engine.coverage.traces.values()].map(({stale,...trace})=>trace),JSON.parse(beforeManual).map(({stale,...trace})=>trace),'cancellation must not replace dependency or coverage data');
+ assert.equal(engine.coverage.summarize(engine.hashes).find(file=>file.file===arithmetic).stale,true,'cancelled test inputs leave retained production coverage stale');
  cancelOnStart=undefined;
  await fs.writeFile(testFile,testSource);
  console.log(JSON.stringify({baselineMs:baseline.duration,affectedMs:changed.duration,baselineTests:baseline.tests,affectedTests:changed.tests}));

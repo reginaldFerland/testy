@@ -3,9 +3,10 @@ import { randomUUID } from 'node:crypto';
 import { createMessageConnection, MessageConnection } from 'vscode-jsonrpc/node';
 import { DiscoveredTest, TestResult } from '../core/model';
 import { normalizePath } from '../core/paths';
+import { mergeTestUpdate, TestNode } from '../core/testUpdates';
 import { OwnedProcess, ProcessOptions, startProcess } from './process';
 
-export type TestNode = Readonly<Record<string, unknown>> & { readonly uid: string };
+export type { TestNode } from '../core/testUpdates';
 interface TestUpdates { readonly runId: string; readonly changes: readonly { readonly node: TestNode }[] | null; }
 interface InitializeResult { readonly capabilities: { readonly testing: { readonly supportsDiscovery: boolean } }; }
 
@@ -61,7 +62,7 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
             if (update.runId !== runId) {return;}
             if (update.changes === null) { completed = true; return; }
             for (const { node } of update.changes ?? []) {
-                const merged = { ...nodes.get(node.uid), ...node };
+                const merged = operation === 'run' ? mergeTestUpdate(nodes.get(node.uid), node) : { ...nodes.get(node.uid), ...node };
                 nodes.set(node.uid, merged);
                 options.onNode?.(merged);
             }
@@ -83,6 +84,13 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
         await rpc.sendNotification('exit', {});
         const result = await process.done;
         if (result.code !== 0 && result.code !== 2) {throw new Error(`The test application failed (exit ${result.code}).\n${result.stderr || result.stdout}`);}
+        const failedGroup = [...nodes.values()].find(node => node['node-type'] === 'group' && ['failed', 'errored'].includes(testResult(node)?.outcome ?? ''));
+        if (operation === 'run' && failedGroup) {throw new Error(`The test group failed: ${failedGroup['display-name'] ?? failedGroup.uid}. ${failedGroup['error.message'] ?? ''}`);}
+        if (operation === 'run' && result.code === 2 && ![...nodes.values()].some(node => {
+            if (node['node-type'] === 'group') {return false;}
+            const outcome = testResult(node)?.outcome;
+            return outcome === 'failed' || outcome === 'errored';
+        })) {throw new Error('MTP reported a failing run (exit 2), but did not provide a matching failed test result. The run cannot be reported as passing.');}
         options.signal?.throwIfAborted();
         return [...nodes.values()].filter(node => node['node-type'] !== 'group');
     } finally {
@@ -117,6 +125,6 @@ export function testResult(node: TestNode): TestResult | undefined {
         duration: Number(node['time.duration-ms'] ?? 0),
         message: typeof node['error.message'] === 'string' ? node['error.message'] : undefined,
         stack: typeof node['error.stacktrace'] === 'string' ? node['error.stacktrace'] : undefined,
-        output: [node.standardOutput, node.standardError].filter(value => typeof value === 'string').join('\n')
+        output: [node.standardOutput, node.standardError].filter(value => typeof value === 'string').join('\n'), node
     };
 }

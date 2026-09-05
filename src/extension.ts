@@ -6,7 +6,6 @@ import { CoverageSummary } from './core/coverage';
 import { TestFile, TestResult } from './core/model';
 import { contentHash, isExcluded, isInside, matchesPattern, normalizePath } from './core/paths';
 import { ChangeBatch, Scheduler, SchedulerState } from './core/scheduler';
-import { selectTests } from './core/selection';
 import { ManualSelection, RunSummary, TestEngine } from './services/engine';
 
 export async function activate(context: vscode.ExtensionContext): Promise<{ snapshot: () => unknown } | undefined> {
@@ -33,7 +32,13 @@ class Testy implements vscode.Disposable {
     private readonly runProfile: vscode.TestRunProfile;
     private readonly coverageProfile: vscode.TestRunProfile;
     private config: Configuration;
-    private watcher: vscode.FileSystemWatcher | undefined;
+    private watchers: vscode.FileSystemWatcher[] = [];
+    private renderTimer: NodeJS.Timeout | undefined;
+    private readonly pendingEditors = new Set<vscode.TextEditor>();
+    private productionSources = new Set<string>();
+    private coverageSuffix = '';
+    private passed = 0;
+    private failed = 0;
     private activeRun: vscode.TestRun | undefined;
     private phase = '';
     private scheduling: SchedulerState = 'idle';
@@ -41,7 +46,7 @@ class Testy implements vscode.Disposable {
     private lastError = '';
     private disposed = false;
 
-    constructor(private readonly context: vscode.ExtensionContext, private readonly roots: readonly string[]) {
+    constructor(private readonly context: vscode.ExtensionContext, private roots: readonly string[]) {
         this.config = configuration();
         this.decorations = Object.fromEntries(['covered', 'uncovered', 'stale'].map(kind => [kind, vscode.window.createTextEditorDecorationType({
             gutterIconPath: vscode.Uri.joinPath(context.extensionUri, 'media', `${kind}.svg`), gutterIconSize: 'contain'
@@ -51,14 +56,14 @@ class Testy implements vscode.Disposable {
             roots, storage, tools: context.globalStorageUri.fsPath,
             analyzer: path.join(context.extensionPath, 'dist', 'analyzer', 'Testy.Analysis.dll'), configuration: () => this.config,
             events: {
-                output: text => { this.output.append(text); this.activeRun?.appendOutput(text.replace(/\r?\n/g, '\r\n')); },
+                output: text => { if (this.disposed) {return;} this.output.append(text); this.activeRun?.appendOutput(text.replace(/\r?\n/g, '\r\n')); },
                 phase: phase => { this.phase = phase; this.updateStatus(); },
                 discovered: groups => this.updateTree(groups),
                 selected: selection => {
                     this.output.appendLine(`${selection.reason}: ${selection.groups.length} of ${this.engine.groups.length} test files.`);
-                    for (const group of selection.groups) {for (const test of group.tests) {
+                    for (const group of selection.groups) {for (const test of this.engine.knownTests(group)) {
                         const item = this.items.get(`${group.id}:${test.id}`);
-                        if (item) {this.outcomes.delete(item.id); this.activeRun?.enqueued(item);}
+                        if (item) {this.setOutcome(item.id); this.activeRun?.enqueued(item);}
                     }}
                 },
                 started: (group, id) => { const item = this.items.get(`${group.id}:${id}`); if (item) {this.activeRun?.started(item);} },
@@ -80,14 +85,14 @@ class Testy implements vscode.Disposable {
             (this.details.get(coverage)?.lines ?? []).map(line => new vscode.StatementCoverage(line.hits, new vscode.Position(line.line - 1, 0)));
         this.controller.refreshHandler = async token => {
             const abort = this.bindCancellation(token);
-            try { await this.scheduler.runManual(signal => this.execute({ files: [], full: true }, signal), abort.controller.signal, true); }
+            try { await this.scheduler.runManual(signal => this.execute({ files: [], full: true }, signal, undefined, undefined, true), abort.controller.signal, true); }
             catch (error) { this.reportError(error); }
             finally { abort.dispose(); }
         };
         this.status.name = 'Testy'; this.status.command = 'testy.toggleAutoRun'; this.status.show();
         this.disposables.push(
             vscode.commands.registerCommand('testy.refreshTests', async () => {
-                try { await this.scheduler.runManual(signal => this.execute({ files: [], full: true }, signal), undefined, true); }
+                try { await this.scheduler.runManual(signal => this.execute({ files: [], full: true }, signal, undefined, undefined, true), undefined, true); }
                 catch (error) { this.reportError(error); }
             }),
             vscode.commands.registerCommand('testy.toggleAutoRun', async () => {
@@ -97,8 +102,8 @@ class Testy implements vscode.Disposable {
             vscode.workspace.onDidSaveTextDocument(document => {
                 if (this.config.trigger === 'save') {void this.changed(document.uri, document.getText());}
             }),
-            vscode.workspace.onDidDeleteFiles(event => { for (const uri of event.files) {void this.changed(uri);} }),
-            vscode.workspace.onDidRenameFiles(event => { for (const file of event.files) { void this.changed(file.oldUri); void this.changed(file.newUri); } }),
+            vscode.workspace.onDidDeleteFiles(event => { for (const uri of event.files) {void this.changed(uri, undefined, true);} }),
+            vscode.workspace.onDidRenameFiles(event => { for (const file of event.files) { void this.changed(file.oldUri, undefined, true); void this.changed(file.newUri, undefined, true); } }),
             vscode.workspace.onDidChangeConfiguration(event => {
                 if (!event.affectsConfiguration('testy')) {return;}
                 try {
@@ -109,8 +114,14 @@ class Testy implements vscode.Disposable {
                     if (['runMode', 'runWithCoverage', 'buildConfiguration', 'dotnetPath', 'testArguments', 'exclude', 'coverageToolPath'].some(key => event.affectsConfiguration(`testy.${key}`))) {this.scheduler.request([], true);}
                 } catch (error) { this.reportError(error); }
             }),
-            vscode.window.onDidChangeVisibleTextEditors(() => this.decorate()),
-            vscode.workspace.onDidChangeTextDocument(event => { if (event.contentChanges.length) {this.decorate();} })
+            vscode.workspace.onDidChangeWorkspaceFolders(() => {
+                this.roots = (vscode.workspace.workspaceFolders ?? []).map(folder => normalizePath(folder.uri.fsPath));
+                this.engine.setRoots(this.roots); this.watch(); this.scheduler.request([], true);
+            }),
+            vscode.window.onDidChangeVisibleTextEditors(() => this.queueDecorations(vscode.window.visibleTextEditors)),
+            vscode.workspace.onDidChangeTextDocument(event => {
+                if (event.contentChanges.length) {this.queueDecorations(vscode.window.visibleTextEditors.filter(editor => editor.document === event.document));}
+            })
         );
     }
 
@@ -125,39 +136,67 @@ class Testy implements vscode.Disposable {
         return {
             running: this.scheduler.isRunning, paused: this.scheduler.isPaused, phase: this.phase,
             error: this.lastError, summary: this.lastSummary,
-            groups: this.engine.groups, coverage: this.engine.coverage.summarize(this.engine.hashes),
+            groups: this.engine.groups, baseline: this.engine.baselineProgress, coverage: this.engine.coverage.summarize(this.engine.hashes),
             status: this.status.text, outcomes: Object.fromEntries(this.outcomes)
         };
     }
 
     private watch(): void {
-        this.watcher?.dispose();
-        this.watcher = undefined;
+        this.watchers.forEach(watcher => watcher.dispose()); this.watchers = [];
         if (this.config.trigger !== 'fileSystem') {return;}
-        this.watcher = vscode.workspace.createFileSystemWatcher(this.config.pattern);
-        this.watcher.onDidChange(uri => { void this.changed(uri); });
-        this.watcher.onDidCreate(uri => { void this.changed(uri); });
-        this.watcher.onDidDelete(uri => { void this.changed(uri); });
+        const external = this.engine.directories.filter(directory => !this.roots.some(root => isInside(directory, root)));
+        for (const pattern of [this.config.pattern, ...external.map(directory => new vscode.RelativePattern(directory, this.config.pattern))]) {
+            const watcher = vscode.workspace.createFileSystemWatcher(pattern);
+            watcher.onDidChange(uri => {void this.changed(uri);});
+            watcher.onDidCreate(uri => {void this.changed(uri, undefined, true);});
+            watcher.onDidDelete(uri => {void this.changed(uri, undefined, true);});
+            this.watchers.push(watcher);
+        }
     }
 
-    private async changed(uri: vscode.Uri, content?: string): Promise<void> {
+    private async changed(uri: vscode.Uri, content?: string, directoryEvent = false): Promise<void> {
         if (this.disposed || uri.scheme !== 'file') {return;}
         const file = normalizePath(uri.fsPath);
-        if (!this.roots.some(root => isInside(file, root)) && !this.engine.projects.some(project => project.sourceFiles.includes(file))) {return;}
-        if (isExcluded(file, this.config.excludes, this.roots) || !matchesPattern(file, this.config.pattern, this.roots)) {return;}
-        if (file.endsWith('.cs')) {
-            try { content ??= (await fs.readFile(file, 'utf8')).slice(0, 2048); } catch { /* Deleted file. */ }
+        if (!this.roots.some(root => isInside(file, root)) && !this.engine.knownFiles.includes(file)
+            && !this.engine.knownFiles.some(known => isInside(known, file))) {return;}
+        if (isExcluded(file, this.config.excludes, this.roots)) {return;}
+        const descendants = directoryEvent ? this.engine.knownFiles.filter(known => known !== file && isInside(known, file)) : [];
+        let directory = descendants.length > 0;
+        if (directoryEvent && !directory) {try {directory = (await fs.stat(file)).isDirectory();} catch { /* Deleted path. */ }}
+        if (!directory && !matchesPattern(file, this.config.pattern, this.roots)) {return;}
+        if (!directory && file.endsWith('.cs')) {
+            if (content === undefined) {
+                let handle: fs.FileHandle | undefined;
+                try {handle = await fs.open(file, 'r'); const buffer = Buffer.alloc(2048); const { bytesRead } = await handle.read(buffer); content = buffer.toString('utf8', 0, bytesRead);}
+                catch { /* Deleted file. */ } finally {await handle?.close();}
+            }
             if (/<auto-generated\b/i.test(content?.slice(0, 2048) ?? '')) {return;}
         }
-        const selection = selectTests(this.engine.groups, this.engine.projects, this.engine.coverage.traces, [file], this.config.mode);
-        const stale = selection.groups.flatMap(group => group.tests.map(test => this.items.get(`${group.id}:${test.id}`))).filter((item): item is vscode.TestItem => !!item);
+        if (this.disposed) {return;}
+        const files = [...descendants, file];
+        this.scheduler.request(files, directory);
+        const selection = this.engine.select(files, true);
+        const stale = selection.groups.flatMap(group => this.engine.knownTests(group).map(test => this.items.get(`${group.id}:${test.id}`))).filter((item): item is vscode.TestItem => !!item);
         this.controller.invalidateTestResults(stale);
-        for (const item of stale) { this.outcomes.delete(item.id); }
-        this.scheduler.request([file]);
-        try { await this.engine.markChanged(); } catch (error) { this.reportError(error); }
+        for (const item of stale) {this.setOutcome(item.id);}
+        await this.engine.markChanged(files);
+    }
+
+    private setOutcome(id: string, outcome?: string): void {
+        const previous = this.outcomes.get(id);
+        if (previous === 'passed') {this.passed--;}
+        if (previous === 'failed' || previous === 'errored') {this.failed--;}
+        if (outcome) {this.outcomes.set(id, outcome);} else {this.outcomes.delete(id);}
+        if (outcome === 'passed') {this.passed++;}
+        if (outcome === 'failed' || outcome === 'errored') {this.failed++;}
     }
 
     private updateTree(groups: readonly TestFile[]): void {
+        if (this.disposed) {return;}
+        this.productionSources = new Set(this.engine.projects.filter(project => !project.isTestProject).flatMap(project => [...project.sourceFiles]));
+        this.watch();
+        const projectCounts = new Map<string, number>();
+        for (const group of groups) {projectCounts.set(group.project, (projectCounts.get(group.project) ?? 0) + this.engine.knownTests(group).length);}
         const live = new Set<string>();
         const projects = new Map<string, vscode.TestItem[]>();
         this.testIds.clear();
@@ -168,7 +207,7 @@ class Testy implements vscode.Disposable {
             const files = projects.get(projectId) ?? [];
             const file = this.item(`file:${group.id}`, `${path.basename(group.file ?? 'Other tests')} · ${group.framework}`, group.file);
             live.add(file.id); files.push(file); projects.set(projectId, files);
-            const children = group.tests.map(test => {
+            const children = this.engine.knownTests(group).map(test => {
                 const id = `${group.id}:${test.id}`;
                 const item = this.item(id, test.name, test.file);
                 if (test.file) {item.range = new vscode.Range(Math.max(0, test.line - 1), 0, Math.max(0, test.line - 1), 0);}
@@ -176,11 +215,11 @@ class Testy implements vscode.Disposable {
                 return item;
             });
             file.children.replace(children);
-            project.description = `${groups.filter(item => item.project === group.project).reduce((total, item) => total + item.tests.length, 0)} tests`;
+            project.description = `${projectCounts.get(group.project)} tests`;
         }
         for (const [id, files] of projects) {this.items.get(id)!.children.replace(files);}
         this.controller.items.replace([...projects.keys()].map(id => this.items.get(id)!));
-        for (const id of this.items.keys()) {if (!live.has(id)) { this.items.delete(id); this.outcomes.delete(id); }}
+        for (const id of this.items.keys()) {if (!live.has(id)) { this.items.delete(id); this.setOutcome(id); }}
         this.updateStatus();
     }
 
@@ -211,7 +250,7 @@ class Testy implements vscode.Disposable {
         finally { abort.dispose(); }
     }
 
-    private async execute(batch: ChangeBatch, signal: AbortSignal, request?: vscode.TestRunRequest, manual?: ManualSelection): Promise<void> {
+    private async execute(batch: ChangeBatch, signal: AbortSignal, request?: vscode.TestRunRequest, manual?: ManualSelection, manualOperation = false): Promise<void> {
         const abort = new AbortController();
         const cancel = (): void => abort.abort();
         signal.addEventListener('abort', cancel, { once: true });
@@ -220,7 +259,7 @@ class Testy implements vscode.Disposable {
         const cancellation = run.token.onCancellationRequested(cancel);
         this.activeRun = run; this.lastError = '';
         try {
-            this.lastSummary = await this.engine.run(batch, abort.signal, manual);
+            this.lastSummary = await this.engine.run(batch, abort.signal, manual, manualOperation);
             this.output.appendLine(`${this.lastSummary.passed} passed, ${this.lastSummary.failed} failed, ${this.lastSummary.skipped} skipped in ${(this.lastSummary.duration / 1000).toFixed(1)}s.\n`);
         } catch (error) {
             if (!abort.signal.aborted && (error as Error).name !== 'AbortError') {
@@ -235,13 +274,15 @@ class Testy implements vscode.Disposable {
     }
 
     private publishResult(group: TestFile, result: TestResult): void {
+        if (this.disposed) {return;}
         const id = `${group.id}:${result.id}`;
+        this.testIds.set(id, { group: group.id, test: result.id });
         let item = this.items.get(id);
         if (!item) {
             item = this.item(id, result.name, group.file);
             this.items.get(`file:${group.id}`)?.children.add(item);
         }
-        this.outcomes.set(id, result.outcome);
+        this.setOutcome(id, result.outcome);
         if (result.outcome === 'passed') {this.activeRun?.passed(item, result.duration);}
         else if (result.outcome === 'skipped') {this.activeRun?.skipped(item);}
         else {
@@ -255,19 +296,33 @@ class Testy implements vscode.Disposable {
     }
 
     private publishCoverage(): void {
+        if (this.disposed) {return;}
+        let total = 0, covered = 0;
         for (const summary of this.engine.coverage.summarize(this.engine.hashes)) {
             if (summary.stale) {continue;}
+            if (this.productionSources.has(summary.file)) {total += summary.total; covered += summary.covered;}
             const coverage = new vscode.FileCoverage(vscode.Uri.file(summary.file), { covered: summary.covered, total: summary.total });
             this.details.set(coverage, summary); this.activeRun?.addCoverage(coverage);
         }
-        this.decorate(); this.updateStatus();
+        this.coverageSuffix = total ? ` · ${Math.round(covered / total * 100)}%` : '';
+        this.queueDecorations(vscode.window.visibleTextEditors); this.updateStatus();
     }
 
-    private decorate(): void {
-        const summaries = new Map(this.engine.coverage.summarize(this.engine.hashes).map(summary => [summary.file, summary]));
-        for (const editor of vscode.window.visibleTextEditors) {
+    private queueDecorations(editors: readonly vscode.TextEditor[]): void {
+        if (this.disposed) {return;}
+        editors.forEach(editor => this.pendingEditors.add(editor));
+        this.renderTimer ??= setTimeout(() => {
+            this.renderTimer = undefined;
+            const pending = [...this.pendingEditors]; this.pendingEditors.clear();
+            this.decorate(pending);
+        }, 50);
+    }
+
+    private decorate(editors: readonly vscode.TextEditor[] = vscode.window.visibleTextEditors): void {
+        if (this.disposed) {return;}
+        for (const editor of editors) {
             const entries: Record<'covered' | 'uncovered' | 'stale', vscode.DecorationOptions[]> = { covered: [], uncovered: [], stale: [] };
-            const summary = this.config.showCoverage ? summaries.get(normalizePath(editor.document.uri.fsPath)) : undefined;
+            const summary = this.config.showCoverage ? this.engine.coverage.summary(normalizePath(editor.document.uri.fsPath), this.engine.hashes) : undefined;
             if (summary) {for (const line of summary.lines) {
                 if (line.line > editor.document.lineCount) {continue;}
                 const stale = summary.stale || editor.document.isDirty;
@@ -283,13 +338,8 @@ class Testy implements vscode.Disposable {
 
     private updateStatus(): void {
         if (this.disposed || !this.engine || !this.scheduler) {return;}
-        const failed = [...this.outcomes.values()].filter(outcome => outcome === 'failed' || outcome === 'errored').length;
-        const passed = [...this.outcomes.values()].filter(outcome => outcome === 'passed').length;
-        const productionSources = new Set(this.engine.projects.filter(project => !project.isTestProject).flatMap(project => [...project.sourceFiles]));
-        const coverage = this.engine.coverage.summarize(this.engine.hashes).filter(file => !file.stale && productionSources.has(file.file));
-        const total = coverage.reduce((sum, file) => sum + file.total, 0);
-        const covered = coverage.reduce((sum, file) => sum + file.covered, 0);
-        const suffix = total ? ` · ${Math.round(covered / total * 100)}%` : '';
+        const { passed, failed } = this;
+        const suffix = this.coverageSuffix;
         this.status.text = this.scheduler.isPaused ? '$(debug-pause) Testy: paused'
             : this.lastError ? '$(warning) Testy: needs attention'
             : this.phase ? `$(sync~spin) Testy: ${this.phase}`
@@ -317,7 +367,8 @@ class Testy implements vscode.Disposable {
     }
 
     dispose(): void {
-        this.disposed = true; this.scheduler.dispose(); this.watcher?.dispose();
+        this.disposed = true; this.scheduler.dispose(); this.watchers.forEach(watcher => watcher.dispose());
+        if (this.renderTimer) {clearTimeout(this.renderTimer);} this.pendingEditors.clear();
         this.disposables.forEach(disposable => disposable.dispose());
         Object.values(this.decorations).forEach(decoration => decoration.dispose());
         this.activeRun?.end(); this.controller.dispose(); this.output.dispose(); this.status.dispose();

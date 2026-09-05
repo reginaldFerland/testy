@@ -33,3 +33,24 @@ test('declaration analysis distinguishes executable edits from compile-time depe
  for(const name of ['constant','signature','attribute','initializer','constructor','directive']) assert.notEqual(shapes.get(files[name]),shapes.get(files.original),name);
  assert.equal(shapes.get(files.invalid),null);
 });
+
+
+test('excluded attributes, local/global aliases, and hidden regions keep body changes conservative',async t=>{
+ const directory=await fs.mkdtemp(path.join(os.tmpdir(),'testy-blind-spots-'));
+ t.after(()=>fs.rm(directory,{recursive:true,force:true}));
+ const variants=[
+  '[System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage] public class C { public int M()=>1; }',
+  'using Blind = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute; [Blind] public class C { public int M()=>1; }',
+  '[ExternalBlind] public class C { public int M()=>1; }',
+  'public class C { [System.Diagnostics.DebuggerHidden] public int M()=>1; }',
+  'public class C {\n#line hidden\npublic int M()=>1;\n#line default\n}'
+ ];
+ for(const [index,source] of variants.entries()) {
+  const file=normalizePath(path.join(directory,`${index}.cs`));
+  await fs.writeFile(file,source);
+  const shape=await sourceShapes('dotnet',path.resolve('dist/analyzer/Testy.Analysis.dll'),[file],directory,{cwd:directory},['ExternalBlind']);
+  await fs.writeFile(file,source.replace('M()=>1','M()=>2'));
+  const changed=await sourceShapes('dotnet',path.resolve('dist/analyzer/Testy.Analysis.dll'),[file],directory,{cwd:directory},['ExternalBlind']);
+  assert.notEqual(shape.get(file),changed.get(file),source);
+ }
+});

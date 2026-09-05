@@ -8,3 +8,5 @@ node_modules
 **/TestResults/
 backend/publish/
 .testy/
+
+.test-tools/

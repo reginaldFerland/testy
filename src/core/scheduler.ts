@@ -1,6 +1,6 @@
 import { Cancelled } from '../services/process';
 
-export interface ChangeBatch { readonly files: readonly string[]; readonly full: boolean; }
+export interface ChangeBatch { readonly files: readonly string[]; readonly full: boolean; readonly generation?: number; }
 export type SchedulerState = 'idle' | 'waiting' | 'running' | 'paused';
 export interface SchedulerOptions {
     readonly run: (batch: ChangeBatch, signal: AbortSignal) => Promise<void>;
@@ -120,7 +120,7 @@ export class Scheduler {
         this.active = { kind: 'auto', controller };
         this.ready = false;
         this.publish();
-        void this.options.run({ files: [...snapshot.keys()], full: full !== undefined }, controller.signal).then(() => {
+        void this.options.run({ files: [...snapshot.keys()], full: full !== undefined, ...(full !== undefined ? { generation: full } : {}) }, controller.signal).then(() => {
             if (controller.signal.aborted) {return;}
             for (const [file, revision] of snapshot) {if (this.pending.get(file) === revision) {this.pending.delete(file);}}
             if (this.fullRevision === full) {this.fullRevision = undefined;}

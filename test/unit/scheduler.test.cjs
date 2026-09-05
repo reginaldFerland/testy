@@ -16,7 +16,7 @@ test('cancels immediately but waits for exit and debounce before restart',async(
  const s=setup();s.scheduler.request(['a'],true);await s.tick();s.scheduler.request(['b']);
  assert.equal(s.runs[0].signal.aborted,true);await s.tick();assert.equal(s.runs.length,1);
  s.runs[0].resolve();await flush();assert.equal(s.runs.length,2);
- assert.deepEqual(s.runs[1].batch,{files:['a','b'],full:true});s.runs[1].resolve();await flush();s.scheduler.dispose();
+ assert.deepEqual(s.runs[1].batch,{files:['a','b'],full:true,generation:s.runs[0].batch.generation});s.runs[1].resolve();await flush();s.scheduler.dispose();
 });
 test('a save does not cancel a manual run',async()=>{
  const s=setup();const manual=gate();let signal;const task=s.scheduler.runManual(token=>{signal=token;return manual.promise;});

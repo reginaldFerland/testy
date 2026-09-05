@@ -2,6 +2,12 @@
 
 ## 1.0.0
 
+- Preserve shared-UID failures and retry semantics; continue after skipped or initialization-failing files.
+- Honor excluded/hidden code, binary references, directory changes, changing workspace roots, and per-project SDK contexts.
+- Checkpoint baseline progress; preserve manual-run attribution and mark stale dependency/test inputs.
+- Share sparse coverage geometry, cache summaries, index ownership, and reuse isolated output preparation.
+- Support path-dependent xUnit identities and missing NUnit source locations; rebuild the analyzer on F5.
+
 - Own Test Explorer integration backed by .NET 10+ and Microsoft.Testing.Platform; no Dev Kit dependency.
 - Automatic startup baseline and affected test-file execution based on recorded runtime code usage.
 - Roslyn declaration analysis triggers project fallback for compile-time dependencies such as inlined constants.

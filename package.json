@@ -163,7 +163,8 @@
     "test": "node --test test/unit/*.test.cjs",
     "test:integration": "npm run compile && node --test test/integration/*.test.cjs",
     "test:extension": "vscode-test",
-    "package": "vsce package"
+    "package": "vsce package",
+    "benchmark": "npm run compile && node test/performance/benchmark.cjs"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",

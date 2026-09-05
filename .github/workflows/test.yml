@@ -1,0 +1,35 @@
+name: Test
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: npm ci
+      - run: dotnet tool install dotnet-coverage --version 18.1.0 --tool-path .test-tools
+      - name: Select coverage collector
+        shell: pwsh
+        run: |
+          $suffix = if ($IsWindows) { '.exe' } else { '' }
+          "TESTY_COVERAGE_TOOL=$((Join-Path $pwd '.test-tools/dotnet-coverage') + $suffix)" >> $env:GITHUB_ENV
+      - run: npm test
+      - run: npm run test:integration
+      - run: npm run package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: testy-${{ matrix.os }}
+          path: '*.vsix'

@@ -38,13 +38,20 @@ export function startProcess(command: string, args: readonly string[], options: 
     let killTimer: NodeJS.Timeout | undefined;
     let stdout = '';
     let stderr = '';
+    const teardowns: Promise<void>[] = [];
+    let windowsKillStarted = false;
     const limit = 8 * 1024 * 1024;
     const killTree = (force: boolean): void => {
         if (!child.pid) {return;}
         try {
             if (process.platform === 'win32') {
-                const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-                killer.on('error', () => child.kill());
+                if (windowsKillStarted) {return;}
+                windowsKillStarted = true;
+                teardowns.push(new Promise<void>(resolve => {
+                    const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+                    killer.once('error', () => {child.kill(); resolve();});
+                    killer.once('close', code => {if (code !== 0 && !closed) {child.kill();} resolve();});
+                }));
             } else {
                 process.kill(-child.pid, force ? 'SIGKILL' : 'SIGTERM');
             }
@@ -69,7 +76,7 @@ export function startProcess(command: string, args: readonly string[], options: 
             const text = data.toString(); stderr = (stderr + text).slice(-limit); options.output?.(text);
         });
         child.once('error', reject);
-        child.once('close', code => {
+        child.once('close', async code => {
             closed = true;
             clearTimeout(timeout);
             // Kill any remaining descendants of our own detached process group
@@ -77,6 +84,7 @@ export function startProcess(command: string, args: readonly string[], options: 
             if (cancelled) {killTree(true);}
             if (killTimer) {clearTimeout(killTimer);}
             options.signal?.removeEventListener('abort', stop);
+            await Promise.all(teardowns);
             if (timedOut) {reject(new Error(`The command exceeded its time limit: ${command}`));}
             else if (cancelled) {reject(new Cancelled());}
             else {resolve({ code: code ?? -1, stdout, stderr });}

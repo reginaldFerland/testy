@@ -6,6 +6,7 @@ export interface Project {
     readonly runner: 'mtp';
     readonly sourceFiles: readonly string[];
     readonly references: readonly string[];
+    readonly binaryReferences?: readonly string[];
 }
 
 export interface DiscoveredTest {
@@ -45,6 +46,9 @@ export interface Trace {
     /** Only complete, successful runs can narrow subsequent selections. */
     readonly reliable: boolean;
     readonly timestamp: number;
+    /** Source versions that produced this contribution, including the test file. */
+    readonly inputs?: Readonly<Record<string, string>>;
+    readonly stale?: boolean;
 }
 
 export interface TestResult {
@@ -56,4 +60,5 @@ export interface TestResult {
     readonly message?: string;
     readonly stack?: string;
     readonly output?: string;
+    readonly node?: Readonly<Record<string, unknown>>;
 }
