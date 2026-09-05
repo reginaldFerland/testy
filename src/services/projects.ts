@@ -4,10 +4,12 @@ import { Project } from '../core/model';
 import { defaultExcludes, isExcluded, normalizePath } from '../core/paths';
 import { ProcessOptions, requireSuccess, runProcess } from './process';
 
-export async function findProjects(roots: readonly string[], excludes: readonly string[] = defaultExcludes): Promise<readonly string[]> {
+export async function findProjects(roots: readonly string[], excludes: readonly string[] = defaultExcludes, signal?: AbortSignal): Promise<readonly string[]> {
     const result = new Set<string>();
     async function visit(directory: string): Promise<void> {
+        signal?.throwIfAborted();
         for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+            signal?.throwIfAborted();
             const file = path.join(directory, entry.name);
             if (isExcluded(entry.isDirectory() ? `${file}/` : file, excludes, roots)) {continue;}
             if (entry.isDirectory()) {await visit(file);}
@@ -15,6 +17,7 @@ export async function findProjects(roots: readonly string[], excludes: readonly 
         }
     }
     for (const root of roots) {await visit(root);}
+    signal?.throwIfAborted();
     return [...result].sort();
 }
 
@@ -37,35 +40,46 @@ export function buildOrder(projects: readonly Project[], selected: ReadonlySet<s
     return ordered;
 }
 
-interface Evaluation {
-    readonly Properties: Record<string, string>;
-    readonly Items: Record<string, readonly { readonly FullPath: string; readonly HintPath?: string }[]>;
+/** Preserve reference property contexts by asking the selected SDK to evaluate its graph. */
+export async function evaluateProject(dotnet: string, file: string, configuration: string, options: ProcessOptions, analyzer: string): Promise<readonly Project[]> {
+    const directory = await fs.mkdtemp(path.join((await import('node:os')).tmpdir(), 'testy-graph-'));
+    const xml = (value: string): string => value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+    try {
+        const input = path.join(directory, 'input.json'), output = path.join(directory, 'output.json'), query = path.join(directory, 'query.proj');
+        await fs.writeFile(input, JSON.stringify({ file, configuration }));
+        await fs.writeFile(query, `<Project><UsingTask TaskName="Testy.Analysis.ProjectGraphTask" AssemblyFile="${xml(analyzer)}"/><Target Name="Inspect"><ProjectGraphTask RequestFile="${xml(input)}" OutputFile="${xml(output)}"/></Target></Project>`);
+        requireSuccess(await runProcess(dotnet, ['msbuild', query, '-nologo', '-target:Inspect'], { ...options, output: undefined }), `Inspecting ${path.basename(file)}`);
+        const graph = JSON.parse(await fs.readFile(output, { encoding: 'utf8', signal: options.signal })) as (Project & { isMtp: boolean })[];
+        return graph.map(project => {
+            if (project.isTestProject && !project.isMtp) {throw new Error(`${path.basename(project.file)} uses VSTest. Testy requires a Microsoft.Testing.Platform test project.`);}
+            if (project.isTestProject && Number(/^net(\d+)\./.exec(project.framework)?.[1] ?? 0) < 10) {throw new Error(`${path.basename(project.file)} targets ${project.framework}. Testy requires test projects targeting .NET 10 or later.`);}
+            const paths = (files: readonly string[]): string[] => [...new Set(files.map(normalizePath))];
+            return { ...project, file: normalizePath(project.file), assembly: normalizePath(project.assembly), runner: 'mtp',
+                sourceFiles: paths(project.sourceFiles).filter(file => !isExcluded(file)), inputs: paths(project.inputs ?? []).filter(file => !isExcluded(file)),
+                references: paths(project.references), binaryReferences: paths(project.binaryReferences ?? []) };
+        });
+    } finally {await fs.rm(directory, { recursive: true, force: true });}
 }
 
-export async function evaluateProject(dotnet: string, file: string, configuration: string, options: ProcessOptions, framework?: string): Promise<readonly Project[]> {
-    const result = requireSuccess(await runProcess(dotnet, ['msbuild', file, '-nologo',
-        `-property:Configuration=${configuration}`, ...framework ? [`-property:TargetFramework=${framework}`] : [],
-        '-getProperty:TargetPath,TargetFramework,TargetFrameworks,IsTestProject,IsTestingPlatformApplication', '-getItem:Compile,ProjectReference,Reference'
-    ], { ...options, output: undefined }), `Inspecting ${path.basename(file)}`);
-    let parsed: Evaluation;
-    try { parsed = JSON.parse(result.stdout); }
-    catch { throw new Error(`MSBuild did not return project information for ${file}.\n${result.stdout}`); }
-    const p = parsed.Properties;
-    if (!p || !parsed.Items) {throw new Error(`Incomplete project information for ${file}.`);}
-    const frameworks = p.TargetFrameworks?.split(';').filter(Boolean) ?? [];
-    if (!framework && frameworks.length) {
-        const targets: Project[] = [];
-        for (const target of frameworks) {targets.push(...await evaluateProject(dotnet, file, configuration, options, target));}
-        return targets;
+/** Union ownership across contexts; execute each workspace entry point only once. */
+export function mergeProjects(projects: readonly Project[]): readonly Project[] {
+    const merged = new Map<string, Project>();
+    for (const project of projects) {
+        const key = `${project.file}\0${project.framework}`, previous = merged.get(key);
+        if (!previous) {merged.set(key, project); continue;}
+        const preferred = project.entryPoint ? project : previous;
+        const union = (a: readonly string[], b: readonly string[]): string[] => [...new Set([...a, ...b])];
+        merged.set(key, { ...preferred, entryPoint: previous.entryPoint || project.entryPoint,
+            assemblies: union(previous.assemblies ?? [previous.assembly], project.assemblies ?? [project.assembly]),
+            sourceFiles: union(previous.sourceFiles, project.sourceFiles), inputs: union(previous.inputs ?? [], project.inputs ?? []),
+            references: union(previous.references, project.references), binaryReferences: union(previous.binaryReferences ?? [], project.binaryReferences ?? []) });
     }
-    const isTestProject = p.IsTestProject?.toLowerCase() === 'true' || p.IsTestingPlatformApplication?.toLowerCase() === 'true';
-    if (isTestProject && p.IsTestingPlatformApplication?.toLowerCase() !== 'true') {throw new Error(`${path.basename(file)} uses VSTest. Testy 1.0 requires a Microsoft.Testing.Platform test project targeting .NET 10 or later.`);}
-    if (isTestProject && Number(/^net(\d+)\./.exec(p.TargetFramework)?.[1] ?? 0) < 10) {throw new Error(`${path.basename(file)} targets ${p.TargetFramework}. Testy requires test projects targeting .NET 10 or later.`);}
-    return [{
-        file: normalizePath(file), framework: p.TargetFramework, assembly: p.TargetPath ? normalizePath(p.TargetPath) : '',
-        isTestProject, runner: 'mtp',
-        sourceFiles: (parsed.Items.Compile ?? []).map(item => normalizePath(item.FullPath)).filter(file => !isExcluded(file)),
-        references: (parsed.Items.ProjectReference ?? []).map(item => normalizePath(item.FullPath)),
-        binaryReferences: (parsed.Items.Reference ?? []).filter(item => item.HintPath).map(item => normalizePath(path.resolve(path.dirname(file), item.HintPath!)))
-    }];
+    return [...merged.values()];
+}
+
+/** MSBuild builds project edges in their proper property contexts. Binary edges still need explicit producers. */
+export function buildRoots(projects: readonly Project[]): readonly Project[] {
+    const referenced = new Set(projects.flatMap(project => [...project.references]));
+    const binaries = new Set(projects.flatMap(project => [...project.binaryReferences ?? []]));
+    return projects.filter(project => !referenced.has(project.file) || binaries.has(project.assembly) || (project.isTestProject && project.entryPoint !== false));
 }

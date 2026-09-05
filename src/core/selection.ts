@@ -17,9 +17,9 @@ export class ProjectIndex {
 
     constructor(readonly projects: readonly Project[]) {
         this.projectIds = new Set(projects.map(project => project.file));
-        const assemblies = new Map(projects.map(project => [project.assembly, project.file]));
+        const assemblies = new Map(projects.flatMap(project => (project.assemblies ?? [project.assembly]).map(assembly => [assembly, project.file] as const)));
         for (const project of projects) {
-            for (const file of [project.file, ...project.sourceFiles]) {this.add(this.owners, file, project.file);}
+            for (const file of [project.file, ...project.sourceFiles, ...project.inputs ?? []]) {this.add(this.owners, file, project.file);}
             this.add(this.directories, path.dirname(project.file), project.file);
             const references = [...project.references, ...(project.binaryReferences ?? []).map(file => assemblies.get(file)).filter((file): file is string => !!file)];
             for (const reference of references) {this.add(this.dependents, reference, project.file);}

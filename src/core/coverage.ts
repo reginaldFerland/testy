@@ -47,24 +47,38 @@ export class CoverageStore {
     }
 
     invalidate(groupIds: ReadonlySet<string>, stale = true): void {
+        let changed = false;
         for (const id of groupIds) {
             const trace = this.records.get(id);
             if (!trace || (!trace.reliable && (!stale || trace.stale))) {continue;}
             this.records.set(id, { ...trace, reliable: false, stale: stale || trace.stale });
+            changed = true;
             this.changedTraces.add(id);
-            for (const coverage of trace.coverage) {this.dirtyFiles.add(coverage.file);}
+            for (const sourceId of trace.sourceIds) {const source = this.sources.get(sourceId); if (source) {this.dirtyFiles.add(source.source.file);}}
         }
-        this.cached = undefined;
+        if (changed) {this.cached = undefined;}
     }
 
     markStale(groupIds: ReadonlySet<string>, stale = true): void {
+        let changed = false;
         for (const id of groupIds) {
             const trace = this.records.get(id);
-            if (!trace || !!trace.stale === stale) {continue;}
+            if (!trace || (!stale && trace.historical) || !!trace.stale === stale) {continue;}
             this.records.set(id, { ...trace, stale }); this.changedTraces.add(id);
-            for (const coverage of trace.coverage) {this.dirtyFiles.add(coverage.file);}
+            changed = true;
+            for (const sourceId of trace.sourceIds) {const source = this.sources.get(sourceId); if (source) {this.dirtyFiles.add(source.source.file);}}
         }
-        this.cached = undefined;
+        if (changed) {this.cached = undefined;}
+    }
+
+    markHistorical(groupIds: ReadonlySet<string>): void {
+        this.markStale(groupIds);
+        for (const id of groupIds) {
+            const trace = this.records.get(id);
+            if (trace && !trace.historical) {
+                this.records.set(id, { ...trace, reliable: false, historical: true }); this.changedTraces.add(id);
+            }
+        }
     }
 
     replace(traces: readonly Trace[], liveGroupIds: ReadonlySet<string>): void {
@@ -96,8 +110,8 @@ export class CoverageStore {
 
     restore(traces: readonly Trace[]): void { this.replace(traces, new Set(traces.map(trace => trace.groupId))); }
 
-    restorePacked(sources: readonly CoverageSource[], traces: readonly StoredTrace[]): void {
-        for (const source of sources) {this.registerSource(source);}
+    restorePacked(sources: readonly CoverageSource[], traces: readonly StoredTrace[], canonical = false): void {
+        for (const source of sources) {this.registerSource(source, canonical);}
         for (const trace of traces) {
             if (trace.sourceIds.every(id => this.sources.has(id))) {this.install({ ...trace, reliable: false, stale: true });}
         }
@@ -154,9 +168,9 @@ export class CoverageStore {
         this.hashes = hashes; this.markStale(stale); this.cached = undefined;
     }
 
-    private registerSource(source: CoverageSource): void {
+    private registerSource(source: CoverageSource, canonical = false): void {
         const previous = this.sources.get(source.id);
-        const lines = previous ? [...new Set([...previous.source.lines, ...source.lines])].sort((a, b) => a - b) : [...new Set(source.lines)].sort((a, b) => a - b);
+        const lines = previous ? [...new Set([...previous.source.lines, ...source.lines])].sort((a, b) => a - b) : canonical ? source.lines : [...new Set(source.lines)].sort((a, b) => a - b);
         if (previous && lines.length === previous.source.lines.length) {return;}
         this.sources.set(source.id, { source: { ...source, lines }, groups: previous?.groups ?? new Set(), hits: previous?.hits ?? new Map() });
         const versions = this.byFile.get(source.file) ?? new Set<string>(); versions.add(source.id); this.byFile.set(source.file, versions);
@@ -208,13 +222,25 @@ export class CoverageStore {
         const groups = new Set<string>();
         let stale = !current;
         for (const version of versions) {
-            for (const [group, contribution] of version.hits) {
+            // Zero-hit reports still assert that these lines were uncovered.
+            // That assertion becomes stale when the reporting test changes.
+            for (const group of version.groups) {
                 groups.add(group);
+                if (this.records.get(group)?.stale) {stale = true;}
+            }
+            for (const [group, contribution] of version.hits) {
                 if (version !== current || this.records.get(group)?.stale) {stale = true;}
                 if (version === displayed) {for (const line of contribution) {hits.set(line.line, Math.max(hits.get(line.line) ?? 0, line.hits));}}
             }
         }
-        const lines = displayed.source.lines.map(line => ({ line, hits: hits.get(line) ?? 0 }));
-        return { file, lines, stale, covered: hits.size, total: lines.length, groupIds: [...groups] };
+        const previous = this.summaries.get(file);
+        const calculated = displayed.source.lines.map(line => ({ line, hits: hits.get(line) ?? 0 }));
+        const sameLines = previous && previous.lines.length === calculated.length
+            && calculated.every((line, index) => line.line === previous.lines[index].line && line.hits === previous.lines[index].hits);
+        const lines = sameLines ? previous.lines : calculated;
+        const groupIds = [...groups].sort();
+        if (previous && sameLines && previous.stale === stale && previous.covered === hits.size
+            && previous.groupIds.length === groupIds.length && groupIds.every((id, index) => id === previous.groupIds[index])) {return previous;}
+        return { file, lines, stale, covered: hits.size, total: lines.length, groupIds };
     }
 }

@@ -155,7 +155,8 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./ && npm run build:analyzer",
+    "compile": "tsc -p ./ && npm run build:analyzer && npm run build:process-host",
+    "build:process-host": "dotnet build backend/Testy.ProcessHost/Testy.ProcessHost.csproj --configuration Release --output dist/processhost --nologo",
     "build:analyzer": "dotnet build backend/Testy.Analysis/Testy.Analysis.csproj --configuration Release --output dist/analyzer --nologo",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
@@ -164,7 +165,8 @@
     "test:integration": "npm run compile && node --test test/integration/*.test.cjs",
     "test:extension": "vscode-test",
     "package": "vsce package",
-    "benchmark": "npm run compile && node test/performance/benchmark.cjs"
+    "benchmark": "npm run compile && node test/performance/benchmark.cjs",
+    "benchmark:responsiveness": "npm run compile && node test/performance/responsiveness.cjs"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",

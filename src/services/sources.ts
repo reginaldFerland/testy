@@ -44,14 +44,16 @@ export class SourceTracker {
                 if (!file) {return;}
                 try {
                     const stat = await fs.stat(file, { bigint: true });
+                    if (!stat.isFile()) {updates.set(file, undefined); continue;}
                     const stamp = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
                     const previous = this.states.get(file);
                     if (previous?.stamp === stamp && !this.dirty.has(file)) {continue;}
-                    const content = await fs.readFile(file, { encoding: 'utf8', signal });
+                    const bytes = await fs.readFile(file, { signal });
+                    const content = file.endsWith('.cs') ? bytes.toString('utf8') : '';
                     const excludedAliases = [...content.matchAll(/\bglobal\s+using\s+(@?\w+)\s*=([^;]+);/g)]
                         .filter(match => /\b(ExcludeFromCodeCoverage|DebuggerHidden|DebuggerNonUserCode|GeneratedCode|CompilerGenerated)(Attribute)?\b/.test(match[2]))
                         .flatMap(match => {const name = match[1].replace(/^@/, ''); return [name, name.replace(/Attribute$/, '')];});
-                    updates.set(file, { stamp, hash: contentHash(content), excludedAliases });
+                    updates.set(file, { stamp, hash: contentHash(bytes), excludedAliases });
                 } catch (error) {
                     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {throw error;}
                     updates.set(file, undefined);

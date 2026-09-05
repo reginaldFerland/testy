@@ -2,7 +2,8 @@
     "version": "2.0.0",
     "tasks": [
         { "type": "npm", "script": "build:analyzer", "problemMatcher": "$msCompile" },
+        { "type": "npm", "script": "build:process-host", "problemMatcher": "$msCompile" },
         { "type": "npm", "script": "watch", "problemMatcher": "$tsc-watch", "isBackground": true, "presentation": { "reveal": "never" } },
-        { "label": "Prepare extension", "dependsOrder": "sequence", "dependsOn": ["npm: build:analyzer", "npm: watch"], "group": { "kind": "build", "isDefault": true }, "problemMatcher": [] }
+        { "label": "Prepare extension", "dependsOrder": "sequence", "dependsOn": ["npm: build:analyzer", "npm: build:process-host", "npm: watch"], "group": { "kind": "build", "isDefault": true }, "problemMatcher": [] }
     ]
 }

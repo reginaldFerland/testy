@@ -15,17 +15,68 @@ test('MTP transport preserves explicit retry outcomes and rejects inconsistent f
  assert.equal(testResult(nodes[0]).outcome,'passed');assert.equal(testResult(nodes[0]).message,undefined);
  await assert.rejects(requestTests({...options,env:{TESTY_UPDATES:JSON.stringify([{uid:'row','execution-state':'passed'}]),TESTY_EXIT:'2'}},'run'),/cannot be reported as passing/);
  await assert.rejects(requestTests({...options,env:{TESTY_UPDATES:JSON.stringify([{uid:'suite','node-type':'group','execution-state':'failed'}])}},'run'),/test group failed/);
- const runtime=await requestTests({...options,env:{TESTY_UPDATES:JSON.stringify([{uid:'only-at-runtime','execution-state':'passed','location.file':'/workspace/Test.cs'}])}},'run',[{uid:'parent'}]);
+ const runtime=await requestTests({...options,env:{TESTY_UPDATES:JSON.stringify([{uid:'only-at-runtime','execution-state':'passed','location.file':'/workspace/Test.cs','location.type':'Tests','location.method':'Theory'}])}},'run',[{uid:'parent','location.type':'Tests','location.method':'Theory'}]);
  assert.equal(runtime[0].uid,'only-at-runtime');assert.ok(testResult(runtime[0]).node);
 });
 
-function uiPrototype() {
+test('MTP reports timeouts and early process exits instead of RPC disposal errors',async()=>{
+ const options={dotnet:process.execPath,assembly:path.resolve('test/fixtures/mtp-peer.cjs'),cwd:process.cwd(),timeoutMs:500};
+ await assert.rejects(requestTests({...options,env:{TESTY_HANG:'1'}},'run'),/exceeded its time limit/);
+ await assert.rejects(requestTests({...options,env:{TESTY_EXIT_DURING:'41'}},'run'),/exit 41.*\ncontrolled process failure/);
+});
+
+function uiPrototype(vscode={}) {
  const file=path.resolve('out/extension.js'), realRequire=createRequire(file), exports={};
  vm.runInNewContext(fs.readFileSync(file,'utf8')+'\nexports.Testy=Testy;',{
-  exports,require:name=>name==='vscode'||name==='./configuration'?{}:realRequire(name),Buffer,setTimeout,clearTimeout
+  exports,require:name=>name==='vscode'?vscode:name==='./configuration'?{}:realRequire(name),Buffer,setTimeout,clearTimeout
  });
  return exports.Testy.prototype;
 }
+
+test('Windows assembly matching instruments mixed-case output names',async()=>{
+ const file=path.resolve('out/services/runner.js'),realRequire=createRequire(file),exports={};
+ const io={readdir:async()=>['Product.dll','Tests.dll','External.dll'].map(name=>({name,isDirectory:()=>false,isFile:()=>true}))};
+ vm.runInNewContext(fs.readFileSync(file,'utf8')+'\nexports.workspaceOutputs=workspaceOutputs;exports.assemblyName=assemblyName;',{
+  exports,process:{platform:'win32'},require:name=>name==='node:fs/promises'?io:realRequire(name)
+ });
+ const selected=await exports.workspaceOutputs('/output',new Set(['product.dll','tests.dll'].map(exports.assemblyName)));
+ assert.deepEqual([...selected].map(file=>path.basename(file)),['Product.dll','Tests.dll']);
+});
+
+test('watchers cover external sources, reuse unchanged roots and dispose removed roots',()=>{
+ const patterns=[];let disposed=0;
+ const proto=uiPrototype({RelativePattern:class {constructor(base,pattern){Object.assign(this,{base,pattern});}},workspace:{createFileSystemWatcher:pattern=>{
+  patterns.push(pattern);return{dispose(){disposed++;},onDidChange(){},onDidCreate(){},onDidDelete(){}};
+ }}});
+ const context={watchers:[],roots:['/workspace'],config:{trigger:'fileSystem',pattern:'**/*.cs'},engine:{knownFiles:[],directories:['/workspace/Tests','/linked/src','/linked','/other']}};
+ proto.watch.call(context);assert.equal(patterns.length,3);assert.deepEqual(patterns.slice(1).map(p=>p.base),['/other','/linked']);
+ proto.watch.call(context);assert.equal(patterns.length,3,'unchanged discovery must not recreate watchers');
+ context.engine.directories=['/workspace/Tests','/linked'];proto.watch.call(context);assert.equal(disposed,3);assert.equal(patterns.length,5);
+ context.config.trigger='save';proto.watch.call(context);assert.equal(disposed,5);assert.equal(context.watchers.length,0);
+});
+
+test('save invalidation preserves historical test outcomes until final selection',async()=>{
+ const proto=uiPrototype();let invalidated=0,cleared=0;
+ const context={disposed:false,roots:['/workspace'],config:{excludes:[],pattern:'**/*.cs'},
+  engine:{knownFiles:['/workspace/Code.cs'],markChanged:async()=>{}},scheduler:{request(){}},
+  controller:{invalidateTestResults(){invalidated++;}},setOutcome(){cleared++;}};
+ await proto.changed.call(context,{scheme:'file',fsPath:'/workspace/Code.cs'},'class Code {}');
+ assert.equal(invalidated,0);assert.equal(cleared,0);
+});
+
+test('coverage publication sends only changed line data and a fresh snapshot per run',()=>{
+ let calls=0;
+ const proto=uiPrototype({Uri:{file:fsPath=>({fsPath})},FileCoverage:class {},window:{visibleTextEditors:[]}});
+ const lines=[{line:1,hits:1}],summary={file:'/Code.cs',covered:1,total:1,stale:false,lines,groupIds:['one']};
+ let summaries=[summary];
+ const context={disposed:false,engine:{coverage:{summarize:()=>summaries},hashes:new Map()},productionSources:new Set(['/Code.cs']),
+  publishedCoverage:new Map(),details:new WeakMap(),activeRun:{addCoverage(){calls++;}},queueDecorations(){},updateStatus(){}};
+ proto.publishCoverage.call(context);proto.publishCoverage.call(context);assert.equal(calls,1);
+ summaries=[{...summary,groupIds:['one','two']}];proto.publishCoverage.call(context);assert.equal(calls,1,'new attribution with identical line data needs no UI publication');
+ summaries=[{...summary,covered:0,lines:[{line:1,hits:0}]}];proto.publishCoverage.call(context);assert.equal(calls,2);
+ context.publishedCoverage.clear();proto.publishCoverage.call(context);assert.equal(calls,3,'each run needs its retained snapshot');
+ context.activeRun=undefined;context.publishedCoverage.clear();proto.publishCoverage.call(context);assert.equal(calls,3,'do not allocate publications outside a run');
+});
 
 test('save-mode directory events expand known paths and trigger structural discovery',async()=>{
  const proto=uiPrototype(), requested=[], marked=[];
@@ -50,16 +101,88 @@ test('runtime-only result IDs are registered and selected for manual reruns',asy
  assert.equal(selected.groups.has('file'),true);assert.equal(selected.tests.get('file').has('runtime'),true);
 });
 
-test('Windows cancellation waits for taskkill completion before releasing the owned run',async()=>{
+test('unresolved runtime and ambiguous row identities expand to fresh containing-file nodes',async()=>{
+ const file=path.resolve('out/services/runner.js'),realRequire=createRequire(file),exports={};let sent,expanded;
+ const mtp=realRequire('./mtp');
+ vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:name=>name==='./mtp'?{...mtp,requestTests:async(_options,_operation,nodes)=>{
+  sent=nodes;return nodes.map(node=>({...node,'execution-state':'passed'}));
+ }}:realRequire(name)});
+ const nodes=[{uid:'one','display-name':'duplicate'},{uid:'two','display-name':'duplicate'},{uid:'other','display-name':'other'}];
+ const project={project:'/Tests.csproj',assembly:'/Tests.dll',framework:'net10.0'};
+ const group={...project,id:'file',file:'/Tests.cs',tests:nodes.slice(0,2).map(mtp.discoveredTest)};
+ const other={...project,id:'other-file',file:'/Other.cs',tests:[mtp.discoveredTest(nodes[2])]};
+ const session=new exports.RunnerSession({dotnet:'dotnet',storage:'.',testArguments:[],onExpanded:groups=>expanded=groups});
+ const byKey=new Map([[JSON.stringify(['duplicate',null,null,null]),nodes.slice(0,2)]]);
+ session.prepared.set('/Tests.dll',{root:'.',output:{directory:'.',restore:async()=>{}},session:'fake',coverage:false,nodes,
+  nativeById:new Map(nodes.map(node=>[node.uid,node])),byKey,groups:[group,other],runs:0});
+ for(const name of ['runtime only','duplicate']){
+  const result=await session.run([{...group,tests:[mtp.discoveredTest({uid:'old-runtime-id','display-name':name})]}],new Map());
+  assert.deepEqual([...sent].map(node=>node.uid),['one','two']);
+  assert.equal(expanded.length,1);assert.equal(expanded[0].id,'file');
+  assert.equal(result.executedGroups[0].tests.length,2);assert.equal(result.results.length,2);
+ }
+ // No real output or worker was created by this controlled preparation.
+ session.prepared.clear();await session.dispose();
+});
+
+test('Windows fallback cancellation waits for taskkill completion before releasing the owned run',async()=>{
  const file=path.resolve('out/services/process.js'), exports={}, processes=[];
  function spawn(command,args) {
   const child=new EventEmitter();Object.assign(child,{pid:100,stdout:new EventEmitter(),stderr:new EventEmitter(),kill:()=>{}});
   processes.push({command,args,child});return child;
  }
- vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:()=>({spawn}),process:{platform:'win32',env:{}},setTimeout,clearTimeout});
+ vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:name=>name==='node:child_process'?{spawn}:require(name),__dirname:path.dirname(file),process:{platform:'win32',env:{}},setTimeout,clearTimeout});
  const abort=new AbortController(), owned=exports.startProcess('dotnet',['test'],{cwd:'.',signal:abort.signal});
  let settled=false;const done=owned.done.catch(error=>{settled=true;assert.equal(error.name,'AbortError');});
  abort.abort();assert.equal(processes[1].command,'taskkill');assert.ok(processes[1].args.includes('/T'));
  processes[0].child.emit('close',1);await Promise.resolve();assert.equal(settled,false);
  processes[1].child.emit('close',0);await done;assert.equal(settled,true);
+});
+
+test('Windows owned processes receive cancellation through the job host before forced fallback',async()=>{
+ const file=path.resolve('out/services/process.js'),exports={},processes=[],writes=[];
+ function spawn(command,args){
+  const child=new EventEmitter();const stdin=new EventEmitter();Object.assign(stdin,{writable:true,write:value=>writes.push(value)});
+  Object.assign(child,{pid:100,stdin,stdout:new EventEmitter(),stderr:new EventEmitter(),kill(){}});processes.push({command,args,child});return child;
+ }
+ vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:name=>name==='node:child_process'?{spawn}:require(name),__dirname:path.dirname(file),process:{platform:'win32',env:{}},setTimeout,clearTimeout});
+ const abort=new AbortController(),owned=exports.startProcess('a tool.exe',['argument with spaces'],{cwd:'.',signal:abort.signal,dotnetHost:'custom-dotnet.exe'});
+ assert.equal(processes[0].command,'custom-dotnet.exe');assert.match(processes[0].args[0],/Testy.ProcessHost.dll$/);
+ assert.deepEqual([...processes[0].args.slice(1)],['a tool.exe','argument with spaces']);
+ abort.abort();assert.deepEqual(writes,['cancel\n']);assert.equal(processes.length,1);
+ processes[0].child.emit('close',1);await assert.rejects(owned.done,{name:'AbortError'});
+});
+
+test('a complete MTP stream cannot hide unfinished or missing test outcomes',async()=>{
+ const options={dotnet:process.execPath,assembly:path.resolve('test/fixtures/mtp-peer.cjs'),timeoutMs:5000};
+ const expected=[{uid:'first','location.type':'Tests','location.method':'First'},{uid:'second','location.type':'Tests','location.method':'Second'}];
+ const passed={...expected[0],'execution-state':'passed'};
+ for(const updates of [[passed,{...expected[1],'execution-state':'in-progress'}],[passed]]){
+  const seen=[];
+  await assert.rejects(requestTests({...options,expectedTests:expected,onNode:node=>seen.push(node),env:{TESTY_UPDATES:JSON.stringify(updates)}},'run'),/Incomplete test run/);
+  assert.ok(seen.some(node=>testResult(node)?.outcome==='passed'),'completed results remain visible');
+  assert.ok(seen.some(node=>node.uid==='second' && testResult(node)?.outcome==='errored'),'missing outcome is visible as an error');
+ }
+ const deferred=[{uid:'parent','location.type':'Tests','location.method':'Theory'}];
+ const updates=[{...deferred[0],'execution-state':'in-progress'},{uid:'row','location.type':'Tests','location.method':'Theory','execution-state':'passed'}];
+ assert.equal((await requestTests({...options,expectedTests:deferred,env:{TESTY_UPDATES:JSON.stringify(updates)}},'run')).length,2);
+});
+
+
+test('runtime rows cannot conceal another unfinished row or ambiguously replace several discovered cases',()=>{
+ const {assertComplete}=require('../../out/services/mtp');
+ const identity={'location.type':'Tests','location.method':'Theory'};
+ assert.throws(()=>assertComplete([{uid:'new-pass',...identity,'execution-state':'passed'},{uid:'new-running',...identity,'execution-state':'in-progress'}],[{uid:'parent',...identity}]),/Incomplete/);
+ assert.throws(()=>assertComplete([{uid:'new-pass',...identity,'execution-state':'passed'}],[{uid:'first',...identity},{uid:'second',...identity}]),/Incomplete/);
+});
+
+test('manual UI captures containers without freezing their old child IDs',async()=>{
+ const proto=uiPrototype();let selection;
+ const leaf={id:'leaf',children:{forEach:()=>{}}},file={id:'file:g',children:{forEach:callback=>callback(leaf)}},project={id:'project:/Tests.csproj',children:{forEach:callback=>callback(file)}};
+ const context={testIds:new Map([['leaf',{group:'g',test:'old'}]]),bindCancellation:()=>({controller:new AbortController(),dispose(){}}),
+  scheduler:{runManual:async callback=>callback(new AbortController().signal)},execute:async(_batch,_signal,_request,manual)=>selection=manual,reportError:error=>{throw error;}};
+ await proto.manual.call(context,{include:[file],exclude:[leaf]}, {},false);
+ assert.equal(selection.groups.has('g'),true);assert.equal(selection.tests.has('g'),false);assert.equal(selection.exclude.tests.get('g').has('old'),true);
+ await proto.manual.call(context,{include:[project]}, {},false);assert.equal(selection.projects.has('/Tests.csproj'),true);
+ await proto.manual.call(context,{}, {},false);assert.equal(selection.all,true);
 });

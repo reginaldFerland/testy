@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const vscode = require('vscode');
 const path = require('node:path');
 const fs = require('node:fs/promises');
+const os = require('node:os');
 
 async function until(predicate, description, timeout=90000) {
  const start=Date.now();
@@ -40,6 +41,10 @@ suite('Testy in VS Code',()=>{
    assert.equal(await document.save(),true);
   };
   try {
+   const previousPassing=snapshot().summary;
+   await replace(original.replace('a + b','a + b + 0'));
+   await until(()=>snapshot().summary!==previousPassing && !snapshot().running,'passing affected run');
+   assert.equal(snapshot().summary.tests,2);assert.match(snapshot().status,/3 passed/,'retain the unselected Greeting outcome');
    await replace(original.replace('a + b','a + b + 1'));
    await until(()=>snapshot().summary?.failed===2 || snapshot().error,'affected failing run');
    assert.equal(snapshot().error,'',snapshot().error);
@@ -82,6 +87,45 @@ suite('Testy in VS Code',()=>{
    assert.equal(snapshot().summary.failed,2);
   } finally {
    if(document.getText()!==original) await replace(original);
+  }
+ });
+
+ test('filesystem mode observes edits, renames and deletion of externally linked source',async()=>{
+  const api=await vscode.extensions.getExtension('reginaldFerland.testy').activate(), snapshot=()=>api.snapshot();
+  const root=vscode.workspace.workspaceFolders[0].uri.fsPath, settings=vscode.workspace.getConfiguration('testy');
+  await until(()=>!snapshot().running && !/waiting/.test(snapshot().status),'previous run to settle');
+  let previous=snapshot().summary;
+  await settings.update('runMode','affected',vscode.ConfigurationTarget.Workspace);
+  await settings.update('runWithCoverage',true,vscode.ConfigurationTarget.Workspace);
+  await until(()=>snapshot().summary!==previous && !snapshot().running,'affected baseline');
+  assert.equal(snapshot().error,'',snapshot().error);
+  const external=await fs.mkdtemp(path.join(os.tmpdir(),'testy linked '));
+  const source=path.join(root,'ImpactDemo','Arithmetic.cs'),project=path.join(root,'ImpactDemo','ImpactDemo.csproj');
+  const original=await fs.readFile(source,'utf8'),originalProject=await fs.readFile(project,'utf8');
+  let linked=path.join(external,'Arithmetic.cs');
+  const include=file=>originalProject.replace('</Project>',`<ItemGroup><Compile Include="${file.replace(/&/g,'&amp;').replace(/"/g,'&quot;')}" Link="Arithmetic.cs" /></ItemGroup></Project>`);
+  try{
+   previous=snapshot().summary;
+   await fs.rename(source,linked);await fs.writeFile(project,include(linked));
+   await until(()=>snapshot().summary!==previous && !snapshot().running,'linked source baseline');
+   assert.equal(snapshot().error,'',snapshot().error);
+   await new Promise(resolve=>setTimeout(resolve,500));
+   previous=snapshot().summary;await fs.writeFile(linked,original.replace('a + b','a + b + 1'));
+   await until(()=>snapshot().summary!==previous && !snapshot().running,'external linked edit');
+   assert.equal(snapshot().summary.tests,2);assert.equal(snapshot().summary.failed,2);
+   previous=snapshot().summary;
+   const renamed=path.join(external,'Renamed.cs');await fs.rename(linked,renamed);linked=renamed;
+   await fs.writeFile(project,include(linked));await fs.writeFile(linked,original);
+   await until(()=>snapshot().summary!==previous && !snapshot().running,'linked source rename');
+   assert.equal(snapshot().error,'',snapshot().error);assert.equal(snapshot().summary.failed,0);
+   await fs.rm(linked);await until(()=>snapshot().error && !snapshot().running,'linked source deletion build error');
+   assert.match(snapshot().error,/Building|could not be found|not found/);
+   await fs.writeFile(linked,original);await until(()=>!snapshot().error && !snapshot().running,'recreated linked source');
+   assert.match(snapshot().status,/3 passed/);
+  }finally{
+   await settings.update('autoRun',false,vscode.ConfigurationTarget.Workspace);
+   await until(()=>snapshot().paused && !snapshot().running,'pause before fixture cleanup');
+   await fs.writeFile(project,originalProject);await fs.writeFile(source,original);await fs.rm(external,{recursive:true,force:true});
   }
  });
 });

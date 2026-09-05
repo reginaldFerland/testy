@@ -1,4 +1,5 @@
 import { ChildProcess, spawn } from 'node:child_process';
+import * as path from 'node:path';
 
 export class Cancelled extends Error {
     constructor() { super('Run cancelled'); this.name = 'AbortError'; }
@@ -16,20 +17,27 @@ export interface ProcessOptions {
     readonly env?: NodeJS.ProcessEnv;
     readonly output?: (text: string) => void;
     readonly timeoutMs?: number;
+    readonly dotnetHost?: string;
+    /** Build commands may leave shared compiler servers; test processes may not. */
+    readonly cleanupDescendants?: boolean;
 }
 
 export interface OwnedProcess {
     readonly child: ChildProcess;
     readonly done: Promise<ProcessResult>;
+    readonly interruption?: Error;
     stop(): void;
 }
 
 /** Every subprocess tree has an owner. Never use global process-name cancellation. */
 export function startProcess(command: string, args: readonly string[], options: ProcessOptions): OwnedProcess {
     options.signal?.throwIfAborted();
-    const child = spawn(command, [...args], {
+    const windowsOwner = process.platform === 'win32' && options.cleanupDescendants !== false;
+    const executable = windowsOwner ? options.dotnetHost ?? 'dotnet' : command;
+    const arguments_ = windowsOwner ? [path.join(__dirname, '../../dist/processhost/Testy.ProcessHost.dll'), command, ...args] : [...args];
+    const child = spawn(executable, arguments_, {
         cwd: options.cwd, shell: false, detached: process.platform !== 'win32',
-        windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true, stdio: [windowsOwner ? 'pipe' : 'ignore', 'pipe', 'pipe'],
         env: { ...process.env, DOTNET_CLI_TELEMETRY_OPTOUT: '1', TESTINGPLATFORM_TELEMETRY_OPTOUT: '1', DOTNET_NOLOGO: '1', ...options.env }
     });
     let cancelled = false;
@@ -41,10 +49,15 @@ export function startProcess(command: string, args: readonly string[], options: 
     const teardowns: Promise<void>[] = [];
     let windowsKillStarted = false;
     const limit = 8 * 1024 * 1024;
+    child.stdin?.on('error', () => undefined);
     const killTree = (force: boolean): void => {
         if (!child.pid) {return;}
         try {
             if (process.platform === 'win32') {
+                if (windowsOwner && !force && child.stdin?.writable) {
+                    child.stdin.write('cancel\n', error => {if (error) {killTree(true);}});
+                    return;
+                }
                 if (windowsKillStarted) {return;}
                 windowsKillStarted = true;
                 teardowns.push(new Promise<void>(resolve => {
@@ -76,12 +89,17 @@ export function startProcess(command: string, args: readonly string[], options: 
             const text = data.toString(); stderr = (stderr + text).slice(-limit); options.output?.(text);
         });
         child.once('error', reject);
+        child.once('exit', () => {
+            // Close inherited pipes and stop workers even after a successful
+            // parent exit. Windows' owner performs the same cleanup in its job.
+            if (process.platform !== 'win32' && (cancelled || options.cleanupDescendants !== false)) {killTree(true);}
+        });
         child.once('close', async code => {
             closed = true;
             clearTimeout(timeout);
             // Kill any remaining descendants of our own detached process group
             // before reporting cancellation complete.
-            if (cancelled) {killTree(true);}
+            if (cancelled && !windowsOwner) {killTree(true);}
             if (killTimer) {clearTimeout(killTimer);}
             options.signal?.removeEventListener('abort', stop);
             await Promise.all(teardowns);
@@ -94,7 +112,9 @@ export function startProcess(command: string, args: readonly string[], options: 
     if (options.signal?.aborted) {stop();}
     // Consumers may await connection establishment before awaiting exit.
     void done.catch(() => undefined);
-    return { child, done, stop };
+    return { child, done, stop, get interruption() {
+        return timedOut ? new Error(`The command exceeded its time limit: ${command}`) : cancelled ? new Cancelled() : undefined;
+    } };
 }
 
 export async function runProcess(command: string, args: readonly string[], options: ProcessOptions): Promise<ProcessResult> {

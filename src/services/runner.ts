@@ -5,8 +5,8 @@ import { DiscoveredTest, FileCoverage, Project, TestFile, TestResult, Trace } fr
 import { contentHash, normalizePath, testFileId } from '../core/paths';
 import { discoveredTest, requestTests, TestNode, testResult } from './mtp';
 import { ProcessOptions, requireSuccess, runProcess } from './process';
-import { parseCobertura } from './reports';
-import { copyOutput, PreparedOutput } from './output';
+import { CoverageReader } from './coverageReader';
+import { copyOutput, PreparedOutput, removeOutput } from './output';
 import { sourceLocations } from './analysis';
 
 export interface RunnerOptions extends ProcessOptions {
@@ -15,14 +15,18 @@ export interface RunnerOptions extends ProcessOptions {
     readonly testArguments: readonly string[];
     readonly coverageTool?: string;
     readonly assemblies?: readonly string[];
+    readonly buildInputs?: ReadonlyMap<string, readonly string[]>;
     readonly analyzer?: string;
+    /** Stable within an engine, isolated from every other extension instance. */
+    readonly identity?: string;
     readonly onResult?: (group: TestFile, result: TestResult) => void;
     readonly onStarted?: (group: TestFile, id: string) => void;
     readonly onPrepared?: (project: string) => void;
+    readonly onExpanded?: (groups: readonly TestFile[]) => void;
 }
 
-export async function discover(project: Project, options: RunnerOptions): Promise<readonly TestFile[]> {
-    let nodes = await requestTests({ ...options, cwd: path.dirname(project.file), assembly: project.assembly, args: options.testArguments }, 'discover');
+export async function discover(project: Project, options: RunnerOptions, discovered?: readonly TestNode[]): Promise<readonly TestFile[]> {
+    let nodes = discovered ?? await requestTests({ ...options, cwd: path.dirname(project.file), assembly: project.assembly, args: options.testArguments }, 'discover');
     if (options.analyzer && nodes.some(node => !node['location.file'])) {
         try {
             const locations = await sourceLocations(options.dotnet, options.analyzer, project.assembly, options.storage, options);
@@ -60,11 +64,21 @@ export interface FileRun {
     readonly results: readonly TestResult[];
     readonly trace: Trace;
     readonly coverageAvailable: boolean;
+    readonly executedGroups: readonly TestFile[];
 }
-interface Preparation { readonly root: string; readonly output: PreparedOutput; readonly session: string; readonly coverage: boolean; readonly nodes: readonly TestNode[]; runs: number; }
+interface Preparation {
+    readonly root: string; readonly output: PreparedOutput; readonly session: string; readonly coverage: boolean;
+    readonly nodes: readonly TestNode[]; readonly nativeById: ReadonlyMap<string, TestNode>;
+    readonly byKey: ReadonlyMap<string, readonly TestNode[]>; groups?: readonly TestFile[]; runs: number;
+}
 
 function nodeKey(node: TestNode): string {
     return JSON.stringify(['display-name', 'location.type', 'location.method', 'location.method-arity'].map(key => node[key] ?? null));
+}
+
+function assemblyName(file: string): string {
+    const name = path.basename(file);
+    return process.platform === 'win32' ? name.toLowerCase() : name;
 }
 
 async function workspaceOutputs(directory: string, names: ReadonlySet<string>, signal?: AbortSignal): Promise<string[]> {
@@ -73,14 +87,23 @@ async function workspaceOutputs(directory: string, names: ReadonlySet<string>, s
         signal?.throwIfAborted();
         const file = path.join(directory, entry.name);
         if (entry.isDirectory()) {files.push(...await workspaceOutputs(file, names, signal));}
-        else if (entry.isFile() && names.has(entry.name)) {files.push(file);}
+        else if (entry.isFile() && names.has(assemblyName(entry.name))) {files.push(file);}
     }
     return files;
 }
 
 export class RunnerSession {
     private readonly prepared = new Map<string, Preparation>();
+    private readonly coverageReader = new CoverageReader();
     constructor(private readonly options: RunnerOptions) {}
+
+    async discover(project: Project): Promise<readonly TestFile[]> {
+        const preparation = await this.prepare({ id: testFileId(project.file, project.framework), project: project.file,
+            assembly: project.assembly, framework: project.framework, tests: [] });
+        const groups = await discover(project, this.options, preparation.nodes);
+        preparation.groups = groups;
+        return groups;
+    }
 
     async run(groups: readonly TestFile[], hashes: ReadonlyMap<string, string>): Promise<FileRun> {
         const group = groups[0];
@@ -89,27 +112,42 @@ export class RunnerSession {
         const preparation = await this.prepare(group);
         if (preparation.runs++) {await preparation.output.restore(options.signal);}
         const report = path.join(preparation.root, `coverage-${preparation.runs}.xml`);
-        // Some providers include the assembly path in their UIDs. Match their
-        // private-output discovery back to the original UI identities.
-        const nativeById = new Map(preparation.nodes.map(node => [node.uid, node]));
-        const byKey = new Map<string, TestNode[]>();
-        for (const node of preparation.nodes) {const key = nodeKey(node); const nodes = byKey.get(key) ?? []; nodes.push(node); byKey.set(key, nodes);}
+        // Discovery and execution use one stable private path, so exact native
+        // UIDs work even when displayed theory names are indistinguishable.
+        const { nativeById, byKey } = preparation;
         const originals = new Map<string, TestNode>();
-        const selected = groups.flatMap(item => item.tests.map(test => {
-            const matching = byKey.get(nodeKey(test.node as TestNode));
-            const native = nativeById.get(test.id) ?? (matching?.length === 1 ? matching[0] : undefined);
-            if (native) {originals.set(native.uid, test.node as TestNode);}
-            return native ?? test.node as TestNode;
-        }));
+        const selectedNodes = new Map<string, TestNode>();
+        let expanded = false;
+        for (const item of groups) {for (const test of item.tests) {
+            let native = nativeById.get(test.id);
+            if (!native) {const matching = byKey.get(nodeKey(test.node as TestNode)); if (matching?.length === 1) {native = matching[0];}}
+            if (native) {originals.set(native.uid, test.node as TestNode); selectedNodes.set(native.uid, native); continue;}
+            // Runtime-only rows may not be individually selectable. Use the
+            // freshly discovered containing file; never send an unresolved UID
+            // from an old path or guess between indistinguishable row names.
+            const containing = preparation.groups?.find(group => group.id === item.id);
+            if (!containing) {throw new Error('The selected test identity is unavailable. Rediscover the project before rerunning it.');}
+            for (const candidate of containing.tests) {const node = nativeById.get(candidate.id); if (node) {selectedNodes.set(node.uid, node);}}
+            expanded = true;
+        }}
+        const selected = [...selectedNodes.values()];
+        const executedGroups = expanded ? preparation.groups!.map(item => ({ ...item, tests: item.tests.filter(test => selectedNodes.has(test.id)) }))
+            .filter(item => item.tests.length) : groups;
+        if (expanded) {
+            options.output?.('The provider cannot select this runtime or changed test identity individually; running its containing test file.\n');
+            options.onExpanded?.(executedGroups);
+        }
         const originalNode = (node: TestNode): TestNode => {
             const original = originals.get(node.uid);
             return original ? { ...original, ...node, uid: original.uid } : node;
         };
-        const owner = new Map(groups.flatMap(item => item.tests.map(test => [test.id, item] as const)));
+        const owner = new Map([...groups, ...executedGroups].flatMap(item => item.tests.map(test => [test.id, item] as const)));
         const groupFor = (node: TestNode): TestFile => owner.get(node.uid)
-            ?? groups.find(item => item.file === discoveredTest(node).file) ?? group;
+            ?? executedGroups.find(item => item.file === discoveredTest(node).file) ?? group;
+        const selectedIds = new Set(selected.map(node => node.uid));
+        const completeProject = preparation.nodes.every(node => selectedIds.has(node.uid));
         const nodes = await requestTests({
-            ...options, assembly: path.join(preparation.output.directory, path.basename(group.assembly)),
+            ...options, expectedTests: selected, assembly: path.join(preparation.output.directory, path.basename(group.assembly)),
             args: ['--results-directory', path.join(preparation.root, `results-${preparation.runs}`), ...options.testArguments],
             wrapper: preparation.coverage ? {
                 command: options.coverageTool!, args: ['collect', '--nologo', '--session-id', preparation.session, '-f', 'cobertura', '-o', report]
@@ -120,7 +158,7 @@ export class RunnerSession {
                 if (node['execution-state'] === 'in-progress') {options.onStarted?.(item, node.uid);}
                 const result = testResult(node); if (result) {options.onResult?.(item, result);}
             }
-        }, 'run', selected);
+        }, 'run', completeProject ? undefined : selected);
         options.signal?.throwIfAborted();
         const results = nodes.map(originalNode).map(testResult).filter((result): result is TestResult => !!result);
         if (!results.length) {throw new Error(`No test results were received for ${group.file ?? group.project}.`);}
@@ -128,43 +166,48 @@ export class RunnerSession {
         let available = preparation.coverage;
         if (available) {
             try {
-                const parsed = parseCobertura(await fs.readFile(report, 'utf8'), options.cwd, new Set(hashes.keys()));
-                for (const [file, lines] of parsed) {coverage.push({ file, hash: hashes.get(file)!, lines });}
+                coverage.push(...await this.coverageReader.read(report, options.cwd, hashes, options.signal));
             } catch (error) {
                 options.signal?.throwIfAborted(); available = false;
                 options.output?.(`Coverage unavailable for ${path.basename(group.project)}; test results are retained. ${String(error)}\n`);
             }
         }
         const dependencies = [...new Set([...coverage.filter(file => file.lines.some(line => line.hits > 0)).map(file => file.file),
-            ...groups.map(item => item.file).filter((file): file is string => !!file)])];
-        const reliable = groups.length === 1 && available && coverage.some(file => file.lines.some(line => line.hits > 0)) && !!group.file
-            && results.every(result => result.outcome === 'passed') && group.tests.every(test => results.some(result => result.id === test.id));
+            ...executedGroups.flatMap(item => this.options.buildInputs?.get(item.project) ?? []),
+            ...executedGroups.map(item => item.file).filter((file): file is string => !!file)])];
+        const reported = new Set(results.map(result => result.id));
+        const reliable = executedGroups.length === 1 && available && coverage.some(file => file.lines.some(line => line.hits > 0)) && !!group.file
+            && results.every(result => result.outcome === 'passed') && executedGroups[0].tests.every(test => reported.has(test.id));
         return {
-            results, coverageAvailable: available,
+            results, coverageAvailable: available, executedGroups,
             trace: {
-                groupId: groups.length === 1 ? group.id : projectCoverageId(group), dependencies, coverage, reliable, timestamp: Date.now(),
+                groupId: executedGroups.length === 1 ? group.id : projectCoverageId(group), dependencies, coverage, reliable, timestamp: Date.now(),
                 inputs: Object.fromEntries(dependencies.filter(file => hashes.has(file)).map(file => [file, hashes.get(file)!]))
             }
         };
     }
 
     async dispose(): Promise<void> {
-        for (const preparation of this.prepared.values()) {await fs.rm(preparation.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });}
+        await this.coverageReader.dispose();
+        for (const preparation of this.prepared.values()) {await removeOutput(preparation.root);}
         this.prepared.clear();
+        if (this.options.identity) {await fs.rmdir(path.join(this.options.storage, this.options.identity)).catch(() => undefined);}
     }
 
     private async prepare(group: TestFile): Promise<Preparation> {
         const existing = this.prepared.get(group.assembly); if (existing) {return existing;}
         const options = { ...this.options, cwd: path.dirname(group.project) };
         await fs.mkdir(options.storage, { recursive: true });
-        const root = await fs.mkdtemp(path.join(options.storage, 'run-'));
+        const root = options.identity ? path.join(options.storage, options.identity, contentHash(group.assembly))
+            : await fs.mkdtemp(path.join(options.storage, 'run-'));
+        if (options.identity) {await removeOutput(root); await fs.mkdir(root, { recursive: true });}
         const template = path.join(root, 'template');
         const session = randomUUID();
         let coverage = !!options.coverageTool;
         try {
             await copyOutput(path.dirname(group.assembly), template, options.signal);
             if (coverage) {
-                const assemblies = new Set((options.assemblies ?? [group.assembly]).map(file => path.basename(file)));
+                const assemblies = new Set((options.assemblies ?? [group.assembly]).map(assemblyName));
                 for (const assembly of await workspaceOutputs(template, assemblies, options.signal)) {
                     try {
                         requireSuccess(await runProcess(options.coverageTool!, ['instrument', assembly, '--session-id', session, '--nologo'], options), `Instrumenting ${path.basename(assembly)}`);
@@ -172,7 +215,7 @@ export class RunnerSession {
                         options.signal?.throwIfAborted(); coverage = false;
                         options.output?.(`Coverage preparation failed; running tests without collection. ${String(error)}\n`);
                         // Never execute partially instrumented output without its collector.
-                        await fs.rm(template, { recursive: true, force: true });
+                        await removeOutput(template);
                         await copyOutput(path.dirname(group.assembly), template, options.signal); break;
                     }
                 }
@@ -182,10 +225,13 @@ export class RunnerSession {
             const nodes = await requestTests({ ...options, assembly: path.join(output.directory, path.basename(group.assembly)), args: options.testArguments }, 'discover');
             // Discovery can also execute user code and mutate assets.
             await output.restore(options.signal);
-            const prepared = { root, output, session, coverage, nodes, runs: 0 };
+            const nativeById = new Map(nodes.map(node => [node.uid, node]));
+            const byKey = new Map<string, TestNode[]>();
+            for (const node of nodes) {const key = nodeKey(node); const matching = byKey.get(key) ?? []; matching.push(node); byKey.set(key, matching);}
+            const prepared = { root, output, session, coverage, nodes, nativeById, byKey, runs: 0 };
             this.prepared.set(group.assembly, prepared); options.onPrepared?.(group.project);
             return prepared;
-        } catch (error) {await fs.rm(root, { recursive: true, force: true, maxRetries: 5 }); throw error;}
+        } catch (error) {await removeOutput(root); throw error;}
     }
 }
 

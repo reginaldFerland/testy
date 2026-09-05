@@ -2,6 +2,18 @@
 
 ## 1.0.0
 
+- Track evaluated shared build inputs and preserve MSBuild reference-property contexts.
+- Preserve manual container scopes through discovery and honor individual-case exclusions.
+- Report missing or unfinished outcomes without checkpointing incomplete batches.
+- Repair test-modified output permissions and cancel recursive project discovery promptly.
+- Restore large caches in a cancellable worker, preserve unreadable-record geometry, and index live result IDs.
+
+- Resolve coverage exclusions across partial declarations and preserve stable Unicode/colliding xUnit identities.
+- Retain unselected coverage and outcomes; preserve aggregate history through manual subsets and interrupted learning.
+- Cancel cache checkpoints promptly; isolate manual build scope and build excluded required dependencies.
+- Watch external linked source directories and clean test-owned descendants on normal exit as well as cancellation.
+- Parse coverage in a worker; cache identity/geometry indexes, publish coverage deltas, and bound output-copy concurrency.
+
 - Preserve shared-UID failures and retry semantics; continue after skipped or initialization-failing files.
 - Honor excluded/hidden code, binary references, directory changes, changing workspace roots, and per-project SDK contexts.
 - Checkpoint baseline progress; preserve manual-run attribution and mark stale dependency/test inputs.

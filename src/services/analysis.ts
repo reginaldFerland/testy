@@ -1,6 +1,7 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { normalizePath } from '../core/paths';
+import { Project } from '../core/model';
 import { ProcessOptions, requireSuccess, runProcess } from './process';
 
 export async function sourceLocations(dotnet: string, analyzer: string, assembly: string, storage: string, options: ProcessOptions): Promise<ReadonlyMap<string, { file: string; line: number }>> {
@@ -17,8 +18,28 @@ export async function sourceLocations(dotnet: string, analyzer: string, assembly
     } finally {await fs.rm(directory, { recursive: true, force: true });}
 }
 
+export interface SourceShape {
+    readonly signature: string;
+    readonly body: string;
+    readonly partialTypes: readonly string[];
+    readonly excludedTypes: readonly string[];
+}
+
+/** Resolve cross-file exclusions using incremental syntax records, not rereads. */
+export function resolveShapes(analyses: ReadonlyMap<string, SourceShape | null>, projects?: readonly Pick<Project, 'sourceFiles'>[]): ReadonlyMap<string, string | null> {
+    const bodies = new Set<string>();
+    for (const files of projects?.map(project => project.sourceFiles) ?? [[...analyses.keys()]]) {
+        const excluded = new Set(files.flatMap(file => analyses.get(file)?.excludedTypes ?? []));
+        if (!excluded.size) {continue;}
+        for (const file of files) {
+            if (excluded.has('*') || analyses.get(file)?.partialTypes.some(type => excluded.has(type))) {bodies.add(file);}
+        }
+    }
+    return new Map([...analyses].map(([file, shape]) => [file, !shape ? null : bodies.has(file) ? shape.body : shape.signature]));
+}
+
 /** Declaration fingerprints catch dependencies that runtime coverage cannot see. */
-export async function sourceShapes(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: ProcessOptions, excludedAliases: readonly string[] = []): Promise<ReadonlyMap<string, string | null>> {
+export async function sourceAnalyses(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: ProcessOptions, excludedAliases: readonly string[] = []): Promise<ReadonlyMap<string, SourceShape | null>> {
     if (!files.length) {return new Map();}
     await fs.mkdir(storage, { recursive: true });
     const directory = await fs.mkdtemp(path.join(storage, 'analysis-'));
@@ -28,13 +49,19 @@ export async function sourceShapes(dotnet: string, analyzer: string, files: read
         const output = requireSuccess(await runProcess(dotnet, [analyzer, input], { ...options, output: undefined }), 'Analyzing C# declarations').stdout;
         const parsed: unknown = JSON.parse(output);
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {throw new Error('Invalid source analysis response.');}
-        const result = new Map<string, string | null>();
+        const result = new Map<string, SourceShape | null>();
         for (const file of files) {
-            const value = (parsed as Record<string, unknown>)[file];
-            result.set(normalizePath(file), typeof value === 'string' && /^[A-F0-9]{64}$/.test(value) ? value : null);
+            const value = (parsed as Record<string, Partial<SourceShape> | null>)[file];
+            const hash = (value: unknown): value is string => typeof value === 'string' && /^[A-F0-9]{64}$/.test(value);
+            const names = (value: unknown): value is string[] => Array.isArray(value) && value.every(name => typeof name === 'string');
+            result.set(normalizePath(file), value && hash(value.signature) && hash(value.body) && names(value.partialTypes) && names(value.excludedTypes) ? value as SourceShape : null);
         }
         return result;
     } finally {
         await fs.rm(directory, { recursive: true, force: true });
     }
+}
+
+export async function sourceShapes(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: ProcessOptions, excludedAliases: readonly string[] = []): Promise<ReadonlyMap<string, string | null>> {
+    return resolveShapes(await sourceAnalyses(dotnet, analyzer, files, storage, options, excludedAliases));
 }

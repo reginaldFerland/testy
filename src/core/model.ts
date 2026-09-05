@@ -2,11 +2,16 @@ export interface Project {
     readonly file: string;
     readonly framework: string;
     readonly assembly: string;
+    readonly assemblies?: readonly string[];
     readonly isTestProject: boolean;
     readonly runner: 'mtp';
     readonly sourceFiles: readonly string[];
     readonly references: readonly string[];
     readonly binaryReferences?: readonly string[];
+    /** Evaluated imports, resources and other build inputs across reference contexts. */
+    readonly inputs?: readonly string[];
+    readonly entryPoint?: boolean;
+    readonly properties?: Readonly<Record<string, string>>;
 }
 
 export interface DiscoveredTest {
@@ -49,6 +54,8 @@ export interface Trace {
     /** Source versions that produced this contribution, including the test file. */
     readonly inputs?: Readonly<Record<string, string>>;
     readonly stale?: boolean;
+    /** An aggregate partially superseded by file runs cannot become fresh again. */
+    readonly historical?: boolean;
 }
 
 export interface TestResult {

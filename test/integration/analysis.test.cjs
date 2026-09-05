@@ -3,7 +3,7 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs/promises');
 const os=require('node:os');
 const path=require('node:path');
-const {sourceShapes}=require('../../out/services/analysis');
+const {sourceShapes,sourceAnalyses,resolveShapes}=require('../../out/services/analysis');
 const {normalizePath}=require('../../out/core/paths');
 
 test('declaration analysis distinguishes executable edits from compile-time dependencies',async t=>{
@@ -32,6 +32,30 @@ test('declaration analysis distinguishes executable edits from compile-time depe
  for(const name of ['body','property','accessor']) assert.equal(shapes.get(files[name]),shapes.get(files.original),name);
  for(const name of ['constant','signature','attribute','initializer','constructor','directive']) assert.notEqual(shapes.get(files[name]),shapes.get(files.original),name);
  assert.equal(shapes.get(files.invalid),null);
+});
+
+test('partial exclusions cross namespace styles, generic/nested types and partial members incrementally',async t=>{
+ const directory=await fs.mkdtemp(path.join(os.tmpdir(),'testy-partial-shapes-'));
+ t.after(()=>fs.rm(directory,{recursive:true,force:true}));
+ const excluded=normalizePath(path.join(directory,'Excluded.cs')), implementation=normalizePath(path.join(directory,'Implementation.cs'));
+ const ordinary=normalizePath(path.join(directory,'Ordinary.cs'));
+ await fs.writeFile(excluded,'namespace N { public partial class Outer<T> { [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage] public partial class Inner { } } }');
+ await fs.writeFile(implementation,'namespace N; public partial class Outer<T> { public partial class Inner { public int Value()=>1; } }');
+ await fs.writeFile(ordinary,'namespace N; public partial class Ordinary { public int Value()=>1; }');
+ const options={cwd:directory}, analyzer=path.resolve('dist/analyzer/Testy.Analysis.dll');
+ const initial=await sourceAnalyses('dotnet',analyzer,[excluded,implementation,ordinary],directory,options);
+ const before=resolveShapes(initial);
+ await fs.writeFile(implementation,'namespace N; public partial class Outer<T> { public partial class Inner { public int Value()=>2; } }');
+ await fs.writeFile(ordinary,'namespace N; public partial class Ordinary { public int Value()=>2; }');
+ const changed=await sourceAnalyses('dotnet',analyzer,[implementation,ordinary],directory,options);
+ const after=resolveShapes(new Map([...initial,...changed]));
+ assert.notEqual(after.get(implementation),before.get(implementation));
+ assert.equal(after.get(ordinary),before.get(ordinary),'ordinary partial classes must retain narrow selection');
+ const isolated=resolveShapes(new Map([...initial,...changed]),[{sourceFiles:[excluded]},{sourceFiles:[implementation,ordinary]}]);
+ assert.equal(isolated.get(implementation),initial.get(implementation).signature,'same-named types in unrelated projects do not share exclusions');
+ await fs.writeFile(excluded,'namespace N { public partial class Outer<T> { public partial class Inner { [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage] public partial int Value(); } } }');
+ const member=await sourceAnalyses('dotnet',analyzer,[excluded],directory,options);
+ assert.equal(resolveShapes(new Map([...initial,...member])).get(implementation),before.get(implementation),'a partial member attribute must cover its implementation');
 });
 
 
