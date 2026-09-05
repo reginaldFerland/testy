@@ -1,0 +1,53 @@
+import * as path from 'node:path';
+import { realpathSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { minimatch } from 'minimatch';
+
+export const defaultExcludes = [
+    '**/bin/**', '**/obj/**', '**/TestResults/**', '**/node_modules/**', '**/.git/**',
+    '**/.testy/**', '**/*.g.cs', '**/*.g.i.cs', '**/*.generated.cs', '**/*.designer.cs'
+] as const;
+
+export function normalizePath(file: string): string {
+    // PDBs and MSBuild may spell the same path through different symlink aliases
+    // (notably /var and /private/var on macOS). Preserve that identity for new or
+    // deleted files by resolving their nearest existing ancestor as well.
+    let parent = path.resolve(file);
+    const missing: string[] = [];
+    for (;;) {
+        try { parent = path.join(realpathSync.native(parent), ...missing); break; }
+        catch {
+            const next = path.dirname(parent);
+            if (next === parent) { parent = path.resolve(file); break; }
+            missing.unshift(path.basename(parent)); parent = next;
+        }
+    }
+    const normalized = parent.replace(/\\/g, '/');
+    return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+export function isInside(file: string, folder: string): boolean {
+    const relative = path.relative(folder, file);
+    return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+export function matchesPattern(file: string, pattern: string, roots: readonly string[] = []): boolean {
+    const candidates = [file, ...roots.filter(root => isInside(file, root)).map(root => path.relative(root, file))];
+    return candidates.some(candidate => minimatch(candidate.replace(/\\/g, '/'), pattern, { dot: true, nocase: true }));
+}
+
+export function isExcluded(file: string, excludes: readonly string[] = defaultExcludes, roots: readonly string[] = []): boolean {
+    return excludes.some(pattern => matchesPattern(file, pattern, roots));
+}
+
+export function contentHash(content: string | Buffer): string {
+    return createHash('sha256').update(content).digest('hex');
+}
+
+export function testFileId(project: string, framework: string, file?: string): string {
+    return contentHash(`${normalizePath(project)}\0${framework}\0${file ? normalizePath(file) : '<unknown>'}`);
+}
+
+export function isConfigurationFile(file: string): boolean {
+    return /\.(csproj|sln|slnx|props|targets|runsettings|json|config|resx)$/i.test(file);
+}

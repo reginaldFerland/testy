@@ -1,13 +1,13 @@
 {
   "name": "testy",
-  "displayName": "testy",
-  "description": "C# test helper that integrates with VS Code Test Explorer",
+  "displayName": "Testy",
+  "description": "Automatic affected C# tests and live, retained code coverage for .NET 10+ and Microsoft.Testing.Platform.",
   "repository": {
     "url": "https://github.com/reginaldFerland/testy",
     "type": "git"
   },
   "publisher": "reginaldFerland",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "icon": "testy.png",
   "engines": {
     "vscode": "^1.99.0"
@@ -18,75 +18,178 @@
   "activationEvents": [
     "workspaceContains:**/*.csproj",
     "workspaceContains:**/*.sln",
-    "workspaceContains:**/*.cs"
-  ],
-  "extensionPack": [
-    "ms-dotnettools.csdevkit"
-  ],
-  "extensionDependencies": [
-    "ms-dotnettools.csdevkit"
+    "workspaceContains:**/*.slnx"
   ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       {
         "command": "testy.refreshTests",
-        "title": "Refresh C# Tests",
+        "title": "Refresh and Run All C# Tests",
+        "category": "Testy",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "testy.toggleAutoRun",
+        "title": "Pause or Resume Automatic Testing",
+        "category": "Testy",
+        "icon": "$(debug-pause)"
+      },
+      {
+        "command": "testy.showOutput",
+        "title": "Show Output",
+        "category": "Testy",
+        "icon": "$(output)"
       }
     ],
     "menus": {
       "view/title": [
         {
           "command": "testy.refreshTests",
-          "when": "view == testing",
-          "group": "navigation"
+          "when": "view == workbench.view.testing",
+          "group": "navigation@testy"
+        },
+        {
+          "command": "testy.toggleAutoRun",
+          "when": "view == workbench.view.testing",
+          "group": "navigation@testy"
         }
       ]
     },
     "configuration": {
       "title": "Testy",
       "properties": {
-        "testy.fileWatcherPattern": {
+        "testy.autoRun": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically establish a baseline on open and run affected tests after changes."
+        },
+        "testy.runMode": {
           "type": "string",
-          "default": "**/*.cs",
-          "description": "Glob pattern for files to watch for changes that trigger test runs"
+          "default": "affected",
+          "description": "Choose affected test files or the entire C# suite.",
+          "enum": [
+            "affected",
+            "all"
+          ],
+          "enumDescriptions": [
+            "Use recorded code usage, with project fallback when information is incomplete.",
+            "Run every C# test file after a change."
+          ]
+        },
+        "testy.trigger": {
+          "type": "string",
+          "default": "save",
+          "description": "Choose which changes trigger automatic tests.",
+          "enum": [
+            "save",
+            "fileSystem"
+          ],
+          "enumDescriptions": [
+            "Editor saves, plus files renamed or deleted through VS Code.",
+            "All matching disk changes, including external edits and branch switches."
+          ]
         },
         "testy.debounceTime": {
           "type": "number",
-          "default": 1000,
-          "description": "Delay in milliseconds before triggering tests after a file change"
+          "default": 500,
+          "description": "Milliseconds to wait after the latest change before rebuilding and testing.",
+          "minimum": 0,
+          "maximum": 60000
         },
         "testy.runWithCoverage": {
           "type": "boolean",
           "default": true,
-          "description": "Whether to run tests with coverage"
+          "description": "Collect and retain code coverage. Disabling coverage uses conservative project selection."
         },
-        "testy.startupDelay": {
+        "testy.showCoverage": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show covered, uncovered, and stale coverage markers in editor gutters."
+        },
+        "testy.fileWatcherPattern": {
+          "type": "string",
+          "default": "**/*.{cs,csproj,sln,slnx,props,targets,runsettings,json,config,resx}",
+          "description": "Files whose changes can trigger tests."
+        },
+        "testy.exclude": {
+          "type": "array",
+          "default": [],
+          "description": "Additional glob patterns to ignore. Generated files, bin, obj, TestResults, node_modules, and .git are always excluded.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "testy.buildConfiguration": {
+          "type": "string",
+          "default": "Debug",
+          "description": "MSBuild configuration used for builds and test discovery."
+        },
+        "testy.dotnetPath": {
+          "type": "string",
+          "default": "dotnet",
+          "description": "Path to the .NET 10+ CLI executable."
+        },
+        "testy.testArguments": {
+          "type": "array",
+          "default": [],
+          "description": "Additional MTP application arguments. Discovery, filtering, and connection arguments are managed by Testy.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "testy.timeoutSeconds": {
           "type": "number",
-          "default": 10000,
-          "description": "Delay in milliseconds before initializing the extension, to give other extensions time to get ready"
+          "default": 600,
+          "description": "Maximum duration for an individual build, discovery, or test-file run.",
+          "minimum": 10,
+          "maximum": 86400
+        },
+        "testy.coverageToolPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to dotnet-coverage. By default, Testy installs a pinned collector into its own storage on first use."
         }
       }
     }
   },
   "scripts": {
-    "vscode:prepublish": "pnpm run compile",
-    "compile": "tsc -p ./",
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./ && npm run build:analyzer",
+    "build:analyzer": "dotnet build backend/Testy.Analysis/Testy.Analysis.csproj --configuration Release --output dist/analyzer --nologo",
     "watch": "tsc -watch -p ./",
-    "pretest": "pnpm run compile && pnpm run lint",
+    "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
-    "test": "vscode-test"
+    "test": "node --test test/unit/*.test.cjs",
+    "test:integration": "npm run compile && node --test test/integration/*.test.cjs",
+    "test:extension": "vscode-test",
+    "package": "vsce package"
   },
   "devDependencies": {
-    "@types/vscode": "^1.99.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "20.x",
+    "@types/vscode": "^1.99.0",
     "@typescript-eslint/eslint-plugin": "^8.31.1",
     "@typescript-eslint/parser": "^8.31.1",
-    "eslint": "^9.25.1",
-    "typescript": "^5.8.3",
     "@vscode/test-cli": "^0.0.10",
-    "@vscode/test-electron": "^2.5.2"
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.9.2",
+    "eslint": "^9.25.1",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^5.11.1",
+    "minimatch": "^10.2.6",
+    "vscode-jsonrpc": "^9.0.2"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Testy builds and executes workspace code automatically."
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "Testy requires the .NET CLI and local workspace files."
+    }
   }
 }
