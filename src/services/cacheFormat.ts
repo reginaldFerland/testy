@@ -15,6 +15,7 @@ export function validTrace(value: unknown): value is StoredTrace {
     const trace = record(value);
     const sourceIds = new Set(strings(trace?.sourceIds) ? trace.sourceIds : []);
     return !!trace && typeof trace.groupId === 'string' && strings(trace.sourceIds) && strings(trace.dependencies)
+        && (trace.moduleProjects === undefined || strings(trace.moduleProjects))
         && typeof trace.reliable === 'boolean' && (trace.stale === undefined || typeof trace.stale === 'boolean')
         && (trace.historical === undefined || typeof trace.historical === 'boolean')
         && typeof trace.timestamp === 'number' && Number.isFinite(trace.timestamp) && !!record(trace.inputs)

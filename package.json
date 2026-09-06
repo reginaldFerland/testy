@@ -109,7 +109,7 @@
         },
         "testy.fileWatcherPattern": {
           "type": "string",
-          "default": "**/*.{cs,csproj,sln,slnx,props,targets,runsettings,json,config,resx}",
+          "default": "**/*.{cs,csproj,sln,slnx,props,targets,runsettings,json,config,resx,editorconfig,globalconfig,ruleset}",
           "description": "Files whose changes can trigger tests."
         },
         "testy.exclude": {
@@ -155,7 +155,8 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./ && npm run build:analyzer && npm run build:process-host",
+    "compile": "tsc -p ./ && npm run build:analyzer && npm run build:process-host && npm run build:observer",
+    "build:observer": "dotnet build backend/Testy.RuntimeObserver/Testy.RuntimeObserver.csproj --configuration Release --output dist/observer --nologo",
     "build:process-host": "dotnet build backend/Testy.ProcessHost/Testy.ProcessHost.csproj --configuration Release --output dist/processhost --nologo",
     "build:analyzer": "dotnet build backend/Testy.Analysis/Testy.Analysis.csproj --configuration Release --output dist/analyzer --nologo",
     "watch": "tsc -watch -p ./",

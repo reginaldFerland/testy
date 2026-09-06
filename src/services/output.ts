@@ -80,7 +80,7 @@ async function entries(directory: string, signal?: AbortSignal, prefix = ''): Pr
     return result;
 }
 
-async function digest(file: string, signal?: AbortSignal): Promise<string> {
+export async function fileHash(file: string, signal?: AbortSignal): Promise<string> {
     const hash = createHash('sha256');
     for await (const chunk of createReadStream(file, { signal })) {hash.update(chunk);}
     return hash.digest('hex');
@@ -127,8 +127,8 @@ export class PreparedOutput {
             // in the same tick; compare its bytes when metadata is unchanged.
             if (!changed && BigInt(previous.split(':')[3]) === this.collisionTime) {
                 let expected = this.templateHashes.get(file);
-                if (!expected) {expected = await digest(path.join(this.template, file), signal); this.templateHashes.set(file, expected);}
-                changed = expected !== await digest(path.join(this.directory, file), signal);
+                if (!expected) {expected = await fileHash(path.join(this.template, file), signal); this.templateHashes.set(file, expected);}
+                changed = expected !== await fileHash(path.join(this.directory, file), signal);
             }
             if (changed) {
                 await fs.rm(path.join(this.directory, file), { force: true });

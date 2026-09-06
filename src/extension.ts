@@ -5,7 +5,7 @@ import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { configuration, Configuration } from './configuration';
 import { CoverageSummary } from './core/coverage';
 import { TestFile, TestResult } from './core/model';
-import { contentHash, isExcluded, isGeneratedSource, isInside, matchesPattern, normalizePath } from './core/paths';
+import { contentHash, isInheritedConfiguration, isExcluded, isGeneratedSource, isInside, matchesPattern, normalizePath, sourceDirectories } from './core/paths';
 import { ChangeBatch, Scheduler, SchedulerState } from './core/scheduler';
 import { ManualSelection, RunSummary, TestEngine } from './services/engine';
 
@@ -67,11 +67,14 @@ class Testy implements vscode.Disposable {
             events: {
                 output: text => { if (this.disposed) {return;} this.output.append(text); this.activeRun?.appendOutput(text.replace(/\r?\n/g, '\r\n')); },
                 phase: phase => { this.phase = phase; this.updateStatus(); },
+                inputsChanged: () => this.watch(),
                 discovered: groups => this.updateTree(groups),
                 selected: selection => {
                     this.output.appendLine(`${selection.reason}: ${selection.groups.length} of ${this.engine.groups.length} test files.`);
                     const invalidated: vscode.TestItem[] = [];
-                    for (const group of selection.groups) {for (const test of this.engine.knownTests(group)) {
+                    // The resolved selection is authoritative. Expanding it
+                    // with remembered runtime rows would clear unselected failures.
+                    for (const group of selection.groups) {for (const test of group.tests) {
                         const item = this.items.get(`${group.id}:${test.id}`);
                         if (item) {invalidated.push(item); this.setOutcome(item.id); this.activeRun?.enqueued(item);}
                     }}
@@ -111,7 +114,7 @@ class Testy implements vscode.Disposable {
             }),
             vscode.commands.registerCommand('testy.showOutput', () => this.output.show()),
             vscode.workspace.onDidSaveTextDocument(document => {
-                if (this.config.trigger === 'save') {void this.changed(document.uri, document.getText());}
+                if (this.config.trigger === 'save') {void this.changed(document.uri);}
             }),
             vscode.workspace.onDidDeleteFiles(event => { for (const uri of event.files) {void this.changed(uri, undefined, true);} }),
             vscode.workspace.onDidRenameFiles(event => { for (const file of event.files) { void this.changed(file.oldUri, undefined, true); void this.changed(file.newUri, undefined, true); } }),
@@ -159,12 +162,14 @@ class Testy implements vscode.Disposable {
         this.watchSignature = signature;
         this.watchers.forEach(watcher => watcher.dispose()); this.watchers = [];
         if (this.config.trigger !== 'fileSystem') {return;}
+        const inputs = this.engine.knownFiles, directories = this.engine.directories;
         const external: string[] = [];
-        for (const directory of this.engine.directories.filter(directory => !this.roots.some(root => isInside(directory, root)))
+        for (const directory of sourceDirectories(inputs, directories).filter(directory => !this.roots.some(root => isInside(directory, root)))
             .sort((a, b) => a.length - b.length || a.localeCompare(b))) {
             if (!external.some(parent => isInside(directory, parent))) {external.push(directory);}
         }
-        const inputDirectories = [...new Set(this.engine.knownFiles.filter(file => !matchesPattern(file, this.config.pattern, this.roots)).map(file => path.dirname(file)))];
+        const inputDirectories = [...new Set(inputs.filter(file => !matchesPattern(file, this.config.pattern, this.roots)
+            || (isInheritedConfiguration(file) && !this.roots.some(root => isInside(file, root)))).map(file => path.dirname(file)))];
         for (const pattern of [this.config.pattern, ...external.map(directory => new vscode.RelativePattern(directory, this.config.pattern)),
             ...inputDirectories.map(directory => new vscode.RelativePattern(directory, '*'))]) {
             const watcher = vscode.workspace.createFileSystemWatcher(pattern);
@@ -175,12 +180,12 @@ class Testy implements vscode.Disposable {
         }
     }
 
-    private async changed(uri: vscode.Uri, content?: string, directoryEvent = false): Promise<void> {
+    private async changed(uri: vscode.Uri, content?: string | Buffer, directoryEvent = false): Promise<void> {
         if (this.disposed || uri.scheme !== 'file') {return;}
         const file = normalizePath(uri.fsPath);
         if (!this.roots.some(root => isInside(file, root)) && !this.engine.knownFiles.includes(file)
             && !this.engine.knownFiles.some(known => isInside(known, file))
-            && !this.engine.directories.some(directory => isInside(file, directory))) {return;}
+            && !sourceDirectories(this.engine.knownFiles, this.engine.directories).some(directory => isInside(file, directory))) {return;}
         if (isExcluded(file, this.config.excludes, this.roots)) {return;}
         const descendants = directoryEvent ? this.engine.knownFiles.filter(known => known !== file && isInside(known, file)) : [];
         let directory = descendants.length > 0;
@@ -190,7 +195,7 @@ class Testy implements vscode.Disposable {
         if (!directory && /\.cs$/i.test(file)) {
             if (content === undefined) {
                 let handle: fs.FileHandle | undefined;
-                try {handle = await fs.open(file, 'r'); const buffer = Buffer.alloc(2048); const { bytesRead } = await handle.read(buffer); content = buffer.toString('utf8', 0, bytesRead);}
+                try {handle = await fs.open(file, 'r'); const buffer = Buffer.alloc(2048); const { bytesRead } = await handle.read(buffer); content = buffer.subarray(0, bytesRead);}
                 catch { /* Deleted file. */ } finally {await handle?.close();}
             }
             if (content !== undefined) {

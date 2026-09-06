@@ -3,13 +3,14 @@ import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { DiscoveredTest, FileCoverage, Project, TestFile, TestResult, Trace } from '../core/model';
-import { contentHash, pathNormalizer, testFileId, testTargetKey } from '../core/paths';
+import { contentHash, pathNormalizer, sourceVersion, testFileId, testTargetKey } from '../core/paths';
 import { requestTests, testConverter, TestNode, testResult } from './mtp';
 import { ProcessOptions, requireSuccess, runProcess } from './process';
 import { CoverageReader } from './coverageReader';
-import { copyOutput, PreparedOutput, removeOutput } from './output';
+import { copyOutput, fileHash, PreparedOutput, removeOutput } from './output';
 import { sourceLocations } from './analysis';
 import { claimRunOutputs, RunOutputLease } from './runOutputs';
+import { RuntimeModule, RuntimeObservation } from './runtimeObservation';
 
 export interface RunnerOptions extends ProcessOptions {
     readonly dotnet: string;
@@ -17,6 +18,7 @@ export interface RunnerOptions extends ProcessOptions {
     readonly testArguments: readonly string[];
     readonly coverageTool?: string;
     readonly assemblies?: readonly string[];
+    readonly modules?: readonly RuntimeModule[];
     readonly buildInputs?: ReadonlyMap<string, readonly string[]>;
     readonly analyzer?: string;
     /** Stable within an engine, isolated from every other extension instance. */
@@ -79,7 +81,7 @@ export interface FileRun {
 interface Preparation {
     readonly root: string; readonly output: PreparedOutput; readonly session: string; readonly coverage: boolean;
     readonly nodes: readonly TestNode[]; readonly nativeById: ReadonlyMap<string, TestNode>;
-    readonly byKey: ReadonlyMap<string, readonly TestNode[]>; groups?: readonly TestFile[]; runs: number;
+    readonly byKey: ReadonlyMap<string, readonly TestNode[]>; readonly instrumented?: readonly string[]; groups?: readonly TestFile[]; runs: number;
 }
 
 function nodeKey(node: TestNode): string {
@@ -122,13 +124,11 @@ export class RunnerSession {
         return groups;
     }
 
-    async run(groups: readonly TestFile[], hashes: ReadonlyMap<string, string>): Promise<FileRun> {
+    private async resolve(groups: readonly TestFile[]): Promise<{ preparation: Preparation; selected: TestNode[]; executedGroups: readonly TestFile[]; originals: ReadonlyMap<string, TestNode> }> {
         const group = groups[0];
         if (!group || groups.some(item => item.assembly !== group.assembly || item.project !== group.project || item.framework !== group.framework)) {throw new Error('A test batch must belong to one project and target framework.');}
         const options = { ...this.options, cwd: path.dirname(group.project) };
         const preparation = await this.prepare(group);
-        if (preparation.runs++) {await preparation.output.restore(options.signal);}
-        const report = path.join(preparation.root, `coverage-${preparation.runs}.xml`);
         // Discovery and execution use one stable private path, so exact native
         // UIDs work even when displayed theory names are indistinguishable.
         const { nativeById, byKey } = preparation;
@@ -176,6 +176,27 @@ export class RunnerSession {
             options.output?.(`The provider cannot select this runtime or changed test identity individually; running its ${projectFallback ? 'project (source file unknown)' : 'containing test file'}.\n`);
             options.onExpanded?.(executedGroups);
         }
+        return { preparation, selected, executedGroups, originals };
+    }
+
+    /** Resolve the union before batching, so project fallback cannot overlap a file run. */
+    async resolveSelection(groups: readonly TestFile[]): Promise<readonly TestFile[]> {
+        const projects = new Map<string, TestFile[]>();
+        for (const group of groups) {
+            const key = testTargetKey(group.project, group.framework), selected = projects.get(key) ?? [];
+            selected.push(group); projects.set(key, selected);
+        }
+        const selected: TestFile[] = [];
+        for (const groups of projects.values()) {selected.push(...(await this.resolve(groups)).executedGroups);}
+        return selected;
+    }
+
+    async run(groups: readonly TestFile[], hashes: ReadonlyMap<string, string>): Promise<FileRun> {
+        const { preparation, selected, executedGroups, originals } = await this.resolve(groups);
+        const group = groups[0], options = { ...this.options, cwd: path.dirname(group.project) };
+        if (preparation.runs++) {await preparation.output.restore(options.signal);}
+        const report = path.join(preparation.root, `coverage-${preparation.runs}.xml`);
+        let work = 0;
         const originalNode = (node: TestNode): TestNode => {
             const original = originals.get(node.uid);
             return original ? { ...original, ...node, uid: original.uid } : node;
@@ -200,8 +221,17 @@ export class RunnerSession {
             ?? (test.file ? files.get(test.file) : undefined) ?? methods.get(methodKey(test.node) ?? '') ?? unknown;
         const selectedIds = new Set(selected.map(node => node.uid));
         const completeProject = preparation.nodes.every(node => selectedIds.has(node.uid));
+        const assembly = path.join(preparation.output.directory, path.basename(group.assembly));
+        let observation: RuntimeObservation | undefined;
+        if (preparation.coverage) {
+            try {
+                observation = await RuntimeObservation.start(path.join(preparation.root, `modules-${preparation.runs}`), assembly,
+                    options.modules ?? (options.assemblies ?? [group.assembly]).map(file => ({ name: path.basename(file, path.extname(file)), sources: [...hashes.keys()] })),
+                    preparation.instrumented ?? [], options.env);
+            } catch (error) {options.signal?.throwIfAborted(); options.output?.(`Runtime observation unavailable; retaining conservative dependencies. ${String(error)}\n`);}
+        }
         const nodes = await requestTests({
-            ...options, expectedTests: selected, assembly: path.join(preparation.output.directory, path.basename(group.assembly)),
+            ...options, env: observation?.env ?? options.env, expectedTests: selected, assembly,
             args: ['--results-directory', path.join(preparation.root, `results-${preparation.runs}`), ...options.testArguments],
             wrapper: preparation.coverage ? {
                 command: options.coverageTool!, args: ['collect', '--nologo', '--session-id', preparation.session, '-f', 'cobertura', '-o', report]
@@ -227,17 +257,29 @@ export class RunnerSession {
                 options.output?.(`Coverage unavailable for ${path.basename(group.project)}; test results are retained. ${String(error)}\n`);
             }
         }
-        const dependencies = [...new Set([...coverage.filter(file => file.lines.some(line => line.hits > 0)).map(file => file.file),
+        let runtimeDependencies: readonly string[] = [], moduleProjects: readonly string[] = [], observed = !preparation.coverage;
+        if (preparation.coverage) {
+            try {
+                if (!observation) {throw new Error('No runtime observer was available.');}
+                const dependencies = await observation.dependencies(options.signal);
+                runtimeDependencies = dependencies.files; moduleProjects = dependencies.projects; observed = true;
+            } catch (error) {
+                options.signal?.throwIfAborted(); runtimeDependencies = [...hashes.keys()];
+                moduleProjects = [...new Set(options.modules?.flatMap(module => module.project ? [module.project] : []) ?? [])];
+                options.output?.(`Runtime observation incomplete; retaining workspace dependencies. ${String(error)}\n`);
+            }
+        }
+        const dependencies = [...new Set([...coverage.filter(file => file.lines.some(line => line.hits > 0)).map(file => file.file), ...runtimeDependencies,
             ...executedGroups.flatMap(item => this.options.buildInputs?.get(item.project) ?? []),
             ...executedGroups.map(item => item.file).filter((file): file is string => !!file)])];
         const reported = new Set(results.map(result => result.id));
-        const reliable = executedGroups.length === 1 && available && coverage.some(file => file.lines.some(line => line.hits > 0)) && !!executedGroups[0].file
+        const reliable = executedGroups.length === 1 && available && observed && coverage.some(file => file.lines.some(line => line.hits > 0)) && !!executedGroups[0].file
             && results.every(result => result.outcome === 'passed') && executedGroups[0].tests.every(test => reported.has(test.id));
         return {
             results, coverageAvailable: available, executedGroups,
             trace: {
-                groupId: executedGroups.length === 1 ? executedGroups[0].id : projectCoverageId(group), dependencies, coverage, reliable, timestamp: Date.now(),
-                inputs: Object.fromEntries(dependencies.filter(file => hashes.has(file)).map(file => [file, hashes.get(file)!]))
+                groupId: executedGroups.length === 1 ? executedGroups[0].id : projectCoverageId(group), dependencies, moduleProjects, coverage, reliable, timestamp: Date.now(),
+                inputs: Object.fromEntries(dependencies.map(file => [file, sourceVersion(hashes, file)]))
             }
         };
     }
@@ -260,13 +302,21 @@ export class RunnerSession {
         const template = path.join(root, 'template');
         const session = randomUUID();
         let coverage = !!options.coverageTool;
+        const instrumented: string[] = [];
         try {
             await copyOutput(source, template, options.signal);
             if (coverage) {
                 const assemblies = new Set((options.assemblies ?? [group.assembly]).map(assemblyName));
                 for (const assembly of await workspaceOutputs(template, assemblies, options.signal)) {
                     try {
+                        const before = await fileHash(assembly, options.signal);
                         requireSuccess(await runProcess(options.coverageTool!, ['instrument', assembly, '--session-id', session, '--nologo'], options), `Instrumenting ${path.basename(assembly)}`);
+                        // The collector can exit 0 after skipping a module (for
+                        // example, no_symbols). An unchanged DLL must retain its
+                        // whole-module dependency when the observer sees it load.
+                        if (await fileHash(assembly, options.signal) !== before) {
+                            instrumented.push(path.join(root, 'assembly', path.relative(template, assembly)));
+                        } else {options.output?.(`No instrumentation change in ${path.basename(assembly)}; retaining module dependencies.\n`);}
                     } catch (error) {
                         options.signal?.throwIfAborted(); coverage = false;
                         options.output?.(`Coverage preparation failed; running tests without collection. ${String(error)}\n`);
@@ -289,7 +339,7 @@ export class RunnerSession {
                 const key = nodeKey(node); const matching = byKey.get(key) ?? []; matching.push(node); byKey.set(key, matching);
                 if (++work % 512 === 0) {await yieldTurn(); options.signal?.throwIfAborted();}
             }
-            const prepared = { root, output, session, coverage, nodes, nativeById, byKey, runs: 0 };
+            const prepared = { root, output, session, coverage, nodes, nativeById, byKey, instrumented, runs: 0 };
             this.prepared.set(key, prepared); options.onPrepared?.(group.project);
             return prepared;
         } catch (error) {await removeOutput(root); throw error;}

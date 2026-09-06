@@ -260,9 +260,11 @@ test('runtime fallback honors explicit exclusions and rejects unselectable runti
  session.prepared.clear();await session.dispose();
 });
 
-test('startup schedules its baseline after optional cache failure, but never after cancellation',async()=>{
+test('startup schedules its baseline after optional cache failure, but never after cancellation',async t=>{
  const {TestEngine}=require('../../out/services/engine'),proto=uiPrototype(),requested=[];
- const warnings=[],engine=new TestEngine({roots:[],storage:'.',events:{output:text=>warnings.push(text)}});
+ const io=require('node:fs/promises'),storage=await io.mkdtemp(path.join(require('node:os').tmpdir(),'testy-cache-failure-'));
+ t.after(()=>io.rm(storage,{recursive:true,force:true}));
+ const warnings=[],engine=new TestEngine({roots:[],storage,events:{output:text=>warnings.push(text)}});
  engine.cache.restore=async()=>{throw new Error('unavailable cache worker');};
  const lifetime=new AbortController(),context={engine,lifetime,config:{enabled:true},watch(){},scheduler:{setPaused(){},request:(...args)=>requested.push(args)}};
  await proto.start.call(context);assert.equal(requested.length,1);assert.equal(requested[0][1],true);assert.match(warnings[0],/fresh baseline/);

@@ -16,7 +16,7 @@ export function configuration(): Configuration {
     return {
         enabled: settings.get('autoRun', true), trigger: settings.get('trigger', 'save'),
         debounce: Math.max(0, settings.get('debounceTime', 500)),
-        pattern: settings.get('fileWatcherPattern', '**/*.{cs,csproj,sln,slnx,props,targets,runsettings,json,config,resx}'),
+        pattern: settings.get('fileWatcherPattern', '**/*.{cs,csproj,sln,slnx,props,targets,runsettings,json,config,resx,editorconfig,globalconfig,ruleset}'),
         showCoverage: settings.get('showCoverage', true),
         dotnet: settings.get('dotnetPath', 'dotnet'), configuration: settings.get('buildConfiguration', 'Debug'),
         mode: settings.get('runMode', 'affected'), coverage: settings.get('runWithCoverage', true),

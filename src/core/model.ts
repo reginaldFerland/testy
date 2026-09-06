@@ -2,6 +2,7 @@ export interface Project {
     readonly file: string;
     readonly framework: string;
     readonly assembly: string;
+    readonly assemblyName?: string;
     readonly assemblies?: readonly string[];
     readonly isTestProject: boolean;
     readonly runner: 'mtp';
@@ -58,6 +59,8 @@ export interface FileCoverage {
 export interface Trace {
     readonly groupId: string;
     readonly dependencies: readonly string[];
+    /** Whole-module dependencies observed outside the instrumented private copy. */
+    readonly moduleProjects?: readonly string[];
     readonly coverage: readonly FileCoverage[];
     /** Only complete, successful runs can narrow subsequent selections. */
     readonly reliable: boolean;

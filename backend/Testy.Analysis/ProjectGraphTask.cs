@@ -53,11 +53,26 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
                 {
                     var project = node.ProjectInstance;
                     string[] Items(string name) => project.GetItems(name).Select(item => item.GetMetadataValue("FullPath")).Where(value => value.Length > 0).Distinct().ToArray();
+                    // The compiler discovers inherited editorconfig files after
+                    // evaluation. Include absent candidates so creation and
+                    // deletion are watched and versioned, including linked code.
+                    var compilerConfigs = new HashSet<string>(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+                    foreach (var file in Items("Compile").Append(project.FullPath))
+                    {
+                        for (var directory = Path.GetDirectoryName(file); directory is not null; directory = Path.GetDirectoryName(directory))
+                        {
+                            if (!compilerConfigs.Add(Path.Combine(directory, ".editorconfig"))) { break; }
+                        }
+                    }
+                    compilerConfigs.Add(Path.Combine(project.Directory, ".globalconfig"));
+                    var ruleSet = project.GetPropertyValue("CodeAnalysisRuleSet");
+                    if (!string.IsNullOrWhiteSpace(ruleSet)) { compilerConfigs.Add(Path.GetFullPath(ruleSet, project.Directory)); }
                     return new
                     {
                         file = project.FullPath,
                         framework = project.GetPropertyValue("TargetFramework"),
                         assembly = project.GetPropertyValue("TargetPath"),
+                        assemblyName = project.GetPropertyValue("AssemblyName"),
                         isTestProject = project.GetPropertyValue("IsTestProject").Equals("true", StringComparison.OrdinalIgnoreCase)
                             || project.GetPropertyValue("IsTestingPlatformApplication").Equals("true", StringComparison.OrdinalIgnoreCase),
                         isMtp = project.GetPropertyValue("IsTestingPlatformApplication").Equals("true", StringComparison.OrdinalIgnoreCase),
@@ -67,7 +82,9 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
                         contextReferences = node.ProjectReferences.SelectMany(Targets).Select(Identity).Distinct().ToArray(),
                         sourceFiles = Items("Compile"),
                         inputs = inputs[project].Concat(Items("Content")).Concat(Items("None")).Concat(Items("EmbeddedResource"))
-                            .Concat(Items("AdditionalFiles")).Where(input => !input.StartsWith(project.GetPropertyValue("MSBuildToolsPath") + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)).Distinct().ToArray(),
+                            .Concat(Items("AdditionalFiles")).Concat(Items("EditorConfigFiles")).Concat(Items("GlobalAnalyzerConfigFiles"))
+                            .Concat(Items("AnalyzerConfigFiles")).Concat(compilerConfigs)
+                            .Where(input => !input.StartsWith(project.GetPropertyValue("MSBuildToolsPath") + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)).Distinct().ToArray(),
                         references = node.ProjectReferences.Select(reference => reference.ProjectInstance.FullPath).Where(reference => reference != project.FullPath).Distinct().ToArray(),
                         binaryReferences = project.GetItems("Reference").Select(item => item.GetMetadataValue("HintPath"))
                             .Where(value => value.Length > 0).Select(value => Path.GetFullPath(value, project.Directory)).Distinct().ToArray()

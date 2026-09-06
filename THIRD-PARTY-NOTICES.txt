@@ -1,4 +1,4 @@
-Testy bundles Microsoft.CodeAnalysis and Microsoft.CodeAnalysis.CSharp from the .NET SDK.
+Testy bundles Microsoft.CodeAnalysis and Microsoft.CodeAnalysis.CSharp 5.9.0 from their portable NuGet packages.
 Source: https://github.com/dotnet/roslyn
 
 The MIT License (MIT)
@@ -6845,4 +6845,3 @@ It also applies even if Microsoft knew or should have known about the possibilit
 
 
 ---------------------------------------------------------
-

@@ -62,7 +62,7 @@ export function selectTests(
     groups: readonly TestFile[], projects: readonly Project[], traces: ReadonlyMap<string, Trace>,
     changes: readonly string[], mode: 'affected' | 'all', force = false,
     conservativeChanges: ReadonlySet<string> = new Set(), index = new ProjectIndex(projects),
-    dependencies?: (file: string) => ReadonlySet<string>
+    dependencies?: (file: string) => ReadonlySet<string>, modules?: (project: string) => ReadonlySet<string>
 ): Selection {
     if (force || mode === 'all') {return { groups: [...groups], reason: force ? 'Full baseline' : 'Run all mode', fallback: false };}
     if (!changes.length) {return { groups: [], reason: 'No pending changes', fallback: false };}
@@ -71,9 +71,14 @@ export function selectTests(
     for (const change of changes) {
         // Observed runtime edges are authoritative even without ProjectReference.
         const observed = dependencies?.(change);
-        const mapped = groups.filter(group => (group.file ?? group.project) === change
-            || (observed ? observed.has(group.id) : traces.get(group.id)?.dependencies.includes(change)));
         const projectsForChange = index.affected([change]);
+        const coarse = new Set<string>();
+        for (const project of projectsForChange) {
+            for (const id of modules?.(project) ?? groups.filter(group => traces.get(group.id)?.moduleProjects?.includes(project)).map(group => group.id)) {coarse.add(id);}
+        }
+        const mapped = groups.filter(group => (group.file ?? group.project) === change
+            || coarse.has(group.id) || (observed ? observed.has(group.id) : traces.get(group.id)?.dependencies.includes(change)));
+        if (coarse.size) {fallback = true;}
         for (const group of mapped) {projectsForChange.add(group.project);}
         const broad = isConfigurationFile(change) || conservativeChanges.has(change) || mapped.length === 0;
         if (broad) {fallback = true;}

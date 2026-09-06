@@ -18,6 +18,10 @@ Coverage collection is enabled by default. On first use, Testy installs a pinned
 
 Testy prepares an isolated, instrumented output once per project and target framework, then runs each selected test file in a separate process. Test targets that share output directories with another framework or reference context are saved immediately after their own build. Files mutated by tests are restored from a pristine template before reuse. Testy records the workspace source files that execution reaches, including indirect calls, and keeps a separate coverage contribution for that test file. Later changes select every test file known to have exercised the changed code.
 
+Workspace assemblies loaded from original build outputs, other paths, or memory are also recorded, including loads in child .NET processes that inherit and support the startup hook. When a load bypasses the instrumented copy, Testy records a dependency on the loaded project. Changes and new source files in that project rerun the calling test file, even without a `ProjectReference`. Those loads do not themselves supply line coverage. If runtime observation is incomplete, retained coverage stays visible and selection becomes conservative.
+
+A collector command can succeed without instrumenting a module, for example when its symbols are missing. Testy verifies that the assembly bytes changed and retains project dependencies for skipped modules, so their callers cannot be silently omitted.
+
 When target frameworks share an output directory, Testy snapshots each target immediately after building it. Discovery, test execution, and portable symbols use that target's copy.
 
 New or unknown source files, project/configuration changes, missing coverage, and incomplete or failing traces use a conservative fallback: all test files in the affected project and its dependent test projects. A bundled Roslyn analyzer also detects declaration changes, including constants, signatures, attributes, and initializers that can affect consumers without appearing in runtime coverage. Edits in coverage-excluded methods or hidden regions also force fallback. Recorded runtime dependencies and workspace binary references are included even without a `ProjectReference`. Evaluated imports, resources and additional build inputs are tracked across consuming projects. MSBuild applies reference-specific properties when building dependencies. Ordinary method-body edits use the recorded traces. Choose `testy.runMode: "all"` to always run the complete suite.
@@ -39,6 +43,10 @@ A manual subset of files in run-all mode collects separate file contributions. T
 Some frameworks report deferred theory rows under one shared test identity; Testy preserves a failure if another row subsequently passes. Testy maps runtime-only rows using provider identities, source paths, and unambiguous type/method metadata. If a row cannot be selected individually after discovery, Testy runs its containing file. Rows whose file cannot be identified appear under **Unmapped runtime tests** and rerun their project. Output explains the expanded selection.
 
 Explicit exclusions still apply to that fallback. If a runtime-only exclusion cannot be honored by the provider, the run reports the limitation before executing tests. An unavailable coverage cache is reported in Output and does not prevent a fresh startup baseline.
+
+A manual test selection preserves failures from unselected runtime rows. Their outcomes change only when those rows run again or a complete run establishes that they no longer exist.
+
+Overlapping manual selections run each discovered test once after fallback expansion. A complete refresh removes runtime rows that no longer exist, including when the project runs file by file or resumes from a completed checkpoint. Partial or cancelled refreshes retain unresolved rows until the remaining project files finish.
 
 Test failures include their messages and stack traces in Test Explorer. The status item shows progress, passing/failing totals, and fresh production-code line coverage. **Testy: Show Output** includes build output and explains each selection.
 
@@ -62,7 +70,13 @@ Test failures include their messages and stack traces in Test Explorer. The stat
 
 Generated files and build outputs (`bin`, `obj`, `TestResults`, `*.g.cs`, `*.generated.cs`, `*.designer.cs`, and files with an auto-generated header in the first 2,048 bytes) do not trigger test runs. Observed generated headers remain recognized through deletion and rename; a refresh or save that sees ordinary content clears that classification. Header-marked outputs and configured `testy.exclude` patterns are also excluded from input hashes, so a generator that rewrites them during a build does not restart the baseline. Ignored Compile inputs still supply global aliases and partial-type coverage-exclusion metadata for conservative source analysis. Evaluated generator inputs remain tracked unless explicitly excluded. Directory events honor the same exclusions as their children. VS Code file renames and deletions are handled in both trigger modes.
 
+Generated headers must be declarations in leading comments. A marker such as `"<auto-generated/>"` inside a handwritten test or an explanatory comment does not exclude that file. Inherited `.editorconfig` files, global analyzer configuration, and configured rulesets are tracked as compiler inputs. Creating or deleting a previously absent configuration also invalidates the consuming projects, including changes that arrive while tests run.
+
+Saved and on-disk generated headers use the same 2,048-byte prefix, including UTF-8 and UTF-16 files with a BOM in either byte order. Removing a generated header makes the file an ordinary tracked input again.
+
 Filesystem mode also watches evaluated source files and build inputs linked from outside the workspace, including known inputs outside the usual file-pattern extensions. Excluding a referenced project from discovery does not prevent MSBuild from building that required dependency.
+
+External input watchers are installed before builds and discovery, allowing a corrected linked file to recover a failed run. Inherited `global.json` candidates are tracked before SDK validation, so correcting an invalid initial SDK pin also triggers recovery. SDK file creation and deletion participate in input-version checks.
 
 ## Requirements and boundaries
 
@@ -73,7 +87,11 @@ Filesystem mode also watches evaluated source files and build inputs linked from
 
 Test discovery is scoped to projects inside the opened workspace folders. Referenced projects outside those folders are built as dependencies, but their tests are not discovered. A build failure stops the current batch, including independent projects.
 
+When an evaluated project stops being a test target or leaves the workspace, its test inventory, runtime rows, coverage and baseline checkpoints are removed. Required references still build as dependencies. These removals persist even if a subsequent build fails.
+
 Source analysis can inspect generated declarations only when they appear in evaluated Compile inputs. If a source generator applies coverage-exclusion metadata through compiler-only output, use `testy.runMode: "all"`. Changes to external services, environment variables, and unwatched data require a full refresh.
+
+Child execution that suppresses startup hooks or runs through an external service cannot supply module dependencies. Use run-all mode when tests rely on workspace code executed that way.
 
 Testy cleans up owned test processes after completion, cancellation, and extension-host failure. On Windows, a Job Object contains descendants. On macOS and Linux, an independent supervisor watches the extension host’s control pipe and combines process groups with an inherited ownership marker to find detached children. The supervisor uses VS Code’s bundled runtime; no separate Node installation is required. Programs that deliberately remove that marker and detach, or launch work through an external service, must manage that work's lifetime themselves.
 
@@ -99,8 +117,10 @@ node test/performance/live-updates.cjs
 node test/performance/discovery.cjs
 ```
 
-Compilation builds TypeScript, the bundled .NET source analyzer, and the Windows process owner. Integration tests copy the sample workspace into a temporary directory, build it, modify its source, and assert the selected test identities, failure results, retained coverage, constant-change fallback, and cancellation. Set `TESTY_COVERAGE_TOOL` to an existing collector executable to reuse it in tests. The extension-host suite downloads an isolated VS Code build and exercises actual saves, pause/resume, refresh, and external linked-file events. Set `TESTY_VSCODE_PATH` to use an existing VS Code executable instead.
+Compilation builds TypeScript, the bundled .NET source analyzer, the Windows process owner, and the runtime observer. The observer uses a .NET startup hook compatible with the collector and managed child runtimes; it does not edit workspace packages or build outputs. Integration tests copy the sample workspace into a temporary directory, build it, modify its source, and assert the selected test identities, failure results, retained coverage, constant-change fallback, and cancellation. Set `TESTY_COVERAGE_TOOL` to an existing collector executable to reuse it in tests. The extension-host suite downloads an isolated VS Code build and exercises actual saves, pause/resume, refresh, and external linked-file events. Set `TESTY_VSCODE_PATH` to use an existing VS Code executable instead.
 
-For interactive development, open this repository in VS Code and press **F5**. The launch task builds both .NET helpers before starting the TypeScript watcher. Open `test/fixtures/ImpactDemo` in the Extension Development Host, save a source edit, and inspect Test Explorer and **Testy: Show Output**. To test the installable artifact, use **Extensions: Install from VSIX…** and choose `testy-1.0.0.vsix`; reload the window afterward. No publication is needed.
+The analyzer bundles pinned, portable Roslyn NuGet assemblies. Unit validation rejects platform-specific managed binaries, so a VSIX built on one OS can use the same analyzer on another.
+
+For interactive development, open this repository in VS Code and press **F5**. The launch task builds the bundled .NET helpers before starting the TypeScript watcher. Open `test/fixtures/ImpactDemo` in the Extension Development Host, save a source edit, and inspect Test Explorer and **Testy: Show Output**. To test the installable artifact, use **Extensions: Install from VSIX…** and choose `testy-1.0.0.vsix`; reload the window afterward. No publication is needed.
 
 See [validation evidence](docs/1.0-validation.md) for measured performance and platform limits.

@@ -11,9 +11,9 @@ async function fixture(t) {
  const root=path.join(temp,'workspace');
  await fs.cp(path.resolve('test/fixtures/ImpactDemo'),root,{recursive:true,filter:file=>!/(^|[/\\])(bin|obj|TestResults)([/\\]|$)/.test(file)});
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:60000,coverageTool:process.env.TESTY_COVERAGE_TOOL};
- const state={selected:[],results:[],prepared:0,started:()=>{},output:[]};
+ const state={selected:[],results:[],prepared:0,started:()=>{},inputsChanged:()=>{},output:[]};
  const engine=new TestEngine({roots:[root],storage:path.join(temp,'state'),tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,events:{
-  output:text=>state.output.push(text),phase:()=>{},discovered:()=>{},selected:s=>state.selected=s.groups.map(group=>path.basename(group.file||group.project)),
+  output:text=>state.output.push(text),phase:()=>{},inputsChanged:()=>state.inputsChanged(),discovered:()=>{},selected:s=>state.selected=s.groups.map(group=>path.basename(group.file||group.project)),
   result:(group,result)=>state.results.push({file:group.file,...result}),started:(...args)=>state.started(...args),coverage:()=>{},invalidated:()=>{},prepared:()=>state.prepared++
  }});
  return {root,temp,config,state,engine,file:relative=>normalizePath(path.join(root,relative)),run:(files=[],full=false,manual)=>engine.run({files,full},new AbortController().signal,manual)};
@@ -534,4 +534,265 @@ test('an unchanged manual leaf evaluates only its root in a shared solution',{ti
   const result=await f.run([],false,{groups:new Set([group.id]),tests:new Map([[group.id,new Set([group.tests[0].id])]]),coverage:false});
   assert.equal(result.tests,1);assert.deepEqual(evaluated,[group.project]);
  }finally{projects.evaluateProject=evaluate;}
+});
+
+
+test('dynamically loaded workspace code must select its calling test file',{timeout:90000},async t=>{
+ const f=await fixture(t);
+ const source=f.file('ImpactDemo/Calculator.cs'),originalAssembly=path.join(f.root,'ImpactDemo/bin/Debug/net10.0/ImpactDemo.dll');
+ await fs.writeFile(source,'namespace ImpactDemo; public static class Calculator { public static int DynamicValue()=>1; public static int OtherValue()=>2; }');
+ await fs.writeFile(f.file('ImpactDemo.Tests/CalculatorTests.cs'),`using Microsoft.VisualStudio.TestTools.UnitTesting; namespace ImpactDemo.Tests; [TestClass] public class CalculatorTests { [TestMethod] public void Dynamic() { var assembly=System.Reflection.Assembly.LoadFile(@"${originalAssembly.replaceAll('"','""')}"); Assert.AreEqual(1,(int)assembly.GetType("ImpactDemo.Calculator")!.GetMethod("DynamicValue")!.Invoke(null,null)!); } }`);
+ await fs.writeFile(f.file('ImpactDemo.Tests/GreetingTests.cs'),'using Microsoft.VisualStudio.TestTools.UnitTesting; namespace ImpactDemo.Tests; [TestClass] public class GreetingTests { [TestMethod] public void Direct() => Assert.AreEqual(2,Calculator.OtherValue()); }');
+ assert.equal((await f.run([],true)).passed,2);
+ const dynamic=f.engine.groups.find(g=>g.file.endsWith('CalculatorTests.cs'));
+ assert.ok(f.engine.coverage.traces.get(dynamic.id).dependencies.includes(source));
+ await fs.writeFile(source,'namespace ImpactDemo; public static class Calculator { public static int DynamicValue()=>3; public static int OtherValue()=>2; }');
+ const affected=await f.run([source]);assert.deepEqual(new Set(f.state.selected),new Set(['CalculatorTests.cs','GreetingTests.cs']));
+ assert.equal((await f.run([],true)).failed,1);
+ assert.equal(affected.failed,1,'affected run must include the changed reflected method');
+});
+
+
+test('shared editorconfig saves must invalidate the projects they compile',{timeout:90000},async t=>{
+ const f=await fixture(t); f.config.coverage=false;
+ const config=f.file('.editorconfig');
+ await fs.writeFile(config,'root = true\n[*.cs]\ndotnet_diagnostic.CS0168.severity = none\n');
+ await fs.appendFile(f.file('ImpactDemo/Calculator.cs'),'\ninternal class W { public void M() { int unused; } }');
+ const baseline=await f.run([],true);assert.equal(baseline.passed,3);assert.ok(f.engine.knownFiles.includes(config));
+ const contents='root = true\n[*.cs]\ndotnet_diagnostic.CS0168.severity = error\n';
+ await fs.writeFile(config,contents);
+ const file=path.resolve('out/extension.js'),exports={},realRequire=require('node:module').createRequire(file);
+ require('node:vm').runInNewContext((await fs.readFile(file,'utf8'))+'\nexports.Testy=Testy;',{
+  exports,require:name=>name==='vscode'?{}:name==='./configuration'?{}:realRequire(name),Buffer,setTimeout,clearTimeout
+ });
+ const requests=[],context={roots:[normalizePath(f.root)],disposed:false,engine:f.engine,scheduler:{request:(...args)=>requests.push(args)},
+  config:{excludes:[],pattern:'**/*.{cs,csproj,sln,slnx,props,targets,runsettings,json,config,resx}'}};
+ await exports.Testy.prototype.changed.call(context,{scheme:'file',fsPath:config},contents);
+ let actualBuildError='';try {await f.run([],true);}catch(e){actualBuildError=e.message;}
+ assert.match(actualBuildError,/CS0168/);
+ assert.equal(requests.length,1,'the saved compiler configuration should trigger a run');
+});
+
+
+test('full per-file refresh should retire a disappeared unmapped runtime failure',{timeout:90000},async t=>{
+ const f=await fixture(t),mtp=require('../../out/services/mtp');
+ f.config.coverage=false;
+ const original=mtp.requestTests;
+ try {
+  mtp.requestTests=(options,operation,tests)=>operation==='discover'?original(options,operation,tests):original({...options,dotnet:process.execPath,
+   assembly:path.resolve('test/fixtures/mtp-peer.cjs'),wrapper:undefined,env:{TESTY_UPDATES:JSON.stringify([...(tests??options.expectedTests).map(node=>({...node,'execution-state':'passed'})),
+    {uid:'obsolete-row','display-name':'Obsolete runtime failure','execution-state':'failed'}])}},operation,tests);
+  await f.run([],true);
+ } finally {mtp.requestTests=original;}
+ assert.equal(f.engine.displayGroups.some(group=>group.runtimeOnly),true);
+ f.config.coverage=true;
+ const abort=new AbortController();let first;
+ f.state.started=group=>{if(first&&first!==group.id)abort.abort();first??=group.id;};
+ await assert.rejects(f.engine.run({files:[],full:true,generation:901},abort.signal),{name:'AbortError'});
+ assert.equal(f.engine.baselineProgress.completed,1);assert.equal(f.engine.displayGroups.some(group=>group.runtimeOnly),true,'partial refresh retains unknown rows');
+ f.state.started=()=>{};
+ const summary=await f.engine.run({files:[],full:true,generation:901},new AbortController().signal);
+ assert.equal(summary.files,1,'resuming reconciles the first checkpoint without rerunning it');
+ assert.equal(summary.failed,0);
+ assert.equal(f.engine.displayGroups.some(group=>group.runtimeOnly),false,'full refresh must remove disappeared rows');
+});
+
+
+test('overlapping manual runtime fallback must execute discovered tests only once',{timeout:90000},async t=>{
+ const f=await fixture(t),mtp=require('../../out/services/mtp');
+ f.config.coverage=false;
+ const original=mtp.requestTests;
+ try {
+  mtp.requestTests=(options,operation,tests)=>operation==='discover'?original(options,operation,tests):original({...options,dotnet:process.execPath,
+   assembly:path.resolve('test/fixtures/mtp-peer.cjs'),wrapper:undefined,env:{TESTY_UPDATES:JSON.stringify([...(tests??options.expectedTests).map(node=>({...node,'execution-state':'passed'})),
+    {uid:'obsolete-row','display-name':'Obsolete runtime failure','execution-state':'failed'}])}},operation,tests);
+  await f.run([],true);
+ } finally {mtp.requestTests=original;}
+ const unknown=f.engine.displayGroups.find(group=>group.runtimeOnly),greeting=f.engine.groups.find(group=>group.file.endsWith('GreetingTests.cs'));
+ f.config.coverage=true;
+ const summary=await f.run([],false,{groups:new Set([unknown.id,greeting.id])});
+ assert.equal(summary.tests,3,'the overlapping file should not execute twice');
+ assert.equal(f.engine.coverage.traces.get(greeting.id).reliable,true,'fallback still collects a separate file contribution');
+});
+
+test('in-memory loads and managed child processes retain workspace module dependencies',{timeout:120000},async t=>{
+ const f=await fixture(t),source=f.file('ImpactDemo/Calculator.cs'),tests=f.file('ImpactDemo.Tests/CalculatorTests.cs');
+ const library=path.join(f.root,'ImpactDemo/bin/Debug/net10.0/ImpactDemo.dll');
+ await fs.mkdir(f.file('Child'));
+ await fs.writeFile(f.file('Child/Child.csproj'),'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><OutputType>Exe</OutputType></PropertyGroup><ItemGroup><ProjectReference Include="../ImpactDemo/ImpactDemo.csproj"/></ItemGroup></Project>');
+ await fs.writeFile(f.file('Child/Program.cs'),'System.Console.WriteLine(ImpactDemo.Calculator.DynamicValue());');
+ await fs.writeFile(f.file('ImpactDemo.Tests/GreetingTests.cs'),'using Microsoft.VisualStudio.TestTools.UnitTesting; namespace ImpactDemo.Tests; [TestClass] public class GreetingTests { [TestMethod] public void Direct() => Assert.AreEqual(2,Calculator.OtherValue()); }');
+ const value=n=>`namespace ImpactDemo; public static class Calculator { public static int DynamicValue()=>${n}; public static int OtherValue()=>2; }`;
+ for(const kind of ['memory','child']){
+  await fs.writeFile(source,value(1));
+  const body=kind==='memory'?`var assembly=System.Reflection.Assembly.Load(System.IO.File.ReadAllBytes(@"${library}")); Assert.AreEqual(1,(int)assembly.GetType("ImpactDemo.Calculator")!.GetMethod("DynamicValue")!.Invoke(null,null)!);`
+   :`var p=System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("dotnet") { ArgumentList={ @"${path.join(f.root,'Child/bin/Debug/net10.0/Child.dll')}" }, UseShellExecute=false, RedirectStandardOutput=true }); var output=p!.StandardOutput.ReadToEnd(); p.WaitForExit(); Assert.AreEqual("1",output.Trim());`;
+  await fs.writeFile(tests,`using Microsoft.VisualStudio.TestTools.UnitTesting; namespace ImpactDemo.Tests; [TestClass] public class CalculatorTests { [TestMethod] public void Dynamic() { ${body} } }`);
+  assert.equal((await f.run([],true)).passed,2,kind);
+  const group=f.engine.groups.find(g=>g.file===tests),trace=f.engine.coverage.traces.get(group.id);
+  assert.equal(trace.reliable,true,kind);assert.ok(trace.moduleProjects.includes(f.file('ImpactDemo/ImpactDemo.csproj')),kind);
+  await fs.writeFile(source,value(3));assert.equal((await f.run([source])).failed,1,kind);
+ }
+});
+
+test('module dependencies select callers without ProjectReference when a new source file changes discovery',{timeout:90000},async t=>{
+ const f=await fixture(t),library=path.join(f.root,'ImpactDemo/bin/Debug/net10.0/ImpactDemo.dll');
+ await fs.mkdir(f.file('DynamicTests'));
+ const project=await fs.readFile(f.file('ImpactDemo.Tests/ImpactDemo.Tests.csproj'),'utf8');
+ await fs.writeFile(f.file('DynamicTests/DynamicTests.csproj'),project.replace('<ProjectReference Include="../ImpactDemo/ImpactDemo.csproj" />',''));
+ await fs.writeFile(f.file('DynamicTests/ReflectionTests.cs'),`using Microsoft.VisualStudio.TestTools.UnitTesting; [TestClass] public class ReflectionTests { [TestMethod] public void NoNewType() { var a=System.Reflection.Assembly.LoadFile(@"${library}"); Assert.IsNull(a.GetType("ImpactDemo.Added")); } }`);
+ assert.equal((await f.run([],true)).passed,4);
+ const added=f.file('ImpactDemo/Added.cs');await fs.writeFile(added,'namespace ImpactDemo; public class Added {}');
+ const result=await f.run([added]);assert.equal(result.failed,1);assert.ok(f.state.selected.includes('ReflectionTests.cs'));
+});
+
+test('missing observer reports keep coverage visible and selection conservative',{timeout:90000},async t=>{
+ const f=await fixture(t),{RuntimeObservation}=require('../../out/services/runtimeObservation'),original=RuntimeObservation.prototype.dependencies;
+ RuntimeObservation.prototype.dependencies=async()=>{throw new Error('controlled missing observation');};
+ try {
+  const result=await f.run([],true);assert.equal(result.passed,3);assert.equal(result.coverageAvailable,true);
+  assert.ok([...f.engine.coverage.traces.values()].every(trace=>!trace.reliable));
+  assert.ok(f.engine.coverage.summarize(f.engine.hashes).some(source=>source.covered>0));
+  assert.equal(f.engine.select([f.file('ImpactDemo/Calculator.cs')]).groups.length,2);
+ }finally{RuntimeObservation.prototype.dependencies=original;}
+});
+
+test('creating and deleting compiler configuration during tests prevents obsolete checkpoints',{timeout:90000},async t=>{
+ const f=await fixture(t),config=f.file('.editorconfig');
+ await f.run([],true);assert.ok(f.engine.knownFiles.includes(config));
+ for(const action of ['create','delete']){
+  const before=new Map(f.engine.coverage.traces);let changed=false;
+  f.state.started=()=>{if(changed)return;changed=true;if(action==='create')require('node:fs').writeFileSync(config,'root = true\n[*.cs]\ndotnet_diagnostic.CS0168.severity = none\n');else require('node:fs').unlinkSync(config);};
+  await assert.rejects(f.run([],true),{name:'AbortError'});assert.equal(changed,true);
+  for(const [id,trace] of before){assert.equal(f.engine.coverage.traces.get(id).timestamp,trace.timestamp,'obsolete contribution did not replace the checkpoint');}
+  f.state.started=()=>{};assert.equal((await f.run([],true)).passed,3);
+ }
+});
+
+test('symbol-less workspace modules retain affected callers without selecting unrelated tests',{timeout:90000},async t=>{
+ const f=await fixture(t),source=f.file('ImpactDemo/Calculator.cs');
+ const content=n=>`namespace ImpactDemo; public static class Calculator { public static int Blind(int value) => value + ${n}; public static int Visible(int value) => value + 1; }`;
+ await fs.writeFile(source,content(1));
+ await fs.writeFile(f.file('ImpactDemo.Tests/CalculatorTests.cs'),'using ImpactDemo; using Microsoft.VisualStudio.TestTools.UnitTesting; [TestClass] public class CalculatorTests { [TestMethod] public void C() => Assert.AreEqual(2,Calculator.Visible(1)); }');
+ await fs.mkdir(f.file('BlindLibrary'));await fs.writeFile(f.file('BlindLibrary/BlindLibrary.csproj'),'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><DebugType>none</DebugType></PropertyGroup><ItemGroup><Compile Include="../ImpactDemo/Calculator.cs" Link="Calculator.cs" /></ItemGroup></Project>');
+ await fs.mkdir(f.file('BlindTests'));await fs.writeFile(f.file('BlindTests/BlindTests.csproj'),'<Project Sdk="MSTest.Sdk/4.3.3"><PropertyGroup><TargetFramework>net10.0</TargetFramework><TestingExtensionsProfile>None</TestingExtensionsProfile></PropertyGroup><ItemGroup><ProjectReference Include="../BlindLibrary/BlindLibrary.csproj" /></ItemGroup></Project>');
+ await fs.writeFile(f.file('BlindTests/BlindTests.cs'),'using ImpactDemo; using Microsoft.VisualStudio.TestTools.UnitTesting; [TestClass] public class BlindCases { [TestMethod] public void C() => Assert.AreEqual(2,Calculator.Blind(1)); }');
+ assert.equal((await f.run([],true)).passed,3);
+ const caller=f.engine.groups.find(group=>group.file.endsWith('/BlindTests.cs')),trace=f.engine.coverage.traces.get(caller.id);
+ assert.equal(trace.reliable,true);assert.ok(trace.dependencies.includes(source));assert.ok(trace.moduleProjects.includes(f.file('BlindLibrary/BlindLibrary.csproj')));
+ assert.ok(f.state.output.some(text=>text.includes('No instrumentation change in BlindLibrary.dll')));
+ await fs.writeFile(source,content(2));const affected=await f.run([source]);
+ assert.equal(affected.failed,1);assert.equal(affected.tests,2);assert.deepEqual(new Set(f.state.selected),new Set(['BlindTests.cs','CalculatorTests.cs']));
+ const all=await f.run([],true);assert.equal(all.tests,3);assert.equal(affected.failed,all.failed);
+});
+
+test('converting a test target to a library retires checkpoints and cached coverage before build failure',{timeout:90000},async t=>{
+ const f=await fixture(t),project=f.file('ImpactDemo.Tests/ImpactDemo.Tests.csproj'),original=await fs.readFile(project,'utf8');
+ await f.run([],true);
+ const abort=new AbortController();let first;
+ f.state.started=group=>{if(first&&first!==group.id)abort.abort();first??=group.id;};
+ await assert.rejects(f.engine.run({files:[],full:true,generation:910},abort.signal),{name:'AbortError'});
+ assert.equal(f.engine.baselineProgress.completed,1);assert.equal(f.engine.coverage.traces.size,2);f.state.started=()=>{};
+ const library='<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup></Project>';
+ await fs.writeFile(project,library.replace('</Project>','<Target Name="ControlledFailure" BeforeTargets="BeforeBuild"><Error Text="controlled library build failure" /></Target></Project>'));
+ await assert.rejects(f.run([project]),/controlled library build failure/);
+ assert.equal(f.engine.groups.length,0);assert.equal(f.engine.displayGroups.length,0);assert.equal(f.engine.baselineProgress.completed,0);assert.equal(f.engine.baseline.runtimeResults.size,0);
+ assert.equal(f.engine.coverage.traces.size,0);
+ const {CoverageStore}=require('../../out/core/coverage'),{CoverageCache}=require('../../out/services/cache'),restored=new CoverageStore();
+ await new CoverageCache(path.join(f.temp,'state'),()=>{}).restore(restored);assert.equal(restored.traces.size,0,'removed target contributions stay removed after reopening');
+ await fs.writeFile(project,library);assert.equal((await f.run([project])).tests,0);
+ await fs.writeFile(project,original);assert.equal((await f.run([project])).passed,3,'a target that becomes eligible again is discovered afresh');
+});
+
+test('retiring a test target also removes unmapped runtime rows and remembered identities',{timeout:90000},async t=>{
+ const f=await fixture(t),mtp=require('../../out/services/mtp'),request=mtp.requestTests;f.config.coverage=false;
+ try{
+  mtp.requestTests=(options,operation,tests)=>operation==='discover'?request(options,operation,tests):request({...options,dotnet:process.execPath,
+   assembly:path.resolve('test/fixtures/mtp-peer.cjs'),wrapper:undefined,env:{TESTY_UPDATES:JSON.stringify([...(tests??options.expectedTests).map(node=>({...node,'execution-state':'passed'})),
+    {uid:'retired-row','display-name':'Runtime failure','execution-state':'failed'}])}},operation,tests);
+  await f.run([],true);
+ }finally{mtp.requestTests=request;}
+ const runtime=f.engine.displayGroups.find(group=>group.runtimeOnly);assert.ok(runtime);assert.ok(f.engine.knownTests(runtime).length);
+ const project=f.file('ImpactDemo.Tests/ImpactDemo.Tests.csproj');
+ await fs.writeFile(project,'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup></Project>');
+ assert.equal((await f.run([project])).tests,0);assert.equal(f.engine.displayGroups.length,0);assert.equal(f.engine.runtime.size,0);assert.equal(f.engine.knownCache.size,0);assert.equal(f.engine.coverage.traces.size,0);
+});
+
+test('removing a workspace test folder stops execution while its referenced project still builds',{timeout:90000},async t=>{
+ const f=await fixture(t);await fs.mkdir(f.file('Consumer'));
+ await fs.writeFile(f.file('Consumer/Consumer.csproj'),'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup><ItemGroup><ProjectReference Include="../ImpactDemo.Tests/ImpactDemo.Tests.csproj" /></ItemGroup></Project>');
+ assert.equal((await f.run([],true)).passed,3);const prepared=f.state.prepared;
+ f.engine.setRoots([f.file('Consumer')]);await fs.rm(f.file('ImpactDemo.Tests/bin'),{recursive:true,force:true});
+ const result=await f.run([],true);assert.equal(result.tests,0);assert.equal(f.engine.groups.length,0);assert.equal(f.engine.coverage.traces.size,0);assert.equal(f.state.prepared,prepared);
+ const reference=f.engine.projects.find(project=>project.isTestProject);assert.equal(reference.entryPoint,false);await fs.access(reference.assembly);
+ f.engine.setRoots([f.root]);assert.equal((await f.run([],true)).passed,3);
+});
+
+async function editorInputs(f,trigger='fileSystem') {
+ const file=path.resolve('out/extension.js'),exports={},real=require('node:module').createRequire(file),patterns=[],requests=[];
+ const vscode={RelativePattern:class {constructor(base,pattern){Object.assign(this,{base,pattern});}},workspace:{createFileSystemWatcher:pattern=>{
+  patterns.push(pattern);return {dispose(){},onDidChange(){},onDidCreate(){},onDidDelete(){}};
+ }}};
+ require('node:vm').runInNewContext((await fs.readFile(file,'utf8'))+'\nexports.Testy=Testy;',{
+  exports,require:name=>name==='vscode'?vscode:name==='./configuration'?{}:real(name),Buffer,setTimeout,clearTimeout
+ });
+ const ui={roots:[normalizePath(f.root)],watchers:[],engine:f.engine,scheduler:{request:(...args)=>requests.push(args)},
+  config:{trigger,excludes:[],pattern:require('../../package.json').contributes.configuration.properties['testy.fileWatcherPattern'].default}};
+ const watch=()=>exports.Testy.prototype.watch.call(ui);f.state.inputsChanged=watch;watch();
+ return {patterns,requests,changed:file=>exports.Testy.prototype.changed.call(ui,{scheme:'file',fsPath:file})};
+}
+
+test('an inherited SDK pin remains observable through initial failure and subsequent saves',{timeout:90000},async t=>{
+ const f=await fixture(t);f.config.coverage=false;await fs.rm(f.file('global.json'));
+ const {runProcess,requireSuccess}=require('../../out/services/process');
+ const version=requireSuccess(await runProcess('dotnet',['--version'],{cwd:f.root}),'Reading selected SDK').stdout.trim();
+ const global=normalizePath(path.join(f.temp,'global.json')),valid=JSON.stringify({sdk:{version,rollForward:'disable'}}),invalid=JSON.stringify({sdk:{version:'9.0.100',rollForward:'disable'}});
+ const editor=await editorInputs(f);await fs.writeFile(global,invalid);await assert.rejects(f.run([],true),/SDK|sdk|9\.0\.100/);
+ assert.ok(f.engine.knownFiles.includes(global));assert.ok(editor.patterns.some(p=>p.base===normalizePath(f.temp)&&p.pattern==='*'));
+ await fs.writeFile(global,valid);await editor.changed(global);assert.equal(editor.requests.length,1);assert.equal((await f.run(editor.requests[0][0])).passed,3);
+ assert.ok(f.engine.hashes.has(global));
+ await fs.writeFile(global,invalid);await editor.changed(global);assert.equal(editor.requests.length,2);await assert.rejects(f.run(editor.requests[1][0]),/SDK|sdk|9\.0\.100/);
+ await fs.writeFile(global,valid);await editor.changed(global);assert.equal(editor.requests.length,3);assert.equal((await f.run(editor.requests[2][0])).passed,3);
+});
+
+test('external input watchers are published before a first failed build or discovery',{timeout:90000},async t=>{
+ const f=await fixture(t);f.config.coverage=false;
+ const external=normalizePath(path.join(f.temp,'linked'));await fs.mkdir(external);
+ const linked=normalizePath(path.join(external,'Arithmetic.cs')),source=f.file('ImpactDemo/Arithmetic.cs'),original=await fs.readFile(source,'utf8');
+ await fs.rm(source);await fs.writeFile(linked,original.replace('a + b','a +'));
+ const project=f.file('ImpactDemo/ImpactDemo.csproj');await fs.writeFile(project,(await fs.readFile(project,'utf8')).replace('</Project>',`<ItemGroup><Compile Include="${linked}" Link="Arithmetic.cs" /></ItemGroup></Project>`));
+ const editor=await editorInputs(f);await assert.rejects(f.run([],true),/Building.*failed/);
+ assert.ok(f.engine.knownFiles.includes(linked));assert.ok(editor.patterns.some(p=>p.base===external),'a failing build still installs external watchers');
+ await fs.writeFile(linked,original);await editor.changed(linked);assert.equal(editor.requests.length,1);assert.equal((await f.run(editor.requests[0][0])).passed,3);
+ // Discover a new external input during a later failing discovery as well.
+ const other=normalizePath(path.join(f.temp,'data'));await fs.mkdir(other);const data=normalizePath(path.join(other,'tests.txt'));await fs.writeFile(data,'fixture');
+ await fs.writeFile(project,(await fs.readFile(project,'utf8')).replace('</Project>',`<ItemGroup><AdditionalFiles Include="${data}" /></ItemGroup></Project>`));
+ const mtp=require('../../out/services/mtp'),request=mtp.requestTests;
+ try{mtp.requestTests=async()=>{throw new Error('controlled discovery failure');};await assert.rejects(f.run([project]),/controlled discovery failure/);}
+ finally{mtp.requestTests=request;}
+ assert.ok(editor.patterns.some(p=>p.base===other));await editor.changed(data);assert.equal(editor.requests.length,2);assert.equal((await f.run(editor.requests[1][0])).passed,3);
+});
+
+test('SDK candidate creation and deletion during execution discard obsolete checkpoints',{timeout:90000},async t=>{
+ const f=await fixture(t);await fs.rm(f.file('global.json'));const global=normalizePath(path.join(f.temp,'global.json'));
+ await f.run([],true);assert.ok(f.engine.knownFiles.includes(global));
+ for(const action of ['create','delete']){
+  const before=new Map(f.engine.coverage.traces);let changed=false;
+  f.state.started=()=>{if(changed)return;changed=true;if(action==='create')require('node:fs').writeFileSync(global,'{}');else require('node:fs').unlinkSync(global);};
+  await assert.rejects(f.run([],true),{name:'AbortError'});assert.equal(changed,true);
+  for(const [id,trace] of before)assert.equal(f.engine.coverage.traces.get(id).timestamp,trace.timestamp);
+  f.state.started=()=>{};assert.equal((await f.run([],true)).passed,3);assert.equal(f.engine.hashes.has(global),action==='create');
+ }
+});
+
+test('UTF-16 generated build outputs do not invalidate the initial baseline',{timeout:90000},async t=>{
+ const f=await fixture(t);f.config.coverage=false;const project=f.file('ImpactDemo/ImpactDemo.csproj'),original=await fs.readFile(project,'utf8');
+ const generated=f.file('ImpactDemo/UnicodeOutput.cs');
+ for(const [encoding,bom] of [['Unicode',[0xff,0xfe]],['unicodeFFFE',[0xfe,0xff]]]){
+  const content=Buffer.from('// <auto-generated/> initial\n','utf16le');if(encoding==='unicodeFFFE')content.swap16();
+  await fs.writeFile(generated,Buffer.concat([Buffer.from(bom),content]));
+  await fs.writeFile(project,original.replace('</Project>',`<Target Name="EmitUnicode" BeforeTargets="CoreCompile"><PropertyGroup><GeneratedStamp>$([System.DateTime]::UtcNow.Ticks)</GeneratedStamp></PropertyGroup><WriteLinesToFile File="$(MSBuildProjectDirectory)/UnicodeOutput.cs" Lines="// &lt;auto-generated/&gt; $(GeneratedStamp)" Encoding="${encoding}" Overwrite="true" /></Target></Project>`));
+  for(let attempt=0;attempt<2;attempt++)assert.equal((await f.run([],true)).passed,3,encoding);
+  assert.equal(f.engine.hashes.has(generated),false);assert.equal(f.engine.sources.isGenerated(generated),true);
+ }
 });

@@ -1,6 +1,6 @@
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { CoveredLine, Trace } from './model';
-import { contentHash } from './paths';
+import { contentHash, sourceVersion } from './paths';
 import { finish, finishAsync, sortedUnion } from './work';
 
 export interface CoverageSummary {
@@ -24,6 +24,8 @@ interface SourceRecord {
     readonly groups: Set<string>;
     readonly hits: Map<string, readonly CoveredLine[]>;
 }
+const moduleKey = (project: string): string => `\0module:${project}`;
+const dependencyKeys = (trace: Trace): readonly string[] => [...trace.dependencies, ...trace.moduleProjects?.map(moduleKey) ?? []];
 
 /** Line geometry is shared; each test file stores only its positive hits. */
 export class CoverageStore {
@@ -51,6 +53,8 @@ export class CoverageStore {
         for (const file of files) {for (const id of this.byDependency.get(file) ?? []) {ids.add(id);}}
         return ids;
     }
+
+    dependentProjects(projects: readonly string[]): Set<string> { return this.dependentGroups(projects.map(moduleKey)); }
 
     invalidate(groupIds: ReadonlySet<string>, stale = true): void {
         let changed = false;
@@ -111,6 +115,7 @@ export class CoverageStore {
             if (!liveGroupIds.has(trace.groupId)) {continue;}
             const previous = this.records.get(trace.groupId);
             const dependencies = trace.reliable ? trace.dependencies : [...new Set([...previous?.dependencies ?? [], ...trace.dependencies])];
+            const moduleProjects = trace.reliable ? trace.moduleProjects : [...new Set([...previous?.moduleProjects ?? [], ...trace.moduleProjects ?? []])];
             const sourceIds: string[] = [];
             const coverage = [];
             const inputHashes = new Map(trace.coverage.map(file => [file.file, file.hash]));
@@ -132,7 +137,7 @@ export class CoverageStore {
                 if (hits.length) {coverage.push({ ...file, lines: hits });}
             }
             packed.push({
-                ...trace, dependencies, coverage, sourceIds,
+                ...trace, dependencies, moduleProjects, coverage, sourceIds,
                 inputs: trace.inputs ?? Object.fromEntries(dependencies.filter(file => inputHashes.has(file)).map(file => [file, inputHashes.get(file)!])),
                 stale: trace.stale ?? false
             });
@@ -291,7 +296,7 @@ export class CoverageStore {
         const stale = new Set<string>();
         for (const id of this.dependentGroups([...changed])) {
             const trace = this.records.get(id)!;
-            if (Object.entries(trace.inputs ?? {}).some(([file, hash]) => hashes.get(file) !== hash)) {stale.add(id);}
+            if (Object.entries(trace.inputs ?? {}).some(([file, hash]) => sourceVersion(hashes, file) !== hash)) {stale.add(id);}
         }
         this.hashes = hashes; this.markStale(stale); this.cached = undefined; this.version++;
     }
@@ -323,7 +328,7 @@ export class CoverageStore {
         this.remove(trace.groupId);
         this.staleOrigins.delete(trace.groupId);
         this.records.set(trace.groupId, trace); this.changedTraces.add(trace.groupId); this.removedTraces.delete(trace.groupId);
-        for (const file of trace.dependencies) {
+        for (const file of dependencyKeys(trace)) {
             const groups = this.byDependency.get(file) ?? new Set<string>(); groups.add(trace.groupId); this.byDependency.set(file, groups);
             if (++count % 512 === 0) {yield;}
         }
@@ -344,7 +349,7 @@ export class CoverageStore {
         if (!trace) {return;}
         this.staleOrigins.delete(id); this.dirtyGroups.delete(id);
         this.records.delete(id); this.removedTraces.add(id); this.changedTraces.delete(id);
-        for (const file of trace.dependencies) {
+        for (const file of dependencyKeys(trace)) {
             const groups = this.byDependency.get(file); groups?.delete(id); if (!groups?.size) {this.byDependency.delete(file);}
         }
         for (const sourceId of trace.sourceIds) {

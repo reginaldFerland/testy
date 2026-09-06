@@ -1,5 +1,5 @@
 import * as fs from 'node:fs/promises';
-import { contentHash, isGeneratedSource } from '../core/paths';
+import { contentHash, isGeneratedSource, sourceText } from '../core/paths';
 
 interface SourceState { readonly stamp: string; readonly hash?: string; readonly analysisHash?: string; readonly generated: boolean; readonly aliasSource?: string; }
 
@@ -61,7 +61,7 @@ export class SourceTracker {
                     const previous = this.states.get(file);
                     if (previous?.stamp === stamp && !this.dirty.has(file)) {continue;}
                     const bytes = await fs.readFile(file, { signal });
-                    const content = /\.cs$/i.test(file) ? bytes.toString('utf8') : '';
+                    const content = /\.cs$/i.test(file) ? sourceText(bytes) : '';
                     const generated = isGeneratedSource(file, bytes);
                     // This is only a cheap candidate check. Roslyn interprets
                     // comments, escapes, Unicode and disabled branches later.

@@ -23,6 +23,17 @@ export async function findProjects(roots: readonly string[], excludes: readonly 
 
 const contextId = (project: Project): string => project.contextId ?? `${project.file}\0${project.framework}`;
 
+/** SDK resolution walks project ancestors, including paths outside the workspace. */
+export function sdkConfigurationFiles(file: string): readonly string[] {
+    const files: string[] = [];
+    for (let directory = path.dirname(file);;) {
+        files.push(normalizePath(path.join(directory, 'global.json')));
+        const parent = path.dirname(directory);
+        if (parent === directory) {return files;}
+        directory = parent;
+    }
+}
+
 /** Keep exact SDK contexts for execution; file unions are only for ownership. */
 function buildContexts(projects: readonly Project[]): readonly Project[] {
     const contexts = new Map<string, Project>();
@@ -81,7 +92,8 @@ export async function evaluateProject(dotnet: string, file: string, configuratio
             const paths = (files: readonly string[]): string[] => [...new Set(files.map(normalizePath))];
             return { ...project, file: normalizePath(project.file), assembly: normalizePath(project.assembly), runner: 'mtp',
                 analysisFiles: paths(project.sourceFiles),
-                sourceFiles: paths(project.sourceFiles).filter(file => !isExcluded(file)), inputs: paths(project.inputs ?? []).filter(file => !isExcluded(file)),
+                sourceFiles: paths(project.sourceFiles).filter(file => !isExcluded(file)),
+                inputs: paths([...project.inputs ?? [], ...sdkConfigurationFiles(project.file)]).filter(file => !isExcluded(file)),
                 references: paths(project.references), binaryReferences: paths(project.binaryReferences ?? []) };
         });
     } finally {await fs.rm(directory, { recursive: true, force: true });}
