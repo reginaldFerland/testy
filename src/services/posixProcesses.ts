@@ -54,10 +54,12 @@ export async function cleanupPosixOwner(owner: string): Promise<void> {
     for (let attempt = 0; attempt < 10; attempt++) {
         const pids = await ownedPids(owner);
         if (!pids.length) {return;}
+        const errors: unknown[] = [];
         for (const pid of pids) {
             try {process.kill(pid, 'SIGKILL');}
-            catch (error) {if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {throw error;}}
+            catch (error) {if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {errors.push(error);}}
         }
+        if (errors.length) {throw new AggregateError(errors, 'Unable to terminate owned POSIX descendants.');}
     }
     throw new Error('Owned POSIX descendants did not exit during cleanup.');
 }

@@ -5,6 +5,7 @@ const fs=require('node:fs');
 const vm=require('node:vm');
 const {createRequire}=require('node:module');
 const {EventEmitter}=require('node:events');
+const {PassThrough}=require('node:stream');
 const {requestTests,testResult}=require('../../out/services/mtp');
 
 test('MTP transport preserves explicit retry outcomes and rejects inconsistent failure exits',async()=>{
@@ -22,7 +23,7 @@ test('MTP transport preserves explicit retry outcomes and rejects inconsistent f
 test('MTP reports timeouts and early process exits instead of RPC disposal errors',async()=>{
  const options={dotnet:process.execPath,assembly:path.resolve('test/fixtures/mtp-peer.cjs'),cwd:process.cwd(),timeoutMs:500};
  await assert.rejects(requestTests({...options,env:{TESTY_HANG:'1'}},'run'),/exceeded its time limit/);
- await assert.rejects(requestTests({...options,env:{TESTY_EXIT_DURING:'41'}},'run'),/exit 41.*\ncontrolled process failure/);
+ await assert.rejects(requestTests({...options,timeoutMs:5000,env:{TESTY_EXIT_DURING:'41'}},'run'),/exit 41.*\ncontrolled process failure/);
 });
 
 function uiPrototype(vscode={}) {
@@ -113,7 +114,7 @@ test('save-mode directory events expand known paths and trigger structural disco
 test('runtime-only result IDs are registered and selected for manual reruns',async()=>{
  const proto=uiPrototype();let selected;
  const item={id:'file:runtime',children:{forEach:()=>{}}};
- const context={disposed:false,items:new Map([['file:runtime',item]]),testIds:new Map(),setOutcome:()=>{},updateStatus:()=>{},
+ const context={disposed:false,items:new Map([['file:runtime',item]]),testIds:new Map(),treeFiles:new Map(),setOutcome:()=>{},updateStatus:()=>{},
   scheduler:{runManual:async callback=>callback(new AbortController().signal)},bindCancellation:()=>({controller:new AbortController(),dispose:()=>{}}),
   execute:async(_batch,_signal,_request,selection)=>selected=selection};
  proto.publishResult.call(context,{id:'file',file:'/workspace/Test.cs'},{id:'runtime',name:'Runtime case',outcome:'passed'});
@@ -148,7 +149,7 @@ test('unresolved runtime and ambiguous row identities expand to fresh containing
 test('Windows fallback cancellation waits for taskkill completion before releasing the owned run',async()=>{
  const file=path.resolve('out/services/process.js'), exports={}, processes=[];
  function spawn(command,args) {
-  const child=new EventEmitter();Object.assign(child,{pid:100,stdout:new EventEmitter(),stderr:new EventEmitter(),kill:()=>{}});
+  const child=new EventEmitter();Object.assign(child,{pid:100,stdout:new PassThrough(),stderr:new PassThrough(),kill:()=>{}});
   processes.push({command,args,child});return child;
  }
  vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:name=>name==='node:child_process'?{spawn}:createRequire(file)(name),__dirname:path.dirname(file),process:{platform:'win32',env:{}},setTimeout,clearTimeout});
@@ -163,7 +164,7 @@ test('Windows owned processes receive cancellation through the job host before f
  const file=path.resolve('out/services/process.js'),exports={},processes=[],writes=[];
  function spawn(command,args){
   const child=new EventEmitter();const stdin=new EventEmitter();Object.assign(stdin,{writable:true,write:value=>writes.push(value)});
-  Object.assign(child,{pid:100,stdin,stdout:new EventEmitter(),stderr:new EventEmitter(),kill(){}});processes.push({command,args,child});return child;
+  Object.assign(child,{pid:100,stdin,stdout:new PassThrough(),stderr:new PassThrough(),kill(){}});processes.push({command,args,child});return child;
  }
  vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:name=>name==='node:child_process'?{spawn}:createRequire(file)(name),__dirname:path.dirname(file),process:{platform:'win32',env:{}},setTimeout,clearTimeout});
  const abort=new AbortController(),owned=exports.startProcess('a tool.exe',['argument with spaces'],{cwd:'.',signal:abort.signal,dotnetHost:'custom-dotnet.exe'});
@@ -229,7 +230,7 @@ test('status context commands are emitted only for pause state changes',()=>{
 
 test('MTP output is published once across metadata updates while preserving rows, retries and pre-terminal output',async()=>{
  const output=[],proto=uiPrototype();
- const context={testIds:new Map(),items:new Map([['g:row',{}]]),setOutcome(){},updateStatus(){},activeRun:{passed(){},appendOutput:text=>output.push(text)}};
+ const context={testIds:new Map(),treeFiles:new Map(),items:new Map([['g:row',{}]]),setOutcome(){},updateStatus(){},activeRun:{passed(){},appendOutput:text=>output.push(text)}};
  const updates=[{uid:'row','execution-state':'in-progress',standardOutput:'before '},
   {uid:'row','execution-state':'passed',standardOutput:'done\n'}, {uid:'row','time.duration-ms':12},
   {uid:'row','execution-state':'passed',standardOutput:'same row text\n'},

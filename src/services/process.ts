@@ -2,6 +2,7 @@ import { ChildProcess, spawn } from 'node:child_process';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { cleanupPosixOwner } from './posixProcesses';
+import { OutputTail } from '../core/outputTail';
 
 export class Cancelled extends Error {
     constructor() { super('Run cancelled'); this.name = 'AbortError'; }
@@ -50,11 +51,16 @@ export function startProcess(command: string, args: readonly string[], options: 
     let timedOut = false;
     let closed = false;
     let killTimer: NodeJS.Timeout | undefined;
-    let stdout = '';
-    let stderr = '';
+    const stdout = new OutputTail(8 * 1024 * 1024);
+    const stderr = new OutputTail(8 * 1024 * 1024);
     const teardowns: Promise<void>[] = [];
+    let posixCleanup: Promise<void> | undefined;
+    const cleanPosix = (): void => {
+        if (posixCleanup) {return;}
+        posixCleanup = cleanupPosixOwner(owner);
+        void posixCleanup.catch(() => undefined); teardowns.push(posixCleanup);
+    };
     let windowsKillStarted = false;
-    const limit = 8 * 1024 * 1024;
     child.stdin?.on('error', () => undefined);
     if (posixOwner) {
         child.stdin!.write(JSON.stringify({ command, args, owner, cleanupDescendants: options.cleanupDescendants !== false, electronRunAsNode: env.ELECTRON_RUN_AS_NODE }) + '\n');
@@ -75,15 +81,13 @@ export function startProcess(command: string, args: readonly string[], options: 
                     killer.once('close', code => {if (code !== 0 && !closed) {child.kill();} resolve();});
                 }));
             } else {
-                if (!force && child.stdin?.writable) {child.stdin.write('cancel\n'); return;}
+                if (!force && child.stdin?.writable) {child.stdin.write('cancel\n', error => {if (error) {killTree(true);}}); return;}
                 process.kill(-child.pid, force ? 'SIGKILL' : 'SIGTERM');
-                if (force) {
-                    const cleanup = cleanupPosixOwner(owner);
-                    void cleanup.catch(() => undefined); teardowns.push(cleanup);
-                }
             }
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {child.kill(force ? 'SIGKILL' : 'SIGTERM');}
+        } finally {
+            if (force && posixOwner) {cleanPosix();}
         }
     };
     const stop = (): void => {
@@ -96,20 +100,18 @@ export function startProcess(command: string, args: readonly string[], options: 
     const timeout = setTimeout(() => { timedOut = true; stop(); }, options.timeoutMs ?? 600_000);
     timeout.unref();
     const done = new Promise<ProcessResult>((resolve, reject) => {
-        child.stdout?.on('data', (data: Buffer) => {
-            const text = data.toString(); stdout = (stdout + text).slice(-limit); options.output?.(text);
+        child.stdout?.setEncoding('utf8'); child.stderr?.setEncoding('utf8');
+        child.stdout?.on('data', (text: string) => {
+            stdout.append(text); options.output?.(text);
         });
-        child.stderr?.on('data', (data: Buffer) => {
-            const text = data.toString(); stderr = (stderr + text).slice(-limit); options.output?.(text);
+        child.stderr?.on('data', (text: string) => {
+            stderr.append(text); options.output?.(text);
         });
         child.once('error', reject);
-        child.once('exit', (_code, signal) => {
-            // If the independent owner itself is killed, the surviving host
-            // makes a final ownership scan. Ordinary exits clean up in the owner.
-            if (posixOwner && signal) {
-                const cleanup = cleanupPosixOwner(owner);
-                void cleanup.catch(() => undefined); teardowns.push(cleanup);
-            }
+        child.once('exit', (code, signal) => {
+            // A killed/crashed owner needs a fallback scan. Normal MTP failure
+            // exit 2 already completed cleanup in the supervisor.
+            if (posixOwner && (signal || ((code === 1 || code === 127) && (cancelled || options.cleanupDescendants !== false)))) {cleanPosix();}
         });
         child.once('close', async code => {
             closed = true;
@@ -126,7 +128,7 @@ export function startProcess(command: string, args: readonly string[], options: 
             if (timedOut) {reject(new Error(`The command exceeded its time limit: ${command}`));}
             else if (cancelled) {reject(new Cancelled());}
             else if (cleanupError) {reject(cleanupError);}
-            else {resolve({ code: code ?? -1, stdout, stderr });}
+            else {resolve({ code: code ?? -1, stdout: stdout.text(), stderr: stderr.text() });}
         });
     });
     options.signal?.addEventListener('abort', stop, { once: true });

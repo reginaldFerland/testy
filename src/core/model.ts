@@ -40,6 +40,8 @@ export interface TestFile {
     readonly tests: readonly DiscoveredTest[];
     /** Explicit manual exclusions must also constrain runtime identity fallback. */
     readonly excludedTestIds?: readonly string[];
+    /** Rows whose file cannot be identified; manual fallback covers the project. */
+    readonly runtimeOnly?: boolean;
 }
 
 export interface CoveredLine {

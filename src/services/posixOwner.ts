@@ -12,23 +12,31 @@ interface Launch {
 
 // This process outlives the extension host. Its stdin is held exclusively by
 // that host; EOF also covers SIGKILL and crashes, where host callbacks cannot run.
+// The host also owns the readers of our output pipes. Diagnostics after its
+// death must not crash the supervisor with EPIPE before cleanup finishes.
+process.stdout.on('error', () => undefined);
+process.stderr.on('error', () => undefined);
 const control = createInterface({ input: process.stdin });
 let child: ChildProcess | undefined, launch: Launch | undefined;
 let stopping = false, finishing = false;
 let escalation: NodeJS.Timeout | undefined;
 
-function signalTree(signal: NodeJS.Signals): void {
-    if (!child?.pid) {return;}
+function signalTree(signal: NodeJS.Signals): boolean {
+    if (!child?.pid) {return true;}
     try {process.kill(-child.pid, signal);}
-    catch (error) {if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {throw error;}}
+    catch (error) {if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
+        process.stderr.write(`Process group signal failed; checking owned descendants: ${String(error)}\n`);
+        return false;
+    }}
+    return true;
 }
 
 function stop(): void {
     if (stopping || finishing) {return;}
     stopping = true;
     if (!child) {process.exit(1);}
-    signalTree('SIGTERM');
-    escalation = setTimeout(() => signalTree('SIGKILL'), 1500);
+    if (!signalTree('SIGTERM')) {void finish(1); return;}
+    escalation = setTimeout(() => {void finish(1);}, 1500);
 }
 
 async function finish(code: number): Promise<void> {

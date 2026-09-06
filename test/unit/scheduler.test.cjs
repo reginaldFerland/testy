@@ -39,3 +39,24 @@ test('changing debounce replaces a queued timer instead of duplicating runs',asy
 test('disposal cancels work and removes queued startup timers',async()=>{
  const s=setup();s.scheduler.request([],true);s.scheduler.dispose();await s.tick();assert.equal(s.runs.length,0);
 });
+
+test('queued manual cancellation settles immediately without cancelling active work or consuming changes',async()=>{
+ const s=setup(),wait=gate(),abort=new AbortController();let activeSignal,ran=false;
+ const active=s.scheduler.runManual(signal=>{activeSignal=signal;return wait.promise;});
+ s.scheduler.request(['a'],true);await s.tick();
+ const queued=s.scheduler.runManual(async()=>{ran=true;},abort.signal,true);
+ const cancelled=assert.rejects(queued,{name:'AbortError'});abort.abort();await flush();
+ assert.equal(s.scheduler.manual.length,0);await cancelled;assert.equal(ran,false);assert.equal(activeSignal.aborted,false);
+ wait.resolve();await active;await flush();assert.deepEqual(s.runs[0].batch.files,['a']);assert.equal(s.runs[0].batch.full,true);
+ s.runs[0].resolve();await flush();s.scheduler.dispose();
+});
+
+test('removing cancelled queued jobs preserves remaining manual FIFO order',async()=>{
+ const s=setup(),wait=gate(),abort=new AbortController(),order=[];
+ const first=s.scheduler.runManual(()=>wait.promise);
+ const cancelled=s.scheduler.runManual(async()=>order.push('cancelled'),abort.signal);
+ const rejection=assert.rejects(cancelled,{name:'AbortError'});
+ const second=s.scheduler.runManual(async()=>order.push('second')),third=s.scheduler.runManual(async()=>order.push('third'));
+ abort.abort();await rejection;wait.resolve();await Promise.all([first,second,third]);
+ assert.deepEqual(order,['second','third']);s.scheduler.dispose();
+});

@@ -33,6 +33,8 @@ export class CoverageStore {
     private byDependency = new Map<string, Set<string>>();
     private summaries = new Map<string, CoverageSummary>();
     private dirtyFiles = new Set<string>();
+    private dirtyGroups = new Set<string>();
+    private readonly staleOrigins = new Map<string, { trace: StoredTrace; dirty: boolean }>();
     private changedSources = new Set<string>();
     private changedTraces = new Set<string>();
     private removedSources = new Set<string>();
@@ -56,9 +58,10 @@ export class CoverageStore {
             const trace = this.records.get(id);
             if (!trace || (!trace.reliable && (!stale || trace.stale))) {continue;}
             this.records.set(id, { ...trace, reliable: false, stale: stale || trace.stale });
+            this.staleOrigins.delete(id);
             changed = true;
             this.changedTraces.add(id);
-            for (const sourceId of trace.sourceIds) {const source = this.sources.get(sourceId); if (source) {this.dirtyFiles.add(source.source.file);}}
+            this.dirtyGroups.add(id);
         }
         if (changed) {this.cached = undefined; this.version++;}
     }
@@ -68,9 +71,16 @@ export class CoverageStore {
         for (const id of groupIds) {
             const trace = this.records.get(id);
             if (!trace || (!stale && trace.historical) || !!trace.stale === stale) {continue;}
-            this.records.set(id, { ...trace, stale }); this.changedTraces.add(id);
+            const origin = this.staleOrigins.get(id) ?? { trace, dirty: this.changedTraces.has(id) };
+            if (!!origin.trace.stale === stale) {
+                this.records.set(id, origin.trace); this.staleOrigins.delete(id);
+                if (!origin.dirty) {this.changedTraces.delete(id);}
+            } else {
+                this.staleOrigins.set(id, origin);
+                this.records.set(id, { ...trace, stale }); this.changedTraces.add(id);
+            }
             changed = true;
-            for (const sourceId of trace.sourceIds) {const source = this.sources.get(sourceId); if (source) {this.dirtyFiles.add(source.source.file);}}
+            this.dirtyGroups.add(id);
         }
         if (changed) {this.cached = undefined; this.version++;}
     }
@@ -81,6 +91,7 @@ export class CoverageStore {
             const trace = this.records.get(id);
             if (trace && !trace.historical) {
                 this.records.set(id, { ...trace, reliable: false, historical: true }); this.changedTraces.add(id);
+                this.staleOrigins.delete(id); this.version++;
             }
         }
     }
@@ -176,6 +187,7 @@ export class CoverageStore {
         this.records = staged.records; this.sources = staged.sources;
         this.byFile = staged.byFile; this.byDependency = staged.byDependency;
         this.summaries = staged.summaries; this.dirtyFiles = staged.dirtyFiles;
+        this.dirtyGroups = staged.dirtyGroups; this.staleOrigins.clear();
         this.changedSources = new Set(); this.changedTraces = new Set();
         this.removedSources = new Set(); this.removedTraces = new Set();
         this.cached = undefined; this.version++;
@@ -183,26 +195,54 @@ export class CoverageStore {
 
     private clearDelta(): void {
         this.changedSources.clear(); this.changedTraces.clear(); this.removedSources.clear(); this.removedTraces.clear();
+        this.staleOrigins.clear();
     }
 
     takeDelta(): CoverageDelta {
-        const delta = {
-            sources: [...new Set([...this.changedSources, ...[...this.changedTraces].flatMap(id => this.records.get(id)?.sourceIds ?? [])])].map(id => this.sources.get(id)?.source).filter((source): source is CoverageSource => !!source),
-            traces: [...this.changedTraces].map(id => this.records.get(id)).filter((trace): trace is StoredTrace => !!trace),
-            removedSources: [...this.removedSources], removedTraces: [...this.removedTraces]
-        };
+        const delta = finish(this.delta());
         this.clearDelta();
         return delta;
     }
 
+    async takeDeltaAsync(signal?: AbortSignal): Promise<CoverageDelta> {
+        for (;;) {
+            const version = this.version;
+            const delta = await finishAsync(this.delta(), signal);
+            signal?.throwIfAborted();
+            if (version !== this.version) {continue;}
+            this.clearDelta(); return delta;
+        }
+    }
+
+    private *delta(): Generator<void, CoverageDelta> {
+        const ids = new Set(this.changedSources), traces: StoredTrace[] = [];
+        let count = 0;
+        for (const id of [...this.changedTraces]) {
+            const trace = this.records.get(id); if (!trace) {continue;}
+            traces.push(trace);
+            for (const source of trace.sourceIds) {ids.add(source); if (++count % 4096 === 0) {yield;}}
+        }
+        const sources: CoverageSource[] = [];
+        for (const id of ids) {
+            const source = this.sources.get(id)?.source; if (source) {sources.push(source);}
+            if (++count % 4096 === 0) {yield;}
+        }
+        return { sources, traces, removedSources: [...this.removedSources], removedTraces: [...this.removedTraces] };
+    }
+
     retryDelta(delta: CoverageDelta): void {
         for (const source of delta.sources) {if (this.sources.has(source.id)) {this.changedSources.add(source.id);}}
-        for (const trace of delta.traces) {if (this.records.has(trace.groupId)) {this.changedTraces.add(trace.groupId);}}
+        for (const trace of delta.traces) {if (this.records.has(trace.groupId)) {
+            this.changedTraces.add(trace.groupId);
+            const origin = this.staleOrigins.get(trace.groupId); if (origin) {this.staleOrigins.set(trace.groupId, { ...origin, dirty: true });}
+        }}
         for (const id of delta.removedTraces) {if (!this.records.has(id)) {this.removedTraces.add(id);}}
+        this.version++;
     }
 
     summarize(hashes: ReadonlyMap<string, string>): readonly CoverageSummary[] {
         this.updateHashes(hashes);
+        finish(this.dirtySources());
         if (this.cached) {return this.cached;}
         for (const file of this.dirtyFiles) {
             const summary = this.calculate(file);
@@ -216,6 +256,8 @@ export class CoverageStore {
     async summarizeAsync(hashes: ReadonlyMap<string, string>, signal?: AbortSignal): Promise<readonly CoverageSummary[]> {
         this.updateHashes(hashes);
         while (!this.cached) {
+            await finishAsync(this.dirtySources(), signal);
+            if (this.dirtyGroups.size) {continue;}
             const version = this.version;
             const summaries = new Map(this.summaries);
             let files = 0;
@@ -233,6 +275,7 @@ export class CoverageStore {
 
     summary(file: string, hashes: ReadonlyMap<string, string>): CoverageSummary | undefined {
         this.updateHashes(hashes);
+        finish(this.dirtySources());
         if (this.dirtyFiles.delete(file)) {
             this.version++;
             const summary = this.calculate(file);
@@ -253,6 +296,17 @@ export class CoverageStore {
         this.hashes = hashes; this.markStale(stale); this.cached = undefined; this.version++;
     }
 
+    /** Delay membership traversal until the scheduled, cancellable aggregation. */
+    private *dirtySources(): Generator<void, void> {
+        const version = this.version, groups = [...this.dirtyGroups];
+        let count = 0;
+        for (const id of groups) {for (const sourceId of this.records.get(id)?.sourceIds ?? []) {
+            const source = this.sources.get(sourceId); if (source) {this.dirtyFiles.add(source.source.file);}
+            if (++count % 4096 === 0) {yield;}
+        }}
+        if (version === this.version) {for (const id of groups) {this.dirtyGroups.delete(id);}}
+    }
+
     private registerSource(source: CoverageSource, canonical = false, merged = false): void {
         const previous = this.sources.get(source.id);
         const lines = merged ? source.lines : previous ? finish(sortedUnion(previous.source.lines, source.lines)) : canonical ? source.lines : finish(sortedUnion([], source.lines));
@@ -267,6 +321,7 @@ export class CoverageStore {
     private *installation(trace: StoredTrace): Generator<void, void> {
         let count = 0;
         this.remove(trace.groupId);
+        this.staleOrigins.delete(trace.groupId);
         this.records.set(trace.groupId, trace); this.changedTraces.add(trace.groupId); this.removedTraces.delete(trace.groupId);
         for (const file of trace.dependencies) {
             const groups = this.byDependency.get(file) ?? new Set<string>(); groups.add(trace.groupId); this.byDependency.set(file, groups);
@@ -287,6 +342,7 @@ export class CoverageStore {
     private remove(id: string): void {
         const trace = this.records.get(id);
         if (!trace) {return;}
+        this.staleOrigins.delete(id); this.dirtyGroups.delete(id);
         this.records.delete(id); this.removedTraces.add(id); this.changedTraces.delete(id);
         for (const file of trace.dependencies) {
             const groups = this.byDependency.get(file); groups?.delete(id); if (!groups?.size) {this.byDependency.delete(file);}

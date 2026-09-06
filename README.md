@@ -16,7 +16,7 @@ Coverage collection is enabled by default. On first use, Testy installs a pinned
 
 ## How affected selection works
 
-Testy prepares an isolated, instrumented output once per project and target framework, then runs each selected test file in a separate process. Files mutated by tests are restored from a pristine template before reuse. Testy records the workspace source files that execution reaches, including indirect calls, and keeps a separate coverage contribution for that test file. Later changes select every test file known to have exercised the changed code.
+Testy prepares an isolated, instrumented output once per project and target framework, then runs each selected test file in a separate process. Test targets that share output directories with another framework or reference context are saved immediately after their own build. Files mutated by tests are restored from a pristine template before reuse. Testy records the workspace source files that execution reaches, including indirect calls, and keeps a separate coverage contribution for that test file. Later changes select every test file known to have exercised the changed code.
 
 When target frameworks share an output directory, Testy snapshots each target immediately after building it. Discovery, test execution, and portable symbols use that target's copy.
 
@@ -36,7 +36,7 @@ Rerunning a file replaces its coverage contribution while retaining contribution
 
 A manual subset of files in run-all mode collects separate file contributions. The previous project aggregate remains visible as stale history until every file has been relearned or the whole project runs again. The same retention applies when switching from run-all to affected mode. Outcomes for tests outside the final affected selection remain available.
 
-Some frameworks report deferred theory rows under one shared test identity; Testy preserves a failure if another row subsequently passes. If a provider emits runtime-only identities that cannot be selected after discovery, Testy runs their containing file and explains the expanded selection in Output.
+Some frameworks report deferred theory rows under one shared test identity; Testy preserves a failure if another row subsequently passes. Testy maps runtime-only rows using provider identities, source paths, and unambiguous type/method metadata. If a row cannot be selected individually after discovery, Testy runs its containing file. Rows whose file cannot be identified appear under **Unmapped runtime tests** and rerun their project. Output explains the expanded selection.
 
 Explicit exclusions still apply to that fallback. If a runtime-only exclusion cannot be honored by the provider, the run reports the limitation before executing tests. An unavailable coverage cache is reported in Output and does not prevent a fresh startup baseline.
 
@@ -60,7 +60,7 @@ Test failures include their messages and stack traces in Test Explorer. The stat
 | `testy.timeoutSeconds` | `600` | Limit for each build, discovery, or test-file run. |
 | `testy.coverageToolPath` | Automatic | Optional existing `dotnet-coverage` executable. |
 
-Generated files and build outputs (`bin`, `obj`, `TestResults`, `*.g.cs`, `*.generated.cs`, `*.designer.cs`, and files with an auto-generated header in the first 2,048 bytes) do not trigger test runs. Observed generated headers remain recognized through deletion and rename. Header-marked outputs and configured `testy.exclude` patterns are also excluded from input hashes, so a generator that rewrites them during a build does not restart the baseline. Ignored Compile inputs can still supply global coverage-exclusion aliases for conservative source analysis. Evaluated generator inputs remain tracked unless explicitly excluded. VS Code file renames and deletions are handled in both trigger modes.
+Generated files and build outputs (`bin`, `obj`, `TestResults`, `*.g.cs`, `*.generated.cs`, `*.designer.cs`, and files with an auto-generated header in the first 2,048 bytes) do not trigger test runs. Observed generated headers remain recognized through deletion and rename; a refresh or save that sees ordinary content clears that classification. Header-marked outputs and configured `testy.exclude` patterns are also excluded from input hashes, so a generator that rewrites them during a build does not restart the baseline. Ignored Compile inputs still supply global aliases and partial-type coverage-exclusion metadata for conservative source analysis. Evaluated generator inputs remain tracked unless explicitly excluded. Directory events honor the same exclusions as their children. VS Code file renames and deletions are handled in both trigger modes.
 
 Filesystem mode also watches evaluated source files and build inputs linked from outside the workspace, including known inputs outside the usual file-pattern extensions. Excluding a referenced project from discovery does not prevent MSBuild from building that required dependency.
 
@@ -72,6 +72,8 @@ Filesystem mode also watches evaluated source files and build inputs linked from
 - Portable debug symbols for source mapping and coverage. A missing source location causes conservative selection.
 
 Test discovery is scoped to projects inside the opened workspace folders. Referenced projects outside those folders are built as dependencies, but their tests are not discovered. A build failure stops the current batch, including independent projects.
+
+Source analysis can inspect generated declarations only when they appear in evaluated Compile inputs. If a source generator applies coverage-exclusion metadata through compiler-only output, use `testy.runMode: "all"`. Changes to external services, environment variables, and unwatched data require a full refresh.
 
 Testy cleans up owned test processes after completion, cancellation, and extension-host failure. On Windows, a Job Object contains descendants. On macOS and Linux, an independent supervisor watches the extension host’s control pipe and combines process groups with an inherited ownership marker to find detached children. The supervisor uses VS Code’s bundled runtime; no separate Node installation is required. Programs that deliberately remove that marker and detach, or launch work through an external service, must manage that work's lifetime themselves.
 
@@ -93,6 +95,8 @@ npm run benchmark
 npm run benchmark:responsiveness
 node test/performance/cache-and-results.cjs
 node test/performance/cache-membership.cjs
+node test/performance/live-updates.cjs
+node test/performance/discovery.cjs
 ```
 
 Compilation builds TypeScript, the bundled .NET source analyzer, and the Windows process owner. Integration tests copy the sample workspace into a temporary directory, build it, modify its source, and assert the selected test identities, failure results, retained coverage, constant-change fallback, and cancellation. Set `TESTY_COVERAGE_TOOL` to an existing collector executable to reuse it in tests. The extension-host suite downloads an isolated VS Code build and exercises actual saves, pause/resume, refresh, and external linked-file events. Set `TESTY_VSCODE_PATH` to use an existing VS Code executable instead.

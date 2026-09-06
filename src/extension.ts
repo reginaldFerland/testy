@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
+import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { configuration, Configuration } from './configuration';
 import { CoverageSummary } from './core/coverage';
 import { TestFile, TestResult } from './core/model';
@@ -24,6 +25,9 @@ class Testy implements vscode.Disposable {
     private readonly disposables: vscode.Disposable[] = [];
     private readonly items = new Map<string, vscode.TestItem>();
     private readonly testIds = new Map<string, { group: string; test: string }>();
+    private readonly treeFiles = new Map<string, { tests: TestFile['tests']; ids: Set<string>; dirty?: boolean }>();
+    private readonly treeProjects = new Map<string, readonly string[]>();
+    private treeRoots: readonly string[] = [];
     private readonly details = new WeakMap<vscode.FileCoverage, CoverageSummary>();
     private readonly outcomes = new Map<string, string>();
     private readonly decorations: Record<'covered' | 'uncovered' | 'stale', vscode.TextEditorDecorationType>;
@@ -39,7 +43,6 @@ class Testy implements vscode.Disposable {
     private renderTimer: NodeJS.Timeout | undefined;
     private rendering = false;
     private readonly pendingEditors = new Set<vscode.TextEditor>();
-    private readonly generatedFiles = new Set<string>();
     private productionSources = new Set<string>();
     private coverageSuffix = '';
     private passed = 0;
@@ -144,7 +147,7 @@ class Testy implements vscode.Disposable {
         return {
             running: this.scheduler.isRunning, paused: this.scheduler.isPaused, phase: this.phase,
             error: this.lastError, summary: this.lastSummary,
-            groups: this.engine.groups, baseline: this.engine.baselineProgress, coverage: this.engine.coverage.summarize(this.engine.hashes),
+            groups: this.engine.displayGroups, baseline: this.engine.baselineProgress, coverage: this.engine.coverage.summarize(this.engine.hashes),
             status: this.status.text, outcomes: Object.fromEntries(this.outcomes)
         };
     }
@@ -182,6 +185,7 @@ class Testy implements vscode.Disposable {
         const descendants = directoryEvent ? this.engine.knownFiles.filter(known => known !== file && isInside(known, file)) : [];
         let directory = descendants.length > 0;
         if (directoryEvent && !directory) {try {directory = (await fs.stat(file)).isDirectory();} catch { /* Deleted path. */ }}
+        if (directoryEvent && isExcluded(`${file}/`, this.config.excludes, this.roots)) {return;}
         if (!directory && !this.engine.knownFiles.includes(file) && !matchesPattern(file, this.config.pattern, this.roots)) {return;}
         if (!directory && /\.cs$/i.test(file)) {
             if (content === undefined) {
@@ -190,9 +194,10 @@ class Testy implements vscode.Disposable {
                 catch { /* Deleted file. */ } finally {await handle?.close();}
             }
             if (content !== undefined) {
-                if (isGeneratedSource(file, content)) {this.generatedFiles.add(file); return;}
-                this.generatedFiles.delete(file);
-            } else if (this.generatedFiles.has(file) || this.engine.sources?.isGenerated(file)) {return;}
+                const generated = isGeneratedSource(file, content);
+                this.engine.sources?.observeGenerated(file, generated);
+                if (generated) {return;}
+            } else if (this.engine.sources?.isGenerated(file)) {return;}
         }
         if (this.disposed) {return;}
         const files = [...descendants, file];
@@ -211,41 +216,70 @@ class Testy implements vscode.Disposable {
         if (outcome === 'failed' || outcome === 'errored') {this.failed++;}
     }
 
-    private updateTree(groups: readonly TestFile[]): void {
+    private async updateTree(groups: readonly TestFile[]): Promise<void> {
         if (this.disposed) {return;}
         this.productionSources = new Set(this.engine.projects.filter(project => !project.isTestProject).flatMap(project => [...project.sourceFiles]));
         this.watch();
-        const projectCounts = new Map<string, number>();
-        for (const group of groups) {projectCounts.set(group.project, (projectCounts.get(group.project) ?? 0) + this.engine.knownTests(group).length);}
-        const live = new Set<string>();
+        const projectCounts = new Map<string, number>(), live = new Set<string>();
         const projects = new Map<string, vscode.TestItem[]>();
-        this.testIds.clear();
-        for (const group of groups) {
+        let work = 0;
+        const ordered = [...groups].sort((a, b) => a.project.localeCompare(b.project) || (a.file ?? '').localeCompare(b.file ?? '') || a.framework.localeCompare(b.framework));
+        for (const group of ordered) {
+            if (++work % 512 === 0) {await yieldTurn(); if (this.disposed) {return;}}
+            const tests = this.engine.knownTests(group), previous = this.treeFiles.get(group.id);
+            projectCounts.set(group.project, (projectCounts.get(group.project) ?? 0) + tests.length);
             const projectId = `project:${group.project}`;
-            const project = this.item(projectId, path.basename(group.project, '.csproj'), group.project);
-            live.add(projectId);
+            this.item(projectId, path.basename(group.project, '.csproj'), group.project);
+            live.add(group.id);
             const files = projects.get(projectId) ?? [];
-            const file = this.item(`file:${group.id}`, `${path.basename(group.file ?? 'Other tests')} · ${group.framework}`, group.file);
-            live.add(file.id); files.push(file); projects.set(projectId, files);
-            const children = this.engine.knownTests(group).map(test => {
-                const id = `${group.id}:${test.id}`;
-                const item = this.item(id, test.name, test.file);
-                if (test.file) {item.range = new vscode.Range(Math.max(0, test.line - 1), 0, Math.max(0, test.line - 1), 0);}
-                live.add(id); this.testIds.set(id, { group: group.id, test: test.id });
-                return item;
-            });
+            const file = this.item(`file:${group.id}`, `${path.basename(group.file ?? (group.runtimeOnly ? 'Unmapped runtime tests' : 'Other tests'))} · ${group.framework}`, group.file);
+            files.push(file); projects.set(projectId, files);
+            let same = !previous?.dirty && previous?.tests.length === tests.length;
+            if (same && previous!.tests !== tests) {for (let index = 0; index < tests.length; index++) {
+                const a = previous!.tests[index], b = tests[index];
+                if (a.id !== b.id || a.name !== b.name || a.file !== b.file || a.line !== b.line) {same = false; break;}
+                if (++work % 512 === 0) {await yieldTurn(); if (this.disposed) {return;}}
+            }}
+            if (same) {this.treeFiles.set(group.id, { tests, ids: previous!.ids }); continue;}
+            const children: vscode.TestItem[] = [], ids = new Set<string>();
+            for (const test of tests) {
+                const id = `${group.id}:${test.id}`, item = this.item(id, test.name, test.file);
+                item.range = test.file ? new vscode.Range(Math.max(0, test.line - 1), 0, Math.max(0, test.line - 1), 0) : undefined;
+                ids.add(id); this.testIds.set(id, { group: group.id, test: test.id }); children.push(item);
+                if (++work % 512 === 0) {await yieldTurn(); if (this.disposed) {return;}}
+            }
             file.children.replace(children);
-            project.description = `${projectCounts.get(group.project)} tests`;
+            for (const id of previous?.ids ?? []) {if (!ids.has(id)) {
+                this.testIds.delete(id); this.items.delete(id); this.setOutcome(id);
+                if (++work % 512 === 0) {await yieldTurn(); if (this.disposed) {return;}}
+            }}
+            this.treeFiles.set(group.id, { tests, ids });
         }
-        for (const [id, files] of projects) {this.items.get(id)!.children.replace(files);}
-        this.controller.items.replace([...projects.keys()].map(id => this.items.get(id)!));
-        for (const id of this.items.keys()) {if (!live.has(id)) { this.items.delete(id); this.setOutcome(id); }}
+        for (const [group, previous] of this.treeFiles) {if (!live.has(group)) {
+            for (const id of previous.ids) {
+                this.testIds.delete(id); this.items.delete(id); this.setOutcome(id);
+                if (++work % 512 === 0) {await yieldTurn(); if (this.disposed) {return;}}
+            }
+            this.items.delete(`file:${group}`); this.treeFiles.delete(group);
+        }}
+        const sameIds = (previous: readonly string[] | undefined, next: readonly string[]): boolean => !!previous && previous.length === next.length && previous.every((id, index) => id === next[index]);
+        for (const [id, files] of projects) {
+            const project = this.items.get(id)!, ids = files.map(file => file.id);
+            const description = `${projectCounts.get(id.slice('project:'.length))} tests`;
+            if (project.description !== description) {project.description = description;}
+            if (!sameIds(this.treeProjects.get(id), ids)) {project.children.replace(files); this.treeProjects.set(id, ids);}
+        }
+        for (const id of this.treeProjects.keys()) {if (!projects.has(id)) {this.treeProjects.delete(id); this.items.delete(id);}}
+        const roots = [...projects.keys()];
+        if (!sameIds(this.treeRoots, roots)) {this.controller.items.replace(roots.map(id => this.items.get(id)!)); this.treeRoots = roots;}
         this.updateStatus();
     }
 
     private item(id: string, label: string, file?: string): vscode.TestItem {
         const existing = this.items.get(id);
-        if (existing) { existing.label = label; return existing; }
+        if (existing && (existing.uri ? file !== undefined && path.normalize(existing.uri.fsPath) === path.normalize(file) : file === undefined)) {
+            if (existing.label !== label) {existing.label = label;} return existing;
+        }
         const item = this.controller.createTestItem(id, label, file ? vscode.Uri.file(file) : undefined);
         this.items.set(id, item); return item;
     }
@@ -297,8 +331,15 @@ class Testy implements vscode.Disposable {
 
     private publishResult(group: TestFile, result: TestResult): void {
         if (this.disposed) {return;}
+        if (group.runtimeOnly && !this.treeFiles.has(group.id)) {
+            const file = this.item(`file:${group.id}`, `Unmapped runtime tests · ${group.framework}`);
+            this.items.get(`project:${group.project}`)?.children.add(file);
+            this.treeFiles.set(group.id, { tests: [], ids: new Set(), dirty: true });
+        }
         const id = `${group.id}:${result.id}`;
         this.testIds.set(id, { group: group.id, test: result.id });
+        const file = this.treeFiles.get(group.id);
+        if (file && !file.ids.has(id)) {file.ids.add(id); file.dirty = true;}
         let item = this.items.get(id);
         if (!item) {
             item = this.item(id, result.name, group.file);

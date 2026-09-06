@@ -1,9 +1,10 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { DiscoveredTest, FileCoverage, Project, TestFile, TestResult, Trace } from '../core/model';
-import { contentHash, normalizePath, testFileId, testTargetKey } from '../core/paths';
-import { discoveredTest, requestTests, TestNode, testResult } from './mtp';
+import { contentHash, pathNormalizer, testFileId, testTargetKey } from '../core/paths';
+import { requestTests, testConverter, TestNode, testResult } from './mtp';
 import { ProcessOptions, requireSuccess, runProcess } from './process';
 import { CoverageReader } from './coverageReader';
 import { copyOutput, PreparedOutput, removeOutput } from './output';
@@ -22,34 +23,40 @@ export interface RunnerOptions extends ProcessOptions {
     readonly identity?: string;
     readonly outputRoot?: string;
     readonly snapshots?: ReadonlyMap<string, string>;
-    readonly onResult?: (group: TestFile, result: TestResult) => void;
+    readonly onResult?: (group: TestFile, result: TestResult, test?: DiscoveredTest) => void;
     readonly onStarted?: (group: TestFile, id: string) => void;
     readonly onPrepared?: (project: string) => void;
     readonly onExpanded?: (groups: readonly TestFile[]) => void;
 }
 
 export async function discover(project: Project, options: RunnerOptions, discovered?: readonly TestNode[]): Promise<readonly TestFile[]> {
-    let nodes = discovered ?? await requestTests({ ...options, cwd: path.dirname(project.file), assembly: project.assembly, args: options.testArguments }, 'discover');
+    const nodes = discovered ?? await requestTests({ ...options, cwd: path.dirname(project.file), assembly: project.assembly, args: options.testArguments }, 'discover');
+    let locations: Awaited<ReturnType<typeof sourceLocations>> | undefined;
     if (options.analyzer && nodes.some(node => !node['location.file'])) {
         try {
-            const locations = await sourceLocations(options.dotnet, options.analyzer, project.assembly, options.storage, options);
-            nodes = nodes.map(node => {
-                if (node['location.file']) {return node;}
-                const key = `${node['location.type']}.${String(node['location.method'] ?? '').split('(')[0]}`;
-                const location = locations.get(key);
-                return location && project.sourceFiles.includes(location.file) ? { ...node, 'location.file': location.file, 'location.line-start': location.line } : node;
-            });
+            locations = await sourceLocations(options.dotnet, options.analyzer, project.assembly, options.storage, options);
         } catch (error) {options.signal?.throwIfAborted(); options.output?.(`Test source locations unavailable; retaining project fallback. ${String(error)}\n`);}
     }
     const byFile = new Map<string, DiscoveredTest[]>();
-    for (const node of nodes) {
-        const test = discoveredTest(node), key = test.file ?? '';
+    const sources = new Set(project.sourceFiles), normalize = pathNormalizer(), convert = testConverter(normalize);
+    let work = 0;
+    options.signal?.throwIfAborted();
+    for (let node of nodes) {
+        if (!node['location.file'] && locations) {
+            const location = locations.get(`${node['location.type']}.${String(node['location.method'] ?? '').split('(')[0]}`);
+            if (location && sources.has(location.file)) {node = { ...node, 'location.file': location.file, 'location.line-start': location.line };}
+        }
+        const test = convert(node), key = test.file ?? '';
         const tests = byFile.get(key) ?? []; tests.push(test); byFile.set(key, tests);
+        if (++work % 512 === 0) {await yieldTurn(); options.signal?.throwIfAborted();}
     }
-    return [...byFile].map(([file, tests]) => ({
-        id: testFileId(project.file, project.framework, file || undefined), project: project.file,
-        framework: project.framework, assembly: project.assembly, file: file || undefined, tests
-    }));
+    const groups: TestFile[] = [];
+    for (const [file, tests] of byFile) {
+        groups.push({ id: testFileId(project.file, project.framework, file || undefined, normalize), project: project.file,
+            framework: project.framework, assembly: project.assembly, file: file || undefined, tests });
+        if (++work % 512 === 0) {await yieldTurn(); options.signal?.throwIfAborted();}
+    }
+    return groups;
 }
 
 /** Compatibility helper for callers that explicitly need a complete snapshot. */
@@ -77,6 +84,11 @@ interface Preparation {
 
 function nodeKey(node: TestNode): string {
     return JSON.stringify(['display-name', 'location.type', 'location.method', 'location.method-arity'].map(key => node[key] ?? null));
+}
+
+function methodKey(node: Readonly<Record<string, unknown>>): string | undefined {
+    return typeof node['location.type'] === 'string' && typeof node['location.method'] === 'string'
+        ? JSON.stringify([node['location.type'], node['location.method'].split('(')[0]]) : undefined;
 }
 
 function assemblyName(file: string): string {
@@ -123,13 +135,18 @@ export class RunnerSession {
         const originals = new Map<string, TestNode>();
         const selectedNodes = new Map<string, TestNode>();
         const forbidden = new Set<string>();
+        let work = 0;
         for (const item of groups) {for (const id of item.excludedTestIds ?? []) {
             const native = nativeById.get(id);
             if (!native) {throw new Error('The provider cannot honor an exclusion for a runtime or changed test identity. Select tests using the refreshed discovery identities.');}
             forbidden.add(native.uid);
         }}
         let expanded = false;
+        let projectFallback = false;
+        const expandedIds = new Set<string>();
+        const preparedGroups = new Map(preparation.groups?.map(item => [item.id, item]));
         for (const item of groups) {for (const test of item.tests) {
+            if (++work % 512 === 0) {await yieldTurn(); options.signal?.throwIfAborted();}
             let native = nativeById.get(test.id);
             if (!native) {const matching = byKey.get(nodeKey(test.node as TestNode)); if (matching?.length === 1) {native = matching[0];}}
             if (native) {
@@ -139,9 +156,16 @@ export class RunnerSession {
             // Runtime-only rows may not be individually selectable. Use the
             // freshly discovered containing file; never send an unresolved UID
             // from an old path or guess between indistinguishable row names.
-            const containing = preparation.groups?.find(group => group.id === item.id);
-            if (!containing) {throw new Error('The selected test identity is unavailable. Rediscover the project before rerunning it.');}
-            for (const candidate of containing.tests) {const node = nativeById.get(candidate.id); if (node && !forbidden.has(node.uid)) {selectedNodes.set(node.uid, node);}}
+            const containing = item.runtimeOnly ? preparation.groups : [preparedGroups.get(item.id)].filter((item): item is TestFile => !!item);
+            if (!containing?.length) {throw new Error('The selected test identity is unavailable. Rediscover the project before rerunning it.');}
+            for (const file of containing) {
+                if (expandedIds.has(file.id)) {continue;} expandedIds.add(file.id);
+                for (const candidate of file.tests) {
+                    const node = nativeById.get(candidate.id); if (node && !forbidden.has(node.uid)) {selectedNodes.set(node.uid, node);}
+                    if (++work % 512 === 0) {await yieldTurn(); options.signal?.throwIfAborted();}
+                }
+            }
+            projectFallback ||= !!item.runtimeOnly;
             expanded = true;
         }}
         const selected = [...selectedNodes.values()];
@@ -149,16 +173,31 @@ export class RunnerSession {
         const executedGroups = expanded ? preparation.groups!.map(item => ({ ...item, tests: item.tests.filter(test => selectedNodes.has(test.id)) }))
             .filter(item => item.tests.length) : groups;
         if (expanded) {
-            options.output?.('The provider cannot select this runtime or changed test identity individually; running its containing test file.\n');
+            options.output?.(`The provider cannot select this runtime or changed test identity individually; running its ${projectFallback ? 'project (source file unknown)' : 'containing test file'}.\n`);
             options.onExpanded?.(executedGroups);
         }
         const originalNode = (node: TestNode): TestNode => {
             const original = originals.get(node.uid);
             return original ? { ...original, ...node, uid: original.uid } : node;
         };
-        const owner = new Map([...groups, ...executedGroups].flatMap(item => item.tests.map(test => [test.id, item] as const)));
-        const groupFor = (node: TestNode): TestFile => owner.get(node.uid)
-            ?? executedGroups.find(item => item.file === discoveredTest(node).file) ?? group;
+        const owner = new Map<string, TestFile>(), files = new Map<string, TestFile>(), methods = new Map<string, TestFile | null>();
+        for (const item of [...groups.filter(item => !item.runtimeOnly), ...executedGroups]) {for (const test of item.tests) {
+            owner.set(test.id, item);
+            if (++work % 512 === 0) {await yieldTurn(); options.signal?.throwIfAborted();}
+        }}
+        for (const item of executedGroups) {
+            if (item.file) {files.set(item.file, item);}
+            for (const test of item.tests) {
+                const key = methodKey(test.node);
+                if (key) {methods.set(key, methods.has(key) && methods.get(key)?.id !== item.id ? null : item);}
+                if (++work % 512 === 0) {await yieldTurn(); options.signal?.throwIfAborted();}
+            }
+        }
+        const convert = testConverter();
+        const unknown: TestFile = executedGroups.length === 1 ? executedGroups[0]
+            : { ...group, id: `runtime:${testFileId(group.project, group.framework)}`, file: undefined, tests: [], excludedTestIds: undefined, runtimeOnly: true };
+        const groupFor = (test: DiscoveredTest): TestFile => owner.get(test.id)
+            ?? (test.file ? files.get(test.file) : undefined) ?? methods.get(methodKey(test.node) ?? '') ?? unknown;
         const selectedIds = new Set(selected.map(node => node.uid));
         const completeProject = preparation.nodes.every(node => selectedIds.has(node.uid));
         const nodes = await requestTests({
@@ -168,10 +207,11 @@ export class RunnerSession {
                 command: options.coverageTool!, args: ['collect', '--nologo', '--session-id', preparation.session, '-f', 'cobertura', '-o', report]
             } : undefined,
             onNode: native => {
+                if (native['node-type'] === 'group') {return;}
                 const node = originalNode(native);
-                const item = groupFor(node);
+                const test = convert(node), item = groupFor(test);
                 if (node['execution-state'] === 'in-progress') {options.onStarted?.(item, node.uid);}
-                const result = testResult(node); if (result) {options.onResult?.(item, result);}
+                const result = testResult(node); if (result) {options.onResult?.(item, result, test);}
             }
         }, 'run', completeProject ? undefined : selected);
         options.signal?.throwIfAborted();
@@ -191,12 +231,12 @@ export class RunnerSession {
             ...executedGroups.flatMap(item => this.options.buildInputs?.get(item.project) ?? []),
             ...executedGroups.map(item => item.file).filter((file): file is string => !!file)])];
         const reported = new Set(results.map(result => result.id));
-        const reliable = executedGroups.length === 1 && available && coverage.some(file => file.lines.some(line => line.hits > 0)) && !!group.file
+        const reliable = executedGroups.length === 1 && available && coverage.some(file => file.lines.some(line => line.hits > 0)) && !!executedGroups[0].file
             && results.every(result => result.outcome === 'passed') && executedGroups[0].tests.every(test => reported.has(test.id));
         return {
             results, coverageAvailable: available, executedGroups,
             trace: {
-                groupId: executedGroups.length === 1 ? group.id : projectCoverageId(group), dependencies, coverage, reliable, timestamp: Date.now(),
+                groupId: executedGroups.length === 1 ? executedGroups[0].id : projectCoverageId(group), dependencies, coverage, reliable, timestamp: Date.now(),
                 inputs: Object.fromEntries(dependencies.filter(file => hashes.has(file)).map(file => [file, hashes.get(file)!]))
             }
         };
@@ -241,9 +281,14 @@ export class RunnerSession {
             const nodes = await requestTests({ ...options, assembly: path.join(output.directory, path.basename(group.assembly)), args: options.testArguments }, 'discover');
             // Discovery can also execute user code and mutate assets.
             await output.restore(options.signal);
-            const nativeById = new Map(nodes.map(node => [node.uid, node]));
+            const nativeById = new Map<string, TestNode>();
             const byKey = new Map<string, TestNode[]>();
-            for (const node of nodes) {const key = nodeKey(node); const matching = byKey.get(key) ?? []; matching.push(node); byKey.set(key, matching);}
+            let work = 0;
+            for (const node of nodes) {
+                nativeById.set(node.uid, node);
+                const key = nodeKey(node); const matching = byKey.get(key) ?? []; matching.push(node); byKey.set(key, matching);
+                if (++work % 512 === 0) {await yieldTurn(); options.signal?.throwIfAborted();}
+            }
             const prepared = { root, output, session, coverage, nodes, nativeById, byKey, runs: 0 };
             this.prepared.set(key, prepared); options.onPrepared?.(group.project);
             return prepared;

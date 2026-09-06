@@ -30,7 +30,11 @@ async function main() {
   const signal=new AbortController().signal;
   const baseline=await engine.run({files:[],full:true},signal);assert.equal(baseline.passed,fileCount*cases);assert.equal(prepared,3);
   const source=normalizePath(path.join(library,'Feature0.cs'));await fs.writeFile(source,(await fs.readFile(source,'utf8')).replace('Shared.Offset(value) + 0','Shared.Offset(value) + 1'));
+  const save=engine.cache.save.bind(engine.cache),writtenTraces=[];
+  engine.cache.save=async(delta,...args)=>{writtenTraces.push(...delta.traces.map(trace=>trace.groupId));return save(delta,...args);};
+  await engine.markChanged([source]);
   const affected=await engine.run({files:[source],full:false},signal);assert.equal(affected.tests,cases);assert.equal(affected.failed,cases);
+  const affectedTraceWrites=writtenTraces.length;assert.equal(affectedTraceWrites,1);engine.cache.save=save;
   const aggregates=engine.coverage.summarize(engine.hashes);let start=performance.now();
   for(let i=0;i<10000;i++) assert.equal(engine.coverage.summarize(engine.hashes),aggregates);
   const cachedAggregateMicroseconds=(performance.now()-start)*1000/10000;
@@ -38,7 +42,7 @@ async function main() {
   await size(path.join(root,'state','coverage-v2'));
   config.mode='all';prepared=0;
   const all=await engine.run({files:[],full:true},signal);assert.equal(all.tests,fileCount*cases);assert.equal(prepared,3);
-  console.log(JSON.stringify({kind:'real-mtp',platform:process.platform,architecture:process.arch,projects:4,testFiles:fileCount,cases:fileCount*cases,baselineMs:baseline.duration,affectedMs:affected.duration,affectedCases:affected.tests,runAllMs:all.duration,cacheBytes,cachedAggregateMicroseconds,peakNodeHeapMiB:peakHeap/1048576,peakNodeRssMiB:peakRss/1048576}));
+  console.log(JSON.stringify({kind:'real-mtp',platform:process.platform,architecture:process.arch,projects:4,testFiles:fileCount,cases:fileCount*cases,baselineMs:baseline.duration,affectedMs:affected.duration,affectedCases:affected.tests,affectedTraceWrites,runAllMs:all.duration,cacheBytes,cachedAggregateMicroseconds,peakNodeHeapMiB:peakHeap/1048576,peakNodeRssMiB:peakRss/1048576}));
  } finally {clearInterval(sample);await fs.rm(root,{recursive:true,force:true});}
 
  const store=new CoverageStore(), hashes=new Map(), ids=new Set(Array.from({length:100},(_,i)=>`test${i}`));

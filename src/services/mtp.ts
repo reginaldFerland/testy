@@ -2,7 +2,7 @@ import * as net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { createMessageConnection, MessageConnection, StreamMessageReader, StreamMessageWriter } from 'vscode-jsonrpc/node';
 import { DiscoveredTest, TestResult } from '../core/model';
-import { normalizePath } from '../core/paths';
+import { normalizePath, pathNormalizer } from '../core/paths';
 import { mergeTestUpdate, TestNode } from '../core/testUpdates';
 import { OwnedProcess, ProcessOptions, startProcess } from './process';
 
@@ -89,7 +89,7 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
                 if (typeof node.standardOutput === 'string') {output.stdout.push(node.standardOutput);}
                 if (typeof node.standardError === 'string') {output.stderr.push(node.standardError);}
                 pendingOutput.set(node.uid, output);
-                const terminal = !!testResult(merged);
+                const terminal = isTerminal(merged);
                 // Keep complete snapshots for result accounting, but publish
                 // output only once. Preserve output received before completion.
                 options.onNode?.({ ...merged, standardOutput: terminal ? output.stdout.join('') : undefined,
@@ -113,7 +113,11 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
         if (!completed) {throw new Error('The test runner ended without a complete test update stream.');}
         await rpc.sendNotification('exit', {});
         const result = await process.done;
-        if (result.code !== 0 && result.code !== 2) {throw new Error(`The test application failed (exit ${result.code}).\n${result.stderr || result.stdout}`);}
+        if (result.code !== 0 && (operation === 'discover' || result.code !== 2)) {throw new Error(`The test application failed during ${operation} (exit ${result.code}).\n${result.stderr || result.stdout}`);}
+        if (operation === 'discover') {
+            const failure = [...nodes.values()].find(node => ['failed', 'errored'].includes(testResult(node)?.outcome ?? ''));
+            if (failure) {throw new Error(`Test discovery failed: ${failure['display-name'] ?? failure.uid}. ${failure['error.message'] ?? ''}`);}
+        }
         const failedGroup = [...nodes.values()].find(node => node['node-type'] === 'group' && ['failed', 'errored'].includes(testResult(node)?.outcome ?? ''));
         if (operation === 'run' && failedGroup) {throw new Error(`The test group failed: ${failedGroup['display-name'] ?? failedGroup.uid}. ${failedGroup['error.message'] ?? ''}`);}
         if (operation === 'run' && result.code === 2 && ![...nodes.values()].some(node => {
@@ -147,11 +151,11 @@ export function assertComplete(nodes: readonly TestNode[], expected: readonly Te
         ? JSON.stringify([node['location.type'], String(node['location.method']).split('(')[0]]) : undefined;
     const expectedMethods = new Map<string | undefined, number>();
     for (const node of expected) {const key = method(node); expectedMethods.set(key, (expectedMethods.get(key) ?? 0) + 1);}
-    const runtimeMethods = new Set(leaves.filter(node => !expectedIds.has(node.uid) && testResult(node)).map(method).filter(Boolean));
+    const runtimeMethods = new Set(leaves.filter(node => !expectedIds.has(node.uid) && isTerminal(node)).map(method).filter(Boolean));
     const replaced = (node: TestNode): boolean => expectedIds.has(node.uid) && !!method(node)
         && expectedMethods.get(method(node)) === 1 && runtimeMethods.has(method(node));
-    const unfinished = leaves.filter(node => !node['retry.is-superseded'] && !testResult(node) && !replaced(node));
-    const missing = expected.filter(node => !testResult(byId.get(node.uid) ?? node) && !replaced(node));
+    const unfinished = leaves.filter(node => !node['retry.is-superseded'] && !isTerminal(node) && !replaced(node));
+    const missing = expected.filter(node => !isTerminal(byId.get(node.uid) ?? node) && !replaced(node));
     if (unfinished.length || missing.length) {
         const names = [...new Set([...unfinished, ...missing].map(node => String(node['display-name'] ?? node.uid)))];
         for (const node of new Map([...unfinished, ...missing].map(node => [node.uid, node])).values()) {
@@ -161,24 +165,40 @@ export function assertComplete(nodes: readonly TestNode[], expected: readonly Te
     }
 }
 
-export function discoveredTest(node: TestNode): DiscoveredTest {
+function qualifiedName(node: TestNode): string {
     const type = typeof node['location.type'] === 'string' ? node['location.type'] : '';
     const method = typeof node['location.method'] === 'string' ? node['location.method'] : '';
+    return [type, method].filter(Boolean).join('.');
+}
+
+export function isTerminal(node: TestNode): boolean {
+    return !node['retry.is-superseded'] && node['execution-state'] !== undefined
+        && node['execution-state'] !== 'discovered' && node['execution-state'] !== 'in-progress';
+}
+
+export function discoveredTest(node: TestNode): DiscoveredTest {
+    return testMetadata(node, normalizePath);
+}
+
+export function testConverter(normalize = pathNormalizer()): (node: TestNode) => DiscoveredTest {
+    return node => testMetadata(node, normalize);
+}
+
+function testMetadata(node: TestNode, normalize: (file: string) => string): DiscoveredTest {
     return {
         id: node.uid, name: String(node['display-name'] ?? node.uid),
-        fullyQualifiedName: [type, method].filter(Boolean).join('.'),
-        file: typeof node['location.file'] === 'string' ? normalizePath(node['location.file']) : undefined,
+        fullyQualifiedName: qualifiedName(node),
+        file: typeof node['location.file'] === 'string' ? normalize(node['location.file']) : undefined,
         line: typeof node['location.line-start'] === 'number' ? Math.max(1, node['location.line-start']) : 1,
         node
     };
 }
 
 export function testResult(node: TestNode): TestResult | undefined {
-    if (node['retry.is-superseded']) {return undefined;}
+    if (!isTerminal(node)) {return undefined;}
     const state = node['execution-state'];
-    if (state === 'discovered' || state === 'in-progress' || state === undefined) {return undefined;}
     return {
-        id: node.uid, name: String(node['display-name'] ?? node.uid), fullyQualifiedName: discoveredTest(node).fullyQualifiedName,
+        id: node.uid, name: String(node['display-name'] ?? node.uid), fullyQualifiedName: qualifiedName(node),
         outcome: state === 'passed' ? 'passed' : state === 'failed' ? 'failed' : state === 'skipped' ? 'skipped' : 'errored',
         duration: Number(node['time.duration-ms'] ?? 0),
         message: typeof node['error.message'] === 'string' ? node['error.message'] : undefined,

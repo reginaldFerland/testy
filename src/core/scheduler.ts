@@ -64,18 +64,26 @@ export class Scheduler {
     runManual(run: ManualJob['run'], signal?: AbortSignal, coversPending = false): Promise<void> {
         if (this.disposed || signal?.aborted) {return Promise.reject(new Cancelled());}
         const controller = new AbortController();
-        const abort = (): void => controller.abort();
-        signal?.addEventListener('abort', abort, { once: true });
         const snapshot = new Map(this.pending);
         const full = this.fullRevision;
         return new Promise((resolve, reject) => {
-            this.manual.push({ controller, run, resolve: () => {
+            const abort = (): void => {
+                controller.abort();
+                const index = this.manual.indexOf(job);
+                if (index !== -1) {
+                    this.manual.splice(index, 1); job.cleanup(); job.reject(new Cancelled());
+                }
+            };
+            const job: ManualJob = { controller, run, resolve: () => {
                 if (coversPending && !controller.signal.aborted) {
                     for (const [file, revision] of snapshot) {if (this.pending.get(file) === revision) {this.pending.delete(file);}}
                     if (this.fullRevision === full) {this.fullRevision = undefined;}
                 }
                 resolve();
-            }, reject, cleanup: () => signal?.removeEventListener('abort', abort) });
+            }, reject, cleanup: () => signal?.removeEventListener('abort', abort) };
+            this.manual.push(job);
+            signal?.addEventListener('abort', abort, { once: true });
+            if (signal?.aborted) {abort(); return;}
             if (this.active?.kind === 'auto') {
                 this.active.controller.abort();
                 this.ready = true;

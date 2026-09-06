@@ -41,9 +41,9 @@ export async function sourceAliases(dotnet: string, analyzer: string, contents: 
 }
 
 /** Resolve cross-file exclusions using incremental syntax records, not rereads. */
-export function resolveShapes(analyses: ReadonlyMap<string, SourceShape | null>, projects?: readonly Pick<Project, 'sourceFiles'>[]): ReadonlyMap<string, string | null> {
+export function resolveShapes(analyses: ReadonlyMap<string, SourceShape | null>, projects?: readonly Pick<Project, 'sourceFiles' | 'analysisFiles'>[]): ReadonlyMap<string, string | null> {
     const bodies = new Set<string>();
-    for (const files of projects?.map(project => project.sourceFiles) ?? [[...analyses.keys()]]) {
+    for (const files of projects?.map(project => project.analysisFiles ?? project.sourceFiles) ?? [[...analyses.keys()]]) {
         const excluded = new Set(files.flatMap(file => analyses.get(file)?.excludedTypes ?? []));
         if (!excluded.size) {continue;}
         for (const file of files) {

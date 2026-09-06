@@ -1,7 +1,7 @@
 import * as fs from 'node:fs/promises';
 import { contentHash, isGeneratedSource } from '../core/paths';
 
-interface SourceState { readonly stamp: string; readonly hash?: string; readonly generated: boolean; readonly aliasSource?: string; }
+interface SourceState { readonly stamp: string; readonly hash?: string; readonly analysisHash?: string; readonly generated: boolean; readonly aliasSource?: string; }
 
 /** Reads changed content only; all expensive work belongs to the scheduled batch. */
 export class SourceTracker {
@@ -10,11 +10,15 @@ export class SourceTracker {
     private current: ReadonlyMap<string, string> = new Map();
     private known = new Set<string>();
     private tracked = new Set<string>();
+    private readonly classifications = new Map<string, { generated: boolean; version: number }>();
+    private classificationVersion = 0;
     revision = 0;
 
     get hashes(): ReadonlyMap<string, string> { return this.current; }
     get files(): readonly string[] { return [...this.known]; }
-    isGenerated(file: string): boolean { return this.states.get(file)?.generated ?? false; }
+    isGenerated(file: string): boolean { return this.classifications.get(file)?.generated ?? this.states.get(file)?.generated ?? false; }
+    observeGenerated(file: string, generated: boolean): void { this.classifications.set(file, { generated, version: ++this.classificationVersion }); }
+    get analysisHashes(): ReadonlyMap<string, string> { return new Map([...this.states].filter(([, state]) => state.analysisHash !== undefined).map(([file, state]) => [file, state.analysisHash!])); }
     get aliasSources(): ReadonlyMap<string, string> { return new Map([...this.states].filter(([, state]) => state.aliasSource !== undefined).map(([file, state]) => [file, state.aliasSource!])); }
 
     setFiles(files: readonly string[], analysisFiles: readonly string[] = []): void {
@@ -23,6 +27,10 @@ export class SourceTracker {
         let changed = false;
         for (const file of this.known) {
             if (!next.has(file)) {this.states.delete(file); hashes.delete(file); this.dirty.delete(file); changed = true;}
+        }
+        // Ordinary paths need no tombstone once they leave the source graph.
+        for (const [file, classification] of this.classifications) {
+            if (!next.has(file) && !classification.generated) {this.classifications.delete(file);}
         }
         for (const file of next) {if (!this.known.has(file) || tracked.has(file) !== this.tracked.has(file)) {this.dirty.add(file);}}
         this.known = next;
@@ -40,6 +48,7 @@ export class SourceTracker {
         const updates = new Map<string, SourceState | undefined>();
         let index = 0;
         const revision = this.revision;
+        const classificationVersion = this.classificationVersion;
         await Promise.all(Array.from({ length: Math.min(16, queue.length) }, async () => {
             for (;;) {
                 signal?.throwIfAborted();
@@ -57,7 +66,9 @@ export class SourceTracker {
                     // This is only a cheap candidate check. Roslyn interprets
                     // comments, escapes, Unicode and disabled branches later.
                     const aliasSource = /\bglobal(?=\s|\/)/.test(content) ? content : undefined;
-                    updates.set(file, { stamp, hash: this.tracked.has(file) && !generated ? contentHash(bytes) : undefined, generated, aliasSource });
+                    const hash = contentHash(bytes);
+                    updates.set(file, { stamp, hash: this.tracked.has(file) && !generated ? hash : undefined,
+                        analysisHash: /\.cs$/i.test(file) ? hash : undefined, generated, aliasSource });
                 } catch (error) {
                     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {throw error;}
                     updates.set(file, undefined);
@@ -72,7 +83,10 @@ export class SourceTracker {
                 changed.push(file); hashes ??= new Map(this.current);
                 if (state?.hash) {hashes.set(file, state.hash);} else {hashes.delete(file);}
             }
-            if (state) {this.states.set(file, state);}
+            if (state) {
+                this.states.set(file, state);
+                if ((this.classifications.get(file)?.version ?? 0) <= classificationVersion) {this.observeGenerated(file, state.generated);}
+            }
             else if (this.states.get(file)?.generated) {this.states.set(file, { stamp: '', generated: true });}
             else {this.states.delete(file);}
         }

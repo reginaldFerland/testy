@@ -19,6 +19,75 @@ async function fixture(t) {
  return {root,temp,config,state,engine,file:relative=>normalizePath(path.join(root,relative)),run:(files=[],full=false,manual)=>engine.run({files,full},new AbortController().signal,manual)};
 }
 
+test('failed discovery preserves the previous inventory and collected coverage, then recovers',{timeout:90000},async t=>{
+ const f=await fixture(t),mtp=require('../../out/services/mtp');
+ assert.equal((await f.run([],true)).coverageAvailable,true);
+ const groups=f.engine.groups,traces=new Map(f.engine.coverage.traces),original=mtp.requestTests;
+ assert.ok([...traces.values()].some(trace=>trace.coverage.length));
+ try{
+  for(const code of [0,2]){
+   mtp.requestTests=(options,operation,tests)=>operation==='discover'?original({dotnet:process.execPath,assembly:path.resolve('test/fixtures/mtp-peer.cjs'),
+    cwd:f.root,timeoutMs:5000,env:{TESTY_EXIT:String(code),TESTY_UPDATES:JSON.stringify([{uid:'suite','node-type':'group','execution-state':'error','error.message':'controlled discovery failure'}])}},'discover'):original(options,operation,tests);
+   await assert.rejects(f.run([],true),/failed/);
+   assert.equal(f.engine.groups,groups);assert.deepEqual(new Map(f.engine.coverage.traces),traces);
+   assert.ok(f.engine.baselineProgress,'failed refresh must leave its baseline unfinished');
+  }
+ }finally{mtp.requestTests=original;}
+ assert.equal((await f.run([],true)).passed,3);assert.equal(f.engine.baselineProgress,undefined);
+});
+
+test('unmapped runtime rows survive rediscovery, honor project exclusions and move to an identified file',{timeout:90000},async t=>{
+ const f=await fixture(t),mtp=require('../../out/services/mtp');f.config.coverage=false;
+ const original=mtp.requestTests,sent=[];
+ try{
+  mtp.requestTests=(options,operation,tests)=>{
+   if(operation==='discover')return original(options,operation,tests);
+   const nodes=tests??options.expectedTests;sent.push(nodes);
+   return original({...options,dotnet:process.execPath,assembly:path.resolve('test/fixtures/mtp-peer.cjs'),cwd:f.root,wrapper:undefined,
+    env:{TESTY_UPDATES:JSON.stringify([...nodes.map(node=>({...node,'execution-state':'passed'})),{uid:'unmapped-row','display-name':'Runtime row','execution-state':'failed'}])}},operation,tests);
+  };
+  await f.run([],true);
+  const unknown=f.engine.displayGroups.find(group=>group.runtimeOnly);assert.ok(unknown);assert.equal(unknown.file,undefined);
+  const rerun=await f.run([],false,{groups:new Set([unknown.id]),tests:new Map([[unknown.id,new Set(['unmapped-row'])]])});
+  assert.equal(rerun.files,2,'the summary counts the actual project files executed by fallback');
+  const greeting=f.engine.groups.find(group=>group.file.endsWith('GreetingTests.cs'));
+  await f.run([],false,{groups:new Set([unknown.id]),tests:new Map([[unknown.id,new Set(['unmapped-row'])]]),exclude:{groups:new Set([greeting.id])}});
+  assert.ok(sent[2].every(node=>!String(node['location.file']).endsWith('GreetingTests.cs')));
+  assert.equal(f.engine.displayGroups.some(group=>group.runtimeOnly),false,'the single-file run identifies the row and removes its project placeholder');
+  const calculator=f.engine.groups.find(group=>group.file.endsWith('CalculatorTests.cs'));
+  assert.ok(f.engine.knownTests(calculator).some(test=>test.id==='unmapped-row'));
+ }finally{mtp.requestTests=original;}
+});
+
+test('real collector cleans detached children after completion, cancellation and host death',{timeout:90000,skip:process.platform==='win32'},async t=>{
+ const {spawn}=require('node:child_process'),{setTimeout:delay}=require('node:timers/promises'),{once}=require('node:events');
+ const f=await fixture(t),marker=path.join(f.temp,'owned-pids.json'),launcher=path.join(f.temp,'launch.cjs');
+ const pids=new Set();t.after(()=>{for(const pid of pids){try{process.kill(pid,'SIGKILL');}catch{}}});
+ await fs.writeFile(launcher,`const c=require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});require('node:fs').writeFileSync(${JSON.stringify(marker)},JSON.stringify([process.ppid,c.pid]));c.unref();`);
+ const literal=value=>'@"'+value.replaceAll('"','""')+'"';
+ const alive=pid=>{try{process.kill(pid,0);return true;}catch{return false;}};
+ for(const mode of ['completion','cancellation','host-death']){
+  await fs.rm(marker,{force:true});
+  await fs.writeFile(f.file('ImpactDemo.Tests/CalculatorTests.cs'),`using Microsoft.VisualStudio.TestTools.UnitTesting; [TestClass] public class CalculatorTests { [TestMethod] public void Launch() { var p=System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(${literal(process.execPath)}) { ArgumentList = { ${literal(launcher)} }, UseShellExecute=false }); p!.WaitForExit(); ${mode==='completion'?'':'System.Threading.Thread.Sleep(60000);'} } }`);
+  const abort=new AbortController();let host,pending,exit;
+  if(mode==='host-death'){
+   const script=`const {TestEngine}=require(${JSON.stringify(path.resolve('out/services/engine'))});const engine=new TestEngine({roots:[${JSON.stringify(f.root)}],storage:${JSON.stringify(path.join(f.temp,'crash-state'))},tools:${JSON.stringify(path.join(f.temp,'tools'))},analyzer:${JSON.stringify(path.resolve('dist/analyzer/Testy.Analysis.dll'))},configuration:()=>(${JSON.stringify(f.config)}),events:{output(){},phase(){},discovered(){},selected(){},result(){},started(){},coverage(){},invalidated(){}}});engine.run({files:[],full:true},new AbortController().signal).catch(()=>process.exitCode=1);`;
+   host=spawn(process.execPath,['-e',script],{stdio:'ignore'});pids.add(host.pid);exit=once(host,'exit');
+  }else{pending=f.engine.run({files:[],full:true},abort.signal);void pending.catch(()=>{});}
+  try{
+   let owned;for(let i=0;i<1200;i++){try{owned=JSON.parse(await fs.readFile(marker,'utf8'));break;}catch{await delay(25);}}
+   assert.ok(owned,`${mode}: test must start`);owned.forEach(pid=>pids.add(pid));
+   if(mode==='cancellation'){await delay(100);abort.abort();await assert.rejects(pending,{name:'AbortError'});}
+   else if(mode==='host-death'){host.kill('SIGKILL');await exit;}
+   else{assert.equal((await pending).coverageAvailable,true);}
+   // Allow exited orphan processes to be reaped; none may still be running.
+   for(let i=0;i<200&&owned.some(alive);i++){await delay(10);}
+   const remaining=owned.filter(alive),states=remaining.map(pid=>{try{return require('node:child_process').execFileSync('ps',['-p',String(pid),'-o','pid=,ppid=,stat=,comm='],{encoding:'utf8'}).trim();}catch{return 'exited';}});
+   assert.deepEqual(remaining,[],`${mode}: all owned processes must exit (${states.join('; ')})`);
+  }finally{abort.abort();await pending?.catch(()=>{});if(host&&host.exitCode===null&&host.signalCode===null){host.kill('SIGKILL');await exit;}}
+ }
+});
+
 test('shared target output paths preserve each framework through discovery and batching',{timeout:180000},async t=>{
  const f=await fixture(t), project=f.file('ImpactDemo.Tests/ImpactDemo.Tests.csproj'), greeting=f.file('ImpactDemo.Tests/GreetingTests.cs');
  await fs.writeFile(project,(await fs.readFile(project,'utf8')).replace('<TargetFramework>net10.0</TargetFramework>',
@@ -32,6 +101,49 @@ test('shared target output paths preserve each framework through discovery and b
   assert.equal(f.engine.groups.length,4);assert.equal(f.state.prepared%2,0);
   assert.deepEqual(await fs.readdir(path.join(f.temp,'state/runs')),[],'normal completion removes snapshots and owner metadata');
  }
+});
+
+test('referenced test contexts cannot overwrite the workspace entry-point binary',{timeout:180000},async t=>{
+ const f=await fixture(t),project=f.file('ImpactDemo.Tests/ImpactDemo.Tests.csproj'),greeting=f.file('ImpactDemo.Tests/GreetingTests.cs');
+ await fs.writeFile(project,(await fs.readFile(project,'utf8')).replace('</Project>',
+  '<PropertyGroup Condition="\'$(Referenced)\' == \'true\'"><DefineConstants>$(DefineConstants);REFERENCED</DefineConstants></PropertyGroup></Project>'));
+ await fs.writeFile(greeting,(await fs.readFile(greeting,'utf8')).replace('Assert.AreEqual(3, Arithmetic.Expected);',
+  'Assert.AreEqual(3, Arithmetic.Expected);\n#if !REFERENCED\nAssert.Fail("Workspace context must fail");\n#endif\n'));
+ const other=f.file('ZConsumer');await fs.mkdir(other);
+ await fs.writeFile(path.join(other,'ZConsumer.csproj'),'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><OutputType>Exe</OutputType><EnableMSTestRunner>true</EnableMSTestRunner><TestingPlatformDotnetTestSupport>true</TestingPlatformDotnetTestSupport><ImplicitUsings>enable</ImplicitUsings></PropertyGroup><ItemGroup><PackageReference Include="MSTest" Version="4.3.3"/><ProjectReference Include="../ImpactDemo.Tests/ImpactDemo.Tests.csproj" AdditionalProperties="Referenced=true" /></ItemGroup></Project>');
+ await fs.writeFile(path.join(other,'ConsumerTests.cs'),'using Microsoft.VisualStudio.TestTools.UnitTesting; [TestClass] public class ConsumerTests { [TestMethod] public void Pass()=>Assert.IsTrue(true); }');
+ for(const coverage of [false,true]) {
+  f.config.coverage=coverage;const result=await f.run([],true);
+  assert.equal(result.tests,4);assert.equal(result.passed,3);assert.equal(result.failed,1,`coverage=${coverage}`);
+  assert.deepEqual(await fs.readdir(path.join(f.temp,'state/runs')),[]);
+ }
+});
+
+for(const [name,fileName,header,excludes] of [
+ ['generated suffix','Hidden.Attributes.g.cs','',[]],
+ ['generated header','Hidden.Attributes.cs','// <auto-generated/>\n',[]],
+ ['configured exclusion','Hidden.Attributes.cs','',['**/Hidden.Attributes.cs']]
+]) test(`partial exclusion metadata in a ${name} preserves affected callers`,{timeout:90000},async t=>{
+ const f=await fixture(t),source=f.file('ImpactDemo/Arithmetic.cs'),greeting=f.file('ImpactDemo.Tests/GreetingTests.cs'),metadata=f.file(`ImpactDemo/${fileName}`);
+ f.config.excludes=excludes;
+ await fs.appendFile(source,'\npublic static partial class Hidden { public static int Value(int value)=>value; }');
+ await fs.writeFile(metadata,header+'namespace ImpactDemo; [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage] public static partial class Hidden {}');
+ await fs.writeFile(greeting,(await fs.readFile(greeting,'utf8')).replace('Assert.AreEqual(3, Arithmetic.Expected);','Assert.AreEqual(3, Arithmetic.Expected); Assert.AreEqual(7, Hidden.Value(7));'));
+ assert.equal((await f.run([],true)).passed,3);assert.equal(f.engine.hashes.has(metadata),false);
+ assert.ok(f.engine.sources.analysisHashes.has(metadata));
+ await fs.writeFile(source,(await fs.readFile(source,'utf8')).replace('Value(int value)=>value;','Value(int value)=>value+1;'));
+ await f.engine.markChanged([source]);const result=await f.run([source]);assert.equal(result.tests,3);assert.equal(result.failed,1);
+ assert.ok(f.state.selected.includes('GreetingTests.cs'));
+});
+
+test('ordinary save invalidation persists only the newly executed file contribution',{timeout:90000},async t=>{
+ const f=await fixture(t),source=f.file('ImpactDemo/Arithmetic.cs');assert.equal((await f.run([],true)).passed,3);
+ const writes=[],save=f.engine.cache.save.bind(f.engine.cache);
+ f.engine.cache.save=async(delta,...args)=>{writes.push(...delta.traces.map(t=>t.groupId));return save(delta,...args);};
+ await fs.writeFile(source,(await fs.readFile(source,'utf8')).replace('a + b','a + b + 0'));
+ await f.engine.markChanged([source]);const result=await f.run([source]);assert.equal(result.passed,2);assert.deepEqual(f.state.selected,['CalculatorTests.cs']);
+ const selected=f.engine.groups.find(group=>group.file.endsWith('CalculatorTests.cs'));
+ assert.deepEqual(writes,[selected.id]);assert.ok([...f.engine.coverage.traces.values()].every(trace=>!trace.stale));
 });
 
 for(const [name,alias,declaration,fileName] of [
