@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.0
+
+- Run independent project discovery, source analysis, and test files concurrently with configurable worker limits.
+- Batch compatible MSBuild roots so shared dependencies are built once, while preserving output and reference-context isolation.
+- Preserve stable test identities, checkpoint completed parallel work safely, and drain workers during cancellation.
+- Add deep dependency-graph benchmarks and concurrency regressions.
+
 ## 1.0.0
 
 - Track evaluated shared build inputs and preserve MSBuild reference-property contexts.
