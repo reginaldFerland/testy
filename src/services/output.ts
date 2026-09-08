@@ -3,6 +3,9 @@ import { constants, createReadStream, createWriteStream } from 'node:fs';
 import * as path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { createHash } from 'node:crypto';
+import { Semaphore } from '../core/concurrency';
+
+const copyWorkers = new Semaphore(8);
 
 async function copyFile(source: string, destination: string, signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
@@ -36,7 +39,7 @@ export async function copyOutput(source: string, destination: string, signal?: A
             if (failed) {queued.length = 0;}
             while (active < 8 && queued.length) {
                 const job = queued.pop()!; active++;
-                void copy(job).then(children => {if (!failed) {for (const child of children) {queued.push(child);}}})
+                void copyWorkers.run(signal, () => copy(job)).then(children => {if (!failed) {for (const child of children) {queued.push(child);}}})
                     .catch(error => {if (!failed) {failed = true; failure = error;}})
                     .finally(() => {active--; pump();});
             }

@@ -22,48 +22,18 @@ try
     var files = request.RootElement.GetProperty("files").Deserialize<string[]>()
         ?? throw new ArgumentException("Expected an array of source paths.");
     var aliases = request.RootElement.GetProperty("excludedAliases").Deserialize<string[]>() ?? [];
-    var result = new Dictionary<string, SourceShape?>();
-    foreach (var file in files)
-    {
-        if (!File.Exists(file)) { result[file] = null; continue; }
-        var tree = CSharpSyntaxTree.ParseText(await File.ReadAllTextAsync(file));
-        if (tree.GetDiagnostics().Any(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error))
+    var concurrency = request.RootElement.TryGetProperty("concurrency", out var requestedConcurrency)
+        ? Math.Max(1, requestedConcurrency.GetInt32()) : 1;
+    // Workers own their syntax tree and result slot. Publish only after all work
+    // completes, in input order, so concurrency does not change fingerprints or JSON.
+    var analyses = new SourceShape?[files.Length];
+    await Parallel.ForEachAsync(Enumerable.Range(0, files.Length),
+        new ParallelOptions { MaxDegreeOfParallelism = concurrency }, async (index, cancellationToken) =>
         {
-            result[file] = null;
-            continue;
-        }
-        var root = await tree.GetRootAsync();
-        // Directives can change compilation or metadata even when they occur
-        // inside a method whose executable body is omitted from the signature.
-        var directives = string.Join("\n", root.DescendantTrivia(descendIntoTrivia: true)
-            .Where(trivia => trivia.IsDirective).Select(trivia => trivia.ToFullString()));
-        // An excluded method can share a file with instrumented code. In that
-        // case a hit elsewhere in this file cannot prove its callers are known.
-        var localAliases = root.DescendantNodes().OfType<UsingDirectiveSyntax>()
-            .Where(directive => directive.Alias is not null && IsExcluded(Name(directive.Name)))
-            .SelectMany(directive => AliasNames(directive.Alias!.Name.Identifier.ValueText));
-        var excludedAliases = aliases.Concat(localAliases).ToHashSet(StringComparer.Ordinal);
-        bool Excluded(AttributeSyntax attribute) => IsExcluded(Name(attribute.Name)) || excludedAliases.Contains(Name(attribute.Name));
-        var attributes = root.DescendantNodes().OfType<AttributeSyntax>().Where(Excluded).ToArray();
-        var blind = attributes.Length > 0 || localAliases.Any()
-            // Mapped documents/line numbers cannot reliably be joined to the
-            // physical file in a coverage report. Include these bodies too.
-            || root.DescendantTrivia(descendIntoTrivia: true).Any(trivia => trivia.GetStructure() is LineDirectiveTriviaSyntax or LineSpanDirectiveTriviaSyntax);
-        var declarations = (blind ? root : new DeclarationSignature().Visit(root)!).NormalizeWhitespace().ToFullString();
-        var partialTypes = root.DescendantNodes().OfType<TypeDeclarationSyntax>()
-            .Where(type => type.Modifiers.Any(SyntaxKind.PartialKeyword)).Select(TypeKey).Distinct().ToArray();
-        // Attributes on a partial member's defining declaration also affect its
-        // implementation in another file. Track the containing type in that case.
-        var excludedTypes = attributes.Select(attribute => attribute.FirstAncestorOrSelf<TypeDeclarationSyntax>())
-            .OfType<TypeDeclarationSyntax>().Select(TypeKey).ToHashSet(StringComparer.Ordinal);
-        // Compilation symbols are project-specific. An exclusion in disabled
-        // text cannot safely be ruled out by this syntax-only analysis.
-        if (attributes.Any(attribute => (attribute.Parent as AttributeListSyntax)?.Target?.Identifier.ValueText == "assembly")
-            || root.DescendantTrivia(descendIntoTrivia: true).Where(trivia => trivia.IsKind(SyntaxKind.DisabledTextTrivia))
-                .Any(trivia => HasExcludedName(trivia.ToFullString()) || excludedAliases.Any(alias => trivia.ToFullString().Contains(alias, StringComparison.Ordinal))))
-        { excludedTypes.Add("*"); }
-        result[file] = new SourceShape(Hash(declarations + directives), Hash(root.NormalizeWhitespace().ToFullString()), partialTypes, [.. excludedTypes]);
-    }
+            analyses[index] = await AnalyzeSource(files[index], aliases, cancellationToken);
+        });
+    var result = new Dictionary<string, SourceShape?>();
+    for (var index = 0; index < files.Length; index++) { result[files[index]] = analyses[index]; }
     Console.WriteLine(JsonSerializer.Serialize(result, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }));
     return 0;
 }
@@ -71,6 +41,47 @@ catch (Exception exception)
 {
     Console.Error.WriteLine(exception.Message);
     return 1;
+}
+
+static async Task<SourceShape?> AnalyzeSource(string file, string[] aliases, CancellationToken cancellationToken)
+{
+    if (!File.Exists(file)) { return null; }
+    var tree = CSharpSyntaxTree.ParseText(await File.ReadAllTextAsync(file, cancellationToken));
+    if (tree.GetDiagnostics().Any(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error))
+    {
+        return null;
+    }
+    var root = await tree.GetRootAsync(cancellationToken);
+    // Directives can change compilation or metadata even when they occur
+    // inside a method whose executable body is omitted from the signature.
+    var directives = string.Join("\n", root.DescendantTrivia(descendIntoTrivia: true)
+        .Where(trivia => trivia.IsDirective).Select(trivia => trivia.ToFullString()));
+    // An excluded method can share a file with instrumented code. In that
+    // case a hit elsewhere in this file cannot prove its callers are known.
+    var localAliases = root.DescendantNodes().OfType<UsingDirectiveSyntax>()
+        .Where(directive => directive.Alias is not null && IsExcluded(Name(directive.Name)))
+        .SelectMany(directive => AliasNames(directive.Alias!.Name.Identifier.ValueText));
+    var excludedAliases = aliases.Concat(localAliases).ToHashSet(StringComparer.Ordinal);
+    bool Excluded(AttributeSyntax attribute) => IsExcluded(Name(attribute.Name)) || excludedAliases.Contains(Name(attribute.Name));
+    var attributes = root.DescendantNodes().OfType<AttributeSyntax>().Where(Excluded).ToArray();
+    var blind = attributes.Length > 0 || localAliases.Any()
+        // Mapped documents/line numbers cannot reliably be joined to the
+        // physical file in a coverage report. Include these bodies too.
+        || root.DescendantTrivia(descendIntoTrivia: true).Any(trivia => trivia.GetStructure() is LineDirectiveTriviaSyntax or LineSpanDirectiveTriviaSyntax);
+    var declarations = (blind ? root : new DeclarationSignature().Visit(root)!).NormalizeWhitespace().ToFullString();
+    var partialTypes = root.DescendantNodes().OfType<TypeDeclarationSyntax>()
+        .Where(type => type.Modifiers.Any(SyntaxKind.PartialKeyword)).Select(TypeKey).Distinct().ToArray();
+    // Attributes on a partial member's defining declaration also affect its
+    // implementation in another file. Track the containing type in that case.
+    var excludedTypes = attributes.Select(attribute => attribute.FirstAncestorOrSelf<TypeDeclarationSyntax>())
+        .OfType<TypeDeclarationSyntax>().Select(TypeKey).ToHashSet(StringComparer.Ordinal);
+    // Compilation symbols are project-specific. An exclusion in disabled
+    // text cannot safely be ruled out by this syntax-only analysis.
+    if (attributes.Any(attribute => (attribute.Parent as AttributeListSyntax)?.Target?.Identifier.ValueText == "assembly")
+        || root.DescendantTrivia(descendIntoTrivia: true).Where(trivia => trivia.IsKind(SyntaxKind.DisabledTextTrivia))
+            .Any(trivia => HasExcludedName(trivia.ToFullString()) || excludedAliases.Any(alias => trivia.ToFullString().Contains(alias, StringComparison.Ordinal))))
+    { excludedTypes.Add("*"); }
+    return new SourceShape(Hash(declarations + directives), Hash(root.NormalizeWhitespace().ToFullString()), partialTypes, [.. excludedTypes]);
 }
 
 static bool IsExcluded(string name) => new[] { "ExcludeFromCodeCoverage", "DebuggerHidden", "DebuggerNonUserCode", "GeneratedCode", "CompilerGenerated" }

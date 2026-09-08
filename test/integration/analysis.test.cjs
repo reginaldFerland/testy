@@ -6,6 +6,34 @@ const path=require('node:path');
 const {sourceShapes,sourceAnalyses,resolveShapes}=require('../../out/services/analysis');
 const {normalizePath}=require('../../out/core/paths');
 
+test('parallel source analysis preserves deterministic order and serial fingerprints',async t=>{
+ const directory=await fs.mkdtemp(path.join(os.tmpdir(),'testy-parallel-shapes-'));
+ t.after(()=>fs.rm(directory,{recursive:true,force:true}));
+ const sources=[
+  'namespace N; public partial class C { public int Value()=>1; }',
+  'namespace N { [ExternalBlind] public partial class C {} }',
+  'using Blind = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute; [Blind] public class Hidden { public int Value()=>2; }',
+  'public class Mapped {\n#line 200 "Virtual.cs"\npublic int Value()=>3;\n#line default\n}',
+  '#if CUSTOM\n[System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]\n#endif\npublic class Conditional { public int Value()=>4; }',
+  'public class Invalid {'
+ ];
+ const files=Array.from({length:48},(_,index)=>normalizePath(path.join(directory,`Source${index}.cs`)));
+ await Promise.all(files.map((file,index)=>fs.writeFile(file,sources[index%sources.length])));
+ files.splice(17,0,normalizePath(path.join(directory,'Missing.cs')));
+ const analyzer=path.resolve('dist/analyzer/Testy.Analysis.dll'),options={cwd:directory};
+ const serial=await sourceAnalyses('dotnet',analyzer,files,directory,options,['ExternalBlind'],1);
+ for(const concurrency of [2,4]){
+  const parallel=await sourceAnalyses('dotnet',analyzer,files,directory,options,['ExternalBlind'],concurrency);
+  assert.deepEqual([...parallel], [...serial]);
+  assert.deepEqual([...parallel.keys()],files);
+  assert.deepEqual(resolveShapes(parallel),resolveShapes(serial));
+ }
+ assert.equal(serial.get(files[17]),null);
+ const abort=new AbortController();abort.abort();
+ await assert.rejects(sourceAnalyses('dotnet',analyzer,files,directory,{...options,signal:abort.signal},[],4),{name:'AbortError'});
+ assert.deepEqual((await fs.readdir(directory)).filter(file=>file.startsWith('analysis-')),[]);
+});
+
 test('Roslyn parses global alias comments, escapes, attribute suffixes and conditional branches',async t=>{
  const {sourceAliases}=require('../../out/services/analysis');
  const directory=await fs.mkdtemp(path.join(os.tmpdir(),'testy-aliases-'));t.after(()=>fs.rm(directory,{recursive:true,force:true}));

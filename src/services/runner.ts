@@ -111,11 +111,30 @@ async function workspaceOutputs(directory: string, names: ReadonlySet<string>, s
 
 export class RunnerSession {
     private readonly prepared = new Map<string, Preparation>();
+    private readonly preparations = new Map<string, Promise<Preparation>>();
+    private readonly discoveries = new Map<string, Promise<readonly TestFile[]>>();
+    private readonly projects = new Map<string, Project>();
+    private readonly lanes = new Map<number, Promise<RunnerSession>>();
+    private readonly queues = new Map<string, Promise<void>>();
+    private readonly running = new Set<Promise<FileRun>>();
     private readonly coverageReader = new CoverageReader();
     private outputLease?: RunOutputLease;
+    private lease?: Promise<RunOutputLease>;
+    private disposed = false;
     constructor(private readonly options: RunnerOptions) {}
 
     async discover(project: Project): Promise<readonly TestFile[]> {
+        this.assertOpen();
+        const key = testTargetKey(project.file, project.framework);
+        const existing = this.discoveries.get(key); if (existing) {return existing;}
+        this.projects.set(key, project);
+        const pending = this.discoverProject(project);
+        this.discoveries.set(key, pending);
+        try {return await pending;}
+        catch (error) {this.discoveries.delete(key); throw error;}
+    }
+
+    private async discoverProject(project: Project): Promise<readonly TestFile[]> {
         const preparation = await this.prepare({ id: testFileId(project.file, project.framework), project: project.file,
             assembly: project.assembly, framework: project.framework, tests: [] });
         const groups = (await discover({ ...project, assembly: path.join(preparation.output.directory, path.basename(project.assembly)) }, this.options, preparation.nodes))
@@ -191,7 +210,73 @@ export class RunnerSession {
         return selected;
     }
 
-    async run(groups: readonly TestFile[], hashes: ReadonlyMap<string, string>): Promise<FileRun> {
+    /** Stable worker IDs reuse private lanes; zero always uses canonical discovery. */
+    async run(groups: readonly TestFile[], hashes: ReadonlyMap<string, string>, workerIndex = 0): Promise<FileRun> {
+        this.assertOpen();
+        const pending = this.runInLane(groups, hashes, workerIndex);
+        this.running.add(pending);
+        try {return await pending;}
+        finally {this.running.delete(pending);}
+    }
+
+    private async runInLane(groups: readonly TestFile[], hashes: ReadonlyMap<string, string>, workerIndex: number): Promise<FileRun> {
+        this.options.signal?.throwIfAborted();
+        const group = groups[0];
+        if (!group) {throw new Error('A test batch must belong to one project and target framework.');}
+        const key = testTargetKey(group.project, group.framework);
+        const primary = this.prepared.get(key), project = this.projects.get(key);
+        const canonical = primary?.groups?.find(item => item.id === group.id);
+        const requested = new Set(group.tests.map(test => test.id));
+        const completeFile = groups.length === 1 && !!group.file && !group.runtimeOnly && !group.excludedTestIds?.length
+            && canonical && group.file === canonical.file && requested.size === group.tests.length && canonical.tests.length === requested.size
+            && canonical.tests.every(test => requested.has(test.id));
+        if (Number.isSafeInteger(workerIndex) && workerIndex > 0 && this.queues.has(key) && completeFile && primary && project) {
+            let pending = this.lanes.get(workerIndex);
+            if (!pending) {
+                pending = this.outputRoot().then(root => new RunnerSession({ ...this.options,
+                    outputRoot: path.join(root, 'lanes', String(workerIndex)), onPrepared: undefined }));
+                this.lanes.set(workerIndex, pending);
+            }
+            const lane = await pending;
+            await lane.discover(project);
+            if (this.matchesFile(canonical, primary, lane.prepared.get(key)!)) {return lane.run(groups, hashes);}
+            this.options.output?.(`Parallel test identities could not be matched for ${path.basename(group.file!)}; using its primary runner.\n`);
+        }
+        // Fallbacks and partial selections share canonical native IDs and output.
+        // They must remain serial even when several pool workers request them.
+        const previous = this.queues.get(key) ?? Promise.resolve();
+        const execution = previous.then(() => this.execute(groups, hashes));
+        // Keep the rejection until every already-queued request has drained.
+        // Engine cancellation may arrive after this promise's next microtask.
+        const tail = execution.then(() => undefined);
+        this.queues.set(key, tail);
+        const clear = (): void => {if (this.queues.get(key) === tail) {this.queues.delete(key);}};
+        void tail.then(clear, clear);
+        return execution;
+    }
+
+    /** Never guess between indistinguishable rows or run a different file shape. */
+    private matchesFile(group: TestFile, primary: Preparation, lane: Preparation): boolean {
+        const local = lane.groups?.find(item => item.id === group.id && item.file === group.file);
+        if (!local || local.tests.length !== group.tests.length) {return false;}
+        const localIds = new Set(local.tests.map(test => test.id)), matched = new Set<string>();
+        for (const test of group.tests) {
+            const key = nodeKey(test.node as TestNode);
+            let native = lane.nativeById.get(test.id);
+            if (native && nodeKey(native) !== key) {return false;}
+            if (!native) {
+                const candidates = lane.byKey.get(key);
+                if (candidates?.length !== 1 || primary.byKey.get(key)?.length !== 1) {return false;}
+                native = candidates[0];
+            }
+            if (!localIds.has(native.uid) || matched.has(native.uid)) {return false;}
+            matched.add(native.uid);
+        }
+        return matched.size === localIds.size;
+    }
+
+    private async execute(groups: readonly TestFile[], hashes: ReadonlyMap<string, string>): Promise<FileRun> {
+        this.options.signal?.throwIfAborted();
         const { preparation, selected, executedGroups, originals } = await this.resolve(groups);
         const group = groups[0], options = { ...this.options, cwd: path.dirname(group.project) };
         if (preparation.runs++) {await preparation.output.restore(options.signal);}
@@ -285,18 +370,41 @@ export class RunnerSession {
     }
 
     async dispose(): Promise<void> {
+        this.disposed = true;
+        await Promise.allSettled([...this.running, ...this.discoveries.values(), ...this.preparations.values()]);
+        const lanes = await Promise.allSettled(this.lanes.values());
+        for (const lane of lanes) {if (lane.status === 'fulfilled') {await lane.value.dispose();}}
         await this.coverageReader.dispose();
         for (const preparation of this.prepared.values()) {await removeOutput(preparation.root);}
         this.prepared.clear();
         await this.outputLease?.dispose();
     }
 
+    private assertOpen(): void {if (this.disposed) {throw new Error('The test runner session has been disposed.');}}
+
+    private async outputRoot(): Promise<string> {
+        if (this.options.outputRoot) {return this.options.outputRoot;}
+        if (!this.lease) {
+            this.lease = claimRunOutputs(this.options.storage, this.options.identity, this.options.signal);
+        }
+        try {this.outputLease = await this.lease; return this.outputLease.directory;}
+        catch (error) {this.lease = undefined; throw error;}
+    }
+
     private async prepare(group: TestFile): Promise<Preparation> {
         const key = testTargetKey(group.project, group.framework);
         const existing = this.prepared.get(key); if (existing) {return existing;}
+        const preparing = this.preparations.get(key); if (preparing) {return preparing;}
+        const pending = this.prepareTarget(group);
+        this.preparations.set(key, pending);
+        try {return await pending;}
+        finally {this.preparations.delete(key);}
+    }
+
+    private async prepareTarget(group: TestFile): Promise<Preparation> {
+        const key = testTargetKey(group.project, group.framework);
         const options = { ...this.options, cwd: path.dirname(group.project) };
-        if (!options.outputRoot && !this.outputLease) {this.outputLease = await claimRunOutputs(options.storage, options.identity, options.signal);}
-        const root = path.join(options.outputRoot ?? this.outputLease!.directory, contentHash(key));
+        const root = path.join(await this.outputRoot(), contentHash(key));
         await fs.mkdir(root, { recursive: true });
         const source = options.snapshots?.get(key) ?? path.dirname(group.assembly);
         const template = path.join(root, 'template');

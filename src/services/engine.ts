@@ -6,7 +6,7 @@ import { Project, TestFile, TestResult, Trace } from '../core/model';
 import { ChangeBatch } from '../core/scheduler';
 import { ProjectIndex, selectTests, Selection } from '../core/selection';
 import { contentHash, defaultExcludes, isConfigurationFile, isExcluded, normalizePath, sourceVersion, testTargetKey } from '../core/paths';
-import { buildOrder, buildRoots, buildProperties, mergeProjects, evaluateProject, findProjects, refreshProjectSnapshots, sdkConfigurationFiles } from './projects';
+import { buildOrder, buildRoots, buildWaves, buildSnapshotTargets, buildProjects, mergeProjects, evaluateProjects, restoreProjects, findProjects, refreshProjectSnapshotBatches, sdkContextGroups, sdkConfigurationFiles } from './projects';
 import { Cancelled, ProcessOptions, requireSuccess, runProcess } from './process';
 import { projectCoverageId, RunnerOptions, RunnerSession } from './runner';
 import { resolveShapes, sourceAliases, sourceAnalyses, SourceShape } from './analysis';
@@ -16,6 +16,7 @@ import { discoveredTest } from './mtp';
 import { installCoverageTool } from './coverageTool';
 import { claimRunOutputs, reclaimRunOutputs } from './runOutputs';
 import { copyOutput } from './output';
+import { mapConcurrent, resolveConcurrency, SerialQueue } from '../core/concurrency';
 
 export interface EngineConfiguration {
     readonly dotnet: string;
@@ -26,6 +27,8 @@ export interface EngineConfiguration {
     readonly testArguments: readonly string[];
     readonly timeout: number;
     readonly coverageTool?: string;
+    readonly maxParallelProjects?: number;
+    readonly maxParallelTestFiles?: number;
 }
 export interface EngineEvents {
     readonly output: (text: string) => void;
@@ -106,6 +109,7 @@ export class TestEngine {
     readonly sources = new SourceTracker();
     projects: readonly Project[] = [];
     groups: readonly TestFile[] = [];
+    private buildGraph: readonly Project[] = [];
     private roots: readonly string[];
     private index = new ProjectIndex([]);
     private initialized = false;
@@ -118,6 +122,7 @@ export class TestEngine {
     private aliasStamp: string | undefined;
     private excludedAliases: readonly string[] = [];
     private readonly sdkContexts = new Set<string>();
+    private readonly sdkChecks = new Map<string, Promise<void>>();
     private readonly restored = new Set<string>();
     private readonly runtime = new Map<string, Map<string, ReturnType<typeof discoveredTest>>>();
     private readonly runtimeGroups = new Map<string, TestFile>();
@@ -184,8 +189,25 @@ export class TestEngine {
     }
 
     async run(batch: ChangeBatch, signal: AbortSignal, manual?: ManualSelection, manualOperation = false): Promise<RunSummary> {
+        signal.throwIfAborted();
+        const controller = new AbortController();
+        const abort = (): void => controller.abort(signal.reason);
+        signal.addEventListener('abort', abort, { once: true });
+        try {return await this.runBatch(batch, controller, manual, manualOperation);}
+        finally {signal.removeEventListener('abort', abort);}
+    }
+
+    private async runBatch(batch: ChangeBatch, controller: AbortController, manual?: ManualSelection, manualOperation = false): Promise<RunSummary> {
+        const signal = controller.signal;
         const began = Date.now(), events = this.options.events, topology = this.topology;
         const configured = this.options.configuration(), config = { ...configured, coverage: manual?.coverage ?? configured.coverage };
+        const projectLimit = resolveConcurrency(config.maxParallelProjects), testLimit = resolveConcurrency(config.maxParallelTestFiles);
+        events.output(`Testy concurrency: projects=${projectLimit}, test files=${testLimit}.\n`);
+        let phaseName: string | undefined, phaseBegan = began;
+        const finishPhase = (): void => {
+            if (phaseName) {events.output(`Testy timing: ${phaseName} ${Date.now() - phaseBegan}ms\n`); phaseName = undefined;}
+        };
+        const phase = (name: string): void => {finishPhase(); phaseName = name; phaseBegan = Date.now(); events.phase(name);};
         const reserved = ['--server', '--client-port', '--client-host', '--list-tests', '--filter-uid', '--filter', '--treenode-filter', '--results-directory', '--ignore-exit-code', '--help', '--info'];
         if (config.testArguments.some(argument => reserved.some(option => argument === option || argument.startsWith(`${option}=`)))) {
             throw new Error('testy.testArguments contains an option reserved for test discovery, selection, or communication. Remove runner/filter options from that setting.');
@@ -204,29 +226,43 @@ export class TestEngine {
         const previousIndex = this.index;
         const structural = !!manual || this.structureDirty || newBaseline || changes.some(file => isConfigurationFile(file) || !this.index.hasSource(file) || !this.hashes.has(file));
         if (structural) {
-            events.phase('Preparing projects');
+            phase('Preparing projects');
             if (newBaseline || changes.some(isConfigurationFile)) {this.sdkContexts.clear(); this.restored.clear();}
             const selected = manual && !manual.all ? [...new Set([...manual.projects ?? [], ...this.displayGroups.filter(group => manual.groups.has(group.id)).map(group => group.project)])] : undefined;
-            const entryPoints = await findProjects(rootSnapshot, [...defaultExcludes, ...config.excludes], signal);
+            const entryPoints = await findProjects(rootSnapshot, [...defaultExcludes, ...config.excludes], signal, 16);
             // SDK selection can fail before MSBuild can describe any inputs.
             // Keep its candidate paths observable so a corrected pin can recover.
             this.setInputs([...this.inputs, ...entryPoints, ...entryPoints.flatMap(sdkConfigurationFiles)
                 .filter(file => !isExcluded(file, [...defaultExcludes, ...config.excludes], rootSnapshot))]);
-            const snapshots = await refreshProjectSnapshots(this.projectSnapshots, entryPoints, selected, async file => {
-                signal.throwIfAborted();
-                const options = { ...processOptions, cwd: path.dirname(file) };
-                await this.ensureSdk(config.dotnet, options);
-                const restoreKey = `${config.dotnet}\0${config.configuration}\0${file}`;
-                if (!this.restored.has(restoreKey)) {
-                    requireSuccess(await runProcess(config.dotnet, ['restore', file, `-property:Configuration=${config.configuration}`, '--nologo'], options), `Restoring ${path.basename(file)}`);
-                    this.restored.add(restoreKey);
+            const snapshots = await refreshProjectSnapshotBatches(this.projectSnapshots, entryPoints, selected, async files => {
+                const contexts = await sdkContextGroups(files, signal);
+                const key = (file: string): string => `${config.dotnet}\0${config.configuration}\0${file}`;
+                // SDK contexts may restore the same physical dependency. Each
+                // restore graph parallelizes internally without competing writers.
+                for (const context of contexts) {
+                    const options = { ...processOptions, cwd: context.cwd };
+                    await this.ensureSdk(config.dotnet, options, context.key);
+                    const missing = context.files.filter(file => !this.restored.has(key(file)));
+                    if (missing.length) {
+                        await restoreProjects(config.dotnet, missing, config.configuration, options, projectLimit);
+                        for (const file of missing) {this.restored.add(key(file));}
+                    }
                 }
-                const targets = await evaluateProject(config.dotnet, file, config.configuration, options, this.options.analyzer);
-                return targets.filter(project => !isExcluded(project.file, config.excludes, rootSnapshot));
+                const workers = Math.min(projectLimit, contexts.length);
+                const graphs = await mapConcurrent(contexts, projectLimit, signal, async (context, _index, workerSignal) => {
+                    const graph = await evaluateProjects(config.dotnet, context.files, config.configuration,
+                        { ...processOptions, cwd: context.cwd, signal: workerSignal }, this.options.analyzer, Math.max(1, Math.floor(projectLimit / workers)));
+                    return [...graph];
+                });
+                return new Map(graphs.flat());
             });
             if (topology !== this.topology) {throw new Cancelled();}
             this.projectSnapshots = snapshots;
-            this.projects = mergeProjects([...snapshots.values()].flat());
+            const evaluated = [...snapshots.values()].flat();
+            // Exclusions control inventory and watching. MSBuild still writes
+            // required excluded dependencies, so their conflicts stay in its plan.
+            this.buildGraph = mergeProjects(evaluated);
+            this.projects = mergeProjects(evaluated.filter(project => !isExcluded(project.file, config.excludes, rootSnapshot)));
             this.index = new ProjectIndex(this.projects); this.structureDirty = !!manual;
             this.sources.setFiles(this.projects.flatMap(project => [...project.sourceFiles, ...project.inputs ?? []])
                 .filter(file => !isExcluded(file, [...defaultExcludes, ...config.excludes], rootSnapshot)),
@@ -252,30 +288,39 @@ export class TestEngine {
         for (const group of this.groups) {
             if (!manual && (anticipated.groups.includes(group) || (baseline && !baseline.completed.has(group.id)))) {relevant.add(group.project);}
         }
-        const closure = buildOrder(this.projects, relevant);
+        const closure = buildOrder(this.buildGraph, relevant);
         const builds = buildRoots(closure);
-        const testBuilds = builds.filter(project => project.isTestProject && project.entryPoint !== false);
-        const outputCounts = new Map<string, number>();
-        for (const project of closure) {const directory = path.dirname(project.assembly); outputCounts.set(directory, (outputCounts.get(directory) ?? 0) + 1);}
-        const sharedOutputs = new Set(testBuilds.filter(project => outputCounts.get(path.dirname(project.assembly))! > 1)
+        const visibleTargets = new Set(this.projects.filter(project => project.isTestProject && project.entryPoint !== false)
             .map(project => testTargetKey(project.file, project.framework)));
+        const testBuilds = builds.filter(project => project.isTestProject && project.entryPoint !== false
+            && visibleTargets.has(testTargetKey(project.file, project.framework)));
+        const sharedOutputs = buildSnapshotTargets(closure, builds);
         const snapshots = new Map<string, string>();
         const outputLease = await claimRunOutputs(path.join(this.options.storage, 'runs'), this.identity, signal);
         let sessions: RunnerSession | undefined;
         try {
-            events.phase('Building');
+            phase('Building');
             const builtInputs = [...new Set(closure.flatMap(project => [...project.analysisFiles ?? project.sourceFiles, ...project.inputs ?? []]))];
             const revision = this.sources.revision;
-            for (const project of builds) {
-                const options = { ...processOptions, cwd: path.dirname(project.file) };
-                await this.ensureSdk(config.dotnet, options);
-                requireSuccess(await runProcess(config.dotnet, ['build', project.file, '--framework', project.framework, '--configuration', config.configuration,
-                    '--no-restore', '--nologo', ...buildProperties(project)], options), `Building ${path.basename(project.file)}`);
-                const key = testTargetKey(project.file, project.framework);
-                if (testBuilds.includes(project) && sharedOutputs.has(key)) {
-                    const snapshot = path.join(outputLease.directory, 'snapshots', contentHash(key));
-                    await copyOutput(path.dirname(project.assembly), snapshot, signal); snapshots.set(key, snapshot);
-                }
+            const buildContexts = await sdkContextGroups([...new Set(builds.map(project => project.file))], signal);
+            const sdkByFile = new Map(buildContexts.flatMap(context => context.files.map(file => [file, context.key] as const)));
+            for (const wave of buildWaves(closure, builds, sdkByFile)) {
+                const contexts = await sdkContextGroups([...new Set(wave.map(project => project.file))], signal);
+                const workers = Math.min(projectLimit, contexts.length);
+                await mapConcurrent(contexts, projectLimit, signal, async (context, _index, workerSignal) => {
+                    const options = { ...processOptions, cwd: context.cwd, signal: workerSignal };
+                    await this.ensureSdk(config.dotnet, options, context.key);
+                    const roots = wave.filter(project => context.files.includes(project.file));
+                    await buildProjects(config.dotnet, roots, config.configuration, options, Math.max(1, Math.floor(projectLimit / workers)));
+                    for (const project of roots) {
+                        const key = testTargetKey(project.file, project.framework);
+                        if (testBuilds.includes(project) && sharedOutputs.has(key)) {
+                            const snapshot = path.join(outputLease.directory, 'snapshots', contentHash(key));
+                            await copyOutput(path.dirname(project.assembly), snapshot, workerSignal); snapshots.set(key, snapshot);
+                        }
+                    }
+                });
+                if (builds.length > wave.length) {events.output(`Build wave complete: ${wave.length} roots; dependency or output conflicts require ordered waves.\n`);}
             }
             const changedDuringBuild = await this.sources.refresh(builtInputs, signal);
             const obsoleteBuild = changedDuringBuild.some(file => !this.sources.isGenerated(file) && beforeBuild.get(file) !== this.hashes.get(file));
@@ -285,6 +330,7 @@ export class TestEngine {
             const before = changedDuringBuild.some(file => this.sources.isGenerated(file))
                 ? new Map([...beforeBuild].filter(([file]) => !this.sources.isGenerated(file))) : beforeBuild;
             const previousShapes = baseline?.shapes ?? this.shapes;
+            phase('Analyzing sources');
             const analysisHashes = this.sources.analysisHashes;
             let shapeFiles = [...analysisHashes.keys()].filter(file => newBaseline || !this.analyses.has(file) || analysisHashes.get(file) !== this.analyzedHashes.get(file));
             let nextAnalyses: ReadonlyMap<string, SourceShape | null>;
@@ -298,7 +344,7 @@ export class TestEngine {
                     }
                     this.excludedAliases = aliases; this.aliasStamp = stamp;
                 }
-                nextAnalyses = await sourceAnalyses(config.dotnet, this.options.analyzer, shapeFiles, this.options.storage, processOptions, this.excludedAliases);
+                nextAnalyses = await sourceAnalyses(config.dotnet, this.options.analyzer, shapeFiles, this.options.storage, processOptions, this.excludedAliases, projectLimit);
             }
             catch (error) {
                 signal.throwIfAborted(); events.output(`Source analysis unavailable; using project fallback. ${String(error)}\n`);
@@ -311,6 +357,7 @@ export class TestEngine {
             let coverageTool: string | undefined;
             let runtimeTreeChanged = false;
             if (config.coverage && builds.some(project => project.isTestProject)) {
+                phase('Setting up coverage');
                 try {coverageTool = await this.ensureCoverageTool(config, processOptions);}
                 catch (error) {signal.throwIfAborted(); events.output(`Coverage unavailable; tests will continue with conservative selection. ${String(error)}\n`);}
             }
@@ -347,10 +394,17 @@ export class TestEngine {
                 onExpanded: groups => events.selected({ groups, reason: 'Containing files for provider runtime identities', fallback: true })
             };
             sessions = new RunnerSession(runnerOptions);
-            events.phase('Discovering tests');
+            phase('Discovering tests');
             const next = this.groups.filter(group => !testBuilds.some(project => project.file === group.project && project.framework === group.framework)
                 && this.projects.some(project => project.file === group.project && project.framework === group.framework && project.isTestProject && project.entryPoint !== false));
-            for (const project of testBuilds) {next.push(...await sessions.discover(project));}
+            let discoveredProjects = 0, activeDiscoveries = 0;
+            const discoveryProgress = (): void => events.phase(`Discovering tests ${discoveredProjects}/${testBuilds.length} · ${activeDiscoveries} active`);
+            const inventories = await mapConcurrent(testBuilds, projectLimit, signal, async project => {
+                activeDiscoveries++; discoveryProgress();
+                try {const groups = await sessions!.discover(project); discoveredProjects++; return groups;}
+                finally {activeDiscoveries--; discoveryProgress();}
+            }, () => controller.abort());
+            next.push(...inventories.flat());
             const liveIds = await this.reconcileGroups(next, baseline);
             const checkpointInputs = new Map(before);
             if (baseline) {for (const file of changes) {
@@ -406,79 +460,89 @@ export class TestEngine {
             const executedFiles = new Set<string>();
             const runtimeResults = baseline?.runtimeResults ?? new Map<string, ReadonlySet<string>>();
             let available = !!coverageTool;
-            for (let index = 0; index < batches.length; index++) {
-                const requestedGroups = batches[index];
-                events.phase(`Testing ${index + 1}/${batches.length}${baseline ? ` · ${baseline.completed.size}/${this.groups.length} files learned` : ''}`);
-                const run = await sessions.run(requestedGroups, before), groups = run.executedGroups;
-                for (const group of groups) {executedFiles.add(group.id);}
-                results.push(...run.results); available &&= run.coverageAvailable;
-                signal.throwIfAborted();
-                await this.sources.refresh(run.trace.dependencies, signal);
-                const current = topology === this.topology && !obsoleteBuild && revision === this.sources.revision
-                    && Object.entries(run.trace.inputs ?? {}).every(([file, hash]) => sourceVersion(this.hashes, file) === hash);
-                if (!current) {
-                    this.coverage.markStale(new Set(groups.map(group => group.id)));
-                    if (!manual && !manualOperation) {events.invalidated(changes); throw new Cancelled();}
-                    continue;
-                }
-                const complete = groups.every(group => {
-                    const requested = new Set(group.tests.map(test => test.id));
-                    return originalGroups.get(group.id)?.tests.every(test => requested.has(test.id));
-                });
-                if (complete) {
-                    const reported = new Set(run.results.map(result => result.id));
-                    let removed = false;
-                    for (const group of groups) {
-                        runtimeResults.set(group.id, reported);
-                        const runtime = this.runtime.get(group.id);
-                        for (const id of runtime?.keys() ?? []) {if (!reported.has(id)) {runtime!.delete(id); this.knownCache.delete(group.id); removed = true;}}
-                    }
-                    const key = testTargetKey(groups[0].project, groups[0].framework), project = projectGroups.get(key);
-                    if (project?.every(group => runtimeResults.has(group.id))) {
-                        const projectReported = new Set(project.flatMap(group => [...runtimeResults.get(group.id)!]));
-                        for (const [id, group] of this.runtimeGroups) {if (testTargetKey(group.project, group.framework) === key) {
-                            const runtime = this.runtime.get(id);
-                            for (const uid of runtime?.keys() ?? []) {if (!projectReported.has(uid)) {runtime!.delete(uid); this.knownCache.delete(id); removed = true;}}
-                            if (!runtime?.size) {this.runtimeGroups.delete(id); this.runtime.delete(id); this.knownCache.delete(id);}
-                        }}
-                    }
-                    runtimeTreeChanged ||= removed;
-                } else {
-                    // A partial manual run may reveal another deferred row, but
-                    // cannot retire rows from an earlier complete checkpoint.
-                    for (const group of groups) {
-                        const previous = runtimeResults.get(group.id);
-                        if (previous) {runtimeResults.set(group.id, new Set([...previous, ...run.results.map(result => result.id)]));}
-                    }
-                }
-                if (runtimeTreeChanged) {await events.discovered(this.displayGroups); runtimeTreeChanged = false;}
-                if (run.coverageAvailable && complete) {
-                    if (groups.length > 1) {for (const group of groups) {liveIds.delete(group.id);}}
-                    else {
-                        // The old aggregate cannot be split into file ownership.
-                        // Retain it as history while publishing the new file trace.
-                        this.coverage.markHistorical(new Set([projectCoverageId(groups[0])]));
-                    }
-                    await this.coverage.replaceAsync([run.trace], liveIds, signal);
-                    if (revision !== this.sources.revision) {this.coverage.markStale(new Set([run.trace.groupId]));}
-                    const aggregate = projectCoverageId(groups[0]);
-                    if (groups.length === 1 && this.coverage.traces.has(aggregate)
-                        && projectGroups.get(testTargetKey(groups[0].project, groups[0].framework))!.every(group => {
-                            const trace = this.coverage.traces.get(group.id); return trace && !trace.stale;
-                        })) {
-                        liveIds.delete(aggregate); this.coverage.replace([], liveIds);
-                    }
-                } else if (!manual) {
-                    // Preserve previous coverage and its freshness state. No
-                    // collection means no new narrowing information was learned.
-                    for (const group of groups) {
-                        if (this.coverage.traces.has(group.id)) {this.coverage.invalidate(new Set([group.id]), false);}
-                        else {this.coverage.replace([{ groupId: group.id, dependencies: group.file ? [group.file] : [], coverage: [], reliable: false, timestamp: Date.now(), inputs: {} }], liveIds);}
-                    }
-                }
-                if (complete && (!manual || !configured.coverage || run.coverageAvailable)) {for (const group of groups) {baseline?.completed.add(group.id);}}
-                await this.publishCoverage(signal); await this.save(signal);
-            }
+            const commits = new SerialQueue();
+            let completed = 0, active = 0;
+            const allowSecondary = !manual || (!manual.exclude && !manual.tests && ![...manual.groups].some(id => this.runtimeGroups.has(id)));
+            const progress = (): void => events.phase(`Testing ${completed}/${batches.length} · ${active} active${baseline ? ` · ${baseline.completed.size}/${this.groups.length} files learned` : ''}`);
+            phase('Testing');
+            await mapConcurrent(batches, testLimit, signal, async (requestedGroups, _index, _workerSignal, worker) => {
+                active++; progress();
+                try {
+                    const run = await sessions!.run(requestedGroups, before, allowSecondary ? worker + 1 : 0), groups = run.executedGroups;
+                    await commits.run(async () => {
+                        signal.throwIfAborted();
+                        for (const group of groups) {executedFiles.add(group.id);}
+                        results.push(...run.results); available &&= run.coverageAvailable;
+                        signal.throwIfAborted();
+                        await this.sources.refresh(run.trace.dependencies, signal);
+                        const current = topology === this.topology && !obsoleteBuild && revision === this.sources.revision
+                            && Object.entries(run.trace.inputs ?? {}).every(([file, hash]) => sourceVersion(this.hashes, file) === hash);
+                        if (!current) {
+                            this.coverage.markStale(new Set(groups.map(group => group.id)));
+                            if (!manual && !manualOperation) {events.invalidated(changes); throw new Cancelled();}
+                            return;
+                        }
+                        const complete = groups.every(group => {
+                            const requested = new Set(group.tests.map(test => test.id));
+                            return originalGroups.get(group.id)?.tests.every(test => requested.has(test.id));
+                        });
+                        if (complete) {
+                            const reported = new Set(run.results.map(result => result.id));
+                            let removed = false;
+                            for (const group of groups) {
+                                runtimeResults.set(group.id, reported);
+                                const runtime = this.runtime.get(group.id);
+                                for (const id of runtime?.keys() ?? []) {if (!reported.has(id)) {runtime!.delete(id); this.knownCache.delete(group.id); removed = true;}}
+                            }
+                            const key = testTargetKey(groups[0].project, groups[0].framework), project = projectGroups.get(key);
+                            if (project?.every(group => runtimeResults.has(group.id))) {
+                                const projectReported = new Set(project.flatMap(group => [...runtimeResults.get(group.id)!]));
+                                for (const [id, group] of this.runtimeGroups) {if (testTargetKey(group.project, group.framework) === key) {
+                                    const runtime = this.runtime.get(id);
+                                    for (const uid of runtime?.keys() ?? []) {if (!projectReported.has(uid)) {runtime!.delete(uid); this.knownCache.delete(id); removed = true;}}
+                                    if (!runtime?.size) {this.runtimeGroups.delete(id); this.runtime.delete(id); this.knownCache.delete(id);}
+                                }}
+                            }
+                            runtimeTreeChanged ||= removed;
+                        } else {
+                            // A partial manual run may reveal another deferred row, but
+                            // cannot retire rows from an earlier complete checkpoint.
+                            for (const group of groups) {
+                                const previous = runtimeResults.get(group.id);
+                                if (previous) {runtimeResults.set(group.id, new Set([...previous, ...run.results.map(result => result.id)]));}
+                            }
+                        }
+                        if (runtimeTreeChanged) {runtimeTreeChanged = false; await events.discovered(this.displayGroups);}
+                        if (run.coverageAvailable && complete) {
+                            if (groups.length > 1) {for (const group of groups) {liveIds.delete(group.id);}}
+                            else {
+                                // The old aggregate cannot be split into file ownership.
+                                // Retain it as history while publishing the new file trace.
+                                this.coverage.markHistorical(new Set([projectCoverageId(groups[0])]));
+                            }
+                            await this.coverage.replaceAsync([run.trace], liveIds, signal);
+                            if (revision !== this.sources.revision) {this.coverage.markStale(new Set([run.trace.groupId]));}
+                            const aggregate = projectCoverageId(groups[0]);
+                            if (groups.length === 1 && this.coverage.traces.has(aggregate)
+                                && projectGroups.get(testTargetKey(groups[0].project, groups[0].framework))!.every(group => {
+                                    const trace = this.coverage.traces.get(group.id); return trace && !trace.stale;
+                                })) {
+                                liveIds.delete(aggregate); this.coverage.replace([], liveIds);
+                            }
+                        } else if (!manual) {
+                            // Preserve previous coverage and its freshness state. No
+                            // collection means no new narrowing information was learned.
+                            for (const group of groups) {
+                                if (this.coverage.traces.has(group.id)) {this.coverage.invalidate(new Set([group.id]), false);}
+                                else {this.coverage.replace([{ groupId: group.id, dependencies: group.file ? [group.file] : [], coverage: [], reliable: false, timestamp: Date.now(), inputs: {} }], liveIds);}
+                            }
+                        }
+                        if (complete && (!manual || !configured.coverage || run.coverageAvailable)) {for (const group of groups) {baseline?.completed.add(group.id);}}
+                        await this.publishCoverage(signal); await this.save(signal);
+                    });
+                    completed++;
+                } finally {active--; progress();}
+            }, () => controller.abort());
             signal.throwIfAborted();
             if (!manual) {
                 this.shapes = currentShapes;
@@ -491,7 +555,7 @@ export class TestEngine {
             return { files: executedFiles.size, tests: results.length, passed: results.filter(result => result.outcome === 'passed').length,
                 failed: results.filter(result => result.outcome === 'failed' || result.outcome === 'errored').length,
                 skipped: results.filter(result => result.outcome === 'skipped').length, duration: Date.now() - began, coverageAvailable: available };
-        } finally {try {await sessions?.dispose();} finally {await outputLease.dispose();}}
+        } finally {finishPhase(); try {await sessions?.dispose();} finally {await outputLease.dispose();}}
     }
 
     private setInputs(files: Iterable<string>): void {
@@ -528,11 +592,16 @@ export class TestEngine {
         return liveIds;
     }
 
-    private async ensureSdk(dotnet: string, options: ProcessOptions): Promise<void> {
-        const key = `${dotnet}\0${options.cwd}`; if (this.sdkContexts.has(key)) {return;}
-        const version = requireSuccess(await runProcess(dotnet, ['--version'], { ...options, output: undefined }), `Finding the .NET SDK for ${options.cwd}`).stdout.trim();
-        if (!/^\d+\./.test(version) || Number(version.split('.')[0]) < 10) {throw new Error(`Testy requires .NET SDK 10 or later; ${options.cwd} selects ${version}. Check its global.json.`);}
-        this.sdkContexts.add(key);
+    private async ensureSdk(dotnet: string, options: ProcessOptions, sdkContext = options.cwd): Promise<void> {
+        const key = `${dotnet}\0${sdkContext}`; if (this.sdkContexts.has(key)) {return;}
+        const existing = this.sdkChecks.get(key); if (existing) {return existing;}
+        const check = (async () => {
+            const version = requireSuccess(await runProcess(dotnet, ['--version'], { ...options, output: undefined }), `Finding the .NET SDK for ${options.cwd}`).stdout.trim();
+            if (!/^\d+\./.test(version) || Number(version.split('.')[0]) < 10) {throw new Error(`Testy requires .NET SDK 10 or later; ${options.cwd} selects ${version}. Check its global.json.`);}
+            this.sdkContexts.add(key);
+        })();
+        this.sdkChecks.set(key, check);
+        try {await check;} finally {this.sdkChecks.delete(key);}
     }
 
     private async ensureCoverageTool(config: EngineConfiguration, options: ProcessOptions): Promise<string> {

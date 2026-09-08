@@ -54,13 +54,13 @@ export function resolveShapes(analyses: ReadonlyMap<string, SourceShape | null>,
 }
 
 /** Declaration fingerprints catch dependencies that runtime coverage cannot see. */
-export async function sourceAnalyses(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: ProcessOptions, excludedAliases: readonly string[] = []): Promise<ReadonlyMap<string, SourceShape | null>> {
+export async function sourceAnalyses(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: ProcessOptions, excludedAliases: readonly string[] = [], concurrency = 1): Promise<ReadonlyMap<string, SourceShape | null>> {
     if (!files.length) {return new Map();}
     await fs.mkdir(storage, { recursive: true });
     const directory = await fs.mkdtemp(path.join(storage, 'analysis-'));
     try {
         const input = path.join(directory, 'files.json');
-        await fs.writeFile(input, JSON.stringify({ files, excludedAliases }));
+        await fs.writeFile(input, JSON.stringify({ files, excludedAliases, concurrency: Number.isFinite(concurrency) ? Math.max(1, Math.floor(concurrency)) : 1 }));
         const output = requireSuccess(await runProcess(dotnet, [analyzer, input], { ...options, output: undefined }), 'Analyzing C# declarations').stdout;
         const parsed: unknown = JSON.parse(output);
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {throw new Error('Invalid source analysis response.');}
@@ -77,6 +77,6 @@ export async function sourceAnalyses(dotnet: string, analyzer: string, files: re
     }
 }
 
-export async function sourceShapes(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: ProcessOptions, excludedAliases: readonly string[] = []): Promise<ReadonlyMap<string, string | null>> {
-    return resolveShapes(await sourceAnalyses(dotnet, analyzer, files, storage, options, excludedAliases));
+export async function sourceShapes(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: ProcessOptions, excludedAliases: readonly string[] = [], concurrency = 1): Promise<ReadonlyMap<string, string | null>> {
+    return resolveShapes(await sourceAnalyses(dotnet, analyzer, files, storage, options, excludedAliases, concurrency));
 }

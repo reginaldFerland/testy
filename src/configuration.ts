@@ -20,6 +20,8 @@ export function configuration(): Configuration {
         showCoverage: settings.get('showCoverage', true),
         dotnet: settings.get('dotnetPath', 'dotnet'), configuration: settings.get('buildConfiguration', 'Debug'),
         mode: settings.get('runMode', 'affected'), coverage: settings.get('runWithCoverage', true),
+        maxParallelProjects: settings.get('maxParallelProjects', 0),
+        maxParallelTestFiles: settings.get('maxParallelTestFiles', 0),
         excludes: [...defaultExcludes, ...settings.get<string[]>('exclude', [])],
         testArguments: args, timeout: Math.max(10, settings.get('timeoutSeconds', 600)) * 1000,
         coverageTool: settings.get<string>('coverageToolPath') || undefined

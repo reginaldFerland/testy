@@ -11,6 +11,8 @@ export interface Project {
     readonly analysisFiles?: readonly string[];
     readonly references: readonly string[];
     readonly binaryReferences?: readonly string[];
+    /** Evaluated output and intermediate directories used to avoid competing builds. */
+    readonly outputDirectories?: readonly string[];
     /** Evaluated imports, resources and other build inputs across reference contexts. */
     readonly inputs?: readonly string[];
     readonly entryPoint?: boolean;

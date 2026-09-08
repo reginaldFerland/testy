@@ -21,22 +21,21 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
         try
         {
             using var request = JsonDocument.Parse(File.ReadAllText(RequestFile));
-            var file = request.RootElement.GetProperty("file").GetString()!;
+            var files = request.RootElement.TryGetProperty("files", out var entries)
+                ? entries.Deserialize<string[]>()! : [request.RootElement.GetProperty("file").GetString()!];
             var configuration = request.RootElement.GetProperty("configuration").GetString()!;
+            var concurrency = request.RootElement.TryGetProperty("concurrency", out var workers) ? Math.Max(1, workers.GetInt32()) : 1;
             var inputs = new ConcurrentDictionary<ProjectInstance, string[]>();
             using var collection = new ProjectCollection();
-            var entry = new ProjectGraphEntryPoint(file, new Dictionary<string, string> { ["Configuration"] = configuration });
-            var graph = new ProjectGraph([entry], collection, (projectFile, properties, projects) =>
+            var entryPoints = files.Select(file => new ProjectGraphEntryPoint(file, new Dictionary<string, string> { ["Configuration"] = configuration }));
+            var graph = new ProjectGraph(entryPoints, collection, (projectFile, properties, projects) =>
             {
                 var project = new Project(projectFile, properties, null, projects);
                 var instance = project.CreateProjectInstance();
                 inputs[instance] = project.Imports.Select(import => import.ImportedProject.FullPath)
                     .Concat(new[] { project.FullPath }).Distinct().ToArray();
                 return instance;
-            });
-            var roots = graph.EntryPointNodes.SelectMany(node => string.IsNullOrEmpty(node.ProjectInstance.GetPropertyValue("TargetFramework"))
-                ? node.ProjectReferences.Where(child => child.ProjectInstance.FullPath == node.ProjectInstance.FullPath)
-                : new[] { node }).ToHashSet();
+            }, concurrency, CancellationToken.None);
             static IEnumerable<ProjectGraphNode> Targets(ProjectGraphNode node) => string.IsNullOrEmpty(node.ProjectInstance.GetPropertyValue("TargetFramework"))
                 ? node.ProjectReferences.Where(child => child.ProjectInstance.FullPath == node.ProjectInstance.FullPath).SelectMany(Targets)
                 : [node];
@@ -46,9 +45,12 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
                 var file = OperatingSystem.IsWindows() ? project.FullPath.ToUpperInvariant() : project.FullPath;
                 var properties = project.GlobalProperties.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
                     .Select(pair => new[] { pair.Key.ToUpperInvariant(), pair.Value });
-                return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { file, properties }))));
+                var sdk = project.GetPropertyValue("MSBuildToolsPath");
+                if (OperatingSystem.IsWindows()) { sdk = sdk.ToUpperInvariant(); }
+                return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { file, properties, sdk }))));
             }
-            var result = graph.ProjectNodes.Where(node => !string.IsNullOrEmpty(node.ProjectInstance.GetPropertyValue("TargetFramework")))
+            var identities = graph.ProjectNodes.ToDictionary(node => node, Identity);
+            var projects = graph.ProjectNodes.Where(node => !string.IsNullOrEmpty(node.ProjectInstance.GetPropertyValue("TargetFramework")))
                 .Select(node =>
                 {
                     var project = node.ProjectInstance;
@@ -73,13 +75,16 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
                         framework = project.GetPropertyValue("TargetFramework"),
                         assembly = project.GetPropertyValue("TargetPath"),
                         assemblyName = project.GetPropertyValue("AssemblyName"),
+                        outputDirectories = new[] { "TargetDir", "OutputPath", "IntermediateOutputPath", "BaseIntermediateOutputPath", "MSBuildProjectExtensionsPath" }
+                            .Select(project.GetPropertyValue).Where(value => !string.IsNullOrWhiteSpace(value))
+                            .Select(value => Path.GetFullPath(value, project.Directory))
+                            .Append(Path.GetDirectoryName(project.GetPropertyValue("TargetPath")) ?? project.Directory).Distinct().ToArray(),
                         isTestProject = project.GetPropertyValue("IsTestProject").Equals("true", StringComparison.OrdinalIgnoreCase)
                             || project.GetPropertyValue("IsTestingPlatformApplication").Equals("true", StringComparison.OrdinalIgnoreCase),
                         isMtp = project.GetPropertyValue("IsTestingPlatformApplication").Equals("true", StringComparison.OrdinalIgnoreCase),
-                        entryPoint = roots.Contains(node),
                         properties = project.GlobalProperties,
-                        contextId = Identity(node),
-                        contextReferences = node.ProjectReferences.SelectMany(Targets).Select(Identity).Distinct().ToArray(),
+                        contextId = identities[node],
+                        contextReferences = node.ProjectReferences.SelectMany(Targets).Select(reference => identities[reference]).Distinct().ToArray(),
                         sourceFiles = Items("Compile"),
                         inputs = inputs[project].Concat(Items("Content")).Concat(Items("None")).Concat(Items("EmbeddedResource"))
                             .Concat(Items("AdditionalFiles")).Concat(Items("EditorConfigFiles")).Concat(Items("GlobalAnalyzerConfigFiles"))
@@ -90,7 +95,26 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
                             .Where(value => value.Length > 0).Select(value => Path.GetFullPath(value, project.Directory)).Distinct().ToArray()
                     };
                 }).ToArray();
-            File.WriteAllText(OutputFile, JsonSerializer.Serialize(result));
+            var comparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+            var roots = files.Distinct(comparer).Select(file =>
+            {
+                var entryNodes = graph.EntryPointNodes.Where(node => comparer.Equals(node.ProjectInstance.FullPath, Path.GetFullPath(file))).ToArray();
+                var pending = new Stack<ProjectGraphNode>(entryNodes);
+                var reachable = new HashSet<ProjectGraphNode>();
+                while (pending.TryPop(out var node))
+                {
+                    if (!reachable.Add(node)) { continue; }
+                    foreach (var reference in node.ProjectReferences) { pending.Push(reference); }
+                }
+                return new
+                {
+                    file = Path.GetFullPath(file),
+                    contexts = reachable.Where(node => !string.IsNullOrEmpty(node.ProjectInstance.GetPropertyValue("TargetFramework")))
+                        .Select(node => identities[node]).Order().ToArray(),
+                    entryPoints = entryNodes.SelectMany(Targets).Select(node => identities[node]).Distinct().Order().ToArray()
+                };
+            }).ToArray();
+            File.WriteAllText(OutputFile, JsonSerializer.Serialize(new { projects, roots }));
             return true;
         }
         catch (Exception error)

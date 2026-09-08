@@ -19,6 +19,76 @@ async function fixture(t) {
  return {root,temp,config,state,engine,file:relative=>normalizePath(path.join(root,relative)),run:(files=[],full=false,manual)=>engine.run({files,full},new AbortController().signal,manual)};
 }
 
+async function parallelFixture(t){
+ const f=await fixture(t);f.config.maxParallelProjects=2;f.config.maxParallelTestFiles=2;
+ for(const [index,layer] of ['App','Infra','Web'].entries()){
+  const previous=['ImpactDemo','App','Infra'][index];await fs.mkdir(f.file(layer));
+  await fs.writeFile(f.file(`${layer}/${layer}.csproj`),`<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup><ItemGroup><ProjectReference Include="../${previous}/${previous}.csproj"/></ItemGroup></Project>`);
+  if(layer!=='Web')await fs.writeFile(f.file(`${layer}/Pipeline.cs`),`namespace ${layer}; public static class Pipeline { public static int Value(int value) => ${index?'App.Pipeline.Value(value)':'ImpactDemo.Arithmetic.Sum(value,1)'}; }`);
+ }
+ const project=f.file('ImpactDemo.Tests/ImpactDemo.Tests.csproj');await fs.writeFile(project,(await fs.readFile(project,'utf8')).replace('../ImpactDemo/ImpactDemo.csproj','../Web/Web.csproj'));
+ await fs.rm(f.file('ImpactDemo.Tests/CalculatorTests.cs'));await fs.rm(f.file('ImpactDemo.Tests/GreetingTests.cs'));
+ for(let index=0;index<6;index++){
+  await fs.writeFile(f.file(`Web/Feature${index}.cs`),`namespace Web; public static class Feature${index} { public static int Value(int value) => Infra.Pipeline.Value(value) + ${index}; }`);
+  await fs.writeFile(f.file(`ImpactDemo.Tests/Feature${index}Tests.cs`),`using Microsoft.VisualStudio.TestTools.UnitTesting; [TestClass] public class Feature${index}Tests { [TestMethod] public void Value() { var marker=System.IO.Path.Combine(System.IO.Path.GetDirectoryName(typeof(Feature${index}Tests).Assembly.Location)!,"worker-marker.txt"); System.IO.File.WriteAllText(marker,"${index}"); System.Threading.Thread.Sleep(40); Assert.AreEqual("${index}",System.IO.File.ReadAllText(marker)); Assert.AreEqual(${index+2},Web.Feature${index}.Value(1)); } }`);
+ }
+ return f;
+}
+
+test('parallel files in one target keep private output and coverage attribution through a deep build graph',{timeout:180000},async t=>{
+ const f=await parallelFixture(t),mtp=require('../../out/services/mtp'),request=mtp.requestTests;
+ let active=0,peak=0;
+ mtp.requestTests=async(...args)=>{
+  if(args[1]!=='run')return request(...args);
+  peak=Math.max(peak,++active);try{return await request(...args);}finally{active--;}
+ };
+ try{
+  const baseline=await f.run([],true);assert.equal(baseline.passed,6);assert.equal(baseline.failed,0);assert.equal(peak,2);assert.equal(active,0);
+  assert.equal(f.state.prepared,1,'worker copies do not repeat primary target preparation events');
+  assert.equal(f.engine.coverage.traces.size,6);
+  const shared=f.file('ImpactDemo/Arithmetic.cs');
+  for(const group of f.engine.groups){
+   const trace=f.engine.coverage.traces.get(group.id);assert.equal(trace.reliable,true);assert.ok(trace.dependencies.includes(shared));
+   const index=/Feature(\d+)Tests/.exec(group.file)[1];assert.ok(trace.dependencies.includes(f.file(`Web/Feature${index}.cs`)));
+   assert.equal(trace.dependencies.filter(file=>/\/Web\/Feature\d+\.cs$/.test(file)).length,1,'concurrent collectors retain individual file ownership');
+  }
+  const source=f.file('Web/Feature0.cs');await fs.writeFile(source,(await fs.readFile(source,'utf8')).replace(' + 0',' + 1'));
+  const affected=await f.run([source]);assert.equal(affected.tests,1);assert.equal(affected.failed,1);assert.deepEqual(f.state.selected,['Feature0Tests.cs']);
+  await fs.writeFile(shared,(await fs.readFile(shared,'utf8')).replace('a + b','a + b + 1'));
+  const callers=await f.run([shared]);assert.equal(callers.tests,6);assert.equal(callers.failed,6);
+  assert.deepEqual(await fs.readdir(path.join(f.temp,'state/runs')),[],'all private worker outputs are removed');
+ }finally{mtp.requestTests=request;}
+});
+
+test('parallel cancellation drains active work and resumes only files without completed checkpoints',{timeout:180000},async t=>{
+ const f=await parallelFixture(t),mtp=require('../../out/services/mtp'),request=mtp.requestTests,save=f.engine.cache.save.bind(f.engine.cache),abort=new AbortController();
+ let admitted=0,active=0,peak=0,release,timeout;const bothAdmitted=new Promise(resolve=>release=resolve);
+ t.after(()=>clearTimeout(timeout));
+ mtp.requestTests=async(...args)=>{
+  if(args[1]!=='run')return request(...args);
+  peak=Math.max(peak,++active);const index=admitted++;
+  timeout??=setTimeout(()=>abort.abort(),60000);
+  try{
+   const signal=args[0].signal;signal.throwIfAborted();
+   let interrupted;
+   const cancelled=new Promise((resolve,reject)=>{interrupted=()=>reject(Object.assign(new Error('Controlled cancellation'),{name:'AbortError'}));signal.addEventListener('abort',interrupted,{once:true});});
+   try{
+    if(index===0){await Promise.race([bothAdmitted,cancelled]);return await request(...args);}
+    release();await cancelled;
+   }finally{signal.removeEventListener('abort',interrupted);}
+  }finally{active--;}
+ };
+ f.engine.cache.save=async(delta,signal)=>{await save(delta,signal);if(delta.traces.length)abort.abort();};
+ try{
+  await assert.rejects(f.engine.run({files:[],full:true,generation:902},abort.signal),{name:'AbortError'});
+  assert.equal(peak,2);assert.equal(active,0);assert.equal(admitted,2,'no later batches start after cancellation');
+  assert.deepEqual(f.engine.baselineProgress,{completed:1,total:6});assert.equal(f.engine.coverage.traces.size,1);
+ }finally{clearTimeout(timeout);mtp.requestTests=request;f.engine.cache.save=save;}
+ const completed=[...f.engine.coverage.traces.values()][0],resumed=await f.engine.run({files:[],full:true,generation:902},new AbortController().signal);
+ assert.equal(resumed.files,5);assert.equal(resumed.passed,5);assert.equal(f.engine.coverage.traces.get(completed.groupId).timestamp,completed.timestamp);
+ assert.equal(f.engine.coverage.traces.size,6);assert.equal(f.engine.baselineProgress,undefined);assert.deepEqual(await fs.readdir(path.join(f.temp,'state/runs')),[]);
+});
+
 test('failed discovery preserves the previous inventory and collected coverage, then recovers',{timeout:90000},async t=>{
  const f=await fixture(t),mtp=require('../../out/services/mtp');
  assert.equal((await f.run([],true)).coverageAvailable,true);
@@ -235,7 +305,9 @@ test('manual builds ignore unrelated broken projects and preserve their pending 
  await fs.writeFile(f.file('Other/Code.cs'),'public class Broken {');
  const group=f.engine.groups.find(group=>group.file.endsWith('CalculatorTests.cs'));
  assert.equal((await f.run([],false,{groups:new Set([group.id]),coverage:false})).passed,2);
- await assert.rejects(f.run(),/Building Other.csproj failed/,'an unrelated edit consumed during the manual refresh must stay pending');
+ await assert.rejects(f.run(),error=>{
+  assert.match(error.message,/Building.*failed/);assert.match(error.message,/Other\.csproj/);return true;
+ },'an unrelated edit consumed during the manual refresh must stay pending');
 });
 
 test('an excluded production dependency is still built from a clean checkout',{timeout:90000},async t=>{
@@ -265,6 +337,7 @@ test('manual multi-file coverage retains the unselected part of an all-mode aggr
 
 test('an aborted checkpoint retries its unsaved coverage without relearning the completed file',{timeout:90000},async t=>{
  const f=await fixture(t),abort=new AbortController();
+ f.config.maxParallelTestFiles=1; // This scenario deliberately cancels between serial checkpoints.
  const {withLock}=require('../../out/services/lock'),{CoverageCache}=require('../../out/services/cache'),{CoverageStore}=require('../../out/core/coverage');
  let release,ready,released=false;
  const gate=new Promise(resolve=>release=()=>{released=true;resolve();}), acquired=new Promise(resolve=>ready=resolve);
@@ -288,6 +361,7 @@ test('an aborted checkpoint retries its unsaved coverage without relearning the 
 
 test('switching from all to affected mode retains aggregate history through cancelled learning',{timeout:90000},async t=>{
  const f=await fixture(t);f.config.mode='all';
+ f.config.maxParallelTestFiles=1; // This scenario deliberately cancels between serial checkpoints.
  assert.equal((await f.run([],true)).passed,3);
  const {projectCoverageId}=require('../../out/services/runner');
  const aggregate=projectCoverageId(f.engine.groups[0]);assert.ok(f.engine.coverage.traces.has(aggregate));
@@ -326,6 +400,7 @@ test('binary Reference builds the changed workspace input and selects its runtim
 
 test('baseline checkpoints completed files and resumes without rerunning unchanged completed work',{timeout:90000},async t=>{
  const f=await fixture(t), abort=new AbortController();let active;
+ f.config.maxParallelTestFiles=1; // This scenario deliberately cancels between serial checkpoints.
  f.state.started=(group)=>{if(active && active!==group.id){abort.abort();}active=group.id;};
  await assert.rejects(f.engine.run({files:[],full:true,generation:42},abort.signal),()=>abort.signal.aborted);
  assert.equal(f.engine.coverage.traces.size,1);assert.deepEqual(f.engine.baselineProgress,{completed:1,total:2});
@@ -528,12 +603,12 @@ test('an unchanged manual leaf evaluates only its root in a shared solution',{ti
  const f=await fixture(t);f.config.coverage=false;
  for(let i=1;i<4;i++){await fs.cp(f.file('ImpactDemo.Tests'),f.file(`Tests${i}`),{recursive:true});}
  assert.equal((await f.run([],true)).passed,12);
- const group=f.engine.groups[0],projects=require('../../out/services/projects'),evaluate=projects.evaluateProject,evaluated=[];
- projects.evaluateProject=async(...args)=>{evaluated.push(args[1]);return evaluate(...args);};
+ const group=f.engine.groups[0],projects=require('../../out/services/projects'),evaluate=projects.evaluateProjects,evaluated=[];
+ projects.evaluateProjects=async(...args)=>{evaluated.push(...args[1]);return evaluate(...args);};
  try{
   const result=await f.run([],false,{groups:new Set([group.id]),tests:new Map([[group.id,new Set([group.tests[0].id])]]),coverage:false});
   assert.equal(result.tests,1);assert.deepEqual(evaluated,[group.project]);
- }finally{projects.evaluateProject=evaluate;}
+ }finally{projects.evaluateProjects=evaluate;}
 });
 
 
@@ -688,6 +763,7 @@ test('symbol-less workspace modules retain affected callers without selecting un
 
 test('converting a test target to a library retires checkpoints and cached coverage before build failure',{timeout:90000},async t=>{
  const f=await fixture(t),project=f.file('ImpactDemo.Tests/ImpactDemo.Tests.csproj'),original=await fs.readFile(project,'utf8');
+ f.config.maxParallelTestFiles=1; // This scenario deliberately cancels between serial checkpoints.
  await f.run([],true);
  const abort=new AbortController();let first;
  f.state.started=group=>{if(first&&first!==group.id)abort.abort();first??=group.id;};

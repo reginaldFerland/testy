@@ -16,7 +16,7 @@ Coverage collection is enabled by default. On first use, Testy installs a pinned
 
 ## How affected selection works
 
-Testy prepares an isolated, instrumented output once per project and target framework, then runs each selected test file in a separate process. Test targets that share output directories with another framework or reference context are saved immediately after their own build. Files mutated by tests are restored from a pristine template before reuse. Testy records the workspace source files that execution reaches, including indirect calls, and keeps a separate coverage contribution for that test file. Later changes select every test file known to have exercised the changed code.
+Testy prepares isolated, instrumented outputs per project and target framework, then runs selected test files concurrently in separate processes. Each worker reuses its own output and collector session; files mutated by tests are restored from that worker's pristine template before reuse. Test targets that share output directories with another framework or reference context are saved before another build can overwrite them. Testy records the workspace source files that execution reaches, including indirect calls, and keeps a separate coverage contribution for each test file. Later changes select every test file known to have exercised the changed code.
 
 Workspace assemblies loaded from original build outputs, other paths, or memory are also recorded, including loads in child .NET processes that inherit and support the startup hook. When a load bypasses the instrumented copy, Testy records a dependency on the loaded project. Changes and new source files in that project rerun the calling test file, even without a `ProjectReference`. Those loads do not themselves supply line coverage. If runtime observation is incomplete, retained coverage stays visible and selection becomes conservative.
 
@@ -26,7 +26,7 @@ When target frameworks share an output directory, Testy snapshots each target im
 
 New or unknown source files, project/configuration changes, missing coverage, and incomplete or failing traces use a conservative fallback: all test files in the affected project and its dependent test projects. A bundled Roslyn analyzer also detects declaration changes, including constants, signatures, attributes, and initializers that can affect consumers without appearing in runtime coverage. Edits in coverage-excluded methods or hidden regions also force fallback. Recorded runtime dependencies and workspace binary references are included even without a `ProjectReference`. Evaluated imports, resources and additional build inputs are tracked across consuming projects. MSBuild applies reference-specific properties when building dependencies. Ordinary method-body edits use the recorded traces. Choose `testy.runMode: "all"` to always run the complete suite.
 
-The first baseline takes longer than a single suite invocation because attribution requires separate test-file runs. Complete projects in run-all mode, and runs without collection, batch tests by project. Subsequent runs build once per affected project and execute only selected test files. Source files with hidden or remapped `#line` regions use conservative project selection because coverage may not identify their physical methods. For unobserved external dependencies, changes to databases, services, environment variables, or data outside the watched files require a full refresh.
+The first baseline requires separate test-file runs for attribution. Independent files run concurrently, including files in the same test project. Complete projects in run-all mode, and runs without collection, batch tests by project. Compatible build roots share an MSBuild invocation so their shared dependencies can be reused. Project discovery runs concurrently; files whose provider identities cannot be safely mapped to another worker use their original runner. Partial selections and exclusions also use that runner. Subsequent runs build the affected roots and execute only selected test files. Source files with hidden or remapped `#line` regions use conservative project selection because coverage may not identify their physical methods. For unobserved external dependencies, changes to databases, services, environment variables, or data outside the watched files require a full refresh.
 
 Changes are accumulated across cancelled runs. Completed, version-checked test files are checkpointed during the baseline, so cancellation resumes unfinished work. An interrupted test file never replaces its previous contribution. Instrumentation happens in temporary copies, so a cancelled collector cannot modify your normal build outputs.
 
@@ -63,10 +63,14 @@ Test failures include their messages and stack traces in Test Explorer. The stat
 | `testy.exclude` | `[]` | Additional file patterns to ignore. |
 | `testy.fileWatcherPattern` | Source and configuration files | Customize which files can trigger runs. |
 | `testy.buildConfiguration` | `Debug` | MSBuild configuration. |
+| `testy.maxParallelProjects` | `0` | Worker budget for project preparation, builds, source analysis, and discovery. |
+| `testy.maxParallelTestFiles` | `0` | Maximum simultaneous test-file processes; a project batch uses one worker. |
 | `testy.dotnetPath` | `dotnet` | Path to the CLI executable. |
 | `testy.testArguments` | `[]` | Additional MTP arguments, such as framework settings. |
 | `testy.timeoutSeconds` | `600` | Limit for each build, discovery, or test-file run. |
 | `testy.coverageToolPath` | Automatic | Optional existing `dotnet-coverage` executable. |
+
+Concurrency settings use `0` for automatic: `max(1, min(4, available CPUs - 1))`. Use `1` for sequential operation or a larger integer to raise the limit. These settings apply on the next run without clearing learned coverage. Test frameworks retain their own internal scheduling. Tests that share databases, fixed ports, or other external resources may require `testy.maxParallelTestFiles: 1`; private outputs isolate files in the build output, not external resources. Output reports the resolved limits, phase timings, and any identity or build-output constraints on parallelism.
 
 Generated files and build outputs (`bin`, `obj`, `TestResults`, `*.g.cs`, `*.generated.cs`, `*.designer.cs`, and files with an auto-generated header in the first 2,048 bytes) do not trigger test runs. Observed generated headers remain recognized through deletion and rename; a refresh or save that sees ordinary content clears that classification. Header-marked outputs and configured `testy.exclude` patterns are also excluded from input hashes, so a generator that rewrites them during a build does not restart the baseline. Ignored Compile inputs still supply global aliases and partial-type coverage-exclusion metadata for conservative source analysis. Evaluated generator inputs remain tracked unless explicitly excluded. Directory events honor the same exclusions as their children. VS Code file renames and deletions are handled in both trigger modes.
 
@@ -107,7 +111,7 @@ npm test
 npm run test:integration
 npm run test:extension
 npm run package
-# Optional 1,200-case runtime and storage benchmark:
+# Optional 4,800-case deep dependency graph benchmark (three serial/automatic pairs):
 npm run benchmark
 # Optional report parsing, output reuse, identity lookup, and UI publication probes:
 npm run benchmark:responsiveness
