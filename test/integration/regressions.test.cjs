@@ -599,7 +599,7 @@ test('fresh conditional MSBuild contexts form a valid build chain through the sa
  const a=order.filter(project=>project.file===f.file('A/A.csproj'));assert.ok(a.length>=2);assert.ok(a.some(project=>project.properties.Flavor==='Leaf'));
 });
 
-test('an unchanged manual leaf evaluates only its root in a shared solution',{timeout:90000},async t=>{
+test('an unchanged manual leaf reuses its validated evaluation in a shared solution',{timeout:90000},async t=>{
  const f=await fixture(t);f.config.coverage=false;
  for(let i=1;i<4;i++){await fs.cp(f.file('ImpactDemo.Tests'),f.file(`Tests${i}`),{recursive:true});}
  assert.equal((await f.run([],true)).passed,12);
@@ -607,7 +607,7 @@ test('an unchanged manual leaf evaluates only its root in a shared solution',{ti
  projects.evaluateProjects=async(...args)=>{evaluated.push(...args[1]);return evaluate(...args);};
  try{
   const result=await f.run([],false,{groups:new Set([group.id]),tests:new Map([[group.id,new Set([group.tests[0].id])]]),coverage:false});
-  assert.equal(result.tests,1);assert.deepEqual(evaluated,[group.project]);
+  assert.equal(result.tests,1);assert.deepEqual(evaluated,[]);
  }finally{projects.evaluateProjects=evaluate;}
 });
 

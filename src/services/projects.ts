@@ -4,6 +4,7 @@ import { Project } from '../core/model';
 import { defaultExcludes, isExcluded, normalizePath, pathNormalizer, testTargetKey } from '../core/paths';
 import { mapConcurrent } from '../core/concurrency';
 import { ProcessOptions, requireSuccess, runProcess } from './process';
+import { EvaluationInputs, evaluationInputs } from './projectEvaluationCache';
 
 export async function findProjects(roots: readonly string[], excludes: readonly string[] = defaultExcludes, signal?: AbortSignal, concurrency = 16): Promise<readonly string[]> {
     const result = new Set<string>();
@@ -134,7 +135,8 @@ export async function evaluateProjects(dotnet: string, files: readonly string[],
         requireSuccess(await runProcess(dotnet, ['msbuild', query, '-nologo', '-target:Inspect', `-maxcpucount:${parallelism(concurrency)}`], { ...options, output: undefined }), `Inspecting ${files.length} project${files.length === 1 ? '' : 's'}`);
         const graph = JSON.parse(await fs.readFile(output, { encoding: 'utf8', signal: options.signal })) as {
             projects: (Project & { isMtp: boolean })[];
-            roots: { file: string; contexts: string[]; entryPoints: string[] }[];
+            roots: { file: string; contexts: string[]; entryPoints: string[]; evaluation?: (string | EvaluationInputs)[] }[];
+            evaluations?: Readonly<Record<string, EvaluationInputs>>;
         };
         const normalize = pathNormalizer();
         const projects = new Map(graph.projects.map(project => {
@@ -153,11 +155,16 @@ export async function evaluateProjects(dotnet: string, files: readonly string[],
         const result = new Map<string, readonly Project[]>();
         for (const root of graph.roots) {
             const entries = new Set(root.entryPoints);
-            result.set(normalize(root.file), root.contexts.map(id => {
+            const snapshot = root.contexts.map(id => {
                 const project = projects.get(id);
                 if (!project) {throw new Error(`Project inspection returned an unknown context: ${id}`);}
                 return { ...project, entryPoint: entries.has(id) };
-            }));
+            });
+            if (root.evaluation) {
+                const metadata = root.evaluation.map(input => typeof input === 'string' ? graph.evaluations?.[input] : input);
+                if (metadata.every((input): input is EvaluationInputs => !!input)) {evaluationInputs.set(snapshot, metadata);}
+            }
+            result.set(normalize(root.file), snapshot);
         }
         for (const file of files) {if (!result.has(normalize(file))) {throw new Error(`Project inspection omitted ${file}.`);}}
         return result;

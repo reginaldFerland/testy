@@ -91,8 +91,9 @@ async function runTrial(directory,template,coverageTool,layout,projectCount,tria
  let prepared=0,firstDiscoveryMs,firstResultMs,started,phaseTimings={},currentPhase='Preparing benchmark';
  const progress=setInterval(()=>console.error(`Benchmark ${layout} pair ${trial}/${trials} ${mode}: ${currentPhase}`),30000);
  const probe=workProbe(),finishResources=resources();
+ let engine;
  try{
-  const engine=new TestEngine({roots:[workspace],storage:path.join(directory,'state'),tools:path.join(directory,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
+  engine=new TestEngine({roots:[workspace],storage:path.join(directory,'state'),tools:path.join(directory,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
    events:{output:text=>{const timing=/Testy timing: (.+) ([\d.]+)ms/.exec(text);if(timing)phaseTimings[timing[1]]=Number(timing[2]);},phase:message=>currentPhase=message,
     discovered:groups=>{if(groups.length)firstDiscoveryMs??=performance.now()-started;},selected:()=>{},result:()=>firstResultMs??=performance.now()-started,
     started:()=>{},coverage:()=>{},invalidated:()=>{},prepared:()=>prepared++}});
@@ -130,7 +131,7 @@ async function runTrial(directory,template,coverageTool,layout,projectCount,tria
    sharedCoreSelectedCases,runAllMs:all.duration,runAllPhases:phaseTimings,
    cacheBytes,cachedAggregateMicroseconds,baselineFingerprint,...measurements};
   console.log(JSON.stringify(result));return result;
- }finally{clearInterval(progress);probe.restore();await finishResources();}
+ }finally{clearInterval(progress);await engine?.dispose();probe.restore();await finishResources();}
 }
 
 async function main(){

@@ -16,7 +16,9 @@ import { discoveredTest } from './mtp';
 import { installCoverageTool } from './coverageTool';
 import { claimRunOutputs, reclaimRunOutputs } from './runOutputs';
 import { copyOutput } from './output';
-import { mapConcurrent, resolveConcurrency, SerialQueue } from '../core/concurrency';
+import { PreparedOutputCache } from './preparedOutputCache';
+import { evaluationToolContext, ProjectEvaluationCache } from './projectEvaluationCache';
+import { mapConcurrent, mapConcurrentByKey, resolveConcurrency, Semaphore, SerialQueue } from '../core/concurrency';
 
 export interface EngineConfiguration {
     readonly dotnet: string;
@@ -130,8 +132,13 @@ export class TestEngine {
     private readonly discoveredIds = new Map<string, ReadonlySet<string>>();
     private readonly cache: CoverageCache;
     private readonly identity = randomUUID();
+    private readonly preparedOutputs: PreparedOutputCache;
+    private readonly operations = new Map<AbortController, Promise<RunSummary>>();
+    private disposed = false;
+    private disposal?: Promise<void>;
     private readonly pendingChanges = new Set<string>();
     private projectSnapshots: ReadonlyMap<string, readonly Project[]> = new Map();
+    private readonly projectEvaluations = new ProjectEvaluationCache();
     private inputTopology = 0;
     private inputs: readonly string[] = [];
     private inputDirectories: readonly string[] = [];
@@ -139,6 +146,7 @@ export class TestEngine {
     constructor(private readonly options: EngineOptions) {
         this.roots = options.roots.map(normalizePath);
         this.cache = new CoverageCache(options.storage, options.events.output);
+        this.preparedOutputs = new PreparedOutputCache(options.storage, this.identity);
     }
 
     get hashes(): ReadonlyMap<string, string> { return this.sources.hashes; }
@@ -179,7 +187,9 @@ export class TestEngine {
     }
 
     async restore(signal?: AbortSignal): Promise<void> {
+        if (this.disposed) {throw new Error('The test engine has been disposed.');}
         await reclaimRunOutputs(path.join(this.options.storage, 'runs'), signal);
+        await reclaimRunOutputs(path.join(this.options.storage, 'prepared'), signal);
         try {await this.cache.restore(this.coverage, signal);}
         catch (error) {
             signal?.throwIfAborted();
@@ -189,12 +199,28 @@ export class TestEngine {
     }
 
     async run(batch: ChangeBatch, signal: AbortSignal, manual?: ManualSelection, manualOperation = false): Promise<RunSummary> {
+        if (this.disposed) {throw new Error('The test engine has been disposed.');}
         signal.throwIfAborted();
         const controller = new AbortController();
         const abort = (): void => controller.abort(signal.reason);
         signal.addEventListener('abort', abort, { once: true });
-        try {return await this.runBatch(batch, controller, manual, manualOperation);}
-        finally {signal.removeEventListener('abort', abort);}
+        const operation = this.runBatch(batch, controller, manual, manualOperation);
+        this.operations.set(controller, operation);
+        try {return await operation;}
+        finally {this.operations.delete(controller); signal.removeEventListener('abort', abort);}
+    }
+
+    /** Stop admitting work, drain owned processes, then remove retained preparations. */
+    dispose(): Promise<void> {
+        if (!this.disposal) {
+            this.disposed = true;
+            for (const controller of this.operations.keys()) {controller.abort();}
+            this.disposal = (async () => {
+                await Promise.allSettled(this.operations.values());
+                await this.preparedOutputs.dispose();
+            })();
+        }
+        return this.disposal;
     }
 
     private async runBatch(batch: ChangeBatch, controller: AbortController, manual?: ManualSelection, manualOperation = false): Promise<RunSummary> {
@@ -234,8 +260,16 @@ export class TestEngine {
             // Keep its candidate paths observable so a corrected pin can recover.
             this.setInputs([...this.inputs, ...entryPoints, ...entryPoints.flatMap(sdkConfigurationFiles)
                 .filter(file => !isExcluded(file, [...defaultExcludes, ...config.excludes], rootSnapshot))]);
+            this.projectEvaluations.retain(entryPoints);
+            const toolContext = await evaluationToolContext(config.dotnet, this.options.analyzer, entryPoints.map(file => path.dirname(file)), signal);
+            const evaluationContext = contentHash(JSON.stringify([toolContext?.key, config.dotnet, config.configuration, this.options.analyzer, rootSnapshot,
+                config.excludes, Object.entries(process.env).sort(([a], [b]) => a.localeCompare(b))]));
             const snapshots = await refreshProjectSnapshotBatches(this.projectSnapshots, entryPoints, selected, async files => {
-                const contexts = await sdkContextGroups(files, signal);
+                const reused = newBaseline || !toolContext ? new Map<string, readonly Project[]>() : await this.projectEvaluations.get(files, evaluationContext, signal);
+                const pending = files.filter(file => !reused.has(file));
+                if (reused.size) {events.output(`Reusing ${reused.size} validated project evaluation${reused.size === 1 ? '' : 's'}.\n`);}
+                if (!pending.length) {return reused;}
+                const contexts = await sdkContextGroups(pending, signal);
                 const key = (file: string): string => `${config.dotnet}\0${config.configuration}\0${file}`;
                 // SDK contexts may restore the same physical dependency. Each
                 // restore graph parallelizes internally without competing writers.
@@ -254,7 +288,9 @@ export class TestEngine {
                         { ...processOptions, cwd: context.cwd, signal: workerSignal }, this.options.analyzer, Math.max(1, Math.floor(projectLimit / workers)));
                     return [...graph];
                 });
-                return new Map(graphs.flat());
+                const evaluated = new Map(graphs.flat());
+                if (toolContext) {await this.projectEvaluations.put(evaluated, evaluationContext, signal, toolContext.root);}
+                return new Map([...reused, ...evaluated]);
             });
             if (topology !== this.topology) {throw new Cancelled();}
             this.projectSnapshots = snapshots;
@@ -298,6 +334,7 @@ export class TestEngine {
         const snapshots = new Map<string, string>();
         const outputLease = await claimRunOutputs(path.join(this.options.storage, 'runs'), this.identity, signal);
         let sessions: RunnerSession | undefined;
+        let analyzing: Promise<ReadonlyMap<string, string | null>> | undefined;
         try {
             phase('Building');
             const builtInputs = [...new Set(closure.flatMap(project => [...project.analysisFiles ?? project.sourceFiles, ...project.inputs ?? []]))];
@@ -330,37 +367,49 @@ export class TestEngine {
             const before = changedDuringBuild.some(file => this.sources.isGenerated(file))
                 ? new Map([...beforeBuild].filter(([file]) => !this.sources.isGenerated(file))) : beforeBuild;
             const previousShapes = baseline?.shapes ?? this.shapes;
-            phase('Analyzing sources');
-            const analysisHashes = this.sources.analysisHashes;
-            let shapeFiles = [...analysisHashes.keys()].filter(file => newBaseline || !this.analyses.has(file) || analysisHashes.get(file) !== this.analyzedHashes.get(file));
-            let nextAnalyses: ReadonlyMap<string, SourceShape | null>;
-            try {
-                const candidates = [...this.sources.aliasSources].sort(([a], [b]) => a.localeCompare(b));
-                const stamp = contentHash(JSON.stringify(candidates));
-                if (stamp !== this.aliasStamp) {
-                    const aliases = await sourceAliases(config.dotnet, this.options.analyzer, candidates.map(([, content]) => content), this.options.storage, processOptions);
-                    if (JSON.stringify(aliases) !== JSON.stringify(this.excludedAliases)) {
-                        shapeFiles = [...analysisHashes.keys()];
+            phase('Preparing tests');
+            const preparationBudget = new Semaphore(projectLimit);
+            const analysisSlots = Math.max(1, projectLimit - testBuilds.length);
+            const analyze = async (): Promise<ReadonlyMap<string, string | null>> => {
+                const started = Date.now(), analysisHashes = this.sources.analysisHashes;
+                let shapeFiles = [...analysisHashes.keys()].filter(file => newBaseline || !this.analyses.has(file) || analysisHashes.get(file) !== this.analyzedHashes.get(file));
+                let nextAnalyses: ReadonlyMap<string, SourceShape | null>;
+                try {
+                    const candidates = [...this.sources.aliasSources].sort(([a], [b]) => a.localeCompare(b));
+                    const stamp = contentHash(JSON.stringify(candidates));
+                    if (stamp !== this.aliasStamp) {
+                        const aliases = await sourceAliases(config.dotnet, this.options.analyzer, candidates.map(([, content]) => content), this.options.storage, processOptions);
+                        if (JSON.stringify(aliases) !== JSON.stringify(this.excludedAliases)) {
+                            shapeFiles = [...analysisHashes.keys()];
+                        }
+                        this.excludedAliases = aliases; this.aliasStamp = stamp;
                     }
-                    this.excludedAliases = aliases; this.aliasStamp = stamp;
+                    nextAnalyses = await sourceAnalyses(config.dotnet, this.options.analyzer, shapeFiles, this.options.storage, processOptions, this.excludedAliases, analysisSlots);
                 }
-                nextAnalyses = await sourceAnalyses(config.dotnet, this.options.analyzer, shapeFiles, this.options.storage, processOptions, this.excludedAliases, projectLimit);
-            }
-            catch (error) {
-                signal.throwIfAborted(); events.output(`Source analysis unavailable; using project fallback. ${String(error)}\n`);
-                nextAnalyses = new Map(shapeFiles.map(file => [file, null]));
-            }
-            this.analyses = new Map([...this.analyses, ...nextAnalyses].filter(([file]) => analysisHashes.has(file)));
-            this.analyzedHashes = analysisHashes;
-            const currentShapes = resolveShapes(this.analyses, this.projects);
-            const conservative = new Set(changes.filter(file => !currentShapes.get(file) || currentShapes.get(file) !== previousShapes.get(file)));
+                catch (error) {
+                    signal.throwIfAborted(); events.output(`Source analysis unavailable; using project fallback. ${String(error)}\n`);
+                    nextAnalyses = new Map(shapeFiles.map(file => [file, null]));
+                } finally {events.output(`Testy timing: Source analysis ${Date.now() - started}ms (overlaps test preparation)\n`);}
+                this.analyses = new Map([...this.analyses, ...nextAnalyses].filter(([file]) => analysisHashes.has(file)));
+                this.analyzedHashes = analysisHashes;
+                return resolveShapes(this.analyses, this.projects);
+            };
+            // Reserve analysis threads before admitting one-slot discovery jobs.
+            // This is the only multi-slot operation, so nested reservations cannot deadlock.
+            const analyzeWithBudget = (slots: number): Promise<ReadonlyMap<string, string | null>> => slots
+                ? preparationBudget.run(signal, () => analyzeWithBudget(slots - 1)) : analyze();
+            analyzing = analyzeWithBudget(analysisSlots);
+            // Discovery may fail before the join; retain/drain the analysis rejection below.
+            void analyzing.catch(() => undefined);
             let coverageTool: string | undefined;
             let runtimeTreeChanged = false;
             if (config.coverage && builds.some(project => project.isTestProject)) {
-                phase('Setting up coverage');
-                try {coverageTool = await this.ensureCoverageTool(config, processOptions);}
+                try {
+                    coverageTool = await preparationBudget.run(signal, () => this.ensureCoverageTool(config, processOptions));
+                }
                 catch (error) {signal.throwIfAborted(); events.output(`Coverage unavailable; tests will continue with conservative selection. ${String(error)}\n`);}
             }
+            const anticipatedTargets = new Set(anticipated.groups.map(group => testTargetKey(group.project, group.framework)));
             const runnerOptions: RunnerOptions = {
                 ...processOptions, dotnet: config.dotnet, storage: path.join(this.options.storage, 'runs'),
                 testArguments: config.testArguments, coverageTool, assemblies: this.projects.flatMap(project => project.assemblies ?? [project.assembly]), analyzer: this.options.analyzer, identity: this.identity,
@@ -369,6 +418,17 @@ export class TestEngine {
                     sources: [...project.sourceFiles, ...project.inputs ?? []]
                 }))),
                 outputRoot: outputLease.directory, snapshots,
+                preparedOutputCache: this.preparedOutputs,
+                deferCoverage: !full && !manual && config.mode === 'affected'
+                    ? target => !anticipatedTargets.has(testTargetKey(target.project, target.framework)) : undefined,
+                preparationContexts: new Map(testBuilds.map(project => [testTargetKey(project.file, project.framework), contentHash(JSON.stringify({
+                    roots: rootSnapshot, configuration: config.configuration, excludes: config.excludes,
+                    target: project.contextId, sdk: sdkByFile.get(project.file),
+                    contexts: buildOrder(this.buildGraph, new Set([project.file])).map(context => ({
+                        id: context.contextId, file: context.file, framework: context.framework, assembly: context.assembly,
+                        properties: Object.entries(context.properties ?? {}).sort(([a], [b]) => a.localeCompare(b))
+                    }))
+                }))])),
                 buildInputs: new Map(this.projects.filter(project => project.isTestProject).map(project => [project.file,
                     [...new Set(buildOrder(this.projects, new Set([project.file])).flatMap(input => [...input.inputs ?? []]))]])),
                 onResult: (group, result, test) => {
@@ -394,16 +454,19 @@ export class TestEngine {
                 onExpanded: groups => events.selected({ groups, reason: 'Containing files for provider runtime identities', fallback: true })
             };
             sessions = new RunnerSession(runnerOptions);
-            phase('Discovering tests');
             const next = this.groups.filter(group => !testBuilds.some(project => project.file === group.project && project.framework === group.framework)
                 && this.projects.some(project => project.file === group.project && project.framework === group.framework && project.isTestProject && project.entryPoint !== false));
             let discoveredProjects = 0, activeDiscoveries = 0;
-            const discoveryProgress = (): void => events.phase(`Discovering tests ${discoveredProjects}/${testBuilds.length} · ${activeDiscoveries} active`);
+            const discoveryProgress = (): void => events.phase(`Preparing tests ${discoveredProjects}/${testBuilds.length} · ${activeDiscoveries} active`);
             const inventories = await mapConcurrent(testBuilds, projectLimit, signal, async project => {
-                activeDiscoveries++; discoveryProgress();
-                try {const groups = await sessions!.discover(project); discoveredProjects++; return groups;}
-                finally {activeDiscoveries--; discoveryProgress();}
+                return preparationBudget.run(signal, async () => {
+                    activeDiscoveries++; discoveryProgress();
+                    try {const groups = await sessions!.discover(project); discoveredProjects++; return groups;}
+                    finally {activeDiscoveries--; discoveryProgress();}
+                });
             }, () => controller.abort());
+            const currentShapes = await analyzing;
+            const conservative = new Set(changes.filter(file => !currentShapes.get(file) || currentShapes.get(file) !== previousShapes.get(file)));
             next.push(...inventories.flat());
             const liveIds = await this.reconcileGroups(next, baseline);
             const checkpointInputs = new Map(before);
@@ -465,7 +528,7 @@ export class TestEngine {
             const allowSecondary = !manual || (!manual.exclude && !manual.tests && ![...manual.groups].some(id => this.runtimeGroups.has(id)));
             const progress = (): void => events.phase(`Testing ${completed}/${batches.length} · ${active} active${baseline ? ` · ${baseline.completed.size}/${this.groups.length} files learned` : ''}`);
             phase('Testing');
-            await mapConcurrent(batches, testLimit, signal, async (requestedGroups, _index, _workerSignal, worker) => {
+            await mapConcurrentByKey(batches, testLimit, signal, groups => testTargetKey(groups[0].project, groups[0].framework), async (requestedGroups, _index, _workerSignal, worker) => {
                 active++; progress();
                 try {
                     const run = await sessions!.run(requestedGroups, before, allowSecondary ? worker + 1 : 0), groups = run.executedGroups;
@@ -542,7 +605,7 @@ export class TestEngine {
                     });
                     completed++;
                 } finally {active--; progress();}
-            }, () => controller.abort());
+            }, () => controller.abort(), groups => allowSecondary && sessions!.canRunParallel(groups));
             signal.throwIfAborted();
             if (!manual) {
                 this.shapes = currentShapes;
@@ -555,7 +618,12 @@ export class TestEngine {
             return { files: executedFiles.size, tests: results.length, passed: results.filter(result => result.outcome === 'passed').length,
                 failed: results.filter(result => result.outcome === 'failed' || result.outcome === 'errored').length,
                 skipped: results.filter(result => result.outcome === 'skipped').length, duration: Date.now() - began, coverageAvailable: available };
-        } finally {finishPhase(); try {await sessions?.dispose();} finally {await outputLease.dispose();}}
+        } catch (error) {controller.abort(error); throw error;}
+        finally {
+            finishPhase();
+            if (analyzing) {await Promise.allSettled([analyzing]);}
+            try {await sessions?.dispose();} finally {await outputLease.dispose();}
+        }
     }
 
     private setInputs(files: Iterable<string>): void {

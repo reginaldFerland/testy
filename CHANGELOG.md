@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Schedule idle project runners before creating additional workers within a project, and redistribute spare capacity as projects finish.
+- Reuse validated prepared outputs between runs, with fresh discovery, isolated collector sessions, bounded retention, and cleanup on shutdown.
+- Reuse project evaluations after validating their recorded inputs and filesystem queries, including changes made while automation is idle.
+- Defer instrumentation for discovery-only targets, overlap source analysis with runner preparation within the worker budget, and share tool fingerprints within each run.
+
 ## 1.1.0
 
 - Run independent project discovery, source analysis, and test files concurrently with configurable worker limits.

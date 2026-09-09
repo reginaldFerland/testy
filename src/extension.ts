@@ -9,13 +9,21 @@ import { contentHash, isInheritedConfiguration, isExcluded, isGeneratedSource, i
 import { ChangeBatch, Scheduler, SchedulerState } from './core/scheduler';
 import { ManualSelection, RunSummary, TestEngine } from './services/engine';
 
+let activeExtension: Testy | undefined;
+
 export async function activate(context: vscode.ExtensionContext): Promise<{ snapshot: () => unknown } | undefined> {
     const roots = (vscode.workspace.workspaceFolders ?? []).map(folder => normalizePath(folder.uri.fsPath));
     if (!roots.length || !vscode.workspace.isTrusted) {return;}
     const extension = new Testy(context, roots);
+    activeExtension = extension;
     context.subscriptions.push(extension);
     await extension.start();
     return { snapshot: () => extension.snapshot() };
+}
+
+export async function deactivate(): Promise<void> {
+    try {await activeExtension?.dispose();}
+    finally {activeExtension = undefined;}
 }
 
 class Testy implements vscode.Disposable {
@@ -53,6 +61,7 @@ class Testy implements vscode.Disposable {
     private lastSummary: RunSummary | undefined;
     private lastError = '';
     private disposed = false;
+    private disposal?: Promise<void>;
     private readonly lifetime = new AbortController();
 
     constructor(private readonly context: vscode.ExtensionContext, private roots: readonly string[]) {
@@ -459,12 +468,17 @@ class Testy implements vscode.Disposable {
         return { controller, dispose: () => registration.dispose() };
     }
 
-    dispose(): void {
+    dispose(): Promise<void> {
+        if (this.disposal) {return this.disposal;}
         this.lifetime.abort();
         this.disposed = true; this.scheduler.dispose(); this.watchers.forEach(watcher => watcher.dispose());
+        this.disposal = this.engine.dispose();
+        // Subscription disposal is synchronous; deactivate also awaits this work.
+        void this.disposal.catch(error => console.error('Testy prepared-output cleanup failed.', error));
         if (this.renderTimer) {clearTimeout(this.renderTimer);} this.pendingEditors.clear();
         this.disposables.forEach(disposable => disposable.dispose());
         Object.values(this.decorations).forEach(decoration => decoration.dispose());
         this.activeRun?.end(); this.controller.dispose(); this.output.dispose(); this.status.dispose();
+        return this.disposal;
     }
 }

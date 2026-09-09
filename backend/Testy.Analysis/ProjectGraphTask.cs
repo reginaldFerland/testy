@@ -6,6 +6,8 @@ using Microsoft.Build.Evaluation;
 using Microsoft.Build.Execution;
 using Microsoft.Build.Framework;
 using Microsoft.Build.Graph;
+using Microsoft.Build.Definition;
+using Microsoft.Build.Evaluation.Context;
 
 namespace Testy.Analysis;
 
@@ -26,12 +28,18 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
             var configuration = request.RootElement.GetProperty("configuration").GetString()!;
             var concurrency = request.RootElement.TryGetProperty("concurrency", out var workers) ? Math.Max(1, workers.GetInt32()) : 1;
             var inputs = new ConcurrentDictionary<ProjectInstance, string[]>();
+            var evaluationInputs = new ConcurrentDictionary<ProjectInstance, EvaluationInputs.Snapshot>();
+            var sharedInputs = new EvaluationInputs.Shared();
             using var collection = new ProjectCollection();
             var entryPoints = files.Select(file => new ProjectGraphEntryPoint(file, new Dictionary<string, string> { ["Configuration"] = configuration }));
             var graph = new ProjectGraph(entryPoints, collection, (projectFile, properties, projects) =>
             {
-                var project = new Project(projectFile, properties, null, projects);
+                var fileSystem = new EvaluationInputs(sharedInputs);
+                var project = Project.FromFile(projectFile, new ProjectOptions { GlobalProperties = properties, ProjectCollection = projects,
+                    EvaluationContext = EvaluationContext.Create(EvaluationContext.SharingPolicy.Shared, fileSystem) });
                 var instance = project.CreateProjectInstance();
+                try { evaluationInputs[instance] = fileSystem.Complete(project); }
+                catch (Exception error) { evaluationInputs[instance] = new(false, [], new Dictionary<string, string>(), [], [], "", error.Message); }
                 inputs[instance] = project.Imports.Select(import => import.ImportedProject.FullPath)
                     .Concat(new[] { project.FullPath }).Distinct().ToArray();
                 return instance;
@@ -111,10 +119,12 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
                     file = Path.GetFullPath(file),
                     contexts = reachable.Where(node => !string.IsNullOrEmpty(node.ProjectInstance.GetPropertyValue("TargetFramework")))
                         .Select(node => identities[node]).Order().ToArray(),
-                    entryPoints = entryNodes.SelectMany(Targets).Select(node => identities[node]).Distinct().Order().ToArray()
+                    entryPoints = entryNodes.SelectMany(Targets).Select(node => identities[node]).Distinct().Order().ToArray(),
+                    evaluation = reachable.Select(node => identities[node]).ToArray()
                 };
             }).ToArray();
-            File.WriteAllText(OutputFile, JsonSerializer.Serialize(new { projects, roots }));
+            var evaluations = graph.ProjectNodes.ToDictionary(node => identities[node], node => evaluationInputs[node.ProjectInstance]);
+            File.WriteAllText(OutputFile, JsonSerializer.Serialize(new { projects, roots, evaluations }));
             return true;
         }
         catch (Exception error)
