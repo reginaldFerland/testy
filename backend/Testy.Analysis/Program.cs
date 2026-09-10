@@ -7,7 +7,11 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 try
 {
-    using var request = JsonDocument.Parse(await File.ReadAllTextAsync(args.Single()));
+    var requestBytes = await File.ReadAllBytesAsync(args.Single());
+    using var requestStream = new MemoryStream(requestBytes, writable: false);
+    using var requestReader = new StreamReader(requestStream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+    using var request = JsonDocument.Parse(await requestReader.ReadToEndAsync());
+    var provenance = request.RootElement.TryGetProperty("provenance", out var requestedProvenance) && requestedProvenance.GetBoolean();
     var combined = request.RootElement.TryGetProperty("allFiles", out var allFiles);
     if (!combined && request.RootElement.TryGetProperty("aliasSources", out var aliasSources))
     {
@@ -37,16 +41,22 @@ try
         ? Math.Max(1, requestedConcurrency.GetInt32()) : 1;
     // Workers own their syntax tree and result slot. Publish only after all work
     // completes, in input order, so concurrency does not change fingerprints or JSON.
-    var analyses = new SourceShape?[files.Length];
+    var analyses = new AnalyzedSource[files.Length];
     await Parallel.ForEachAsync(Enumerable.Range(0, files.Length),
         new ParallelOptions { MaxDegreeOfParallelism = concurrency }, async (index, cancellationToken) =>
         {
             analyses[index] = await AnalyzeSource(files[index], aliases, cancellationToken);
         });
     var result = new Dictionary<string, SourceShape?>();
-    for (var index = 0; index < files.Length; index++) { result[files[index]] = analyses[index]; }
+    for (var index = 0; index < files.Length; index++) { result[files[index]] = analyses[index].Shape; }
     var serialization = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
-    Console.WriteLine(combined ? JsonSerializer.Serialize(new { aliases, analyses = result }, serialization) : JsonSerializer.Serialize(result, serialization));
+    if (provenance)
+    {
+        var sourceHashes = new Dictionary<string, string?>();
+        for (var index = 0; index < files.Length; index++) { sourceHashes[files[index]] = analyses[index].SourceHash; }
+        Console.WriteLine(JsonSerializer.Serialize(new { version = 1, requestHash = Convert.ToHexString(SHA256.HashData(requestBytes)), aliases, analyses = result, sourceHashes }, serialization));
+    }
+    else { Console.WriteLine(combined ? JsonSerializer.Serialize(new { aliases, analyses = result }, serialization) : JsonSerializer.Serialize(result, serialization)); }
     return 0;
 }
 catch (Exception exception)
@@ -55,13 +65,19 @@ catch (Exception exception)
     return 1;
 }
 
-static async Task<SourceShape?> AnalyzeSource(string file, string[] aliases, CancellationToken cancellationToken)
+static async Task<AnalyzedSource> AnalyzeSource(string file, string[] aliases, CancellationToken cancellationToken)
 {
-    if (!File.Exists(file)) { return null; }
-    var tree = CSharpSyntaxTree.ParseText(await File.ReadAllTextAsync(file, cancellationToken));
+    if (!File.Exists(file)) { return new(null, null); }
+    // The fingerprint must describe the bytes Roslyn receives, not a separate
+    // read before or after parsing. Retain ReadAllText's BOM/encoding behavior.
+    var bytes = await File.ReadAllBytesAsync(file, cancellationToken);
+    var sourceHash = Convert.ToHexString(SHA256.HashData(bytes));
+    using var stream = new MemoryStream(bytes, writable: false);
+    using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+    var tree = CSharpSyntaxTree.ParseText(await reader.ReadToEndAsync(cancellationToken));
     if (tree.GetDiagnostics().Any(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error))
     {
-        return null;
+        return new(null, sourceHash);
     }
     var root = await tree.GetRootAsync(cancellationToken);
     // Directives can change compilation or metadata even when they occur
@@ -93,7 +109,7 @@ static async Task<SourceShape?> AnalyzeSource(string file, string[] aliases, Can
         || root.DescendantTrivia(descendIntoTrivia: true).Where(trivia => trivia.IsKind(SyntaxKind.DisabledTextTrivia))
             .Any(trivia => HasExcludedName(trivia.ToFullString()) || excludedAliases.Any(alias => trivia.ToFullString().Contains(alias, StringComparison.Ordinal))))
     { excludedTypes.Add("*"); }
-    return new SourceShape(Hash(declarations + directives), Hash(root.NormalizeWhitespace().ToFullString()), partialTypes, [.. excludedTypes]);
+    return new(new SourceShape(Hash(declarations + directives), Hash(root.NormalizeWhitespace().ToFullString()), partialTypes, [.. excludedTypes]), sourceHash);
 }
 
 static bool IsExcluded(string name) => new[] { "ExcludeFromCodeCoverage", "DebuggerHidden", "DebuggerNonUserCode", "GeneratedCode", "CompilerGenerated" }
@@ -130,6 +146,7 @@ static string TypeKey(TypeDeclarationSyntax type)
 }
 
 sealed record SourceShape(string Signature, string Body, string[] PartialTypes, string[] ExcludedTypes);
+sealed record AnalyzedSource(SourceShape? Shape, string? SourceHash);
 
 // Only executable method/accessor bodies can use runtime traces alone. Keep
 // initializers, constants, constructors, attributes, signatures, and type shape:

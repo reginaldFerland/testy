@@ -10,6 +10,7 @@ import { buildOrder, buildRoots, buildWaves, buildSnapshotTargets, buildProjects
 import { Cancelled, ProcessOptions, requireSuccess, runProcess } from './process';
 import { projectCoverageId, RunnerOptions, RunnerSession } from './runner';
 import { resolveShapes, sourceAnalysisBatch, SourceShape } from './analysis';
+import { sourceAnalysisContext } from './analysisContext';
 import { SourceTracker } from './sources';
 import { CoverageCache } from './cache';
 import { discoveredTest } from './mtp';
@@ -121,6 +122,7 @@ export class TestEngine {
     private shapes: ReadonlyMap<string, string | null> = new Map();
     private analyses: ReadonlyMap<string, SourceShape | null> = new Map();
     private analyzedHashes: ReadonlyMap<string, string> = new Map();
+    private analysisContext: string | undefined;
     private aliasStamp: string | undefined;
     private excludedAliases: readonly string[] = [];
     private readonly sdkContexts = new Set<string>();
@@ -391,28 +393,52 @@ export class TestEngine {
             const analyze = async (): Promise<ReadonlyMap<string, string | null>> => {
                 const started = Date.now(), analysisHashes = this.sources.analysisHashes;
                 const allFiles = [...analysisHashes.keys()];
-                const shapeFiles = allFiles.filter(file => newBaseline || !this.analyses.has(file) || analysisHashes.get(file) !== this.analyzedHashes.get(file));
+                const context = await sourceAnalysisContext(config.dotnet, this.options.analyzer, processOptions);
+                const contextChanged = !context || context !== this.analysisContext;
+                const shapeFiles = allFiles.filter(file => contextChanged || !this.analyses.get(file) || analysisHashes.get(file) !== this.analyzedHashes.get(file));
                 const candidates = [...this.sources.aliasSources].sort(([a], [b]) => a.localeCompare(b));
-                const stamp = contentHash(JSON.stringify(candidates)), aliasesChanged = stamp !== this.aliasStamp;
+                const stamp = contentHash(JSON.stringify(candidates)), aliasesChanged = contextChanged || stamp !== this.aliasStamp;
                 let nextAnalyses: ReadonlyMap<string, SourceShape | null>;
-                let failedFiles: ReadonlySet<string> | undefined;
+                const nextHashes = new Map(contextChanged ? [] : this.analyzedHashes);
+                let uncertain = aliasesChanged;
                 try {
                     const result = await sourceAnalysisBatch(config.dotnet, this.options.analyzer, shapeFiles, this.options.storage, processOptions,
-                        this.excludedAliases, analysisSlots, aliasesChanged ? { sources: candidates.map(([, content]) => content), allFiles } : undefined);
+                        this.excludedAliases, analysisSlots, aliasesChanged ? { sources: candidates.map(([, content]) => content), allFiles } : undefined, true);
+                    if (!result.sourceHashes) {uncertain = true; throw new Error('Source analysis did not provide parsed-byte provenance.');}
+                    const mismatched = [...result.analyses.keys()].filter(file => result.sourceHashes!.get(file) !== analysisHashes.get(file));
+                    if (mismatched.length) {
+                        // An edit can also introduce an alias in a previously
+                        // ordinary source. Retry the complete alias inventory.
+                        this.sources.mark(mismatched); uncertain = true;
+                        throw new Error('Source inputs changed during analysis.');
+                    }
+                    if (context && (result.analyses.size || (aliasesChanged && candidates.length))
+                        && context !== await sourceAnalysisContext(config.dotnet, this.options.analyzer, processOptions)) {
+                        uncertain = true; throw new Error('Source analysis tools changed during analysis.');
+                    }
                     signal.throwIfAborted();
                     nextAnalyses = result.analyses;
+                    for (const [file, shape] of nextAnalyses) {
+                        nextHashes.delete(file);
+                        if (context && shape) {nextHashes.set(file, result.sourceHashes.get(file)!);}
+                    }
+                    this.analysisContext = context;
                     this.excludedAliases = result.aliases; this.aliasStamp = stamp;
+                    const reused = allFiles.length - nextAnalyses.size;
+                    if (reused > 0) {events.output(`Reused ${reused} unchanged source analyses.\n`);}
                 }
                 catch (error) {
                     signal.throwIfAborted(); events.output(`Source analysis unavailable; using project fallback. ${String(error)}\n`);
                     // An unresolved alias edit can affect every otherwise unchanged
                     // declaration. Do not retain narrow signatures or mark a failed
                     // analysis as current; the next operation must retry it.
-                    failedFiles = new Set(aliasesChanged ? allFiles : shapeFiles);
-                    nextAnalyses = new Map([...failedFiles].map(file => [file, null]));
+                    const failedFiles = uncertain ? allFiles : shapeFiles;
+                    nextAnalyses = new Map(failedFiles.map(file => [file, null]));
+                    for (const file of failedFiles) {nextHashes.delete(file);}
+                    if (uncertain) {this.analysisContext = undefined;}
                 } finally {events.output(`Testy timing: Source analysis ${Date.now() - started}ms (overlaps test preparation)\n`);}
                 this.analyses = new Map([...this.analyses, ...nextAnalyses].filter(([file]) => analysisHashes.has(file)));
-                this.analyzedHashes = failedFiles ? new Map([...analysisHashes].filter(([file]) => !failedFiles.has(file))) : analysisHashes;
+                this.analyzedHashes = new Map([...nextHashes].filter(([file]) => analysisHashes.has(file)));
                 return resolveShapes(this.analyses, this.projects);
             };
             // Reserve analysis threads before admitting one-slot discovery jobs.

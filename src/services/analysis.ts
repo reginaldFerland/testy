@@ -1,6 +1,6 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { normalizePath } from '../core/paths';
+import { contentHash, normalizePath } from '../core/paths';
 import { Project } from '../core/model';
 import { ProcessOptions, requireSuccess, runProcess } from './process';
 
@@ -39,6 +39,8 @@ function sourceShape(value: unknown): value is SourceShape {
 export interface SourceAnalysisBatch {
     readonly aliases: readonly string[];
     readonly analyses: ReadonlyMap<string, SourceShape | null>;
+    /** Present only for a complete response bound to the exact request bytes. */
+    readonly sourceHashes?: ReadonlyMap<string, string>;
 }
 export interface SourceAliasUpdate {
     readonly sources: readonly string[];
@@ -48,37 +50,52 @@ export interface SourceAliasUpdate {
 /** Resolve changed aliases and analyze their affected files in one process.
  * A complete response is required before callers may publish the alias state. */
 export async function sourceAnalysisBatch(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: ProcessOptions,
-    excludedAliases: readonly string[] = [], concurrency = 1, aliasUpdate?: SourceAliasUpdate): Promise<SourceAnalysisBatch> {
+    excludedAliases: readonly string[] = [], concurrency = 1, aliasUpdate?: SourceAliasUpdate, provenance = false): Promise<SourceAnalysisBatch> {
     options.signal?.throwIfAborted();
     if (!aliasUpdate || !aliasUpdate.sources.length) {
         const aliases = aliasUpdate ? [] : excludedAliases;
         const selected = aliasUpdate && !aliasesEqual(aliases, excludedAliases) ? aliasUpdate.allFiles : files;
-        return { aliases, analyses: await sourceAnalyses(dotnet, analyzer, selected, storage, options, aliases, concurrency) };
+        if (!provenance) {return { aliases, analyses: await sourceAnalyses(dotnet, analyzer, selected, storage, options, aliases, concurrency) };}
+        if (!selected.length) {return { aliases, analyses: new Map(), sourceHashes: new Map() };}
+        files = selected; excludedAliases = aliases; aliasUpdate = undefined;
     }
     await fs.mkdir(storage, { recursive: true });
     const directory = await fs.mkdtemp(path.join(storage, 'analysis-'));
     try {
         const input = path.join(directory, 'files.json');
-        await fs.writeFile(input, JSON.stringify({ files, excludedAliases, aliasSources: aliasUpdate.sources, allFiles: aliasUpdate.allFiles,
-            concurrency: Number.isFinite(concurrency) ? Math.max(1, Math.floor(concurrency)) : 1 }));
+        const request = JSON.stringify({ files, excludedAliases, aliasSources: aliasUpdate?.sources, allFiles: aliasUpdate?.allFiles,
+            concurrency: Number.isFinite(concurrency) ? Math.max(1, Math.floor(concurrency)) : 1, ...(provenance ? { provenance: true } : {}) });
+        await fs.writeFile(input, request);
         const output = requireSuccess(await runProcess(dotnet, [analyzer, input], { ...options, output: undefined }), 'Analyzing C# declarations and aliases').stdout;
         const parsed: unknown = JSON.parse(output);
-        const value = parsed as Partial<{ aliases: unknown; analyses: Record<string, unknown> }> | null;
+        const value = parsed as Partial<{ aliases: unknown; analyses: Record<string, unknown>; version: unknown; requestHash: unknown; sourceHashes: Record<string, unknown> }> | null;
         if (!value || !names(value.aliases) || !value.analyses || typeof value.analyses !== 'object' || Array.isArray(value.analyses)) {
             throw new Error('Invalid combined source analysis response.');
         }
-        const selected = aliasesEqual(value.aliases, excludedAliases) ? files : aliasUpdate.allFiles;
+        if (!aliasUpdate && !aliasesEqual(value.aliases, excludedAliases)) {throw new Error('Unexpected source analysis aliases.');}
+        const selected = aliasUpdate && !aliasesEqual(value.aliases, excludedAliases) ? aliasUpdate.allFiles : files;
         const expected = new Set(selected);
         if (Object.keys(value.analyses).length !== expected.size) {throw new Error('Incomplete combined source analysis response.');}
+        if (provenance && (value.version !== 1 || value.requestHash !== contentHash(request).toUpperCase()
+            || !value.sourceHashes || typeof value.sourceHashes !== 'object' || Array.isArray(value.sourceHashes)
+            || Object.keys(value.sourceHashes).length !== expected.size)) {throw new Error('Invalid source analysis provenance.');}
         const analyses = new Map<string, SourceShape | null>();
+        const sourceHashes = new Map<string, string>();
         for (const file of expected) {
             if (!Object.hasOwn(value.analyses, file)) {throw new Error('Incomplete combined source analysis response.');}
             const shape = value.analyses[file];
             if (shape !== null && !sourceShape(shape)) {throw new Error('Invalid combined source analysis record.');}
-            analyses.set(normalizePath(file), shape);
+            const normalized = normalizePath(file);
+            if (provenance) {
+                const hash = value.sourceHashes![file];
+                if (!Object.hasOwn(value.sourceHashes!, file) || (hash !== null && (typeof hash !== 'string' || !/^[A-F0-9]{64}$/.test(hash)))
+                    || (shape !== null && hash === null)) {throw new Error('Invalid source analysis hash.');}
+                if (typeof hash === 'string') {sourceHashes.set(normalized, hash.toLowerCase());}
+            }
+            analyses.set(normalized, shape);
         }
         options.signal?.throwIfAborted();
-        return { aliases: value.aliases, analyses };
+        return { aliases: value.aliases, analyses, ...(provenance ? { sourceHashes } : {}) };
     } finally {await fs.rm(directory, { recursive: true, force: true });}
 }
 

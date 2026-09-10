@@ -22,6 +22,8 @@ Prepared outputs are cached between runs and can survive a clean editor shutdown
 
 Project evaluations can also be reused within the editor session and across restarts after validating the files, existence checks, and directory searches MSBuild used. Saved evaluations are bounded to 128 project roots and 32 MiB. A full refresh or startup still checks the SDK and runs Restore before validating an existing evaluation, so generated imports and restored assets remain authoritative. Changes to imports, SDKs, file inventories, configuration, environment, or evaluation tools require fresh evaluation. Unsupported custom evaluation logic and unavailable or invalid saved evaluations use normal evaluation. Builds continue to use MSBuild's incremental checks.
 
+Successful source analyses are retained within the editor session, including across full refreshes. Reuse requires matching source bytes, alias inputs, and analyzer context. Generated sources are checked after Build, and partial declarations and exclusions are resolved against the current projects. Incomplete analysis is retried; custom CLI wrappers or injected runtime components use fresh analysis.
+
 Workspace assemblies loaded from original build outputs, other paths, or memory are also recorded, including loads in child .NET processes that inherit and support the startup hook. When a load bypasses the instrumented copy, Testy records a dependency on the loaded project. Changes and new source files in that project rerun the calling test file, even without a `ProjectReference`. Those loads do not themselves supply line coverage. If runtime observation is incomplete, retained coverage stays visible and selection becomes conservative.
 
 A collector command can succeed without instrumenting a module, for example when its symbols are missing. Testy verifies that the assembly bytes changed and retains project dependencies for skipped modules, so their callers cannot be silently omitted.
@@ -132,3 +134,4 @@ The analyzer bundles pinned, portable Roslyn NuGet assemblies. Unit validation r
 For interactive development, open this repository in VS Code and press **F5**. The launch task builds the bundled .NET helpers before starting the TypeScript watcher. Open `test/fixtures/ImpactDemo` in the Extension Development Host, save a source edit, and inspect Test Explorer and **Testy: Show Output**. To test the installable artifact, use **Extensions: Install from VSIX…** and choose `testy-1.1.0.vsix`; reload the window afterward. No publication is needed.
 
 See [validation evidence](docs/1.0-validation.md) for measured performance and platform limits.
+The [latest performance review](docs/performance-review.md) records optimization measurements and remaining candidates.
