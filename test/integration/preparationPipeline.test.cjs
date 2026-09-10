@@ -20,10 +20,10 @@ async function fixture(t,limit){
 
 for(const limit of [1,2,4])test(`analysis and discovery share ${limit} preparation worker${limit===1?'':'s'}`,{timeout:120000},async t=>{
  const f=await fixture(t,limit),entered=deferred(),release=deferred();
- const analyze=analysis.sourceAnalyses,request=mtp.requestTests;
+ const analyze=analysis.sourceAnalysisBatch,request=mtp.requestTests;
  let active=0,peak=0,overlapped=false;
  const counted=async(slots,work)=>{active+=slots;peak=Math.max(peak,active);assert.ok(active<=limit,`${active} reserved workers exceeds ${limit}`);try{return await work();}finally{active-=slots;}};
- analysis.sourceAnalyses=(...args)=>counted(args[6],async()=>{
+ analysis.sourceAnalysisBatch=(...args)=>counted(args[6],async()=>{
   entered.resolve();if(limit>1)await release.promise;return analyze(...args);
  });
  mtp.requestTests=async(options,operation,...args)=>{
@@ -32,7 +32,7 @@ for(const limit of [1,2,4])test(`analysis and discovery share ${limit} preparati
   overlapped=active>0;
   return counted(1,async()=>{release.resolve();return request(options,operation,...args);});
  };
- f.cleanup(()=>{release.resolve();analysis.sourceAnalyses=analyze;mtp.requestTests=request;});
+ f.cleanup(()=>{release.resolve();analysis.sourceAnalysisBatch=analyze;mtp.requestTests=request;});
  const result=await f.engine.run({files:[],full:true},f.signal);
  assert.equal(result.passed,3,f.output.join(''));assert.equal(result.failed,0);
  assert.equal(overlapped,limit>1,'parallel mode overlaps the stages and sequential mode preserves one worker');
@@ -42,8 +42,8 @@ for(const limit of [1,2,4])test(`analysis and discovery share ${limit} preparati
 
 test('discovery failure cancels and drains concurrent analysis before disposing the engine',{timeout:120000},async t=>{
  const f=await fixture(t,2),entered=deferred(),aborted=deferred(),finish=deferred();
- const analyze=analysis.sourceAnalyses,request=mtp.requestTests;
- analysis.sourceAnalyses=async(...args)=>{
+ const analyze=analysis.sourceAnalysisBatch,request=mtp.requestTests;
+ analysis.sourceAnalysisBatch=async(...args)=>{
   const signal=args[4].signal;entered.resolve();
   await new Promise(resolve=>{if(signal.aborted)resolve();else signal.addEventListener('abort',resolve,{once:true});});
   aborted.resolve();await finish.promise;signal.throwIfAborted();
@@ -52,7 +52,7 @@ test('discovery failure cancels and drains concurrent analysis before disposing 
   if(operation!=='discover')return request(options,operation,...args);
   await entered.promise;throw new Error('controlled discovery failure');
  };
- f.cleanup(()=>{finish.resolve();analysis.sourceAnalyses=analyze;mtp.requestTests=request;});
+ f.cleanup(()=>{finish.resolve();analysis.sourceAnalysisBatch=analyze;mtp.requestTests=request;});
  let settled=false;
  const rejected=assert.rejects(f.engine.run({files:[],full:true},f.signal),/controlled discovery failure/).then(()=>{settled=true;});
  await aborted.promise;

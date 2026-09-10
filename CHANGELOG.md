@@ -7,6 +7,8 @@
 - Reuse project evaluations after validating their recorded inputs and filesystem queries, including changes made while automation is idle.
 - Defer instrumentation for discovery-only targets, overlap source analysis with runner preparation within the worker budget, and share tool fingerprints within each run.
 - Retain validated preparation templates across clean editor shutdowns, with exclusive ownership, bounded storage, fresh startup discovery, and conservative crash recovery.
+- Resolve changed global aliases and analyze C# source files in one helper process, preserving conservative fallback and incremental file selection.
+- Avoid building unused method-level coverage XML trees and reuse source-path normalization within each report.
 
 ## 1.1.0
 

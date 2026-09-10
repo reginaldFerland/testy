@@ -9,7 +9,7 @@ import { contentHash, defaultExcludes, isConfigurationFile, isExcluded, normaliz
 import { buildOrder, buildRoots, buildWaves, buildSnapshotTargets, buildProjects, mergeProjects, evaluateProjects, restoreProjects, findProjects, refreshProjectSnapshotBatches, sdkContextGroups, sdkConfigurationFiles } from './projects';
 import { Cancelled, ProcessOptions, requireSuccess, runProcess } from './process';
 import { projectCoverageId, RunnerOptions, RunnerSession } from './runner';
-import { resolveShapes, sourceAliases, sourceAnalyses, SourceShape } from './analysis';
+import { resolveShapes, sourceAnalysisBatch, SourceShape } from './analysis';
 import { SourceTracker } from './sources';
 import { CoverageCache } from './cache';
 import { discoveredTest } from './mtp';
@@ -372,26 +372,29 @@ export class TestEngine {
             const analysisSlots = Math.max(1, projectLimit - testBuilds.length);
             const analyze = async (): Promise<ReadonlyMap<string, string | null>> => {
                 const started = Date.now(), analysisHashes = this.sources.analysisHashes;
-                let shapeFiles = [...analysisHashes.keys()].filter(file => newBaseline || !this.analyses.has(file) || analysisHashes.get(file) !== this.analyzedHashes.get(file));
+                const allFiles = [...analysisHashes.keys()];
+                const shapeFiles = allFiles.filter(file => newBaseline || !this.analyses.has(file) || analysisHashes.get(file) !== this.analyzedHashes.get(file));
+                const candidates = [...this.sources.aliasSources].sort(([a], [b]) => a.localeCompare(b));
+                const stamp = contentHash(JSON.stringify(candidates)), aliasesChanged = stamp !== this.aliasStamp;
                 let nextAnalyses: ReadonlyMap<string, SourceShape | null>;
+                let failedFiles: ReadonlySet<string> | undefined;
                 try {
-                    const candidates = [...this.sources.aliasSources].sort(([a], [b]) => a.localeCompare(b));
-                    const stamp = contentHash(JSON.stringify(candidates));
-                    if (stamp !== this.aliasStamp) {
-                        const aliases = await sourceAliases(config.dotnet, this.options.analyzer, candidates.map(([, content]) => content), this.options.storage, processOptions);
-                        if (JSON.stringify(aliases) !== JSON.stringify(this.excludedAliases)) {
-                            shapeFiles = [...analysisHashes.keys()];
-                        }
-                        this.excludedAliases = aliases; this.aliasStamp = stamp;
-                    }
-                    nextAnalyses = await sourceAnalyses(config.dotnet, this.options.analyzer, shapeFiles, this.options.storage, processOptions, this.excludedAliases, analysisSlots);
+                    const result = await sourceAnalysisBatch(config.dotnet, this.options.analyzer, shapeFiles, this.options.storage, processOptions,
+                        this.excludedAliases, analysisSlots, aliasesChanged ? { sources: candidates.map(([, content]) => content), allFiles } : undefined);
+                    signal.throwIfAborted();
+                    nextAnalyses = result.analyses;
+                    this.excludedAliases = result.aliases; this.aliasStamp = stamp;
                 }
                 catch (error) {
                     signal.throwIfAborted(); events.output(`Source analysis unavailable; using project fallback. ${String(error)}\n`);
-                    nextAnalyses = new Map(shapeFiles.map(file => [file, null]));
+                    // An unresolved alias edit can affect every otherwise unchanged
+                    // declaration. Do not retain narrow signatures or mark a failed
+                    // analysis as current; the next operation must retry it.
+                    failedFiles = new Set(aliasesChanged ? allFiles : shapeFiles);
+                    nextAnalyses = new Map([...failedFiles].map(file => [file, null]));
                 } finally {events.output(`Testy timing: Source analysis ${Date.now() - started}ms (overlaps test preparation)\n`);}
                 this.analyses = new Map([...this.analyses, ...nextAnalyses].filter(([file]) => analysisHashes.has(file)));
-                this.analyzedHashes = analysisHashes;
+                this.analyzedHashes = failedFiles ? new Map([...analysisHashes].filter(([file]) => !failedFiles.has(file))) : analysisHashes;
                 return resolveShapes(this.analyses, this.projects);
             };
             // Reserve analysis threads before admitting one-slot discovery jobs.

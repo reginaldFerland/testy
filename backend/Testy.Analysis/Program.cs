@@ -8,7 +8,8 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 try
 {
     using var request = JsonDocument.Parse(await File.ReadAllTextAsync(args.Single()));
-    if (request.RootElement.TryGetProperty("aliasSources", out var aliasSources))
+    var combined = request.RootElement.TryGetProperty("allFiles", out var allFiles);
+    if (!combined && request.RootElement.TryGetProperty("aliasSources", out var aliasSources))
     {
         var names = aliasSources.Deserialize<string[]>()!.SelectMany(GlobalAliases).Distinct().Order().ToArray();
         Console.WriteLine(JsonSerializer.Serialize(names));
@@ -22,6 +23,16 @@ try
     var files = request.RootElement.GetProperty("files").Deserialize<string[]>()
         ?? throw new ArgumentException("Expected an array of source paths.");
     var aliases = request.RootElement.GetProperty("excludedAliases").Deserialize<string[]>() ?? [];
+    if (combined)
+    {
+        var resolved = request.RootElement.GetProperty("aliasSources").Deserialize<string[]>()!
+            .SelectMany(GlobalAliases).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+        if (!resolved.ToHashSet(StringComparer.Ordinal).SetEquals(aliases))
+        {
+            files = allFiles.Deserialize<string[]>() ?? throw new ArgumentException("Expected all analysis source paths.");
+        }
+        aliases = resolved;
+    }
     var concurrency = request.RootElement.TryGetProperty("concurrency", out var requestedConcurrency)
         ? Math.Max(1, requestedConcurrency.GetInt32()) : 1;
     // Workers own their syntax tree and result slot. Publish only after all work
@@ -34,7 +45,8 @@ try
         });
     var result = new Dictionary<string, SourceShape?>();
     for (var index = 0; index < files.Length; index++) { result[files[index]] = analyses[index]; }
-    Console.WriteLine(JsonSerializer.Serialize(result, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }));
+    var serialization = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+    Console.WriteLine(combined ? JsonSerializer.Serialize(new { aliases, analyses = result }, serialization) : JsonSerializer.Serialize(result, serialization));
     return 0;
 }
 catch (Exception exception)
