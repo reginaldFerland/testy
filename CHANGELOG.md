@@ -15,6 +15,9 @@
 - Write independent coverage source records concurrently while preserving checkpoint ordering and cancellation draining.
 - Combine output-reset permission repair and metadata inventory, with shared bounded filesystem concurrency and fewer unchanged mode writes.
 - Grow prepared-output entry retention with worker and target needs while preserving the 512-MiB byte limit and exclusive ownership across restarts.
+- Maintain coverage ownership and stale-owner counts incrementally, preserving immutable summaries and cancellation-safe publication.
+- Read coverage-cache records concurrently within a shared filesystem budget while preserving snapshot and warning order.
+- Skip redundant coverage-cache maintenance after validated cleanup when saves cannot orphan source records; invalidate that proof after removals, membership changes, external writes, or interrupted publication.
 
 ## 1.1.0
 

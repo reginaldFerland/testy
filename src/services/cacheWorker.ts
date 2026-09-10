@@ -4,6 +4,7 @@ import { parentPort, workerData } from 'node:worker_threads';
 import { CoverageSource, StoredTrace } from '../core/coverage';
 import { contentHash } from '../core/paths';
 import { validSource, validTrace } from './cacheFormat';
+import { mapConcurrent } from '../core/concurrency';
 
 export interface CacheSnapshot {
     readonly sources: readonly (Omit<CoverageSource, 'lines'> & { lines: Float64Array })[];
@@ -14,22 +15,29 @@ export interface CacheSnapshot {
 
 async function read(directory: string): Promise<CacheSnapshot> {
     const warnings: string[] = [];
-    const load = async (kind: string): Promise<unknown[]> => {
-        const result: unknown[] = [];
-        let names: string[];
-        try {names = await fs.readdir(path.join(directory, kind));}
+    const inventories = await Promise.all(['sources', 'traces'].map(async kind => {
+        try {return { kind, names: (await fs.readdir(path.join(directory, kind))).filter(name => /^[a-f0-9]{64}\.json$/.test(name)) };}
         catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {warnings.push(`Unable to read the coverage cache: ${String(error)}`);}
-            return result;
+            return { kind, names: [], warning: (error as NodeJS.ErrnoException).code !== 'ENOENT' ? `Unable to read the coverage cache: ${String(error)}` : undefined };
         }
-        // No size cutoff: every entry this version writes must be readable.
-        for (const name of names.filter(name => /^[a-f0-9]{64}\.json$/.test(name))) {
-            try {result.push(JSON.parse(await fs.readFile(path.join(directory, kind, name), 'utf8')));}
-            catch {warnings.push(`Ignoring an unreadable coverage cache entry: ${name}`);}
+    }));
+    // One small pool spans both tables. Preserve inventory order, including
+    // warnings, without creating a pending read for every record. No size cutoff:
+    // every entry this version writes must be readable.
+    const records = await mapConcurrent(inventories.flatMap(({ kind, names }) => names.map(name => ({ kind, name }))), 4, undefined, async ({ kind, name }) => {
+        try {return { value: JSON.parse(await fs.readFile(path.join(directory, kind, name), 'utf8')) as unknown };}
+        catch {return { warning: `Ignoring an unreadable coverage cache entry: ${name}` };}
+    });
+    let offset = 0;
+    const [sourceValues, traceValues] = inventories.map(inventory => {
+        if (inventory.warning) {warnings.push(inventory.warning);}
+        const values: unknown[] = [];
+        for (let index = 0; index < inventory.names.length; index++) {
+            const record = records[offset++];
+            if (record.warning) {warnings.push(record.warning);} else {values.push(record.value);}
         }
-        return result;
-    };
-    const sourceValues = await load('sources'), traceValues = await load('traces');
+        return values;
+    });
     const sources = sourceValues.filter(validSource);
     const byId = new Map(sources.map(source => [source.id, new Set(source.lines)]));
     const sourceIndex = new Map(sources.map((source, index) => [source.id, index]));

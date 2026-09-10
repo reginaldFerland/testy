@@ -23,6 +23,7 @@ interface SourceRecord {
     source: CoverageSource;
     readonly groups: Set<string>;
     readonly hits: Map<string, readonly CoveredLine[]>;
+    staleCount: number;
     aggregate?: { readonly lines: readonly CoveredLine[]; readonly covered: number };
     aggregateVersion: number;
 }
@@ -38,6 +39,8 @@ export class CoverageStore {
     private summaries = new Map<string, CoverageSummary>();
     private dirtyFiles = new Set<string>();
     private dirtyGroups = new Set<string>();
+    private appliedStale = new Map<string, boolean>();
+    private owners = new Map<string, readonly string[]>();
     private readonly staleOrigins = new Map<string, { trace: StoredTrace; dirty: boolean }>();
     private changedSources = new Set<string>();
     private changedTraces = new Set<string>();
@@ -195,6 +198,7 @@ export class CoverageStore {
         this.byFile = staged.byFile; this.byDependency = staged.byDependency;
         this.summaries = staged.summaries; this.dirtyFiles = staged.dirtyFiles;
         this.dirtyGroups = staged.dirtyGroups; this.staleOrigins.clear();
+        this.appliedStale = staged.appliedStale; this.owners = staged.owners;
         this.changedSources = new Set(); this.changedTraces = new Set();
         this.removedSources = new Set(); this.removedTraces = new Set();
         this.cached = undefined; this.version++;
@@ -306,12 +310,30 @@ export class CoverageStore {
     /** Delay membership traversal until the scheduled, cancellable aggregation. */
     private *dirtySources(): Generator<void, void> {
         const version = this.version, groups = [...this.dirtyGroups];
+        const counts = new Map<SourceRecord, number>(), applied = new Map<string, boolean>();
         let count = 0;
-        for (const id of groups) {for (const sourceId of this.records.get(id)?.sourceIds ?? []) {
-            const source = this.sources.get(sourceId); if (source) {this.dirtyFiles.add(source.source.file);}
-            if (++count % 4096 === 0) {yield;}
-        }}
-        if (version === this.version) {for (const id of groups) {this.dirtyGroups.delete(id);}}
+        for (const id of groups) {
+            const trace = this.records.get(id), stale = !!trace?.stale;
+            const delta = Number(stale) - Number(this.appliedStale.get(id) ?? false), seen = new Set<string>();
+            for (const sourceId of trace?.sourceIds ?? []) {
+                const source = this.sources.get(sourceId);
+                if (source) {
+                    this.dirtyFiles.add(source.source.file);
+                    if (delta && !seen.has(sourceId)) {counts.set(source, (counts.get(source) ?? 0) + delta); seen.add(sourceId);}
+                }
+                if (++count % 4096 === 0) {yield;}
+            }
+            if (trace) {applied.set(id, stale);}
+        }
+        // A cancelled or superseded pass cannot leave partially applied counts.
+        // Bump the revision even for an unrelated synchronous summary: another
+        // paused pass may have captured the same pending transitions.
+        if (groups.length && version === this.version) {
+            for (const [source, delta] of counts) {source.staleCount += delta;}
+            for (const [id, stale] of applied) {this.appliedStale.set(id, stale);}
+            for (const id of groups) {this.dirtyGroups.delete(id);}
+            this.version++;
+        }
     }
 
     private registerSource(source: CoverageSource, canonical = false, merged = false): void {
@@ -319,7 +341,7 @@ export class CoverageStore {
         const lines = merged ? source.lines : previous ? finish(sortedUnion(previous.source.lines, source.lines)) : canonical ? source.lines : finish(sortedUnion([], source.lines));
         if (previous && lines.length === previous.source.lines.length) {return;}
         this.sources.set(source.id, { source: { ...source, lines }, groups: previous?.groups ?? new Set(), hits: previous?.hits ?? new Map(),
-            aggregateVersion: (previous?.aggregateVersion ?? 0) + 1 });
+            staleCount: previous?.staleCount ?? 0, aggregateVersion: (previous?.aggregateVersion ?? 0) + 1 });
         const versions = this.byFile.get(source.file) ?? new Set<string>(); versions.add(source.id); this.byFile.set(source.file, versions);
         this.changedSources.add(source.id); this.removedSources.delete(source.id); this.dirtyFiles.add(source.file); this.cached = undefined; this.version++;
     }
@@ -327,23 +349,47 @@ export class CoverageStore {
     private install(trace: StoredTrace): void { finish(this.installation(trace)); }
 
     private *installation(trace: StoredTrace): Generator<void, void> {
+        const previous = this.records.get(trace.groupId), wasStale = this.appliedStale.get(trace.groupId) ?? false, stale = !!trace.stale;
+        const sourceIds = new Set<string>(), dependencies = new Set(dependencyKeys(trace));
+        const contributions = new Map<string, readonly CoveredLine[]>();
         let count = 0;
-        this.remove(trace.groupId);
-        this.staleOrigins.delete(trace.groupId);
+        for (const id of trace.sourceIds) {sourceIds.add(id); if (++count % 512 === 0) {yield;}}
+        for (const file of trace.coverage) {
+            contributions.set(contentHash(`${file.file}\0${file.hash}`), file.lines);
+            if (++count % 512 === 0) {yield;}
+        }
+        if (previous) {
+            for (const file of dependencyKeys(previous)) {
+                if (!dependencies.has(file)) {
+                    const groups = this.byDependency.get(file); groups?.delete(trace.groupId); if (!groups?.size) {this.byDependency.delete(file);}
+                }
+                if (++count % 512 === 0) {yield;}
+            }
+            for (const id of previous.sourceIds) {
+                const source = this.sources.get(id)!;
+                if (!sourceIds.has(id)) {this.removeMembership(source, trace.groupId, wasStale);}
+                else if (!contributions.has(id) && source.hits.delete(trace.groupId)) {source.aggregate = undefined; source.aggregateVersion++;}
+                if (++count % 512 === 0) {yield;}
+            }
+        }
+        this.staleOrigins.delete(trace.groupId); this.dirtyGroups.delete(trace.groupId); this.appliedStale.set(trace.groupId, stale);
         this.records.set(trace.groupId, trace); this.changedTraces.add(trace.groupId); this.removedTraces.delete(trace.groupId);
-        for (const file of dependencyKeys(trace)) {
+        for (const file of dependencies) {
             const groups = this.byDependency.get(file) ?? new Set<string>(); groups.add(trace.groupId); this.byDependency.set(file, groups);
             if (++count % 512 === 0) {yield;}
         }
-        for (const id of trace.sourceIds) {
+        for (const id of sourceIds) {
             const source = this.sources.get(id)!;
-            source.groups.add(trace.groupId); this.dirtyFiles.add(source.source.file);
+            if (!source.groups.has(trace.groupId)) {
+                source.groups.add(trace.groupId); this.changeOwnership(source, trace.groupId, true); source.staleCount += Number(stale);
+            } else {source.staleCount += Number(stale) - Number(wasStale);}
+            this.dirtyFiles.add(source.source.file);
             if (++count % 512 === 0) {yield;}
         }
-        for (const file of trace.coverage) {
-            const source = this.sources.get(contentHash(`${file.file}\0${file.hash}`));
+        for (const [id, lines] of contributions) {
+            const source = this.sources.get(id);
             if (source) {
-                source.hits.set(trace.groupId, file.lines); source.aggregate = undefined; source.aggregateVersion++;
+                source.hits.set(trace.groupId, lines); source.aggregate = undefined; source.aggregateVersion++;
             }
             if (++count % 512 === 0) {yield;}
         }
@@ -353,6 +399,8 @@ export class CoverageStore {
     private remove(id: string): void {
         const trace = this.records.get(id);
         if (!trace) {return;}
+        const stale = this.appliedStale.get(id) ?? false;
+        this.appliedStale.delete(id);
         this.staleOrigins.delete(id); this.dirtyGroups.delete(id);
         this.records.delete(id); this.removedTraces.add(id); this.changedTraces.delete(id);
         for (const file of dependencyKeys(trace)) {
@@ -360,11 +408,34 @@ export class CoverageStore {
         }
         for (const sourceId of trace.sourceIds) {
             const source = this.sources.get(sourceId)!;
-            source.groups.delete(id);
-            if (source.hits.delete(id)) {source.aggregate = undefined; source.aggregateVersion++;}
-            this.dirtyFiles.add(source.source.file);
+            this.removeMembership(source, id, stale);
         }
         this.cached = undefined; this.version++;
+    }
+
+    private removeMembership(source: SourceRecord, id: string, stale: boolean): void {
+        if (source.groups.delete(id)) {source.staleCount -= Number(stale); this.changeOwnership(source, id, false);}
+        if (source.hits.delete(id)) {source.aggregate = undefined; source.aggregateVersion++;}
+        this.dirtyFiles.add(source.source.file);
+    }
+
+    /** Published ownership arrays stay immutable; insert only genuinely new owners. */
+    private changeOwnership(source: SourceRecord, id: string, add: boolean): void {
+        const file = source.source.file, previous = this.owners.get(file);
+        if (!previous) {return;}
+        if (!add) {for (const version of this.byFile.get(file) ?? []) {
+            if (this.sources.get(version)?.groups.has(id)) {return;}
+        }}
+        let low = 0, high = previous.length;
+        while (low < high) {
+            const middle = low + Math.floor((high - low) / 2);
+            if (previous[middle] < id) {low = middle + 1;} else {high = middle;}
+        }
+        const exists = previous[low] === id;
+        if (exists === add) {return;}
+        const next = previous.slice();
+        if (add) {next.splice(low, 0, id);} else {next.splice(low, 1);}
+        if (next.length) {this.owners.set(file, next);} else {this.owners.delete(file);}
     }
 
     private pruneSources(): void {
@@ -401,11 +472,13 @@ export class CoverageStore {
     }
 
     private *calculation(file: string): Generator<void, CoverageSummary | undefined> {
+        const revision = this.version;
         const versions = [...this.byFile.get(file) ?? []].map(id => this.sources.get(id)!).filter(Boolean);
         if (!versions.length) {return undefined;}
         const current = versions.find(version => version.source.hash === this.hashes.get(file));
         const displayed = current ?? versions[versions.length - 1];
-        const groups = new Set<string>();
+        let groupIds = this.owners.get(file);
+        const groups = groupIds ? undefined : new Set<string>();
         let stale = !current;
         let count = 0;
         for (const version of versions) {
@@ -416,13 +489,15 @@ export class CoverageStore {
             }
             // Zero-hit reports still assert that these lines were uncovered.
             // That assertion becomes stale when the reporting test changes.
-            for (const group of version.groups) {
+            if (version.staleCount || (version !== current && version.hits.size)) {stale = true;}
+            if (groups) {for (const group of version.groups) {
                 groups.add(group);
-                if (this.records.get(group)?.stale) {stale = true;}
-            }
-            for (const group of version.hits.keys()) {
-                if (version !== current || this.records.get(group)?.stale) {stale = true;}
-            }
+                if (++count % 4096 === 0) {yield;}
+            }}
+        }
+        if (!groupIds) {
+            groupIds = [...groups!].sort();
+            if (revision === this.version) {this.owners.set(file, groupIds);}
         }
         const previous = this.summaries.get(file);
         const aggregate = yield* this.aggregate(displayed);
@@ -439,9 +514,8 @@ export class CoverageStore {
         if (sameLines && displayed.aggregate === aggregate && lines !== aggregate.lines) {
             displayed.aggregate = { ...aggregate, lines };
         }
-        const groupIds = [...groups].sort();
         if (previous && sameLines && previous.stale === stale && previous.covered === aggregate.covered
-            && previous.groupIds.length === groupIds.length && groupIds.every((id, index) => id === previous.groupIds[index])) {return previous;}
+            && (previous.groupIds === groupIds || (previous.groupIds.length === groupIds.length && groupIds.every((id, index) => id === previous.groupIds[index])))) {return previous;}
         return { file, lines, stale, covered: aggregate.covered, total: lines.length, groupIds };
     }
 }
