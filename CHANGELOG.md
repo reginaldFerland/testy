@@ -6,6 +6,7 @@
 - Reuse validated prepared outputs between runs, with fresh discovery, isolated collector sessions, bounded retention, and cleanup on shutdown.
 - Reuse project evaluations after validating their recorded inputs and filesystem queries, including changes made while automation is idle.
 - Defer instrumentation for discovery-only targets, overlap source analysis with runner preparation within the worker budget, and share tool fingerprints within each run.
+- Retain validated preparation templates across clean editor shutdowns, with exclusive ownership, bounded storage, fresh startup discovery, and conservative crash recovery.
 
 ## 1.1.0
 

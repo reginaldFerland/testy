@@ -28,7 +28,7 @@ async function fixture(t,config={}){
   const secondary=options.assembly.includes(`${path.sep}lanes${path.sep}`);
   const bytes=await fs.readFile(options.assembly,'utf8');let nodes=nodesFor(options.assembly,bytes);
   if(operation==='discover'){
-   state.discoveries.push({assembly:options.assembly,secondary});
+   state.discoveries.push({assembly:options.assembly,secondary,env:options.env});
    if(config.failDiscover?.(secondary,state.discoveries.length))throw new Error('controlled discovery failure');
    if(secondary&&config.secondaryNodes)nodes=config.secondaryNodes(nodes);
    if(config.mutateDiscovery)await fs.writeFile(path.join(path.dirname(options.assembly),'asset'),'discovery mutation');
@@ -36,7 +36,7 @@ async function fixture(t,config={}){
   }
   const requested=selected??options.expectedTests;
   assert.ok(requested.every(node=>nodes.some(candidate=>candidate.uid===node.uid)),'only lane-native UIDs may reach MTP');
-  const call={assembly:options.assembly,secondary,ids:requested.map(node=>node.uid),wrapper:options.wrapper,bytes};
+  const call={assembly:options.assembly,secondary,ids:requested.map(node=>node.uid),wrapper:options.wrapper,bytes,env:options.env};
   state.runs.push(call);state.active++;state.peak=Math.max(state.peak,state.active);state.activeAssemblies.add(options.assembly);
   (secondary?state.secondaryStarted:state.primaryStarted).resolve();
   try{
@@ -54,8 +54,8 @@ async function fixture(t,config={}){
  };
  const modules={
   './mtp':{...mtp,requestTests},
-  './process':{...processTools,runProcess:async(_command,args)=>{
-   assert.equal(args[0],'instrument');state.instruments.push({assembly:args[1],session:args[3]});
+  './process':{...processTools,runProcess:async(_command,args,options)=>{
+   assert.equal(args[0],'instrument');state.instruments.push({assembly:args[1],session:args[3],env:options.env});
    await config.instrument?.(args,state,control.signal);
    await fs.appendFile(args[1],args[3]);return{code:0,stdout:'',stderr:''};
   }},
@@ -66,12 +66,12 @@ async function fixture(t,config={}){
   }},
   './runOutputs':{...ownership,claimRunOutputs:async(...args)=>{state.claims++;await delay(5);return ownership.claimRunOutputs(...args);}},
   './coverageReader':{CoverageReader:class{async read(report,_cwd,hashes){return(state.reports.get(report)??[]).map(file=>({file,hash:hashes.get(file),lines:[{line:1,hits:1}]}));}async dispose(){}}},
-  './runtimeObservation':{RuntimeObservation:class{static async start(){return{env:{},dependencies:async()=>({files:[],projects:[]})};}}}
+  './runtimeObservation':{RuntimeObservation:class{static async start(_directory,_assembly,_modules,_instrumented,env){return{env,dependencies:async()=>({files:[],projects:[]})};}}}
  };
  vm.runInNewContext(await fs.readFile(file,'utf8'),{exports,process,require:name=>modules[name]??realRequire(name)});
  const emitted=[],sessions=[],cache=config.cache?new cacheTools.PreparedOutputCache(path.join(root,'cache'),randomUUID()):undefined;
  const createSession=(overrides={})=>{const session=new exports.RunnerSession({dotnet:'dotnet',storage:path.join(root,'runs'),testArguments:[],signal:control.signal,
-  coverageTool:config.coverage?'collector':undefined,assemblies:[project.assembly],onPrepared:()=>state.prepared++,
+  coverageTool:config.coverage?'collector':undefined,managedCoverageTool:config.managedCoverageTool,env:config.env,assemblies:[project.assembly],onPrepared:()=>state.prepared++,
   deferCoverage:config.deferCoverage,preparedOutputCache:cache,onResult:(group,result)=>emitted.push({group,result}),
   output:message=>{if(message.includes('primary runner'))state.fallback.resolve();},...overrides});sessions.push(session);return session;};
  const session=createSession();
@@ -83,6 +83,38 @@ test('concurrent target discovery claims one lease and prepares each target once
  const f=await fixture(t),other={...f.project,file:path.join(path.dirname(f.project.file),'Other.csproj')};
  const [first,again]=await Promise.all([f.session.discover(f.project),f.session.discover(f.project),f.session.discover(other)]);
  assert.equal(first,again);assert.equal(f.state.claims,1);assert.equal(f.state.discoveries.length,2);assert.equal(f.state.prepared,2);
+});
+
+test('managed collector ignores only controlled editor variables in cache identity and preserves discovery and test environments',async t=>{
+ const firstEnv={SHLVL:'2',VSCODE_PID:'1001',TESTY_COLLECTOR_OPTION:'original'};
+ const f=await fixture(t,{coverage:true,cache:true,managedCoverageTool:true,env:firstEnv});
+ const groups=await f.session.discover(f.project);await f.session.run([groups[0]],f.hashes);await f.session.dispose();
+ assert.equal(f.state.instruments.length,1);
+ for(const key of ['SHLVL','VSCODE_PID'])assert.equal(f.state.instruments[0].env[key],undefined,'instrumentation receives the same controlled environment used by its fingerprint');
+ assert.equal(f.state.instruments[0].env.TESTY_COLLECTOR_OPTION,'original');
+ for(const call of [f.state.discoveries[0],f.state.runs[0]])for(const key of Object.keys(firstEnv))assert.equal(call.env[key],firstEnv[key]);
+ const nextEnv={...firstEnv,SHLVL:'5',VSCODE_PID:'2002'},next=f.createSession({env:nextEnv});
+ const fresh=await next.discover(f.project);await next.run([fresh[0]],f.hashes);await next.dispose();
+ assert.equal(f.state.instruments.length,1,'the pinned collector reuses its artifact across editor/shell identity changes');
+ for(const call of [f.state.discoveries[1],f.state.runs[1]])for(const key of Object.keys(nextEnv))assert.equal(call.env[key],nextEnv[key]);
+ const changed=f.createSession({env:{...nextEnv,TESTY_COLLECTOR_OPTION:'changed'}});await changed.discover(f.project);
+ assert.equal(f.state.instruments.length,2,'other managed-collector environment changes still invalidate');
+ assert.equal(f.state.instruments[1].env.TESTY_COLLECTOR_OPTION,'changed');
+});
+
+test('custom collector retains every environment variable and invalidates on editor or arbitrary environment changes',async t=>{
+ const initial={SHLVL:'2',VSCODE_PID:'1001',TESTY_COLLECTOR_OPTION:'original'};
+ const f=await fixture(t,{coverage:true,cache:true,env:initial});
+ await f.session.discover(f.project);await f.session.dispose();assert.equal(f.state.instruments[0].env,initial);
+ let previous=initial;
+ for(const update of [{SHLVL:'3'},{VSCODE_PID:'2002'},{TESTY_COLLECTOR_OPTION:'changed'}]){
+  const env={...previous,...update},session=f.createSession({env}),before=f.state.instruments.length;
+  const groups=await session.discover(f.project);await session.run([groups[0]],f.hashes);await session.dispose();
+  assert.equal(f.state.instruments.length,before+1,'all custom collector inputs remain part of the fingerprint');
+  assert.equal(f.state.instruments.at(-1).env,env,'custom instrumentation receives the untouched caller environment');
+  assert.equal(f.state.discoveries.at(-1).env,env);assert.equal(f.state.runs.at(-1).env,env);previous=env;
+ }
+ const warm=f.createSession({env:previous});await warm.discover(f.project);assert.equal(f.state.instruments.length,4,'unchanged custom inputs still reuse');
 });
 
 test('deferred targets discover without instrumentation and only selected targets upgrade with fresh native IDs',async t=>{

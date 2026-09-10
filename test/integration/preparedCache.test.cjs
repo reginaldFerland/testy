@@ -75,7 +75,7 @@ test('warm prepared outputs reuse instrumentation while rediscovering dynamic te
  assert.equal(f.probe.instruments.length,instruments,'a dynamic data change does not invalidate unchanged instrumented artifacts');
  assert.equal(f.probe.discoveries.length,3);
  assert.equal(new Set(f.probe.discoveries).size,1,'warm discovery and execution retain their stable private assembly path');
- assert.ok((await fs.readdir(path.join(f.storage,'prepared'))).some(name=>name.endsWith('.owner.json')),'prepared artifacts survive completed engine runs');
+ assert.ok((await fs.readdir(path.join(f.storage,'prepared-v2'))).some(name=>name.endsWith('.owner.json')),'prepared artifacts survive completed engine runs');
  assert.deepEqual(await fs.readdir(path.join(f.storage,'runs')),[],'per-run outputs are still released promptly');
 });
 
@@ -117,7 +117,7 @@ test('xUnit selected and excluded row identities survive prepared-output invalid
  assert.equal(new Set(f.probe.discoveries).size,1,'invalidating a primary cache entry preserves its stable discovery path');
 });
 
-test('cancelled cached execution drains, retries cleanly and releases retained outputs on engine disposal',{timeout:150000},async t=>{
+test('cancelled cached execution drains, retries cleanly and parks only pristine templates on engine disposal',{timeout:150000},async t=>{
  const f=await fixture(t);assert.equal((await f.run(true)).passed,1);
  const before=f.probe.instruments.length,abort=new AbortController();
  await fs.writeFile(f.slow,'wait');f.state.started=()=>abort.abort();
@@ -129,7 +129,11 @@ test('cancelled cached execution drains, retries cleanly and releases retained o
  assert.ok(f.probe.instruments.length>before,'a cancelled collector session is discarded before retry');
  assert.equal(f.engine.coverage.traces.get(f.engine.groups[0].id).reliable,true);
  await f.engine.dispose();
- assert.deepEqual(await fs.readdir(path.join(f.storage,'prepared')),[],'disposal removes retained templates, working copies and ownership records');
+ const owners=(await fs.readdir(path.join(f.storage,'prepared-v2'))).filter(name=>name.endsWith('.owner.json'));
+ assert.equal(owners.length,1);
+ const owner=JSON.parse(await fs.readFile(path.join(f.storage,'prepared-v2',owners[0]),'utf8'));
+ assert.equal(owner.state,'parked');assert.equal(owner.pid,0,'the disposed engine relinquishes exclusive ownership');
+ for(const entry of owner.snapshot.entries)assert.deepEqual(await fs.readdir(path.join(f.storage,'prepared-v2',owner.identity,entry.directory)),['template'],'executed output and reports are removed before parking');
  assert.deepEqual(await fs.readdir(path.join(f.storage,'runs')),[]);
 });
 

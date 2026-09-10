@@ -18,6 +18,8 @@ export interface RunnerOptions extends ProcessOptions {
     readonly storage: string;
     readonly testArguments: readonly string[];
     readonly coverageTool?: string;
+    /** The pinned collector receives a stable instrumentation environment across editor launches. */
+    readonly managedCoverageTool?: boolean;
     readonly assemblies?: readonly string[];
     readonly modules?: readonly RuntimeModule[];
     readonly buildInputs?: ReadonlyMap<string, readonly string[]>;
@@ -528,7 +530,7 @@ export class RunnerSession {
         const cwd = path.dirname(group.project);
         let toolContext = this.toolContexts.get(cwd);
         if (!toolContext) {toolContext = (async () => {
-            const env = { ...process.env, ...options.env };
+            const env = this.preparationEnvironment();
             const identities = await Promise.allSettled([options.dotnet, options.coverageTool, options.analyzer]
                 .map(command => preparationToolIdentity(command, env, options.signal, cwd, this.toolIdentities)));
             const tools = identities.map(identity => {if (identity.status === 'rejected') {throw identity.reason;} return identity.value;});
@@ -536,8 +538,15 @@ export class RunnerSession {
                 arguments: options.testArguments, assemblies: [...(options.assemblies ?? [])].sort(), modules: options.modules,
                 runtime: process.version, platform: process.platform, architecture: process.arch }));
         })(); this.toolContexts.set(cwd, toolContext);}
-        return JSON.stringify({ version: 1, tools: await toolContext, project: group.project, framework: group.framework,
+        // Bump when preparation semantics change; retained templates can cross editor lifetimes.
+        return JSON.stringify({ version: 3, tools: await toolContext, project: group.project, framework: group.framework,
             assembly: group.assembly, context: options.preparationContexts?.get(testTargetKey(group.project, group.framework)) });
+    }
+
+    private preparationEnvironment(): NodeJS.ProcessEnv {
+        const env = { ...process.env, ...this.options.env };
+        if (this.options.managedCoverageTool) {env.SHLVL = undefined; env.VSCODE_PID = undefined;}
+        return env;
     }
 
     private async createArtifact(group: TestFile, source: string, root: string): Promise<PreparedArtifact> {
@@ -565,7 +574,8 @@ export class RunnerSession {
     }
 
     private async instrumentTemplate(group: TestFile, source: string, template: string, root: string, session: string): Promise<{ coverage: boolean; instrumented: string[] }> {
-        const options = { ...this.options, cwd: path.dirname(group.project) };
+        const options = { ...this.options, cwd: path.dirname(group.project),
+            env: this.options.managedCoverageTool ? this.preparationEnvironment() : this.options.env };
         let coverage = !!options.coverageTool;
         const instrumented: string[] = [];
         if (coverage) {

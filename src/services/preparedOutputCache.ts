@@ -5,18 +5,20 @@ import { createHash, randomUUID } from 'node:crypto';
 import { Semaphore } from '../core/concurrency';
 import { fileHash, PreparedOutput, removeOutput } from './output';
 import { claimRunOutputs, RunOutputLease } from './runOutputs';
+import { claimPreparedStorage, PreparedStorageLease } from './preparedStorage';
 
 const readers = new Semaphore(8);
 interface Manifest { readonly hash: string; readonly bytes: number; }
 
 /** Follow the same links and exclusions as copyOutput, including executable modes. */
-export async function outputManifest(directory: string, signal?: AbortSignal): Promise<Manifest> {
+export async function outputManifest(directory: string, signal?: AbortSignal, followLinks = true): Promise<Manifest> {
     const records: string[] = [];
     let bytes = 0;
     interface Job { readonly file: string; readonly relative: string; readonly ancestors: ReadonlySet<string>; }
     const queued: Job[] = [{ file: directory, relative: '', ancestors: new Set() }];
     const visit = async ({ file, relative, ancestors }: Job): Promise<Job[]> => {
         signal?.throwIfAborted();
+        if (!followLinks && (await fs.lstat(file)).isSymbolicLink()) {throw new Error('A retained preparation contains a symbolic link.');}
         const real = await fs.realpath(file), stat = await fs.stat(real);
         if (stat.isDirectory()) {
             if (ancestors.has(real)) {throw new Error(`A cycle in the build output prevents safe test isolation: ${file}`);}
@@ -140,23 +142,62 @@ interface Entry {
     used: number;
     released: Promise<void>;
     finish: () => void;
+    uninitialized?: boolean;
 }
-export interface PreparedOutputLimits { readonly maxEntries?: number; readonly maxBytes?: number; }
+export interface PreparedOutputLimits { readonly maxEntries?: number; readonly maxBytes?: number; readonly persist?: boolean; }
+interface StoredEntry {
+    readonly directory: string;
+    readonly key: string;
+    readonly slot?: string;
+    readonly template: Manifest;
+    readonly used: number;
+    readonly session: string;
+    readonly coverage: boolean;
+    readonly coveragePending?: boolean;
+    readonly instrumented: readonly string[];
+}
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const sha256 = /^[0-9a-f]{64}$/i;
+const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+const relativeFile = (value: unknown): value is string => typeof value === 'string' && !!value && !path.isAbsolute(value)
+    && !value.split(/[/\\]/).some(part => part === '..' || part === '.' || !part) && !/^[a-z]:/i.test(value);
 
-/** Engine-owned artifacts only; no executable output is reused across extension lifetimes. */
+function storedEntries(snapshot: unknown): readonly StoredEntry[] {
+    if (!object(snapshot) || snapshot.version !== 1 || !Array.isArray(snapshot.entries)) {throw new Error('Unsupported prepared-output snapshot.');}
+    const directories = new Set<string>(), slots = new Set<string>();
+    for (const entry of snapshot.entries) {
+        if (!object(entry) || typeof entry.directory !== 'string' || !(uuid.test(entry.directory) || sha256.test(entry.directory))
+            || typeof entry.key !== 'string' || !sha256.test(entry.key) || typeof entry.session !== 'string' || !uuid.test(entry.session)
+            || typeof entry.coverage !== 'boolean' || (entry.coveragePending !== undefined && typeof entry.coveragePending !== 'boolean')
+            || !object(entry.template) || typeof entry.template.hash !== 'string' || !sha256.test(entry.template.hash)
+            || !Number.isSafeInteger(entry.template.bytes) || (entry.template.bytes as number) < 0 || (entry.template.bytes as number) > Number.MAX_SAFE_INTEGER / 2
+            || !Number.isSafeInteger(entry.used) || (entry.used as number) < 0
+            || !Array.isArray(entry.instrumented) || !entry.instrumented.every(relativeFile)
+            || (entry.slot !== undefined && (typeof entry.slot !== 'string' || !entry.slot
+                || createHash('sha256').update(entry.slot).digest('hex') !== entry.directory || slots.has(entry.slot)))
+            || directories.has(entry.directory)) {throw new Error('Invalid prepared-output snapshot.');}
+        directories.add(entry.directory);
+        if (typeof entry.slot === 'string') {slots.add(entry.slot);}
+    }
+    return snapshot.entries as unknown as readonly StoredEntry[];
+}
+
+/** Exclusive artifacts; clean shutdown can park validated templates for another engine. */
 export class PreparedOutputCache {
     private readonly entries = new Set<Entry>();
     private readonly claimedSlots = new Set<string>();
     private readonly pending = new Set<Promise<unknown>>();
-    private owner?: Promise<RunOutputLease>;
+    private owner?: Promise<RunOutputLease | PreparedStorageLease>;
     private closed = false;
     private disposal?: Promise<void>;
     private clock = 0;
     private readonly maxEntries: number;
     private readonly maxBytes: number;
+    private readonly persist: boolean;
     constructor(private readonly storage: string, private readonly identity: string, limits: PreparedOutputLimits = {}) {
         this.maxEntries = limits.maxEntries ?? 16;
         this.maxBytes = limits.maxBytes ?? 512 * 1024 * 1024;
+        this.persist = limits.persist ?? false;
         if (![this.maxEntries, this.maxBytes].every(value => Number.isSafeInteger(value) && value >= 0)) {throw new Error('Invalid prepared output cache limit.');}
     }
 
@@ -175,7 +216,7 @@ export class PreparedOutputCache {
     private async acquireArtifact(source: string, context: string, create: (root: string) => Promise<PreparedArtifact>, signal?: AbortSignal, slot?: string): Promise<PreparedArtifactLease | undefined> {
         let sourceManifest: Manifest | undefined, root: string;
         try {
-            this.owner ??= claimRunOutputs(path.join(this.storage, 'prepared'), this.identity, signal).catch(error => {this.owner = undefined; throw error;});
+            this.owner ??= this.claimOwner(signal).catch(error => {this.owner = undefined; throw error;});
             root = (await this.owner).directory;
         } catch {signal?.throwIfAborted(); return undefined;}
         try {sourceManifest = await outputManifest(source, signal);} catch {signal?.throwIfAborted();}
@@ -187,6 +228,33 @@ export class PreparedOutputCache {
             return lease;
         }
         catch (error) {if (slot) {this.claimedSlots.delete(slot);} throw error;}
+    }
+
+    private async claimOwner(signal?: AbortSignal): Promise<RunOutputLease | PreparedStorageLease> {
+        if (!this.persist) {return claimRunOutputs(path.join(this.storage, 'prepared'), this.identity, signal);}
+        const owner = await claimPreparedStorage(path.join(this.storage, 'prepared-v2'), signal,
+            { maxEntries: this.maxEntries, maxBytes: this.maxBytes });
+        try {
+            if (owner.snapshot !== undefined) {
+                let saved: readonly StoredEntry[];
+                try {saved = storedEntries(owner.snapshot);}
+                catch {
+                    // Only extension-owned contents of the exclusively claimed container are removed.
+                    for (const name of await fs.readdir(owner.directory)) {await removeOutput(path.join(owner.directory, name));}
+                    return owner;
+                }
+                const entries = saved.map(value => {
+                    const root = path.join(owner.directory, value.directory), directory = path.join(root, 'assembly');
+                    const artifact: PreparedArtifact = { root, output: new PreparedOutput(path.join(root, 'template'), directory),
+                        session: value.session, coverage: value.coverage, coveragePending: value.coveragePending,
+                        instrumented: value.instrumented.map(file => path.join(directory, file)), reusable: true };
+                    return { key: value.key, slot: value.slot, artifact, template: value.template, bytes: value.template.bytes * 2,
+                        active: false, retired: false, used: value.used, released: Promise.resolve(), finish: () => undefined, uninitialized: true };
+                });
+                for (const entry of entries) {this.entries.add(entry); this.clock = Math.max(this.clock, entry.used);}
+            }
+            return owner;
+        } catch (error) {await owner.dispose(); throw error;}
     }
 
     private async acquireOwnedArtifact(source: string, context: string, sourceManifest: Manifest | undefined, root: string,
@@ -201,8 +269,16 @@ export class PreparedOutputCache {
             if (entry.key !== key) {if (slot) {await this.remove(entry);} continue;}
             this.reserve(entry);
             try {
-                if ((await outputManifest(entry.artifact.output.template, signal)).hash !== entry.template.hash) {throw new Error('Prepared output template changed.');}
-                await entry.artifact.output.restore(signal);
+                if (entry.uninitialized) {
+                    const directory = await fs.lstat(entry.artifact.root);
+                    if (!directory.isDirectory() || directory.isSymbolicLink()) {throw new Error('Invalid retained preparation directory.');}
+                }
+                if ((await outputManifest(entry.artifact.output.template, signal, !entry.uninitialized)).hash !== entry.template.hash) {throw new Error('Prepared output template changed.');}
+                if (entry.uninitialized) {
+                    await removeOutput(entry.artifact.output.directory);
+                    await entry.artifact.output.initialize(signal);
+                    entry.uninitialized = false;
+                } else {await entry.artifact.output.restore(signal);}
                 return this.lease(entry, true);
             } catch (error) {
                 await this.remove(entry);
@@ -266,7 +342,7 @@ export class PreparedOutputCache {
         let claimed = !!entry.slot;
         const unclaim = (): void => {if (claimed) {this.claimedSlots.delete(entry.slot!); claimed = false;}};
         try {
-            if (!reusable || !entry.artifact.reusable || entry.retired || this.closed) {await this.remove(entry); return;}
+            if (!reusable || !entry.artifact.reusable || entry.retired || (this.closed && !this.persist)) {await this.remove(entry); return;}
             // Reports, result attachments and observer payloads never enter retained storage.
             for (const name of await fs.readdir(entry.artifact.root)) {
                 if (name !== 'template' && name !== 'assembly') {await removeOutput(path.join(entry.artifact.root, name));}
@@ -310,9 +386,39 @@ export class PreparedOutputCache {
             while (this.pending.size) {await Promise.allSettled(this.pending);}
             await Promise.allSettled([...this.entries].filter(entry => entry.active).map(entry => entry.released));
             while (this.pending.size) {await Promise.allSettled(this.pending);}
+            const owner = await this.owner;
+            if (owner && 'park' in owner) {
+                const retained: StoredEntry[] = [];
+                try {
+                    await this.trim();
+                    for (const entry of [...this.entries]) {
+                        if (!entry.artifact.reusable || entry.retired) {await this.remove(entry); continue;}
+                        const directory = await fs.lstat(entry.artifact.root).catch(() => undefined);
+                        if (!directory?.isDirectory() || directory.isSymbolicLink()) {await this.remove(entry); continue;}
+                        // Never retain executed working copies, reports, or runtime observations.
+                        for (const name of await fs.readdir(entry.artifact.root)) {
+                            if (name !== 'template') {await removeOutput(path.join(entry.artifact.root, name));}
+                        }
+                        retained.push({ directory: path.basename(entry.artifact.root), key: entry.key, slot: entry.slot,
+                            template: entry.template, used: entry.used, session: entry.artifact.session, coverage: entry.artifact.coverage,
+                            coveragePending: entry.artifact.coveragePending,
+                            instrumented: entry.artifact.instrumented.map(file => path.relative(entry.artifact.output.directory, file)) });
+                    }
+                    const snapshot = { version: 1, entries: retained };
+                    storedEntries(snapshot);
+                    const directories = new Set(retained.map(entry => entry.directory));
+                    for (const name of await fs.readdir(owner.directory)) {
+                        if (!directories.has(name)) {await removeOutput(path.join(owner.directory, name));}
+                    }
+                    if (retained.length) {await owner.park(snapshot, { entries: retained.length, bytes: retained.reduce((sum, entry) => sum + entry.template.bytes, 0) });}
+                    else {await owner.dispose();}
+                    this.entries.clear();
+                    return;
+                } catch { /* Persistence is optional; a failed handoff removes the owned output below. */ }
+            }
             const removed = await Promise.allSettled([...this.entries].map(entry => this.remove(entry)));
-            const owner = await Promise.allSettled([Promise.resolve().then(async () => (await this.owner)?.dispose())]);
-            const errors = [...removed, ...owner].filter((result): result is PromiseRejectedResult => result.status === 'rejected').map(result => result.reason);
+            const owners = await Promise.allSettled([Promise.resolve().then(async () => owner?.dispose())]);
+            const errors = [...removed, ...owners].filter((result): result is PromiseRejectedResult => result.status === 'rejected').map(result => result.reason);
             if (errors.length) {throw new AggregateError(errors, `Prepared output cleanup failed: ${errors.map(String).join('; ')}`);}
         })();
     }

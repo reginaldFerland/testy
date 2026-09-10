@@ -146,7 +146,7 @@ export class TestEngine {
     constructor(private readonly options: EngineOptions) {
         this.roots = options.roots.map(normalizePath);
         this.cache = new CoverageCache(options.storage, options.events.output);
-        this.preparedOutputs = new PreparedOutputCache(options.storage, this.identity);
+        this.preparedOutputs = new PreparedOutputCache(options.storage, this.identity, { persist: true });
     }
 
     get hashes(): ReadonlyMap<string, string> { return this.sources.hashes; }
@@ -412,7 +412,8 @@ export class TestEngine {
             const anticipatedTargets = new Set(anticipated.groups.map(group => testTargetKey(group.project, group.framework)));
             const runnerOptions: RunnerOptions = {
                 ...processOptions, dotnet: config.dotnet, storage: path.join(this.options.storage, 'runs'),
-                testArguments: config.testArguments, coverageTool, assemblies: this.projects.flatMap(project => project.assemblies ?? [project.assembly]), analyzer: this.options.analyzer, identity: this.identity,
+                testArguments: config.testArguments, coverageTool, managedCoverageTool: !config.coverageTool,
+                assemblies: this.projects.flatMap(project => project.assemblies ?? [project.assembly]), analyzer: this.options.analyzer, identity: this.identity,
                 modules: this.projects.flatMap(project => (project.contexts ?? [project]).map(context => ({
                     name: context.assemblyName ?? path.basename(context.assembly, path.extname(context.assembly)), project: project.file,
                     sources: [...project.sourceFiles, ...project.inputs ?? []]

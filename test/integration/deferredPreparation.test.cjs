@@ -137,5 +137,10 @@ test('cancelling a deferred upgrade drains preparation and retries with intact c
  const retry=await f.run(changed);assert.equal(retry.tests,3);assert.equal(retry.passed,2);assert.equal(retry.failed,1,f.state.output.join(''));
  assert.ok(f.probe.instruments.some(item=>item.project==='Suite1'),'the cancelled upgrade is rebuilt before execution');
  const group=f.engine.groups.find(item=>path.basename(item.project)==='Suite1.csproj');assert.equal(f.engine.coverage.traces.get(group.id).reliable,true);
- await f.engine.dispose();assert.deepEqual(await fs.readdir(path.join(f.storage,'prepared')),[]);assert.deepEqual(await fs.readdir(path.join(f.storage,'runs')),[]);
+ await f.engine.dispose();
+ for(const name of (await fs.readdir(path.join(f.storage,'prepared-v2'))).filter(name=>name.endsWith('.owner.json'))){
+  const owner=JSON.parse(await fs.readFile(path.join(f.storage,'prepared-v2',name),'utf8'));assert.equal(owner.state,'parked');assert.equal(owner.pid,0);
+  for(const entry of owner.snapshot.entries)assert.deepEqual(await fs.readdir(path.join(f.storage,'prepared-v2',owner.identity,entry.directory)),['template']);
+ }
+ assert.deepEqual(await fs.readdir(path.join(f.storage,'runs')),[]);
 });
