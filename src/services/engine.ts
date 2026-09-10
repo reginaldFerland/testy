@@ -18,7 +18,7 @@ import { claimRunOutputs, reclaimRunOutputs } from './runOutputs';
 import { copyOutput } from './output';
 import { PreparedOutputCache } from './preparedOutputCache';
 import { evaluationToolContext, ProjectEvaluationCache } from './projectEvaluationCache';
-import { mapConcurrent, mapConcurrentByKey, resolveConcurrency, Semaphore, SerialQueue } from '../core/concurrency';
+import { mapConcurrent, mapConcurrentByKey, resolveConcurrency, resolveTestFileConcurrency, Semaphore, SerialQueue } from '../core/concurrency';
 
 export interface EngineConfiguration {
     readonly dotnet: string;
@@ -227,7 +227,7 @@ export class TestEngine {
         const signal = controller.signal;
         const began = Date.now(), events = this.options.events, topology = this.topology;
         const configured = this.options.configuration(), config = { ...configured, coverage: manual?.coverage ?? configured.coverage };
-        const projectLimit = resolveConcurrency(config.maxParallelProjects), testLimit = resolveConcurrency(config.maxParallelTestFiles);
+        const projectLimit = resolveConcurrency(config.maxParallelProjects), testLimit = resolveTestFileConcurrency(config.maxParallelTestFiles);
         events.output(`Testy concurrency: projects=${projectLimit}, test files=${testLimit}.\n`);
         let phaseName: string | undefined, phaseBegan = began;
         const finishPhase = (): void => {

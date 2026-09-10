@@ -23,6 +23,8 @@ interface SourceRecord {
     source: CoverageSource;
     readonly groups: Set<string>;
     readonly hits: Map<string, readonly CoveredLine[]>;
+    aggregate?: { readonly lines: readonly CoveredLine[]; readonly covered: number };
+    aggregateVersion: number;
 }
 const moduleKey = (project: string): string => `\0module:${project}`;
 const dependencyKeys = (trace: Trace): readonly string[] => [...trace.dependencies, ...trace.moduleProjects?.map(moduleKey) ?? []];
@@ -316,7 +318,8 @@ export class CoverageStore {
         const previous = this.sources.get(source.id);
         const lines = merged ? source.lines : previous ? finish(sortedUnion(previous.source.lines, source.lines)) : canonical ? source.lines : finish(sortedUnion([], source.lines));
         if (previous && lines.length === previous.source.lines.length) {return;}
-        this.sources.set(source.id, { source: { ...source, lines }, groups: previous?.groups ?? new Set(), hits: previous?.hits ?? new Map() });
+        this.sources.set(source.id, { source: { ...source, lines }, groups: previous?.groups ?? new Set(), hits: previous?.hits ?? new Map(),
+            aggregateVersion: (previous?.aggregateVersion ?? 0) + 1 });
         const versions = this.byFile.get(source.file) ?? new Set<string>(); versions.add(source.id); this.byFile.set(source.file, versions);
         this.changedSources.add(source.id); this.removedSources.delete(source.id); this.dirtyFiles.add(source.file); this.cached = undefined; this.version++;
     }
@@ -338,7 +341,10 @@ export class CoverageStore {
             if (++count % 512 === 0) {yield;}
         }
         for (const file of trace.coverage) {
-            this.sources.get(contentHash(`${file.file}\0${file.hash}`))?.hits.set(trace.groupId, file.lines);
+            const source = this.sources.get(contentHash(`${file.file}\0${file.hash}`));
+            if (source) {
+                source.hits.set(trace.groupId, file.lines); source.aggregate = undefined; source.aggregateVersion++;
+            }
             if (++count % 512 === 0) {yield;}
         }
         this.cached = undefined; this.version++;
@@ -354,7 +360,9 @@ export class CoverageStore {
         }
         for (const sourceId of trace.sourceIds) {
             const source = this.sources.get(sourceId)!;
-            source.groups.delete(id); source.hits.delete(id); this.dirtyFiles.add(source.source.file);
+            source.groups.delete(id);
+            if (source.hits.delete(id)) {source.aggregate = undefined; source.aggregateVersion++;}
+            this.dirtyFiles.add(source.source.file);
         }
         this.cached = undefined; this.version++;
     }
@@ -371,43 +379,69 @@ export class CoverageStore {
         return finish(this.calculation(file));
     }
 
+    /** Membership-only updates retain the source's already aggregated line data. */
+    private *aggregate(source: SourceRecord): Generator<void, NonNullable<SourceRecord['aggregate']>> {
+        if (source.aggregate) {return source.aggregate;}
+        const version = source.aggregateVersion, hits = new Map<number, number>();
+        let count = 0;
+        for (const contribution of source.hits.values()) {for (const line of contribution) {
+            hits.set(line.line, Math.max(hits.get(line.line) ?? 0, line.hits));
+            if (++count % 4096 === 0) {yield;}
+        }}
+        const lines: CoveredLine[] = [];
+        for (const line of source.source.lines) {
+            lines.push({ line, hits: hits.get(line) ?? 0 });
+            if (++count % 4096 === 0) {yield;}
+        }
+        const aggregate = { lines, covered: hits.size };
+        // A synchronous editor read or contribution replacement can run while
+        // this calculation yields. Keep only a complete, still-current cache.
+        if (version === source.aggregateVersion) {source.aggregate ??= aggregate; return source.aggregate;}
+        return aggregate;
+    }
+
     private *calculation(file: string): Generator<void, CoverageSummary | undefined> {
         const versions = [...this.byFile.get(file) ?? []].map(id => this.sources.get(id)!).filter(Boolean);
         if (!versions.length) {return undefined;}
         const current = versions.find(version => version.source.hash === this.hashes.get(file));
         const displayed = current ?? versions[versions.length - 1];
-        const hits = new Map<number, number>();
         const groups = new Set<string>();
         let stale = !current;
         let count = 0;
         for (const version of versions) {
+            if (version !== displayed) {
+                // Keep derived line objects for only the displayed source version.
+                // Invalidate paused calculations too; published arrays remain intact.
+                version.aggregate = undefined; version.aggregateVersion++;
+            }
             // Zero-hit reports still assert that these lines were uncovered.
             // That assertion becomes stale when the reporting test changes.
             for (const group of version.groups) {
                 groups.add(group);
                 if (this.records.get(group)?.stale) {stale = true;}
             }
-            for (const [group, contribution] of version.hits) {
+            for (const group of version.hits.keys()) {
                 if (version !== current || this.records.get(group)?.stale) {stale = true;}
-                if (version === displayed) {for (const line of contribution) {
-                    hits.set(line.line, Math.max(hits.get(line.line) ?? 0, line.hits));
-                    if (++count % 4096 === 0) {yield;}
-                }}
             }
         }
         const previous = this.summaries.get(file);
-        const calculated: CoveredLine[] = [];
-        let sameLines = !!previous && previous.lines.length === displayed.source.lines.length;
-        for (const line of displayed.source.lines) {
-            const covered = { line, hits: hits.get(line) ?? 0 }, old = previous?.lines[calculated.length];
-            sameLines &&= covered.line === old?.line && covered.hits === old?.hits;
-            calculated.push(covered);
-            if (++count % 4096 === 0) {yield;}
+        const aggregate = yield* this.aggregate(displayed);
+        let sameLines = previous?.lines === aggregate.lines;
+        if (!sameLines && previous?.lines.length === aggregate.lines.length) {
+            sameLines = true;
+            for (let index = 0; index < aggregate.lines.length; index++) {
+                const line = aggregate.lines[index], old = previous.lines[index];
+                if (line.line !== old.line || line.hits !== old.hits) {sameLines = false; break;}
+                if (++count % 4096 === 0) {yield;}
+            }
         }
-        const lines = sameLines ? previous!.lines : calculated;
+        const lines = sameLines ? previous!.lines : aggregate.lines;
+        if (sameLines && displayed.aggregate === aggregate && lines !== aggregate.lines) {
+            displayed.aggregate = { ...aggregate, lines };
+        }
         const groupIds = [...groups].sort();
-        if (previous && sameLines && previous.stale === stale && previous.covered === hits.size
+        if (previous && sameLines && previous.stale === stale && previous.covered === aggregate.covered
             && previous.groupIds.length === groupIds.length && groupIds.every((id, index) => id === previous.groupIds[index])) {return previous;}
-        return { file, lines, stale, covered: hits.size, total: lines.length, groupIds };
+        return { file, lines, stale, covered: aggregate.covered, total: lines.length, groupIds };
     }
 }

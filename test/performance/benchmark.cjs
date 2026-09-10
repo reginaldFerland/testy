@@ -5,7 +5,7 @@ const assert=require('node:assert/strict'),{createHash}=require('node:crypto');
 const {performance}=require('node:perf_hooks'),{execFile}=require('node:child_process'),{promisify}=require('node:util');
 const {TestEngine}=require('../../out/services/engine');
 const {CoverageStore}=require('../../out/core/coverage'),{ProjectIndex}=require('../../out/core/selection');
-const {normalizePath}=require('../../out/core/paths'),{resolveConcurrency}=require('../../out/core/concurrency');
+const {normalizePath}=require('../../out/core/paths'),{resolveConcurrency,resolveTestFileConcurrency}=require('../../out/core/concurrency');
 const projects=require('../../out/services/projects'),mtp=require('../../out/services/mtp'),processes=require('../../out/services/process');
 const {installCoverageTool}=require('../../out/services/coverageTool');
 const execute=promisify(execFile);
@@ -14,7 +14,7 @@ function integer(name,fallback){const value=Number(process.env[name]??fallback);
 const fileCount=integer('TESTY_BENCH_FILES',240),cases=integer('TESTY_BENCH_CASES',20),trials=integer('TESTY_BENCH_TRIALS',3);
 const layouts=(process.env.TESTY_BENCH_LAYOUTS||'multiple,single').split(',');
 assert.ok(layouts.length&&layouts.every(layout=>['multiple','single'].includes(layout)),'TESTY_BENCH_LAYOUTS must contain multiple and/or single');
-const automatic=resolveConcurrency();
+const automaticProjects=resolveConcurrency(),automaticFiles=resolveTestFileConcurrency();
 
 async function createWorkspace(workspace,projectCount){
  const layers=['Core','App','Infra','Web'];
@@ -101,12 +101,14 @@ async function runTrial(directory,template,coverageTool,layout,projectCount,tria
   const baseline=await engine.run({files:[],full:true},signal),baselinePhases=phaseTimings;phaseTimings={};
   assert.equal(baseline.passed,fileCount*cases);assert.equal(baseline.failed,0);assert.equal(prepared,projectCount);assert.equal(engine.coverage.traces.size,fileCount);
   const baselineFingerprint=await fingerprint(engine,workspace),baselinePeak={...probe.peak},baselinePeakWorkerBudgets={...probe.peakWorkerBudgets},baselineBatches={...probe.batches};
-  const limit=mode==='serial'?1:automatic;
-  for(const [kind,value] of Object.entries(baselinePeak))assert.ok(value<=limit,`${kind} peak ${value} exceeds ${limit}`);
-  for(const [kind,value] of Object.entries(baselinePeakWorkerBudgets))assert.ok(value<=limit,`${kind} worker budget ${value} exceeds ${limit}`);
+  const projectLimit=mode==='serial'?1:automaticProjects,testLimit=mode==='serial'?1:automaticFiles;
+  // Secondary lanes discover inside their file worker, after initial preparation.
+  const limitFor=kind=>kind==='test'?testLimit:kind==='discovery'?Math.max(projectLimit,testLimit):projectLimit;
+  for(const [kind,value] of Object.entries(baselinePeak))assert.ok(value<=limitFor(kind),`${kind} peak ${value} exceeds ${limitFor(kind)}`);
+  for(const [kind,value] of Object.entries(baselinePeakWorkerBudgets))assert.ok(value<=limitFor(kind),`${kind} worker budget ${value} exceeds ${limitFor(kind)}`);
   for(const kind of ['evaluation','restore','build'])assert.ok(baselineBatches[kind]>0&&baselinePeak[kind]>0,`${kind} executes a measured batch`);
-  if(limit>1&&fileCount>1)assert.ok(baselinePeak.test>1,'file execution overlaps, including within one project');
-  if(limit>1&&projectCount>1)assert.ok(baselinePeak.discovery>1,'independent target discovery overlaps');
+  if(testLimit>1&&fileCount>1)assert.ok(baselinePeak.test>1,'file execution overlaps, including within one project');
+  if(projectLimit>1&&projectCount>1)assert.ok(baselinePeak.discovery>1,'independent target discovery overlaps');
   const source=normalizePath(path.join(workspace,'Web','Feature0.cs'));await fs.writeFile(source,(await fs.readFile(source,'utf8')).replace('Scale.Infra.Feature0.Value(value)','Scale.Infra.Feature0.Value(value) + 1'));
   const save=engine.cache.save.bind(engine.cache),writtenTraces=[];
   engine.cache.save=async(delta,...args)=>{writtenTraces.push(...delta.traces.map(trace=>trace.groupId));return save(delta,...args);};
@@ -125,7 +127,8 @@ async function runTrial(directory,template,coverageTool,layout,projectCount,tria
   assert.equal(all.tests,fileCount*cases);assert.equal(all.failed,fileCount*cases);assert.equal(prepared,projectCount);
   assert.deepEqual(await fs.readdir(path.join(directory,'state','runs')),[],'private output is reclaimed');
   const measurements=await finishResources();
-  const result={kind:'real-mtp',platform:process.platform,architecture:process.arch,availableCpus:os.availableParallelism(),layout,trial,concurrencyMode:mode,concurrency:limit,
+  const result={kind:'real-mtp',platform:process.platform,architecture:process.arch,availableCpus:os.availableParallelism(),layout,trial,concurrencyMode:mode,
+   concurrency:testLimit,projectConcurrency:projectLimit,testFileConcurrency:testLimit,
    projects:4+projectCount,testFiles:fileCount,cases:fileCount*cases,baselineMs:baseline.duration,firstDiscoveryMs,firstResultMs,baselinePhases,baselinePeak,baselinePeakWorkerBudgets,baselineBatches,
    affectedMs:affected.duration,affectedPhases,affectedCases:affected.tests,affectedTraceWrites:writtenTraces.length,
    sharedCoreSelectedCases,runAllMs:all.duration,runAllPhases:phaseTimings,

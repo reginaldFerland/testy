@@ -9,6 +9,8 @@
 - Retain validated preparation templates across clean editor shutdowns, with exclusive ownership, bounded storage, fresh startup discovery, and conservative crash recovery.
 - Resolve changed global aliases and analyze C# source files in one helper process, preserving conservative fallback and incremental file selection.
 - Avoid building unused method-level coverage XML trees and reuse source-path normalization within each report.
+- Let automatic test-file workers use available CPUs minus one while keeping initial project preparation conservative and preserving explicit worker limits.
+- Reuse aggregated coverage lines when only test ownership or freshness changes, with invalidation for changed contributions and source geometry.
 
 ## 1.1.0
 

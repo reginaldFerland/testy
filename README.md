@@ -67,14 +67,14 @@ Test failures include their messages and stack traces in Test Explorer. The stat
 | `testy.exclude` | `[]` | Additional file patterns to ignore. |
 | `testy.fileWatcherPattern` | Source and configuration files | Customize which files can trigger runs. |
 | `testy.buildConfiguration` | `Debug` | MSBuild configuration. |
-| `testy.maxParallelProjects` | `0` | Worker budget for project preparation, builds, source analysis, and discovery. |
-| `testy.maxParallelTestFiles` | `0` | Maximum simultaneous test-file processes; a project batch uses one worker. |
+| `testy.maxParallelProjects` | `0` | Worker budget for initial project preparation, builds, source analysis, and discovery. |
+| `testy.maxParallelTestFiles` | `0` | Worker budget for test-file execution and private runner preparation; a project batch uses one worker. |
 | `testy.dotnetPath` | `dotnet` | Path to the CLI executable. |
 | `testy.testArguments` | `[]` | Additional MTP arguments, such as framework settings. |
 | `testy.timeoutSeconds` | `600` | Limit for each build, discovery, or test-file run. |
 | `testy.coverageToolPath` | Automatic | Optional existing `dotnet-coverage` executable. |
 
-Concurrency settings use `0` for automatic: `max(1, min(4, available CPUs - 1))`. Use `1` for sequential operation or a larger integer to raise the limit. These settings apply on the next run without clearing learned coverage. Test frameworks retain their own internal scheduling. Tests that share databases, fixed ports, or other external resources may require `testy.maxParallelTestFiles: 1`; private outputs isolate files in the build output, not external resources. Output reports the resolved limits, phase timings, and any identity or build-output constraints on parallelism.
+Concurrency settings use `0` for automatic. Test-file workers use `max(1, available CPUs - 1)`; initial project preparation uses `max(1, min(4, available CPUs - 1))` because builds and source analysis can also schedule internal parallel work. For example, a machine with 10 available CPUs uses 4 project workers and 9 test-file workers. Each additional file worker can prepare its own isolated runner and consumes additional memory. Use `1` for sequential operation or an explicit positive integer to choose either limit. These settings apply on the next run without clearing learned coverage. Test frameworks retain their own internal scheduling. Tests that share databases, fixed ports, or other external resources may require `testy.maxParallelTestFiles: 1`; private outputs isolate files in the build output, not external resources. Output reports the resolved limits, phase timings, and any identity or build-output constraints on parallelism.
 
 Generated files and build outputs (`bin`, `obj`, `TestResults`, `*.g.cs`, `*.generated.cs`, `*.designer.cs`, and files with an auto-generated header in the first 2,048 bytes) do not trigger test runs. Observed generated headers remain recognized through deletion and rename; a refresh or save that sees ordinary content clears that classification. Header-marked outputs and configured `testy.exclude` patterns are also excluded from input hashes, so a generator that rewrites them during a build does not restart the baseline. Ignored Compile inputs still supply global aliases and partial-type coverage-exclusion metadata for conservative source analysis. Evaluated generator inputs remain tracked unless explicitly excluded. Directory events honor the same exclusions as their children. VS Code file renames and deletions are handled in both trigger modes.
 

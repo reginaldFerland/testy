@@ -277,6 +277,9 @@ test('editor coverage refresh yields during shared-file aggregation and never fa
  const lines=Array.from({length:1000},(_,i)=>({line:i+1,hits:1}));
  const traces=Array.from({length:1000},(_,i)=>({groupId:`g${i}`,dependencies:[file],inputs:{[file]:'v1'},timestamp:1,reliable:true,coverage:[{file,hash:'v1',lines}]}));
  const live=new Set(traces.map(trace=>trace.groupId));await store.replaceAsync(traces,live);await store.summarizeAsync(hashes);store.markStale(live);
+ // A changed positive contribution requires real aggregation work; freshness
+ // changes alone can now reuse the warmed line cache. Other owners remain stale.
+ await store.replaceAsync([{...traces[0],timestamp:2,coverage:[{file,hash:'v1',lines:[{line:1,hits:2},...lines.slice(1)]}]}],live);
  store.summary=()=>assert.fail('editor must not calculate synchronously');
  const proto=uiPrototype({Range:class{}}),calls=[];
  const editor={document:{uri:{fsPath:file},lineCount:1000,isDirty:false},setDecorations:(kind,lines)=>calls.push([kind,lines.length])};

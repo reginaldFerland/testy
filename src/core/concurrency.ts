@@ -1,9 +1,18 @@
 import { availableParallelism } from 'node:os';
 
-/** Zero (and omitted settings) choose a conservative budget for .NET processes. */
+/** Project preparation can itself schedule parallel MSBuild and analysis work. */
 export function resolveConcurrency(value = 0, cpus = availableParallelism()): number {
+    return configuredOrAutomatic(value, Math.max(1, Math.min(4, cpus - 1)));
+}
+
+/** File workers own one isolated test process at a time; reserve one CPU for the editor. */
+export function resolveTestFileConcurrency(value = 0, cpus = availableParallelism()): number {
+    return configuredOrAutomatic(value, Math.max(1, cpus - 1));
+}
+
+function configuredOrAutomatic(value: number, automatic: number): number {
     if (!Number.isSafeInteger(value) || value < 0) {throw new Error('Concurrency must be a nonnegative integer.');}
-    return value || Math.max(1, Math.min(4, cpus - 1));
+    return value || automatic;
 }
 
 /** Stop on the first error, cancel siblings, and drain them before returning. */

@@ -129,13 +129,13 @@
           "type": "integer",
           "default": 0,
           "minimum": 0,
-          "description": "Worker limit for project preparation, builds, source analysis, and discovery. 0 automatically uses up to four workers while reserving one CPU; 1 runs sequentially. Applies on the next run."
+          "description": "Worker limit for initial project preparation, builds, source analysis, and discovery. 0 automatically uses up to four workers while reserving one CPU; 1 runs sequentially. Applies on the next run."
         },
         "testy.maxParallelTestFiles": {
           "type": "integer",
           "default": 0,
           "minimum": 0,
-          "description": "Maximum simultaneous test-file processes. Project-wide batches each use one worker. 0 automatically uses up to four workers while reserving one CPU; 1 runs sequentially. Tests sharing external resources may need 1. Applies on the next run."
+          "description": "Worker limit for test-file execution and private runner preparation. Project-wide batches each use one worker. 0 uses available CPUs minus one, with at least one worker; 1 runs sequentially. Tests sharing external resources may need 1. Applies on the next run."
         },
         "testy.dotnetPath": {
           "type": "string",

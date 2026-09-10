@@ -1,15 +1,27 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { mapConcurrent, mapConcurrentByKey, resolveConcurrency, SerialQueue, Semaphore } = require('../../out/core/concurrency');
+const { mapConcurrent, mapConcurrentByKey, resolveConcurrency, resolveTestFileConcurrency, SerialQueue, Semaphore } = require('../../out/core/concurrency');
 const turn = () => new Promise(resolve => setImmediate(resolve));
 function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; }
 
-test('automatic process budgets reserve a CPU and explicit limits remain configurable', () => {
+test('automatic project budgets reserve a CPU and explicit limits remain configurable', () => {
     assert.equal(resolveConcurrency(0, 1), 1);
     assert.equal(resolveConcurrency(0, 4), 3);
     assert.equal(resolveConcurrency(0, 16), 4);
     assert.equal(resolveConcurrency(12, 4), 12);
     for (const value of [-1, 1.5, NaN, Infinity]) { assert.throws(() => resolveConcurrency(value)); }
+});
+
+test('automatic test-file workers scale with available CPUs while project preparation stays bounded', () => {
+    for (const [cpus, files, projects] of [[1, 1, 1], [2, 1, 1], [4, 3, 3], [10, 9, 4], [16, 15, 4], [64, 63, 4]]) {
+        assert.equal(resolveTestFileConcurrency(0, cpus), files);
+        assert.equal(resolveConcurrency(0, cpus), projects);
+    }
+    for (const resolve of [resolveConcurrency, resolveTestFileConcurrency]) {
+        assert.equal(resolve(1, 64), 1);
+        assert.equal(resolve(12, 4), 12);
+        for (const value of [-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {assert.throws(() => resolve(value));}
+    }
 });
 
 test('bounded workers overlap, retain input order and reuse stable worker numbers', async () => {
