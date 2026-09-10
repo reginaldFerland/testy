@@ -262,14 +262,14 @@ export class TestEngine {
                 .filter(file => !isExcluded(file, [...defaultExcludes, ...config.excludes], rootSnapshot))]);
             this.projectEvaluations.retain(entryPoints);
             const toolContext = await evaluationToolContext(config.dotnet, this.options.analyzer, entryPoints.map(file => path.dirname(file)), signal);
-            const evaluationContext = contentHash(JSON.stringify([toolContext?.key, config.dotnet, config.configuration, this.options.analyzer, rootSnapshot,
+            const evaluationContextFor = (key: string | undefined): string => contentHash(JSON.stringify([key, config.dotnet, config.configuration, this.options.analyzer, rootSnapshot,
                 config.excludes, Object.entries(process.env).sort(([a], [b]) => a.localeCompare(b))]));
+            const evaluationContext = evaluationContextFor(toolContext?.key);
             const snapshots = await refreshProjectSnapshotBatches(this.projectSnapshots, entryPoints, selected, async files => {
-                const reused = newBaseline || !toolContext ? new Map<string, readonly Project[]>() : await this.projectEvaluations.get(files, evaluationContext, signal);
+                let currentToolContext = toolContext, currentEvaluationContext = evaluationContext;
+                let reused = newBaseline || !toolContext ? new Map<string, readonly Project[]>() : await this.projectEvaluations.get(files, evaluationContext, signal);
                 const pending = files.filter(file => !reused.has(file));
-                if (reused.size) {events.output(`Reusing ${reused.size} validated project evaluation${reused.size === 1 ? '' : 's'}.\n`);}
-                if (!pending.length) {return reused;}
-                const contexts = await sdkContextGroups(pending, signal);
+                let contexts = await sdkContextGroups(pending, signal);
                 const key = (file: string): string => `${config.dotnet}\0${config.configuration}\0${file}`;
                 // SDK contexts may restore the same physical dependency. Each
                 // restore graph parallelizes internally without competing writers.
@@ -282,6 +282,19 @@ export class TestEngine {
                         for (const file of missing) {this.restored.add(key(file));}
                     }
                 }
+                // A fresh baseline still runs Restore, which can create or remove
+                // evaluated imports and sources. Only its completed outputs may
+                // validate an older graph; every miss receives normal inspection.
+                if (newBaseline) {
+                    currentToolContext = await evaluationToolContext(config.dotnet, this.options.analyzer, entryPoints.map(file => path.dirname(file)), signal);
+                    currentEvaluationContext = evaluationContextFor(currentToolContext?.key);
+                    reused = currentToolContext ? await this.projectEvaluations.get(files, currentEvaluationContext, signal) : new Map<string, readonly Project[]>();
+                    // Restore can also change the SDK selected by a project.
+                    contexts = await sdkContextGroups(files.filter(file => !reused.has(file)), signal);
+                    for (const context of contexts) {await this.ensureSdk(config.dotnet, { ...processOptions, cwd: context.cwd }, context.key);}
+                }
+                if (reused.size) {events.output(`Reusing ${reused.size} validated project evaluation${reused.size === 1 ? '' : 's'}.\n`);}
+                if (!contexts.length) {return reused;}
                 const workers = Math.min(projectLimit, contexts.length);
                 const graphs = await mapConcurrent(contexts, projectLimit, signal, async (context, _index, workerSignal) => {
                     const graph = await evaluateProjects(config.dotnet, context.files, config.configuration,
@@ -289,7 +302,7 @@ export class TestEngine {
                     return [...graph];
                 });
                 const evaluated = new Map(graphs.flat());
-                if (toolContext) {await this.projectEvaluations.put(evaluated, evaluationContext, signal, toolContext.root);}
+                if (currentToolContext) {await this.projectEvaluations.put(evaluated, currentEvaluationContext, signal, currentToolContext.root);}
                 return new Map([...reused, ...evaluated]);
             });
             if (topology !== this.topology) {throw new Cancelled();}
@@ -368,6 +381,9 @@ export class TestEngine {
                 ? new Map([...beforeBuild].filter(([file]) => !this.sources.isGenerated(file))) : beforeBuild;
             const previousShapes = baseline?.shapes ?? this.shapes;
             phase('Preparing tests');
+            // Each target may eventually use every file worker as other targets finish.
+            // Grow retention to that finite slot budget while retaining its byte limit.
+            await this.preparedOutputs.ensureCapacity(Math.max(16, Math.min(Number.MAX_SAFE_INTEGER, testLimit * testBuilds.length)));
             const preparationBudget = new Semaphore(projectLimit);
             const analysisSlots = Math.max(1, projectLimit - testBuilds.length);
             const analyze = async (): Promise<ReadonlyMap<string, string | null>> => {

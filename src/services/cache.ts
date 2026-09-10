@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { CoverageDelta, CoverageSource, CoverageStore, StoredTrace } from '../core/coverage';
 import { contentHash } from '../core/paths';
+import { mapConcurrent } from '../core/concurrency';
 import { withLock } from './lock';
 
 export { validSource, validTrace } from './cacheFormat';
@@ -38,22 +39,18 @@ export class CoverageCache {
         await withLock(`${this.directory}.lock`, signal, async () => {
             await Promise.all(['sources', 'traces'].map(kind => fs.mkdir(path.join(this.directory, kind), { recursive: true })));
             await this.beginWrite(signal);
+            const sources = new Map<string, CoverageSource[]>();
             for (const source of delta.sources) {
-                signal?.throwIfAborted();
-                let previous = this.knownSources.get(source.id);
-                if (!previous) {
-                    try {
-                        const value: unknown = JSON.parse(await fs.readFile(path.join(this.directory, 'sources', `${source.id}.json`), { encoding: 'utf8', signal }));
-                        if (validSource(value)) {previous = value;}
-                    }
-                    catch {signal?.throwIfAborted(); /* Missing or corrupt. */}
-                }
-                if (previous === source) {continue;}
-                const lines = previous ? await finishAsync(sortedUnion(previous.lines, source.lines), signal) : source.lines;
-                const merged = lines.length === source.lines.length ? source : { ...source, lines };
-                if (!previous || lines.length !== previous.lines.length) {await this.write('sources', source.id, merged, signal);}
-                this.knownSources.set(source.id, merged);
+                const group = sources.get(source.id);
+                if (!group && this.knownSources.get(source.id) === source) {continue;}
+                if (group) {group.push(source);} else {sources.set(source.id, [source]);}
             }
+            // Independent geometry records share a small filesystem budget. Keep
+            // same-ID merges ordered and drain all writes before publishing traces
+            // or releasing the cross-process lock, including after cancellation.
+            await mapConcurrent([...sources.values()], 4, signal, async (group, _index, workerSignal) => {
+                for (const source of group) {await this.saveSource(source, workerSignal);}
+            });
             for (const trace of delta.traces) {await this.write('traces', contentHash(trace.groupId), trace, signal);}
             for (const id of delta.removedTraces) {signal?.throwIfAborted(); await fs.rm(path.join(this.directory, 'traces', `${contentHash(id)}.json`), { force: true });}
             if (++this.writes % 128 === 0) {
@@ -62,6 +59,23 @@ export class CoverageCache {
                 if (snapshot.complete) {await this.prune(snapshot.traces, signal);}
             }
         });
+    }
+
+    private async saveSource(source: CoverageSource, signal: AbortSignal): Promise<void> {
+        signal.throwIfAborted();
+        let previous = this.knownSources.get(source.id);
+        if (!previous) {
+            try {
+                const value: unknown = JSON.parse(await fs.readFile(path.join(this.directory, 'sources', `${source.id}.json`), { encoding: 'utf8', signal }));
+                if (validSource(value)) {previous = value;}
+            }
+            catch {signal.throwIfAborted(); /* Missing or corrupt. */}
+        }
+        if (previous === source) {return;}
+        const lines = previous ? await finishAsync(sortedUnion(previous.lines, source.lines), signal) : source.lines;
+        const merged = lines.length === source.lines.length ? source : { ...source, lines };
+        if (!previous || lines.length !== previous.lines.length) {await this.write('sources', source.id, merged, signal);}
+        this.knownSources.set(source.id, merged);
     }
 
     /** Publish before mutation so even an interrupted other writer invalidates our memo. */

@@ -12,6 +12,8 @@ export interface PreparedStorageLimits { readonly maxEntries?: number; readonly 
 export interface PreparedStorageLease {
     readonly directory: string;
     readonly snapshot?: unknown;
+    /** Accommodate a larger worker pool without changing the retained byte budget. */
+    reserveEntries(entries: number): void;
     /** Publish only after every process and mutable artifact lease has drained. */
     park(snapshot: unknown, retention: Retention): Promise<void>;
     dispose(): Promise<void>;
@@ -152,6 +154,11 @@ export async function claimPreparedStorage(storage: string, signal?: AbortSignal
         pending = next; return next;
     };
     return { directory: path.join(storage, claimed.owner.identity), snapshot: claimed.snapshot,
+        reserveEntries(entries) {
+            if (!count(entries)) {throw new Error('Invalid prepared output storage limit.');}
+            if (closed) {throw new Error('The prepared output storage lease is closed.');}
+            limits.maxEntries = Math.max(limits.maxEntries, entries);
+        },
         park(snapshot, retention) {
             if (!validRetention(retention)) {return Promise.reject(new Error('Invalid prepared output retention.'));}
             return finish(async owner => {

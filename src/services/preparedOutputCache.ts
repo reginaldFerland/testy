@@ -191,7 +191,7 @@ export class PreparedOutputCache {
     private closed = false;
     private disposal?: Promise<void>;
     private clock = 0;
-    private readonly maxEntries: number;
+    private maxEntries: number;
     private readonly maxBytes: number;
     private readonly persist: boolean;
     constructor(private readonly storage: string, private readonly identity: string, limits: PreparedOutputLimits = {}) {
@@ -199,6 +199,17 @@ export class PreparedOutputCache {
         this.maxBytes = limits.maxBytes ?? 512 * 1024 * 1024;
         this.persist = limits.persist ?? false;
         if (![this.maxEntries, this.maxBytes].every(value => Number.isSafeInteger(value) && value >= 0)) {throw new Error('Invalid prepared output cache limit.');}
+    }
+
+    /** Retain the run's possible private slots; the byte budget still bounds storage. */
+    ensureCapacity(entries: number): Promise<void> {
+        if (this.closed) {return Promise.reject(new Error('The prepared output cache has been disposed.'));}
+        if (!Number.isSafeInteger(entries) || entries < 0) {return Promise.reject(new Error('Invalid prepared output cache limit.'));}
+        this.maxEntries = Math.max(this.maxEntries, entries);
+        return this.track((async () => {
+            const owner = await this.owner;
+            if (owner && 'reserveEntries' in owner) {owner.reserveEntries(this.maxEntries);}
+        })());
     }
 
     async acquire(source: string, context: string, create: (root: string) => Promise<PreparedArtifact>, signal?: AbortSignal, slot?: string): Promise<PreparedArtifactLease | undefined> {

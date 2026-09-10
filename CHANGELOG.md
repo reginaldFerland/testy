@@ -11,6 +11,10 @@
 - Avoid building unused method-level coverage XML trees and reuse source-path normalization within each report.
 - Let automatic test-file workers use available CPUs minus one while keeping initial project preparation conservative and preserving explicit worker limits.
 - Reuse aggregated coverage lines when only test ownership or freshness changes, with invalidation for changed contributions and source geometry.
+- Reuse validated project evaluations after authoritative Restore on repeated full baselines, including fresh SDK and analyzer identity checks.
+- Write independent coverage source records concurrently while preserving checkpoint ordering and cancellation draining.
+- Combine output-reset permission repair and metadata inventory, with shared bounded filesystem concurrency and fewer unchanged mode writes.
+- Grow prepared-output entry retention with worker and target needs while preserving the 512-MiB byte limit and exclusive ownership across restarts.
 
 ## 1.1.0
 

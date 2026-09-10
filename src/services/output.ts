@@ -1,11 +1,12 @@
 import * as fs from 'node:fs/promises';
-import { constants, createReadStream, createWriteStream } from 'node:fs';
+import { BigIntStats, constants, createReadStream, createWriteStream } from 'node:fs';
 import * as path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { createHash } from 'node:crypto';
-import { Semaphore } from '../core/concurrency';
+import { mapConcurrent, Semaphore } from '../core/concurrency';
 
 const copyWorkers = new Semaphore(8);
+const metadataWorkers = new Semaphore(8);
 
 async function copyFile(source: string, destination: string, signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
@@ -66,19 +67,38 @@ export async function removeOutput(directory: string): Promise<void> {
     await fs.rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
-async function stamp(file: string): Promise<string> {
-    const stat = await fs.lstat(file, { bigint: true });
+function stampValue(stat: BigIntStats): string {
     return `${stat.isSymbolicLink() ? 'link' : stat.isDirectory() ? 'dir' : 'file'}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}:${stat.dev}:${stat.ino}:${stat.mode}`;
 }
 
-async function entries(directory: string, signal?: AbortSignal, prefix = ''): Promise<Map<string, string>> {
-    const result = new Map<string, string>();
-    for (const entry of await fs.readdir(path.join(directory, prefix), { withFileTypes: true })) {
-        signal?.throwIfAborted();
-        const relative = path.join(prefix, entry.name);
-        const value = await stamp(path.join(directory, relative));
-        result.set(relative, value);
-        if (value.startsWith('dir:')) {for (const [file, value] of await entries(directory, signal, relative)) {result.set(file, value);}}
+async function stamp(file: string, signal?: AbortSignal): Promise<string> {
+    return metadataWorkers.run(signal, async () => stampValue(await fs.lstat(file, { bigint: true })));
+}
+
+/** Repair access before listing each directory; links are inventoried, never followed. */
+async function inventory(directory: string, signal?: AbortSignal, repairAccess = false, root?: BigIntStats): Promise<{ root: string; entries: Map<string, string> }> {
+    const result = { root: '', entries: new Map<string, string>() };
+    let queued = [''];
+    while (queued.length) {
+        const visited = await mapConcurrent(queued, 8, signal, (relative, _index, workerSignal) => metadataWorkers.run(workerSignal, async () => {
+            const file = path.join(directory, relative);
+            let stat = relative === '' && root ? root : await fs.lstat(file, { bigint: true });
+            if (repairAccess && stat.isDirectory() && (stat.mode & 0o700n) !== 0o700n) {
+                workerSignal.throwIfAborted();
+                await fs.chmod(file, Number(stat.mode | 0o700n));
+                stat = await fs.lstat(file, { bigint: true });
+            }
+            workerSignal.throwIfAborted();
+            const children = stat.isDirectory() ? await fs.readdir(file) : [];
+            return { relative, stamp: stampValue(stat), children };
+        }));
+        queued = [];
+        // Breadth-first results retain parent-before-child repair order even
+        // when metadata calls finish out of order. One budget covers all lanes.
+        for (const entry of visited) {
+            if (entry.relative) {result.entries.set(entry.relative, entry.stamp);} else {result.root = entry.stamp;}
+            for (const name of entry.children) {queued.push(path.join(entry.relative, name));}
+        }
     }
     return result;
 }
@@ -99,18 +119,19 @@ export class PreparedOutput {
 
     async initialize(signal?: AbortSignal): Promise<void> {
         await copyOutput(this.template, this.directory, signal);
-        this.stamps = await entries(this.directory, signal);
-        this.rootMode = (await fs.stat(this.directory)).mode;
-        this.advanceClock(await stamp(this.directory));
+        const current = await inventory(this.directory, signal);
+        this.stamps = current.entries;
+        this.rootMode = Number(current.root.split(':').at(-1));
+        this.advanceClock(await stamp(this.directory, signal));
     }
 
     async restore(signal?: AbortSignal): Promise<void> {
-        const root = await fs.lstat(this.directory).catch(error => {if (error.code === 'ENOENT') {return undefined;} throw error;});
+        const root = await metadataWorkers.run(signal, () => fs.lstat(this.directory, { bigint: true }))
+            .catch(error => {if (error?.code === 'ENOENT') {return undefined;} throw error;});
         if (!root?.isDirectory() || root.isSymbolicLink()) {
             await removeOutput(this.directory); await this.initialize(signal); return;
         }
-        await makeAccessible(this.directory, signal);
-        const current = await entries(this.directory, signal);
+        const snapshot = await inventory(this.directory, signal, true, root), current = snapshot.entries;
         const restored = new Map(this.stamps);
         for (const [file, stamp] of [...current].reverse()) {
             signal?.throwIfAborted();
@@ -136,16 +157,25 @@ export class PreparedOutput {
             if (changed) {
                 await fs.rm(path.join(this.directory, file), { force: true });
                 await copyFile(path.join(this.template, file), path.join(this.directory, file), signal);
-                restored.set(file, await stamp(path.join(this.directory, file)));
+                restored.set(file, await stamp(path.join(this.directory, file), signal));
             }
         }
         // Apply directory modes last, after all children have been repaired.
         for (const [file, previous] of [...this.stamps].reverse()) {
-            if (previous.startsWith('dir:')) {await fs.chmod(path.join(this.directory, file), Number(previous.split(':').at(-1)));}
+            if (previous.startsWith('dir:') && previous.split(':').at(-1) !== current.get(file)?.split(':').at(-1)) {
+                await metadataWorkers.run(signal, () => fs.chmod(path.join(this.directory, file), Number(previous.split(':').at(-1))));
+            }
         }
-        await fs.chmod(this.directory, this.rootMode);
+        // Advancing the root clock retires same-tick file cohorts. Keep this
+        // write when needed, including on coarse-timestamp filesystems.
+        const advance = [...restored.values()].some(value => !value.startsWith('dir:') && BigInt(value.split(':')[3]) >= this.collisionTime);
+        if (advance || Number(snapshot.root.split(':').at(-1)) !== this.rootMode) {
+            await metadataWorkers.run(signal, () => fs.chmod(this.directory, this.rootMode));
+        }
+        const rootStamp = await stamp(this.directory, signal);
+        signal?.throwIfAborted();
         this.stamps = restored;
-        this.advanceClock(await stamp(this.directory));
+        this.advanceClock(rootStamp);
     }
 
     private advanceClock(root: string): void {
