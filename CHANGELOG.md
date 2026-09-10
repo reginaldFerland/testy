@@ -18,6 +18,8 @@
 - Maintain coverage ownership and stale-owner counts incrementally, preserving immutable summaries and cancellation-safe publication.
 - Read coverage-cache records concurrently within a shared filesystem budget while preserving snapshot and warning order.
 - Skip redundant coverage-cache maintenance after validated cleanup when saves cannot orphan source records; invalidate that proof after removals, membership changes, external writes, or interrupted publication.
+- Reuse unchanged coverage summaries and positive-hit aggregates while still checkpointing new trace metadata, dependencies, and exact freshness counts.
+- Retain bounded project-evaluation snapshots across editor restarts, with authoritative Restore and fresh validation of captured inputs before reuse.
 
 ## 1.1.0
 

@@ -72,7 +72,7 @@ export class CoverageStore {
             this.changedTraces.add(id);
             this.dirtyGroups.add(id);
         }
-        if (changed) {this.cached = undefined; this.version++;}
+        if (changed) {this.version++;}
     }
 
     markStale(groupIds: ReadonlySet<string>, stale = true): void {
@@ -91,7 +91,7 @@ export class CoverageStore {
             changed = true;
             this.dirtyGroups.add(id);
         }
-        if (changed) {this.cached = undefined; this.version++;}
+        if (changed) {this.version++;}
     }
 
     markHistorical(groupIds: ReadonlySet<string>): void {
@@ -130,16 +130,28 @@ export class CoverageStore {
                 if (++files % 32 === 0) {yield;}
                 const id = contentHash(`${file.file}\0${file.hash}`);
                 const geometry: number[] = [], hits: CoveredLine[] = [];
+                const previousHits = this.sources.get(id)?.hits.get(trace.groupId);
+                let sameHits = previousHits !== undefined;
                 let count = 0;
                 for (const line of file.lines) {
-                    geometry.push(line.line); if (line.hits > 0) {hits.push(line);}
+                    geometry.push(line.line);
+                    if (line.hits > 0) {
+                        if (sameHits) {
+                            const old = previousHits![hits.length];
+                            if (!old || old.line !== line.line || old.hits !== line.hits) {sameHits = false;}
+                        }
+                        hits.push(line);
+                    }
                     if (++count % 4096 === 0) {yield;}
                 }
                 const previous = sources.get(id) ?? this.sources.get(id)?.source;
                 const lines = yield* sortedUnion(previous?.lines ?? [], geometry);
                 sources.set(id, previous && previous.lines.length === lines.length ? previous : { id, file: file.file, hash: file.hash, lines });
                 sourceIds.push(id);
-                if (hits.length) {coverage.push({ ...file, lines: hits });}
+                // Compare while packing can still yield. Installation checks the
+                // current array identity again; a concurrent replacement cannot
+                // authorize reuse of an aggregate for different hit data.
+                if (hits.length) {coverage.push({ ...file, lines: sameHits && previousHits!.length === hits.length ? previousHits! : hits });}
             }
             packed.push({
                 ...trace, dependencies, moduleProjects, coverage, sourceIds,
@@ -265,10 +277,12 @@ export class CoverageStore {
     }
 
     async summarizeAsync(hashes: ReadonlyMap<string, string>, signal?: AbortSignal): Promise<readonly CoverageSummary[]> {
+        signal?.throwIfAborted();
         this.updateHashes(hashes);
-        while (!this.cached) {
+        while (!this.cached || this.dirtyGroups.size) {
             await finishAsync(this.dirtySources(), signal);
             if (this.dirtyGroups.size) {continue;}
+            if (this.cached) {break;}
             const version = this.version;
             const summaries = new Map(this.summaries);
             let files = 0;
@@ -298,13 +312,14 @@ export class CoverageStore {
     private updateHashes(hashes: ReadonlyMap<string, string>): void {
         if (this.hashes === hashes) {return;}
         const changed = new Set([...hashes.keys(), ...this.hashes.keys()].filter(file => hashes.get(file) !== this.hashes.get(file)));
-        for (const file of changed) {this.dirtyFiles.add(file);}
+        if (!changed.size) {this.hashes = hashes; return;}
+        for (const file of changed) {this.dirty(file);}
         const stale = new Set<string>();
         for (const id of this.dependentGroups([...changed])) {
             const trace = this.records.get(id)!;
             if (Object.entries(trace.inputs ?? {}).some(([file, hash]) => sourceVersion(hashes, file) !== hash)) {stale.add(id);}
         }
-        this.hashes = hashes; this.markStale(stale); this.cached = undefined; this.version++;
+        this.hashes = hashes; this.markStale(stale); this.version++;
     }
 
     /** Delay membership traversal until the scheduled, cancellable aggregation. */
@@ -314,26 +329,39 @@ export class CoverageStore {
         let count = 0;
         for (const id of groups) {
             const trace = this.records.get(id), stale = !!trace?.stale;
-            const delta = Number(stale) - Number(this.appliedStale.get(id) ?? false), seen = new Set<string>();
-            for (const sourceId of trace?.sourceIds ?? []) {
-                const source = this.sources.get(sourceId);
-                if (source) {
-                    this.dirtyFiles.add(source.source.file);
-                    if (delta && !seen.has(sourceId)) {counts.set(source, (counts.get(source) ?? 0) + delta); seen.add(sourceId);}
+            const delta = Number(stale) - Number(this.appliedStale.get(id) ?? false);
+            if (delta) {
+                const seen = new Set<string>();
+                for (const sourceId of trace?.sourceIds ?? []) {
+                    const source = this.sources.get(sourceId);
+                    if (source && !seen.has(sourceId)) {counts.set(source, (counts.get(source) ?? 0) + delta); seen.add(sourceId);}
+                    if (++count % 4096 === 0) {yield;}
                 }
-                if (++count % 4096 === 0) {yield;}
             }
             if (trace) {applied.set(id, stale);}
+            if (++count % 4096 === 0) {yield;}
         }
         // A cancelled or superseded pass cannot leave partially applied counts.
         // Bump the revision even for an unrelated synchronous summary: another
         // paused pass may have captured the same pending transitions.
         if (groups.length && version === this.version) {
-            for (const [source, delta] of counts) {source.staleCount += delta;}
+            for (const [source, delta] of counts) {this.changeStale(source, delta);}
             for (const [id, stale] of applied) {this.appliedStale.set(id, stale);}
             for (const id of groups) {this.dirtyGroups.delete(id);}
             this.version++;
         }
+    }
+
+    private dirty(file: string): void {this.dirtyFiles.add(file); this.cached = undefined;}
+
+    private changeStale(source: SourceRecord, delta: number): void {
+        const stale = source.staleCount > 0;
+        source.staleCount += delta;
+        if (stale !== (source.staleCount > 0)) {this.dirty(source.source.file);}
+    }
+
+    private invalidateAggregate(source: SourceRecord): void {
+        source.aggregate = undefined; source.aggregateVersion++; this.dirty(source.source.file);
     }
 
     private registerSource(source: CoverageSource, canonical = false, merged = false): void {
@@ -343,7 +371,7 @@ export class CoverageStore {
         this.sources.set(source.id, { source: { ...source, lines }, groups: previous?.groups ?? new Set(), hits: previous?.hits ?? new Map(),
             staleCount: previous?.staleCount ?? 0, aggregateVersion: (previous?.aggregateVersion ?? 0) + 1 });
         const versions = this.byFile.get(source.file) ?? new Set<string>(); versions.add(source.id); this.byFile.set(source.file, versions);
-        this.changedSources.add(source.id); this.removedSources.delete(source.id); this.dirtyFiles.add(source.file); this.cached = undefined; this.version++;
+        this.changedSources.add(source.id); this.removedSources.delete(source.id); this.dirty(source.file); this.version++;
     }
 
     private install(trace: StoredTrace): void { finish(this.installation(trace)); }
@@ -368,7 +396,7 @@ export class CoverageStore {
             for (const id of previous.sourceIds) {
                 const source = this.sources.get(id)!;
                 if (!sourceIds.has(id)) {this.removeMembership(source, trace.groupId, wasStale);}
-                else if (!contributions.has(id) && source.hits.delete(trace.groupId)) {source.aggregate = undefined; source.aggregateVersion++;}
+                else if (!contributions.has(id) && source.hits.delete(trace.groupId)) {this.invalidateAggregate(source);}
                 if (++count % 512 === 0) {yield;}
             }
         }
@@ -382,18 +410,18 @@ export class CoverageStore {
             const source = this.sources.get(id)!;
             if (!source.groups.has(trace.groupId)) {
                 source.groups.add(trace.groupId); this.changeOwnership(source, trace.groupId, true); source.staleCount += Number(stale);
-            } else {source.staleCount += Number(stale) - Number(wasStale);}
-            this.dirtyFiles.add(source.source.file);
+                this.dirty(source.source.file);
+            } else {this.changeStale(source, Number(stale) - Number(wasStale));}
             if (++count % 512 === 0) {yield;}
         }
         for (const [id, lines] of contributions) {
             const source = this.sources.get(id);
-            if (source) {
-                source.hits.set(trace.groupId, lines); source.aggregate = undefined; source.aggregateVersion++;
+            if (source && source.hits.get(trace.groupId) !== lines) {
+                source.hits.set(trace.groupId, lines); this.invalidateAggregate(source);
             }
             if (++count % 512 === 0) {yield;}
         }
-        this.cached = undefined; this.version++;
+        this.version++;
     }
 
     private remove(id: string): void {
@@ -410,13 +438,13 @@ export class CoverageStore {
             const source = this.sources.get(sourceId)!;
             this.removeMembership(source, id, stale);
         }
-        this.cached = undefined; this.version++;
+        this.version++;
     }
 
     private removeMembership(source: SourceRecord, id: string, stale: boolean): void {
         if (source.groups.delete(id)) {source.staleCount -= Number(stale); this.changeOwnership(source, id, false);}
-        if (source.hits.delete(id)) {source.aggregate = undefined; source.aggregateVersion++;}
-        this.dirtyFiles.add(source.source.file);
+        if (source.hits.delete(id)) {this.invalidateAggregate(source);}
+        this.dirty(source.source.file);
     }
 
     /** Published ownership arrays stay immutable; insert only genuinely new owners. */

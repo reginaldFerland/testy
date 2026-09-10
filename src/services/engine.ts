@@ -138,7 +138,7 @@ export class TestEngine {
     private disposal?: Promise<void>;
     private readonly pendingChanges = new Set<string>();
     private projectSnapshots: ReadonlyMap<string, readonly Project[]> = new Map();
-    private readonly projectEvaluations = new ProjectEvaluationCache();
+    private readonly projectEvaluations: ProjectEvaluationCache;
     private inputTopology = 0;
     private inputs: readonly string[] = [];
     private inputDirectories: readonly string[] = [];
@@ -147,6 +147,7 @@ export class TestEngine {
         this.roots = options.roots.map(normalizePath);
         this.cache = new CoverageCache(options.storage, options.events.output);
         this.preparedOutputs = new PreparedOutputCache(options.storage, this.identity, { persist: true });
+        this.projectEvaluations = new ProjectEvaluationCache(options.storage);
     }
 
     get hashes(): ReadonlyMap<string, string> { return this.sources.hashes; }
@@ -217,6 +218,7 @@ export class TestEngine {
             for (const controller of this.operations.keys()) {controller.abort();}
             this.disposal = (async () => {
                 await Promise.allSettled(this.operations.values());
+                await this.projectEvaluations.dispose();
                 await this.preparedOutputs.dispose();
             })();
         }
