@@ -95,7 +95,7 @@ test('batched restore, inspection and build reuse a deep shared graph',{timeout:
  for(const [file,graph] of snapshots){assert.deepEqual(graph.filter(project=>project.entryPoint).map(project=>project.file),[file]);assert.ok(graph.every(project=>project.outputDirectories.some(directory=>directory.includes('/obj'))));}
  const projects=mergeProjects([...snapshots.values()].flat()),order=buildOrder(projects,new Set(files)),roots=buildRoots(order);
  assert.equal(new Set([...snapshots.values()].flat().map(project=>project.contextId)).size,6);
- assert.deepEqual(new Set(roots.map(project=>path.basename(project.file))),new Set(['TestsA.csproj','TestsB.csproj']));
+ assert.deepEqual(new Set(roots.map(project=>project.file)),new Set(['TestsA','TestsB'].map(name=>normalizePath(path.join(root,name,`${name}.csproj`)))));
  assert.equal(buildWaves(order,roots).length,1);
  await buildProjects('dotnet',roots,'Debug',options,2);
  const compiled=(await fs.readFile(counter,'utf8')).trim().split(/\r?\n/);
