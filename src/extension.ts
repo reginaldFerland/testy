@@ -26,6 +26,16 @@ export async function deactivate(): Promise<void> {
     finally {activeExtension = undefined;}
 }
 
+interface EditorCoverageState {
+    readonly document: vscode.TextDocument;
+    readonly version: number;
+    readonly lineCount: number;
+    readonly dirty: boolean;
+    readonly show: boolean;
+    readonly lines: CoverageSummary['lines'] | undefined;
+    readonly stale: boolean | undefined;
+}
+
 class Testy implements vscode.Disposable {
     private readonly controller = vscode.tests.createTestController('testy', 'Testy');
     private readonly output = vscode.window.createOutputChannel('Testy');
@@ -51,6 +61,8 @@ class Testy implements vscode.Disposable {
     private renderTimer: NodeJS.Timeout | undefined;
     private rendering = false;
     private readonly pendingEditors = new Set<vscode.TextEditor>();
+    private decoratedEditors?: WeakMap<vscode.TextEditor, EditorCoverageState>;
+    private decorationIndex?: { readonly summaries: readonly CoverageSummary[]; readonly files: ReadonlyMap<string, CoverageSummary> };
     private productionSources = new Set<string>();
     private coverageSuffix = '';
     private passed = 0;
@@ -418,20 +430,32 @@ class Testy implements vscode.Disposable {
             summaries = this.config.showCoverage ? await this.engine.coverage.summarizeAsync(hashes, this.lifetime.signal) : [];
         } while (!this.disposed && this.config.showCoverage && hashes !== this.engine.hashes);
         if (this.disposed) {return;}
-        const byFile = new Map(summaries.map(summary => [summary.file, summary]));
+        if (this.decorationIndex?.summaries !== summaries) {
+            this.decorationIndex = { summaries, files: new Map(summaries.map(summary => [summary.file, summary])) };
+        }
+        const byFile = this.decorationIndex.files, rendered = this.decoratedEditors ??= new WeakMap();
         for (const editor of editors) {
+            const document = editor.document;
+            const summary = this.config.showCoverage ? byFile.get(normalizePath(document.uri.fsPath)) : undefined;
+            const state: EditorCoverageState = { document, version: document.version, lineCount: document.lineCount, dirty: document.isDirty,
+                show: this.config.showCoverage, lines: summary?.lines, stale: summary?.stale };
+            const previous = rendered.get(editor);
+            if (previous && previous.document === document && previous.version === state.version && previous.lineCount === state.lineCount
+                && previous.dirty === state.dirty && previous.show === state.show && previous.lines === state.lines && previous.stale === state.stale) {continue;}
             const entries: Record<'covered' | 'uncovered' | 'stale', vscode.DecorationOptions[]> = { covered: [], uncovered: [], stale: [] };
-            const summary = this.config.showCoverage ? byFile.get(normalizePath(editor.document.uri.fsPath)) : undefined;
             if (summary) {for (const line of summary.lines) {
-                if (line.line > editor.document.lineCount) {continue;}
-                const stale = summary.stale || editor.document.isDirty;
+                if (line.line > state.lineCount) {continue;}
+                const stale = summary.stale || state.dirty;
                 const kind = stale ? 'stale' : line.hits > 0 ? 'covered' : 'uncovered';
                 entries[kind].push({
                     range: new vscode.Range(line.line - 1, 0, line.line - 1, 0),
                     hoverMessage: stale ? 'Testy: coverage is out of date. It will refresh after the affected tests finish.' : line.hits > 0 ? 'Testy: covered by tests.' : 'Testy: not covered by tests.'
                 });
             }}
+            // A partially failed submission must never make an older state look current.
+            rendered.delete(editor);
             for (const kind of ['covered', 'uncovered', 'stale'] as const) {editor.setDecorations(this.decorations[kind], entries[kind]);}
+            rendered.set(editor, state);
         }
     }
 
