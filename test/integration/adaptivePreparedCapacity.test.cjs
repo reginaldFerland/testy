@@ -5,14 +5,25 @@ const {TestEngine}=require('../../out/services/engine');
 const {normalizePath}=require('../../out/core/paths');
 const processes=require('../../out/services/process'),mtp=require('../../out/services/mtp');
 
-test('seventeen test targets retain every instrumented preparation through warm runs and clean restart',{timeout:180000},async t=>{
+test('seventeen test targets retain every instrumented preparation through warm runs and clean restart',{timeout:300000},async t=>{
  const count=17,temp=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-adaptive-prepared-')));
  const root=path.join(temp,'workspace'),storage=path.join(temp,'state'),core=path.join(root,'Core','Core.cs');
- const engines=[],control=new AbortController(),signal=AbortSignal.any([t.signal,control.signal]);
+ const engines=[],states=[],operations=new Set(),control=new AbortController(),signal=AbortSignal.any([t.signal,control.signal]);
+ let completed=false,stage='creating fixture',phase,probe;
+ const track=operation=>{
+  operations.add(operation);void operation.then(()=>operations.delete(operation),()=>operations.delete(operation));return operation;
+ };
  const runProcess=processes.runProcess,requestTests=mtp.requestTests;
  t.after(async()=>{
   control.abort();
-  try{await Promise.all(engines.map(engine=>engine.dispose()));}
+  if(!completed)t.diagnostic(JSON.stringify({stage,phase,counts:probe&&{builds:probe.builds,instruments:probe.instruments.length,
+   discoveries:probe.discoveries.length,runs:probe.runs.length,activeInstruments:probe.activeInstruments,activeRequests:probe.activeRequests,
+   activeRuns:probe.activeRuns},output:states.map(state=>state.output.slice(-40).join('').slice(-12000))}));
+  await Promise.allSettled([...operations]);
+  try{
+   const disposed=await Promise.allSettled(engines.map(engine=>engine.dispose()));
+   for(const result of disposed)if(result.status==='rejected')throw result.reason;
+  }
   finally{processes.runProcess=runProcess;mtp.requestTests=requestTests;await fs.rm(temp,{recursive:true,force:true});}
  });
  await fs.mkdir(path.dirname(core),{recursive:true});
@@ -26,7 +37,7 @@ test('seventeen test targets retain every instrumented preparation through warm 
  }
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:60000,
   coverageTool:process.env.TESTY_COVERAGE_TOOL,maxParallelProjects:4,maxParallelTestFiles:1};
- const probe={instruments:[],discoveries:[],runs:[],builds:0,activeInstruments:0,activeRequests:0,activeRuns:0,peakInstruments:0,peakRequests:0,peakRuns:0};
+ probe={instruments:[],discoveries:[],runs:[],builds:0,activeInstruments:0,activeRequests:0,activeRuns:0,peakInstruments:0,peakRequests:0,peakRuns:0};
  processes.runProcess=async(command,args,...rest)=>{
   if(args.includes('-target:Build'))probe.builds++;
   if(args[0]!=='instrument')return runProcess(command,args,...rest);
@@ -47,9 +58,9 @@ test('seventeen test targets retain every instrumented preparation through warm 
   probe.instruments=[];probe.discoveries=[];probe.runs=[];probe.builds=0;probe.peakRequests=0;probe.peakRuns=0;probe.peakInstruments=0;
  };
  const makeEngine=()=>{
-  const state={output:[],results:[]};
+  const state={output:[],results:[]};states.push(state);
   const engine=new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
-   events:{output:text=>state.output.push(text),phase(){},discovered(){},selected(){},result:(group,result)=>state.results.push({group:group.id,...result}),
+   events:{output:text=>state.output.push(text),phase:value=>{phase=value;},discovered(){},selected(){},result:(group,result)=>state.results.push({group:group.id,...result}),
     started(){},coverage(){},invalidated(){}}});
   engines.push(engine);return{engine,state};
  };
@@ -69,9 +80,10 @@ test('seventeen test targets retain every instrumented preparation through warm 
     dependencies:[...trace.dependencies].sort(),coverage:trace.coverage.map(file=>({file:file.file,hash:file.hash,lines:file.lines})).sort((a,b)=>a.file.localeCompare(b.file))};
   }).sort((a,b)=>a.id.localeCompare(b.id));
  };
- const run=async instance=>{
+ const run=async(instance,label)=>{
+  stage=label;phase=undefined;
   instance.state.results=[];instance.state.output=[];
-  const summary=await instance.engine.run({files:[],full:true},signal);
+  const summary=await track(instance.engine.run({files:[],full:true},signal));
   assert.equal(summary.passed,count,instance.state.output.join(''));assert.equal(summary.failed,0);assert.equal(summary.tests,count);assert.equal(summary.coverageAvailable,true);
   assert.equal(probe.discoveries.length,count,'every project performs fresh discovery');assert.equal(probe.runs.length,count,'every baseline executes all seventeen tests');
   assert.equal(probe.peakRuns,1,'test execution is deliberately sequential');
@@ -98,21 +110,23 @@ test('seventeen test targets retain every instrumented preparation through warm 
   return owner;
  };
 
- const first=makeEngine(),initial=await run(first);
+ // Three full baselines retain 51 native runs/discoveries and 34 initial DLL
+ // instrumentations. Keep each process bounded at 60s while allowing slow CI.
+ const first=makeEngine(),initial=await run(first,'initial full baseline');
  assert.equal(probe.instruments.length,count*2,'each target and its private Core copy are instrumented once');
  const originalInvocations=invocations();
  assert.equal(new Set(originalInvocations.map(value=>value.assembly)).size,count);
  assert.equal(new Set(originalInvocations.map(value=>value.session)).size,count);assert.ok(originalInvocations.every(value=>value.session));
- reset();assert.deepEqual(await run(first),initial);
+ reset();assert.deepEqual(await run(first,'unchanged full baseline'),initial);
  assert.equal(probe.instruments.length,0,'a second full baseline reuses all seventeen instrumented preparations');
  assert.deepEqual(invocations(),originalInvocations,'warm runs keep every private assembly path and collector session');
- await first.engine.dispose();const parked=await assertParked();
+ stage='parking initial engine';await first.engine.dispose();const parked=await assertParked();
 
- reset();const second=makeEngine();await second.engine.restore();
- assert.deepEqual(await run(second),initial,'fresh execution after restart preserves exact test identities, results and coverage attribution');
+ reset();const second=makeEngine();stage='restoring restarted engine';await track(second.engine.restore(signal));
+ assert.deepEqual(await run(second,'restarted full baseline'),initial,'fresh execution after restart preserves exact test identities, results and coverage attribution');
  assert.equal(probe.instruments.length,0,'adoption must raise capacity before a default sixteen-entry trim can discard the parked container');
  assert.equal(probe.builds,1,'restart still executes an authoritative MSBuild build');
  assert.deepEqual(invocations(),originalInvocations,'adoption preserves all seventeen instrumentation sessions and absolute paths');
  const [active]=await owners();assert.equal(active.identity,parked.identity);assert.notEqual(active.token,parked.token);assert.equal(active.state,'active');assert.equal(active.pid,process.pid);
- await second.engine.dispose();await assertParked();
+ stage='parking restarted engine';await second.engine.dispose();await assertParked();completed=true;
 });
