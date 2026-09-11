@@ -15,6 +15,12 @@ vsc-extension-quickstart.md
 **/*.ts
 **/tsconfig.tsbuildinfo
 **/.vscode-test.*
+# Keep compiled runtime modules, excluding diagnostics and copied fixtures.
+out/**
+!out/extension.js
+!out/configuration.js
+!out/core/*.js
+!out/services/*.js
 package-lock.json
 pnpm-lock.yaml
 dist/analyzer/Testy.Analysis

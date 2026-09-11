@@ -25,6 +25,7 @@
 - Reuse unchanged editor coverage decorations, while refreshing them after document, freshness, visibility, or editor-identity changes.
 - Avoid redundant Windows directory permission writes during output reset, and recognize forward-slash relative paths when identifying preparation tools.
 - Identify cache tools using their actual launch rules, including Windows `Path` environments and POSIX paths that traverse symlinks before `..`; retain fresh execution when identity is uncertain.
+- Exclude local performance diagnostics and copied fixtures from shareable packages while retaining compiled runtime modules.
 
 ## 1.1.0
 
