@@ -101,13 +101,15 @@ test('coverage publication sends only changed line data and a fresh snapshot per
 
 test('save-mode directory events expand known paths and trigger structural discovery',async()=>{
  const proto=uiPrototype(), requested=[], marked=[];
- const root=require('../../out/core/paths').normalizePath(path.resolve(require('node:os').tmpdir(),'testy-ui-workspace'));
+ const {normalizePath}=require('../../out/core/paths');
+ const root=normalizePath(path.resolve(require('node:os').tmpdir(),'testy-ui-workspace'));
+ const directory=path.join(root,'Tests','Feature'),source=normalizePath(path.join(directory,'FeatureTests.cs'));
  const context={disposed:false,roots:[root],config:{excludes:[],pattern:'**/*.{cs,csproj}',mode:'affected'},
-  engine:{knownFiles:[`${root}/Tests/Feature/FeatureTests.cs`],select:()=>({groups:[]}),markChanged:async files=>marked.push([...files])},
+  engine:{knownFiles:[source],select:()=>({groups:[]}),markChanged:async files=>marked.push([...files])},
   scheduler:{request:(files,full)=>requested.push({files:[...files],full})},controller:{invalidateTestResults:()=>{}},items:new Map()};
- await proto.changed.call(context,{scheme:'file',fsPath:`${root}/Tests/Feature`},undefined,true);
+ await proto.changed.call(context,{scheme:'file',fsPath:directory},undefined,true);
  assert.equal(requested.length,1);assert.equal(requested[0].full,true);
- assert.deepEqual(requested[0].files,[`${root}/Tests/Feature/FeatureTests.cs`,`${root}/Tests/Feature`]);
+ assert.deepEqual(requested[0].files,[source,normalizePath(directory)]);
  assert.deepEqual(marked[0],requested[0].files);
 });
 

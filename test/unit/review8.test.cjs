@@ -52,8 +52,8 @@ test('large discovery normalizes shared source paths once and yields for cancell
  const file=normalizePath(path.resolve('test/fixtures/ImpactDemo/ImpactDemo.Tests/CalculatorTests.cs'));
  const project={file:path.join(path.dirname(file),'ImpactDemo.Tests.csproj'),framework:'net10.0',assembly:'/unused/Tests.dll',sourceFiles:[file]};
  const nodes=Array.from({length:20000},(_,i)=>({uid:`row${i}`,'location.file':file}));
- const original=fs.realpathSync.native;let calls=0,ticked=false;
- fs.realpathSync.native=(...args)=>{if(args[0]===file)calls++;return original(...args);};
+ const original=fs.realpathSync.native,nativeFile=path.resolve(file);let calls=0,ticked=false;
+ fs.realpathSync.native=(...args)=>{if(args[0]===nativeFile)calls++;return original(...args);};
  try{
   setImmediate(()=>{ticked=true;});const groups=await discover(project,{},nodes);
   assert.equal(groups[0].tests.length,nodes.length);assert.equal(calls,1);assert.equal(ticked,true);

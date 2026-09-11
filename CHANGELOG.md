@@ -23,6 +23,7 @@
 - Reuse successful source analysis during unchanged full refreshes within an editor session, validating parsed source bytes, alias inputs, and analyzer context while retrying incomplete results.
 - Instrument independent DLLs concurrently with the bundled collector during initial preparation, sharing idle project workers and draining interrupted work before restoring outputs.
 - Reuse unchanged editor coverage decorations, while refreshing them after document, freshness, visibility, or editor-identity changes.
+- Avoid redundant Windows directory permission writes during output reset, and recognize forward-slash relative paths when identifying preparation tools.
 
 ## 1.1.0
 

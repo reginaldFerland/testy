@@ -88,7 +88,17 @@ test('complete manifest invalidates binaries, symbols, configs, assets, native m
  for(const name of ['Tests.dll','Tests.pdb','Tests.runtimeconfig.json','asset','native']){
   await fs.writeFile(path.join(f.source,name),'different');const next=await f.acquire();assert.equal(next.hit,false,name);await next.release();
  }
- await fs.chmod(path.join(f.source,'native'),0o755);lease=await f.acquire();assert.equal(lease.hit,false);await lease.release();
+ const native=path.join(f.source,'native'),originalMode=(await fs.stat(native)).mode;
+ // Windows exposes the writable bit, but does not implement POSIX execute bits.
+ try{
+  await fs.chmod(native,process.platform==='win32'?0o444:0o755);
+  const changedMode=(await fs.stat(native)).mode;assert.notEqual(changedMode,originalMode,'fixture must make a real mode-only change');
+  lease=await f.acquire();assert.equal(lease.hit,false,'a representable mode-only change invalidates preparation');
+  assert.equal((await fs.stat(path.join(lease.artifact.output.directory,'native'))).mode,changedMode);
+  await lease.release();
+ }finally{await fs.chmod(native,originalMode);}
+ lease=await f.acquire();assert.equal(lease.hit,true,'restoring the original mode can reuse the matching earlier preparation');
+ assert.equal((await fs.stat(path.join(lease.artifact.output.directory,'native'))).mode,originalMode);await lease.release();
  await fs.writeFile(linked,'linked-two');lease=await f.acquire();assert.equal(lease.hit,false);await lease.release();
  lease=await f.acquire('new evaluated reference context');assert.equal(lease.hit,false);
  assert.equal(await fs.readFile(path.join(lease.artifact.output.directory,'link'),'utf8'),'linked-two');
@@ -204,21 +214,26 @@ test('tool identity follows PATH, executable bytes and .NET tool-store dependenc
 
 test('tool identity resolves relative commands and PATH against the actual project working directory',async t=>{
  const f=await fixture(t),project=path.join(f.root,'project'),bin=path.join(project,'bin'),shadow=path.join(project,'shadow');
- await fs.mkdir(bin,{recursive:true});await fs.mkdir(shadow);const command=path.join(bin,'collector');
- await fs.writeFile(command,'real executable',{mode:0o755});await fs.writeFile(path.join(shadow,'collector'),'not executable',{mode:0o644});
- const env={PATH:['shadow','bin'].join(path.delimiter)},expected=await preparationToolIdentity(command,env);
- assert.equal(await preparationToolIdentity('./bin/collector',env,undefined,project),expected);
+ const name=process.platform==='win32'?'collector.exe':'collector';
+ await fs.mkdir(bin,{recursive:true});await fs.mkdir(shadow);const command=path.join(bin,name);
+ await fs.writeFile(command,'real executable',{mode:0o755});
+ if(process.platform==='win32')await fs.mkdir(path.join(shadow,name));
+ else await fs.writeFile(path.join(shadow,name),'not executable',{mode:0o644});
+ const env={PATH:['shadow','bin'].join(path.delimiter),PATHEXT:'.EXE'},expected=await preparationToolIdentity(command,env);
+ assert.equal(await preparationToolIdentity(`./bin/${name}`,env,undefined,project),expected);
+ assert.equal(await preparationToolIdentity(path.join('.', 'bin',name),env,undefined,project),expected);
  assert.equal(await preparationToolIdentity('collector',env,undefined,project),expected);
 });
 
 test('one operation hashes the same resolved executable once across project directories and command aliases',async t=>{
- const f=await fixture(t),command=path.join(f.root,'collector'),alias=path.join(f.root,'alias');
+ const f=await fixture(t),name=process.platform==='win32'?'collector.exe':'collector',command=path.join(f.root,name),alias=path.join(f.root,'alias');
  await fs.writeFile(command,'collector',{mode:0o755});await fs.symlink(command,alias);
  const left=path.join(f.root,'left'),right=path.join(f.root,'right');await fs.mkdir(left);await fs.mkdir(right);
  const hashes=[],hash=outputTools.fileHash;outputTools.fileHash=async(file,signal)=>{hashes.push(file);return hash(file,signal);};t.after(()=>{outputTools.fileHash=hash;});
- const identities=new Map(),env={PATH:f.root};
+ const identities=new Map(),env={PATH:f.root,PATHEXT:'.EXE'};
  const results=await Promise.all([
-  preparationToolIdentity('collector',env,undefined,left,identities),preparationToolIdentity('../collector',env,undefined,right,identities),
+  preparationToolIdentity('collector',env,undefined,left,identities),preparationToolIdentity(`../${name}`,env,undefined,right,identities),
+  preparationToolIdentity(path.join('..',name),env,undefined,right,identities),
   preparationToolIdentity(alias,env,undefined,left,identities)
  ]);
  assert.equal(new Set(results).size,1);assert.deepEqual(hashes,[command]);assert.equal(identities.size,1);

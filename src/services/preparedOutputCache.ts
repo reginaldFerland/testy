@@ -56,8 +56,9 @@ export async function outputManifest(directory: string, signal?: AbortSignal, fo
 export async function preparationToolIdentity(command: string | undefined, env: NodeJS.ProcessEnv, signal?: AbortSignal, cwd = process.cwd(),
     identities?: Map<string, Promise<string>>): Promise<string | undefined> {
     if (!command) {return undefined;}
-    const searchPath = !path.isAbsolute(command) && !command.includes(path.sep);
-    const candidates = path.isAbsolute(command) ? [command] : command.includes(path.sep) ? [path.resolve(cwd, command)]
+    const hasDirectory = command.includes(path.sep) || command.includes('/');
+    const searchPath = !path.isAbsolute(command) && !hasDirectory;
+    const candidates = path.isAbsolute(command) ? [command] : hasDirectory ? [path.resolve(cwd, command)]
         : (env.PATH ?? '').split(path.delimiter).flatMap(directory => process.platform === 'win32'
             ? ['', ...(env.PATHEXT ?? '.EXE;.CMD;.BAT').split(';')].map(extension => path.resolve(cwd, directory, command + extension))
             : [path.resolve(cwd, directory, command)]);

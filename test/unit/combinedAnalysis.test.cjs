@@ -2,6 +2,7 @@ const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const analysis=require('../../out/services/analysis'),processes=require('../../out/services/process');
+const {normalizePath}=require('../../out/core/paths');
 
 const shape={signature:'A'.repeat(64),body:'B'.repeat(64),partialTypes:['N:C`0'],excludedTypes:[]};
 async function fixture(t) {
@@ -14,14 +15,14 @@ async function fixture(t) {
   return typeof value==='string'?{code:0,stdout:value,stderr:''}:{code:0,stdout:JSON.stringify(value),stderr:''};
  };
  t.after(async()=>{processes.runProcess=run;await fs.rm(directory,{recursive:true,force:true});});
- return{directory,files,calls,respond:value=>{respond=value;},
+ return{directory,files,keys:files.map(normalizePath),calls,respond:value=>{respond=value;},
   batch:(files_,aliases,update,options={})=>analysis.sourceAnalysisBatch('dotnet','analyzer.dll',files_,directory,{cwd:directory,...options},aliases,4,update)};
 }
 
 test('combined requests preserve the worker budget and return every source affected by changed aliases',async t=>{
  const f=await fixture(t);f.respond(()=>({aliases:['Blind'],analyses:Object.fromEntries(f.files.map(file=>[file,shape]))}));
  const result=await f.batch([f.files[0]],[],{sources:['global using Blind = ExcludeFromCodeCoverageAttribute;'],allFiles:f.files});
- assert.deepEqual(result.aliases,['Blind']);assert.deepEqual([...result.analyses.keys()],f.files);
+ assert.deepEqual(result.aliases,['Blind']);assert.deepEqual([...result.analyses.keys()],f.keys);
  assert.equal(f.calls.length,1);assert.equal(f.calls[0].request.concurrency,4);assert.deepEqual(f.calls[0].request.files,[f.files[0]]);
  assert.deepEqual(f.calls[0].request.allFiles,f.files);assert.equal(f.calls[0].options.output,undefined);
  assert.deepEqual(await fs.readdir(f.directory),[]);
@@ -30,13 +31,13 @@ test('combined requests preserve the worker budget and return every source affec
 test('alias order and duplicates do not expand analysis when the resolved set is unchanged',async t=>{
  const f=await fixture(t);f.respond(()=>({aliases:['Two','One','One'],analyses:{[f.files[0]]:shape}}));
  const result=await f.batch([f.files[0]],['One','Two'],{sources:['changed comments'],allFiles:f.files});
- assert.deepEqual([...result.analyses.keys()],[f.files[0]]);assert.equal(f.calls.length,1);
+ assert.deepEqual([...result.analyses.keys()],[f.keys[0]]);assert.equal(f.calls.length,1);
 });
 
 test('removing the last alias analyzes all files with one ordinary request, and empty work launches none',async t=>{
  const f=await fixture(t);f.respond(request=>Object.fromEntries(request.files.map(file=>[file,shape])));
  const deleted=await f.batch([],['Blind'],{sources:[],allFiles:f.files});
- assert.deepEqual(deleted.aliases,[]);assert.deepEqual([...deleted.analyses.keys()],f.files);
+ assert.deepEqual(deleted.aliases,[]);assert.deepEqual([...deleted.analyses.keys()],f.keys);
  assert.deepEqual(f.calls[0].request.files,f.files);assert.equal(f.calls[0].request.aliasSources,undefined);
  assert.deepEqual(f.calls[0].request.excludedAliases,[]);
  await f.batch([],[],undefined);await f.batch([],[],{sources:[],allFiles:f.files});
@@ -46,7 +47,7 @@ test('removing the last alias analyzes all files with one ordinary request, and 
 test('legitimate null records remain conservative without discarding healthy siblings',async t=>{
  const f=await fixture(t);f.respond(()=>({aliases:['Blind'],analyses:{[f.files[0]]:shape,[f.files[1]]:null}}));
  const result=await f.batch([],[],{sources:['an alias'],allFiles:f.files});
- assert.deepEqual(result.analyses.get(f.files[0]),shape);assert.equal(result.analyses.get(f.files[1]),null);
+ assert.deepEqual(result.analyses.get(f.keys[0]),shape);assert.equal(result.analyses.get(f.keys[1]),null);
 });
 
 test('malformed and incomplete combined responses reject the whole unpublished transaction',async t=>{

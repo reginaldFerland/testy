@@ -2,6 +2,7 @@ const test=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os'),vm=require('node:vm');
 const {randomUUID}=require('node:crypto');
 const {createRequire}=require('node:module'),{setTimeout:delay}=require('node:timers/promises');
+const {normalizePath}=require('../../out/core/paths');
 
 function deferred(){let resolve;const promise=new Promise(done=>resolve=done);return{promise,resolve};}
 async function until(promise,signal){
@@ -17,7 +18,7 @@ async function fixture(t,config={}){
  await fs.writeFile(path.join(source,'Tests.dll'),'assembly');await fs.writeFile(path.join(source,'asset'),'pristine');
  const definitions=config.definitions??[{token:'a',file:'A.cs',name:'A'},{token:'b',file:'B.cs',name:'B'}];
  const project={file:path.join(workspace,'Tests.csproj'),framework:'net10.0',assembly:path.join(source,'Tests.dll'),
-  sourceFiles:[...new Set(definitions.map(node=>path.join(workspace,node.file)))]};
+  sourceFiles:[...new Set(definitions.map(node=>normalizePath(path.join(workspace,node.file))))]};
  const state={discoveries:[],runs:[],instruments:[],prepared:0,claims:0,active:0,peak:0,activeAssemblies:new Set(),
   primaryStarted:deferred(),secondaryStarted:deferred(),release:deferred(),fallback:deferred(),reports:new Map()};
  const control=new AbortController(),file=path.resolve('out/services/runner.js'),realRequire=createRequire(file),exports={};
@@ -65,7 +66,7 @@ async function fixture(t,config={}){
    return output.removeOutput(directory);
   }},
   './runOutputs':{...ownership,claimRunOutputs:async(...args)=>{state.claims++;await delay(5);return ownership.claimRunOutputs(...args);}},
-  './coverageReader':{CoverageReader:class{async read(report,_cwd,hashes){return(state.reports.get(report)??[]).map(file=>({file,hash:hashes.get(file),lines:[{line:1,hits:1}]}));}async dispose(){}}},
+  './coverageReader':{CoverageReader:class{async read(report,_cwd,hashes){return(state.reports.get(report)??[]).map(normalizePath).map(file=>({file,hash:hashes.get(file),lines:[{line:1,hits:1}]}));}async dispose(){}}},
   './runtimeObservation':{RuntimeObservation:class{static async start(_directory,_assembly,_modules,_instrumented,env){return{env,dependencies:async()=>({files:[],projects:[]})};}}}
  };
  vm.runInNewContext(await fs.readFile(file,'utf8'),{exports,process,require:name=>modules[name]??realRequire(name)});

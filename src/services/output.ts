@@ -7,6 +7,8 @@ import { mapConcurrent, Semaphore } from '../core/concurrency';
 
 const copyWorkers = new Semaphore(8);
 const metadataWorkers = new Semaphore(8);
+// Windows chmod exposes write access but cannot add POSIX directory execute bits.
+const directoryAccess = process.platform === 'win32' ? 0o600 : 0o700;
 
 async function copyFile(source: string, destination: string, signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
@@ -56,7 +58,7 @@ async function makeAccessible(directory: string, signal?: AbortSignal): Promise<
     let stat;
     try {stat = await fs.lstat(directory);} catch (error) {if ((error as NodeJS.ErrnoException).code === 'ENOENT') {return;} throw error;}
     if (!stat.isDirectory() || stat.isSymbolicLink()) {return;}
-    if ((stat.mode & 0o700) !== 0o700) {await fs.chmod(directory, stat.mode | 0o700);}
+    if ((stat.mode & directoryAccess) !== directoryAccess) {await fs.chmod(directory, stat.mode | directoryAccess);}
     for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
         if (entry.isDirectory()) {await makeAccessible(path.join(directory, entry.name), signal);}
     }
@@ -78,14 +80,15 @@ async function stamp(file: string, signal?: AbortSignal): Promise<string> {
 /** Repair access before listing each directory; links are inventoried, never followed. */
 async function inventory(directory: string, signal?: AbortSignal, repairAccess = false, root?: BigIntStats): Promise<{ root: string; entries: Map<string, string> }> {
     const result = { root: '', entries: new Map<string, string>() };
+    const access = BigInt(directoryAccess);
     let queued = [''];
     while (queued.length) {
         const visited = await mapConcurrent(queued, 8, signal, (relative, _index, workerSignal) => metadataWorkers.run(workerSignal, async () => {
             const file = path.join(directory, relative);
             let stat = relative === '' && root ? root : await fs.lstat(file, { bigint: true });
-            if (repairAccess && stat.isDirectory() && (stat.mode & 0o700n) !== 0o700n) {
+            if (repairAccess && stat.isDirectory() && (stat.mode & access) !== access) {
                 workerSignal.throwIfAborted();
-                await fs.chmod(file, Number(stat.mode | 0o700n));
+                await fs.chmod(file, Number(stat.mode | access));
                 stat = await fs.lstat(file, { bigint: true });
             }
             workerSignal.throwIfAborted();
