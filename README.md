@@ -133,7 +133,7 @@ Compilation builds TypeScript, the bundled .NET source analyzer, the Windows pro
 
 The analyzer bundles pinned, portable Roslyn NuGet assemblies. Unit validation rejects platform-specific managed binaries, so a VSIX built on one OS can use the same analyzer on another.
 
-For interactive development, open this repository in VS Code and press **F5**. The launch task builds the bundled .NET helpers before starting the TypeScript watcher. Open `test/fixtures/ImpactDemo` in the Extension Development Host, save a source edit, and inspect Test Explorer and **Testy: Show Output**. To test the installable artifact, use **Extensions: Install from VSIX…** and choose `testy-1.1.0.vsix`; reload the window afterward. No publication is needed.
+For interactive development, open this repository in VS Code and press **F5**. The launch task builds the bundled .NET helpers before starting the TypeScript watcher. Open `test/fixtures/ImpactDemo` in the Extension Development Host, save a source edit, and inspect Test Explorer and **Testy: Show Output**. To test the installable artifact, use **Extensions: Install from VSIX…** and choose `testy-1.2.0.vsix`; reload the window afterward. No publication is needed.
 
 See [validation evidence](docs/1.0-validation.md) for measured performance and platform limits.
 The [latest performance review](docs/performance-review.md) records optimization measurements and remaining candidates.

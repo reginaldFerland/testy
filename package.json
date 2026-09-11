@@ -7,7 +7,7 @@
     "type": "git"
   },
   "publisher": "reginaldFerland",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "icon": "testy.png",
   "engines": {
     "vscode": "^1.99.0"

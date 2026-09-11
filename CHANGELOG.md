@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.0
 
 - Schedule idle project runners before creating additional workers within a project, and redistribute spare capacity as projects finish.
 - Reuse validated prepared outputs between runs, with fresh discovery, isolated collector sessions, bounded retention, and cleanup on shutdown.
