@@ -1,9 +1,9 @@
 import * as fs from 'node:fs/promises';
-import { constants } from 'node:fs';
 import * as path from 'node:path';
 import { contentHash } from '../core/paths';
 import { ProcessOptions } from './process';
 import { preparationToolIdentity } from './preparedOutputCache';
+import { resolveNodeExecutable } from './executable';
 
 /** Testy's syntax helper is pure for its source/alias inputs under an ordinary
  * installed CLR. Treat supported CLR implementation semantics as platform
@@ -17,21 +17,15 @@ export async function sourceAnalysisContext(dotnet: string, analyzer: string, op
     if (Object.entries(env).some(([key, value]) => value && /^(?:CORECLR_|COR_|COMPlus_|DOTNET_(?:STARTUP_HOOKS|ADDITIONAL_DEPS|SHARED_STORE|ROOT(?:_|$)|MULTILEVEL_LOOKUP|ROLL_FORWARD|RUNTIME_ID))/i.test(key))) {return undefined;}
     if (Object.entries(env).some(([key, value]) => value && /^(?:LD_(?:PRELOAD|LIBRARY_PATH|AUDIT|ORIGIN_PATH)|DYLD_(?:INSERT_LIBRARIES|(?:FALLBACK_|VERSIONED_)?(?:LIBRARY|FRAMEWORK)_PATH|ROOT_PATH|IMAGE_SUFFIX|SHARED_CACHE_DIR))$/i.test(key))) {return undefined;}
     try {
-        const candidates = path.isAbsolute(dotnet) ? [dotnet] : /[/\\]/.test(dotnet) ? [path.resolve(options.cwd, dotnet)]
-            : (env.PATH ?? '').split(path.delimiter).flatMap(directory => {
-                const file = path.resolve(options.cwd, directory, dotnet);
-                return process.platform === 'win32' && !path.extname(dotnet)
-                    ? (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').map(extension => file + extension.toLowerCase()) : [file];
-            });
+        // Engine analysis is a direct Node launch. Other callers can use the
+        // Windows owner, whose bare-command search does not match libuv.
         let host: string | undefined;
-        for (const candidate of candidates) {
-            try {
-                await fs.access(candidate, process.platform === 'win32' ? constants.F_OK : constants.X_OK);
-                if ((await fs.stat(candidate)).isFile()) {host = await fs.realpath(candidate); break;}
-            } catch (error) {
-                if (!['ENOENT', 'ENOTDIR', 'EACCES'].includes((error as NodeJS.ErrnoException).code ?? '')) {throw error;}
-            }
-        }
+        if (process.platform === 'win32' && options.cleanupDescendants !== false) {
+            if (!path.isAbsolute(dotnet) || !path.extname(dotnet) || /["'\0]/.test(dotnet)
+                || /^[/\\](?![/\\])/.test(dotnet) || /^[/\\]{2}[?.][/\\]/.test(dotnet)) {return undefined;}
+            if (!(await fs.stat(dotnet)).isFile()) {return undefined;}
+            host = await fs.realpath(dotnet);
+        } else {host = await resolveNodeExecutable(dotnet, env, options.cwd, signal);}
         if (!host || !['dotnet', 'dotnet.exe'].includes(path.basename(host).toLowerCase())) {return undefined;}
         const bytes = await fs.readFile(host, { signal }), magic = bytes.subarray(0, 4).toString('hex');
         if (!(magic.startsWith('4d5a') || ['7f454c46', 'cffaedfe', 'feedfacf', 'cefaedfe', 'feedface', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca'].includes(magic))) {return undefined;}

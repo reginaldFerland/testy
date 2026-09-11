@@ -61,6 +61,7 @@ async function fixture(t,config={}){
    await fs.appendFile(args[1],args[3]);return{code:0,stdout:'',stderr:''};
   }},
   './preparedOutputCache':{...cacheTools,preparationToolIdentity:async command=>command},
+  './preparationIdentity':{windowsPreparationTools:async options=>({dotnet:options.dotnet,collector:options.coverageTool,analyzer:options.analyzer,instrumentationLaunch:'node'})},
   './output':{...output,removeOutput:async directory=>{
    for(const assembly of state.activeAssemblies)assert.equal(assembly.startsWith(directory+path.sep),false,'cleanup must await the owning run');
    return output.removeOutput(directory);
@@ -71,7 +72,7 @@ async function fixture(t,config={}){
  };
  vm.runInNewContext(await fs.readFile(file,'utf8'),{exports,process,require:name=>modules[name]??realRequire(name)});
  const emitted=[],sessions=[],cache=config.cache?new cacheTools.PreparedOutputCache(path.join(root,'cache'),randomUUID()):undefined;
- const createSession=(overrides={})=>{const session=new exports.RunnerSession({dotnet:'dotnet',storage:path.join(root,'runs'),testArguments:[],signal:control.signal,
+ const createSession=(overrides={})=>{const session=new exports.RunnerSession({dotnet:'dotnet',storage:path.join(root,'runs'),testArguments:[],signal:control.signal,cleanupDescendants:false,
   coverageTool:config.coverage?'collector':undefined,managedCoverageTool:config.managedCoverageTool,env:config.env,assemblies:[project.assembly],onPrepared:()=>state.prepared++,
   deferCoverage:config.deferCoverage,preparedOutputCache:cache,onResult:(group,result)=>emitted.push({group,result}),
   output:message=>{if(message.includes('primary runner'))state.fallback.resolve();},...overrides});sessions.push(session);return session;};

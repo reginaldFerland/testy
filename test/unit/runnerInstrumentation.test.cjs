@@ -48,6 +48,7 @@ async function fixture(t, config = {}) {
             return (selected ?? options.expectedTests).map(node => ({ ...node, 'execution-state': 'passed' }));
         } },
         './preparedOutputCache': { ...cacheTools, preparationToolIdentity: async command => command ?? '' },
+        './preparationIdentity': { windowsPreparationTools: async options => ({ dotnet: options.dotnet, collector: options.coverageTool, analyzer: options.analyzer, instrumentationLaunch: 'node' }) },
         './coverageReader': { CoverageReader: class { async read() { return []; } async dispose() {} } },
         './runtimeObservation': { RuntimeObservation: class { static async start(_directory, _assembly, _modules, _instrumented, env) {
             return { env, dependencies: async () => ({ files: [], projects: [] }) };
@@ -59,7 +60,7 @@ async function fixture(t, config = {}) {
     let enabled = true;
     const borrow = (signal, work) => { state.borrows++; return enabled ? budget.tryRun(signal, work) : undefined; };
     const createSession = (overrides = {}) => {
-        const session = new exports.RunnerSession({ dotnet: 'dotnet', storage: path.join(root, 'runs'), testArguments: [], signal: control.signal,
+        const session = new exports.RunnerSession({ dotnet: 'dotnet', storage: path.join(root, 'runs'), testArguments: [], signal: control.signal, cleanupDescendants: false,
             coverageTool: 'collector', managedCoverageTool: config.managed ?? true, assemblies: names.map(name => path.join(source, `${name}.dll`)),
             preparedOutputCache: cache, tryInstrumentation: borrow, output: message => state.messages.push(message), ...overrides });
         sessions.push(session); return session;

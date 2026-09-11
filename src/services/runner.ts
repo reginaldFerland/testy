@@ -12,6 +12,7 @@ import { sourceLocations } from './analysis';
 import { claimRunOutputs, RunOutputLease } from './runOutputs';
 import { RuntimeModule, RuntimeObservation } from './runtimeObservation';
 import { PreparedArtifact, PreparedArtifactLease, PreparedOutputCache, preparationToolIdentity } from './preparedOutputCache';
+import { windowsPreparationTools } from './preparationIdentity';
 
 export interface RunnerOptions extends ProcessOptions {
     readonly dotnet: string;
@@ -579,15 +580,19 @@ export class RunnerSession {
         let toolContext = this.toolContexts.get(cwd);
         if (!toolContext) {toolContext = (async () => {
             const env = this.preparationEnvironment();
-            const identities = await Promise.allSettled([options.dotnet, options.coverageTool, options.analyzer]
-                .map(command => preparationToolIdentity(command, env, options.signal, cwd, this.toolIdentities)));
-            const tools = identities.map(identity => {if (identity.status === 'rejected') {throw identity.reason;} return identity.value;});
+            let tools: unknown;
+            if (process.platform === 'win32') {tools = await windowsPreparationTools(options, env, cwd, this.toolIdentities);}
+            else {
+                const identities = await Promise.allSettled([options.dotnet, options.coverageTool, options.analyzer]
+                    .map(command => preparationToolIdentity(command, env, options.signal, cwd, this.toolIdentities)));
+                tools = identities.map(identity => {if (identity.status === 'rejected') {throw identity.reason;} return identity.value;});
+            }
             return contentHash(JSON.stringify({ tools, env: Object.entries(env).sort(([left], [right]) => left.localeCompare(right)),
                 arguments: options.testArguments, assemblies: [...(options.assemblies ?? [])].sort(), modules: options.modules,
                 runtime: process.version, platform: process.platform, architecture: process.arch }));
         })(); this.toolContexts.set(cwd, toolContext);}
         // Bump when preparation semantics change; retained templates can cross editor lifetimes.
-        return JSON.stringify({ version: 3, tools: await toolContext, project: group.project, framework: group.framework,
+        return JSON.stringify({ version: process.platform === 'win32' ? 4 : 3, tools: await toolContext, project: group.project, framework: group.framework,
             assembly: group.assembly, context: options.preparationContexts?.get(testTargetKey(group.project, group.framework)) });
     }
 

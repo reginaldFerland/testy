@@ -94,6 +94,27 @@ async function fixture(t,{copyAnalyzer=false}={}){
 function rawSnapshot(engine){return new Map([...engine.analyses].map(([file,shape])=>[file,shape]));}
 function assertNoReusableShapes(engine){for(const [file,shape]of engine.analyses){assert.equal(shape,null,file);assert.equal(engine.analyzedHashes.has(file),false,file);}}
 
+test('Windows default dotnet with a mixed-case Path reuses real syntax while rediscovering and running tests',
+ {skip:process.platform!=='win32',timeout:120000},async t=>{
+ const f=await fixture(t),keys=Object.keys(process.env).filter(key=>key.toUpperCase()==='PATH');
+ const prior=new Map(keys.map(key=>[key,process.env[key]]));
+ f.cleanup(()=>{for(const key of Object.keys(process.env))if(key.toUpperCase()==='PATH')delete process.env[key];for(const [key,value]of prior)process.env[key]=value;});
+ for(const key of keys)delete process.env[key];
+ process.env.Path=[path.dirname(f.config.dotnet),...prior.values()].join(path.delimiter);
+ assert.deepEqual(Object.keys(process.env).filter(key=>key.toUpperCase()==='PATH'),['Path'],'fixture exercises the ordinary mixed-case environment spelling');
+ const mtp=require('../../out/services/mtp'),request=mtp.requestTests,calls=[];
+ mtp.requestTests=(options,operation,...args)=>{calls.push(operation);return request(options,operation,...args);};
+ f.cleanup(()=>{mtp.requestTests=request;});
+ f.config.dotnet='dotnet';
+ await f.baseline();assert.ok(f.requests.length>0,'initial baseline invokes the real syntax helper');
+ const shapes=rawSnapshot(f.engine),groups=JSON.stringify(f.engine.groups),results=[...f.results].sort();
+ f.requests.length=0;f.results.length=0;calls.length=0;await f.baseline();
+ assert.equal(f.requests.length,0,'unchanged refresh reuses validated raw syntax');
+ assert.ok(calls.includes('discover')&&calls.includes('run'),'warm syntax reuse still executes real native discovery and test requests');
+ assert.equal(JSON.stringify(f.engine.groups),groups);assert.deepEqual([...f.results].sort(),results,'native cases run again');
+ for(const [file,shape]of shapes)assert.equal(f.engine.analyses.get(file),shape);
+});
+
 test('full refresh reuses raw syntax and recomputes partial exclusions after source additions and deletions within each project',{timeout:120000},async t=>{
  const f=await fixture(t),core=f.file('ImpactDemo/SharedShape.cs'),tests=f.file('ImpactDemo.Tests/SharedShape.cs'),attribute=f.file('ImpactDemo/SharedShape.Attributes.g.cs');
  await fs.writeFile(core,'public partial class SharedShape { public int Value()=>1; }');

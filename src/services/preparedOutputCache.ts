@@ -58,10 +58,16 @@ export async function preparationToolIdentity(command: string | undefined, env: 
     if (!command) {return undefined;}
     const hasDirectory = command.includes(path.sep) || command.includes('/');
     const searchPath = !path.isAbsolute(command) && !hasDirectory;
-    const candidates = path.isAbsolute(command) ? [command] : hasDirectory ? [path.resolve(cwd, command)]
-        : (env.PATH ?? '').split(path.delimiter).flatMap(directory => process.platform === 'win32'
-            ? ['', ...(env.PATHEXT ?? '.EXE;.CMD;.BAT').split(';')].map(extension => path.resolve(cwd, directory, command + extension))
-            : [path.resolve(cwd, directory, command)]);
+    // POSIX '..' traverses symlinks before its parent; lexical normalization
+    // could fingerprint a different file from the process launcher.
+    const fromCwd = (file: string): string => path.isAbsolute(file) ? file : `${cwd}/${file}`;
+    const candidates = path.isAbsolute(command) ? [command] : hasDirectory
+        ? [process.platform === 'win32' ? path.resolve(cwd, command) : fromCwd(command)]
+        : process.platform === 'win32'
+            ? (env.PATH ?? '').split(path.delimiter).flatMap(directory => ['', ...(env.PATHEXT ?? '.EXE;.CMD;.BAT').split(';')]
+                .map(extension => path.resolve(cwd, directory, command + extension)))
+            // Missing PATH uses platform-specific launch defaults; do not guess cwd.
+            : env.PATH === undefined ? [] : env.PATH.split(path.delimiter).map(directory => `${fromCwd(directory)}/${command}`);
     for (const candidate of candidates) {
         try {
             const resolved = await fs.realpath(candidate);
