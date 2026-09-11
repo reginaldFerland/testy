@@ -24,6 +24,8 @@ Project evaluations can also be reused within the editor session and across rest
 
 Successful source analyses are retained within the editor session, including across full refreshes. Reuse requires matching source bytes, alias inputs, and analyzer context. Generated sources are checked after Build, and partial declarations and exclusions are resolved against the current projects. Incomplete analysis is retried; custom CLI wrappers or injected runtime components use fresh analysis.
 
+The bundled collector instruments independent workspace DLLs concurrently during initial preparation when project workers are available. This shares the existing preparation budget with source analysis and discovery. Each private test-file worker still prepares one DLL at a time, and warm prepared-output cache hits skip instrumentation.
+
 Workspace assemblies loaded from original build outputs, other paths, or memory are also recorded, including loads in child .NET processes that inherit and support the startup hook. When a load bypasses the instrumented copy, Testy records a dependency on the loaded project. Changes and new source files in that project rerun the calling test file, even without a `ProjectReference`. Those loads do not themselves supply line coverage. If runtime observation is incomplete, retained coverage stays visible and selection becomes conservative.
 
 A collector command can succeed without instrumenting a module, for example when its symbols are missing. Testy verifies that the assembly bytes changed and retains project dependencies for skipped modules, so their callers cannot be silently omitted.

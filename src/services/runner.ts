@@ -20,6 +20,8 @@ export interface RunnerOptions extends ProcessOptions {
     readonly coverageTool?: string;
     /** The pinned collector receives a stable instrumentation environment across editor launches. */
     readonly managedCoverageTool?: boolean;
+    /** Borrow an idle primary-preparation permit without waiting; the caller already owns one. */
+    readonly tryInstrumentation?: <T>(signal: AbortSignal | undefined, work: () => Promise<T>) => Promise<T> | undefined;
     readonly assemblies?: readonly string[];
     readonly modules?: readonly RuntimeModule[];
     readonly buildInputs?: ReadonlyMap<string, readonly string[]>;
@@ -123,6 +125,51 @@ async function workspaceOutputs(directory: string, names: ReadonlySet<string>, s
         else if (entry.isFile() && names.has(assemblyName(entry.name))) {files.push(file);}
     }
     return files;
+}
+
+/** Keep one inherited worker progressing even when every other preparation owns a permit. */
+async function instrumentWithSpareCapacity<T>(
+    assemblies: readonly string[], signal: AbortSignal | undefined, borrow: NonNullable<RunnerOptions['tryInstrumentation']>,
+    work: (assembly: string, signal: AbortSignal) => Promise<T>
+): Promise<T[]> {
+    signal?.throwIfAborted();
+    const controller = new AbortController(), results = new Array<T>(assemblies.length);
+    const running = new Set<Promise<void>>();
+    let next = 0, inheritedBusy = false, failed = false, failure: unknown;
+    const fail = (error: unknown): void => {
+        if (!failed) {failed = true; failure = error; controller.abort(error);}
+    };
+    const abort = (): void => fail(signal?.reason);
+    signal?.addEventListener('abort', abort, { once: true });
+    const admit = (index: number, borrowed?: Promise<T>): void => {
+        if (!borrowed) {inheritedBusy = true;}
+        const pending = (borrowed ?? Promise.resolve().then(() => work(assemblies[index], controller.signal)))
+            .then(result => {results[index] = result;}, fail).finally(() => {
+                if (!borrowed) {inheritedBusy = false;}
+                running.delete(pending);
+            });
+        running.add(pending);
+    };
+    try {
+        while ((!failed && next < assemblies.length) || running.size) {
+            if (!failed && !inheritedBusy && next < assemblies.length) {admit(next++);}
+            while (!failed && next < assemblies.length) {
+                const index = next;
+                const borrowed = borrow(controller.signal, () => Promise.resolve().then(() => work(assemblies[index], controller.signal)));
+                if (!borrowed) {break;}
+                next++; admit(index, borrowed);
+            }
+            if (running.size) {await Promise.race(running);}
+        }
+    } catch (error) {fail(error);}
+    finally {
+        // No rollback, cache release or output removal may race an admitted instrument process.
+        await Promise.all(running);
+        signal?.removeEventListener('abort', abort);
+    }
+    if (failed) {throw failure;}
+    signal?.throwIfAborted();
+    return results;
 }
 
 export class RunnerSession {
@@ -270,7 +317,8 @@ export class RunnerSession {
                 const number = ++this.laneSequence, laneIndex = lanes.length + 1;
                 slot = { busy: false, session: this.outputRoot().then(root => new RunnerSession({ ...this.options,
                     outputRoot: path.join(root, 'lanes', String(number)), preparationLane: laneIndex, preparationTools: this.toolContexts,
-                    preparationToolIdentities: this.toolIdentities, deferCoverage: undefined, onPrepared: undefined })) };
+                    preparationToolIdentities: this.toolIdentities, deferCoverage: undefined, onPrepared: undefined,
+                    tryInstrumentation: undefined })) };
                 lanes.push(slot); this.lanes.set(key, lanes);
             }
             // Reserve before yielding; changing pool worker IDs must not grow the lane count.
@@ -580,23 +628,33 @@ export class RunnerSession {
         const instrumented: string[] = [];
         if (coverage) {
             const assemblies = new Set((options.assemblies ?? [group.assembly]).map(assemblyName));
-            for (const assembly of await workspaceOutputs(template, assemblies, options.signal)) {
-                try {
-                    const before = await fileHash(assembly, options.signal);
-                    requireSuccess(await runProcess(options.coverageTool!, ['instrument', assembly, '--session-id', session, '--nologo'], options), `Instrumenting ${path.basename(assembly)}`);
-                    // The collector can exit 0 after skipping a module (for
-                    // example, no_symbols). An unchanged DLL must retain its
-                    // whole-module dependency when the observer sees it load.
-                    if (await fileHash(assembly, options.signal) !== before) {
-                        instrumented.push(path.join(root, 'assembly', path.relative(template, assembly)));
-                    } else {options.output?.(`No instrumentation change in ${path.basename(assembly)}; retaining module dependencies.\n`);}
-                } catch (error) {
-                    options.signal?.throwIfAborted(); coverage = false;
-                    options.output?.(`Coverage preparation failed; running tests without collection. ${String(error)}\n`);
-                    // Never execute partially instrumented output without its collector.
-                    await removeOutput(template);
-                    await copyOutput(source, template, options.signal); break;
+            const files = await workspaceOutputs(template, assemblies, options.signal);
+            const instrument = async (assembly: string, signal: AbortSignal | undefined): Promise<string | undefined> => {
+                const before = await fileHash(assembly, signal);
+                requireSuccess(await runProcess(options.coverageTool!, ['instrument', assembly, '--session-id', session, '--nologo'],
+                    { ...options, signal }), `Instrumenting ${path.basename(assembly)}`);
+                // The collector can exit 0 after skipping a module (for
+                // example, no_symbols). An unchanged DLL must retain its
+                // whole-module dependency when the observer sees it load.
+                if (await fileHash(assembly, signal) !== before) {
+                    return path.join(root, 'assembly', path.relative(template, assembly));
                 }
+                options.output?.(`No instrumentation change in ${path.basename(assembly)}; retaining module dependencies.\n`);
+                return undefined;
+            };
+            try {
+                if (options.managedCoverageTool && options.tryInstrumentation) {
+                    const results = await instrumentWithSpareCapacity(files, options.signal, options.tryInstrumentation, instrument);
+                    instrumented.push(...results.filter((assembly): assembly is string => assembly !== undefined));
+                } else {
+                    for (const assembly of files) {const result = await instrument(assembly, options.signal); if (result) {instrumented.push(result);}}
+                }
+            } catch (error) {
+                options.signal?.throwIfAborted(); coverage = false;
+                options.output?.(`Coverage preparation failed; running tests without collection. ${String(error)}\n`);
+                // All sibling commands have drained before restoring the pristine template.
+                await removeOutput(template);
+                await copyOutput(source, template, options.signal);
             }
         }
         return { coverage, instrumented };

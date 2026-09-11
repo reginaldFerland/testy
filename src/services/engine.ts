@@ -442,7 +442,8 @@ export class TestEngine {
                 return resolveShapes(this.analyses, this.projects);
             };
             // Reserve analysis threads before admitting one-slot discovery jobs.
-            // This is the only multi-slot operation, so nested reservations cannot deadlock.
+            // Other preparation work only borrows spare slots without waiting,
+            // so these nested reservations cannot deadlock.
             const analyzeWithBudget = (slots: number): Promise<ReadonlyMap<string, string | null>> => slots
                 ? preparationBudget.run(signal, () => analyzeWithBudget(slots - 1)) : analyze();
             analyzing = analyzeWithBudget(analysisSlots);
@@ -457,6 +458,7 @@ export class TestEngine {
                 catch (error) {signal.throwIfAborted(); events.output(`Coverage unavailable; tests will continue with conservative selection. ${String(error)}\n`);}
             }
             const anticipatedTargets = new Set(anticipated.groups.map(group => testTargetKey(group.project, group.framework)));
+            let initialPreparation = true;
             const runnerOptions: RunnerOptions = {
                 ...processOptions, dotnet: config.dotnet, storage: path.join(this.options.storage, 'runs'),
                 testArguments: config.testArguments, coverageTool, managedCoverageTool: !config.coverageTool,
@@ -467,6 +469,9 @@ export class TestEngine {
                 }))),
                 outputRoot: outputLease.directory, snapshots,
                 preparedOutputCache: this.preparedOutputs,
+                // Primary discovery already owns one permit. Additional DLLs
+                // may borrow spare capacity only during this preparation stage.
+                tryInstrumentation: (workerSignal, work) => initialPreparation ? preparationBudget.tryRun(workerSignal, work) : undefined,
                 deferCoverage: !full && !manual && config.mode === 'affected'
                     ? target => !anticipatedTargets.has(testTargetKey(target.project, target.framework)) : undefined,
                 preparationContexts: new Map(testBuilds.map(project => [testTargetKey(project.file, project.framework), contentHash(JSON.stringify({
@@ -506,13 +511,16 @@ export class TestEngine {
                 && this.projects.some(project => project.file === group.project && project.framework === group.framework && project.isTestProject && project.entryPoint !== false));
             let discoveredProjects = 0, activeDiscoveries = 0;
             const discoveryProgress = (): void => events.phase(`Preparing tests ${discoveredProjects}/${testBuilds.length} · ${activeDiscoveries} active`);
-            const inventories = await mapConcurrent(testBuilds, projectLimit, signal, async project => {
-                return preparationBudget.run(signal, async () => {
-                    activeDiscoveries++; discoveryProgress();
-                    try {const groups = await sessions!.discover(project); discoveredProjects++; return groups;}
-                    finally {activeDiscoveries--; discoveryProgress();}
-                });
-            }, () => controller.abort());
+            let inventories: readonly (readonly TestFile[])[];
+            try {
+                inventories = await mapConcurrent(testBuilds, projectLimit, signal, async project => {
+                    return preparationBudget.run(signal, async () => {
+                        activeDiscoveries++; discoveryProgress();
+                        try {const groups = await sessions!.discover(project); discoveredProjects++; return groups;}
+                        finally {activeDiscoveries--; discoveryProgress();}
+                    });
+                }, () => controller.abort());
+            } finally {initialPreparation = false;}
             const currentShapes = await analyzing;
             const conservative = new Set(changes.filter(file => !currentShapes.get(file) || currentShapes.get(file) !== previousShapes.get(file)));
             next.push(...inventories.flat());

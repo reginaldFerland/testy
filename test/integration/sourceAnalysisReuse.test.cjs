@@ -1,6 +1,7 @@
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
+const {constants}=require('node:fs');
 const {createHash}=require('node:crypto');
 const analysis=require('../../out/services/analysis'),processes=require('../../out/services/process');
 const {sourceAnalysisContext}=require('../../out/services/analysisContext');
@@ -19,6 +20,7 @@ test('Roslyn provenance hashes the exact UTF-8, BOM, UTF-16 and UTF-32 bytes whi
  const files=contents.map((_,index)=>path.join(directory,`Source${index}.cs`));
  for(let index=0;index<files.length;index++)await fs.writeFile(files[index],contents[index]);
  const invalid=path.join(directory,'Invalid.cs'),missing=path.join(directory,'Missing.cs');await fs.writeFile(invalid,'class Invalid {');
+ const keys=files.map(normalizePath),invalidKey=normalizePath(invalid),missingKey=normalizePath(missing);
  const alias='global using 隠す = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute; // <>&😀';
  const analyzer=path.resolve('dist/analyzer/Testy.Analysis.dll'),options={cwd:directory,signal:t.signal};
  const aliases=await analysis.sourceAliases('dotnet',analyzer,[alias],directory,options);
@@ -27,11 +29,11 @@ test('Roslyn provenance hashes the exact UTF-8, BOM, UTF-16 and UTF-32 bytes whi
   {sources:[alias],allFiles:[...files,invalid,missing]},true);
  assert.deepEqual(result.aliases,aliases);assert.deepEqual(result.analyses,legacy);
  for(let index=0;index<files.length;index++){
-  assert.equal(result.sourceHashes.get(files[index]),hash(contents[index]));
-  assert.deepEqual(result.analyses.get(files[index]),legacy.get(files[0]),'decoding preserves declaration semantics across encodings');
+  assert.equal(result.sourceHashes.get(keys[index]),hash(contents[index]));
+  assert.deepEqual(result.analyses.get(keys[index]),legacy.get(keys[0]),'decoding preserves declaration semantics across encodings');
  }
- assert.equal(result.analyses.get(invalid),null);assert.equal(result.sourceHashes.get(invalid),hash('class Invalid {'));
- assert.equal(result.analyses.get(missing),null);assert.equal(result.sourceHashes.has(missing),false);
+ assert.equal(result.analyses.get(invalidKey),null);assert.equal(result.sourceHashes.get(invalidKey),hash('class Invalid {'));
+ assert.equal(result.analyses.get(missingKey),null);assert.equal(result.sourceHashes.has(missingKey),false);
  // Legacy callers could also encode the request itself with a BOM. Bind the
  // response to those raw bytes while retaining the old request decoder.
  const request=JSON.stringify({files:[files[0]],excludedAliases:aliases,concurrency:1,provenance:true}),requestFile=path.join(directory,'encoded-request.json');
@@ -39,16 +41,39 @@ test('Roslyn provenance hashes the exact UTF-8, BOM, UTF-16 and UTF-32 bytes whi
   Buffer.concat([Buffer.from([0xff,0xfe]),Buffer.from(request,'utf16le')])]){
   await fs.writeFile(requestFile,bytes);
   const response=await processes.runProcess('dotnet',[analyzer,requestFile],options);assert.equal(response.code,0,response.stderr);
-  const value=JSON.parse(response.stdout);assert.equal(value.requestHash,hash(bytes).toUpperCase());assert.deepEqual(value.analyses[files[0]],legacy.get(files[0]));
+  const value=JSON.parse(response.stdout);assert.equal(value.requestHash,hash(bytes).toUpperCase());assert.deepEqual(value.analyses[files[0]],legacy.get(keys[0]));
  }
 });
 
+async function ordinaryNativeHost(t){
+ // Positive reuse cases exercise ordinary installed hosting. CI may spell PATH
+ // as Path on Windows or set CLR overrides, whose decline behavior has its own tests.
+ const pathKey=process.platform==='win32'?Object.keys(process.env).find(key=>key.toUpperCase()==='PATH'):'PATH';
+ const executable=process.platform==='win32'?'dotnet.exe':'dotnet';
+ let host;
+ for(const directory of (process.env[pathKey]??'').split(path.delimiter)){
+  const candidate=path.resolve(directory,executable);
+  try{
+   await fs.access(candidate,process.platform==='win32'?constants.F_OK:constants.X_OK);
+   if((await fs.stat(candidate)).isFile()){host=await fs.realpath(candidate);break;}
+  }catch(error){if(!['ENOENT','ENOTDIR','EACCES'].includes(error.code))throw error;}
+ }
+ assert.ok(host,'positive reuse fixture requires a native dotnet executable on PATH');
+ const runtimeOverride=/^(?:CORECLR_|COR_|COMPlus_|DOTNET_(?:STARTUP_HOOKS|ADDITIONAL_DEPS|SHARED_STORE|ROOT(?:_|$)|MULTILEVEL_LOOKUP|ROLL_FORWARD|RUNTIME_ID))/i;
+ const nativeInjection=/^(?:LD_(?:PRELOAD|LIBRARY_PATH|AUDIT|ORIGIN_PATH)|DYLD_(?:INSERT_LIBRARIES|(?:FALLBACK_|VERSIONED_)?(?:LIBRARY|FRAMEWORK)_PATH|ROOT_PATH|IMAGE_SUFFIX|SHARED_CACHE_DIR))$/i;
+ const overrides=Object.entries(process.env).filter(([key])=>runtimeOverride.test(key)||nativeInjection.test(key));
+ t.after(()=>{for(const [key,value]of overrides)process.env[key]=value;});
+ for(const [key]of overrides)delete process.env[key];
+ return host;
+}
+
 async function fixture(t,{copyAnalyzer=false}={}){
+ const dotnet=await ordinaryNativeHost(t);
  const temp=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy source reuse '))),root=path.join(temp,'workspace'),storage=path.join(temp,'state');
  await fs.cp(path.resolve('test/fixtures/ImpactDemo'),root,{recursive:true,filter:file=>!/(^|[/\\])(bin|obj|TestResults)([/\\]|$)/.test(file)});
  const analyzer=copyAnalyzer?path.join(temp,'analyzer','Testy.Analysis.dll'):path.resolve('dist/analyzer/Testy.Analysis.dll');
  if(copyAnalyzer)await fs.cp(path.dirname(path.resolve('dist/analyzer/Testy.Analysis.dll')),path.dirname(analyzer),{recursive:true});
- const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:false,excludes:[],testArguments:[],timeout:60000,maxParallelProjects:2,maxParallelTestFiles:2};
+ const config={dotnet,configuration:'Debug',mode:'affected',coverage:false,excludes:[],testArguments:[],timeout:60000,maxParallelProjects:2,maxParallelTestFiles:2};
  const control=new AbortController(),signal=AbortSignal.any([control.signal,t.signal]),output=[],results=[],requests=[],cleanups=[];
  const engine=new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer,configuration:()=>config,
   events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result:(group,result)=>results.push([group.id,result.id,result.outcome]),started(){},coverage(){},invalidated(){}}});
@@ -60,7 +85,7 @@ async function fixture(t,{copyAnalyzer=false}={}){
   return run(command,args,options);
  };
  t.after(async()=>{control.abort();analysis.sourceAnalysisBatch=batch;processes.runProcess=run;for(const cleanup of cleanups)await cleanup();await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
- assert.ok(await sourceAnalysisContext('dotnet',analyzer,{cwd:root,signal}),'real reuse fixture requires ordinary installed dotnet and bundled analyzer assets');
+ assert.ok(await sourceAnalysisContext(dotnet,analyzer,{cwd:root,signal}),'real reuse fixture requires ordinary installed dotnet and bundled analyzer assets');
  return{temp,root,storage,analyzer,engine,config,signal,output,results,requests,batch,cleanup:fn=>cleanups.push(fn),
   file:relative=>normalizePath(path.join(root,relative)),
   baseline:async(signal_=signal)=>{const value=await engine.run({files:[],full:true},signal_);assert.equal(value.passed,3,output.join(''));assert.equal(value.failed,0);return value;}};

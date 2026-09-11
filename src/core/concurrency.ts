@@ -145,9 +145,23 @@ export class Semaphore {
         if (this.active >= this.limit) {await new Promise<void>(resolve => this.waiting.push(resolve));}
         else {this.active++;}
         try {signal?.throwIfAborted(); return await work();}
-        finally {
-            const next = this.waiting.shift();
-            if (next) {next();} else {this.active--;}
-        }
+        finally {this.release();}
+    }
+
+    /** Borrow idle capacity without queuing behind another permit's owner. */
+    tryRun<T>(signal: AbortSignal | undefined, work: () => Promise<T>): Promise<T> | undefined {
+        signal?.throwIfAborted();
+        if (this.waiting.length || this.active >= this.limit) {return undefined;}
+        this.active++;
+        return (async () => {
+            // The work retains its permit through cancellation and cleanup.
+            try {return await work();}
+            finally {this.release();}
+        })();
+    }
+
+    private release(): void {
+        const next = this.waiting.shift();
+        if (next) {next();} else {this.active--;}
     }
 }
