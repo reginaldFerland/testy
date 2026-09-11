@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
-import { constants } from 'node:fs';
 import * as path from 'node:path';
 import { Project } from '../core/model';
 import { mapConcurrent } from '../core/concurrency';
 import { EvaluationStorageLimits, readEvaluationSnapshot, writeEvaluationSnapshot } from './projectEvaluationStorage';
+import { resolveNodeExecutable } from './executable';
 
 export interface EvaluationQuery {
     readonly kind: 'file' | 'directory' | 'exists' | 'files' | 'directories' | 'entries' | 'mtime' | 'imports';
@@ -37,6 +37,7 @@ const digest = (value: string | Buffer): string => createHash('sha256').update(v
 /** Resolve the actual CLI in every possible inspection cwd. A relative PATH
  * selecting different hosts cannot share an evaluation cache context. */
 export async function evaluationToolContext(dotnet: string, analyzer: string, directories: readonly string[], signal?: AbortSignal): Promise<{ readonly key: string; readonly root: string } | undefined> {
+    signal?.throwIfAborted();
     const fingerprints = new Map<string, Promise<string>>();
     const fingerprint = (file: string): Promise<string> => {
         const previous = fingerprints.get(file);
@@ -49,17 +50,12 @@ export async function evaluationToolContext(dotnet: string, analyzer: string, di
     };
     try {
         if (Object.entries(process.env).some(([key, value]) => value && /^(?:MSBUILD.*SDKRESOLVER|DOTNET_MSBUILD_SDK_RESOLVER|MSBuildSDKsPath|MsBuildCacheFileExistence$)/i.test(key))) {return undefined;}
-        const hosts = await mapConcurrent([...new Set(directories)], 16, signal, async cwd => {
-            const candidates = path.isAbsolute(dotnet) ? [dotnet] : dotnet.includes('/') || dotnet.includes('\\') ? [path.resolve(cwd, dotnet)]
-                : (process.env.PATH ?? '').split(path.delimiter).flatMap(directory => {
-                    const base = path.resolve(cwd, directory, dotnet);
-                    return process.platform === 'win32' && !path.extname(dotnet) ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').map(extension => base + extension.toLowerCase()) : [base];
-                });
-            for (const candidate of candidates) {
-                try {await fs.access(candidate, process.platform === 'win32' ? constants.F_OK : constants.X_OK); if ((await fs.stat(candidate)).isFile()) {return fingerprint(candidate);}}
-                catch (error) {if (!missing(error) && (error as NodeJS.ErrnoException).code !== 'EACCES') {throw error;}}
-            }
-            throw new Error('The configured .NET host could not be resolved.');
+        const hosts = await mapConcurrent([...new Set(directories)], 16, signal, async (cwd, _index, workerSignal) => {
+            // Inspection uses a direct Node launch (cleanupDescendants:false),
+            // including its cwd/PATH precedence and literal POSIX path spelling.
+            const executable = await resolveNodeExecutable(dotnet, process.env, cwd, workerSignal);
+            if (!executable) {throw new Error('The configured .NET host could not be resolved.');}
+            return fingerprint(executable);
         });
         const unique = [...new Set(hosts)];
         if (unique.length !== 1) {return undefined;}
@@ -68,7 +64,9 @@ export async function evaluationToolContext(dotnet: string, analyzer: string, di
         if (!['dotnet', 'dotnet.exe'].includes(path.basename(executable).toLowerCase())
             || !(magic.startsWith('4d5a') || ['7f454c46', 'cffaedfe', 'feedfacf', 'cefaedfe', 'feedface', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca'].includes(magic))
             || !(await fs.stat(path.join(root, 'sdk'))).isDirectory() || !(await fs.stat(path.join(root, 'host', 'fxr'))).isDirectory()) {return undefined;}
-        return { key: digest(JSON.stringify([unique[0], await fingerprint(analyzer)])), root };
+        const analyzerIdentity = await fingerprint(analyzer);
+        signal?.throwIfAborted();
+        return { key: digest(JSON.stringify([unique[0], analyzerIdentity])), root };
     } catch {signal?.throwIfAborted(); return undefined;}
 }
 

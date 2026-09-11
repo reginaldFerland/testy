@@ -46,10 +46,10 @@ There is no demonstrated memory or event-loop improvement. At 400 files, sampled
 | --- | --- | --- |
 | Implemented | Reuse unchanged coverage decorations | Real-editor ABBA: **522/531 warm submissions → zero**, avoiding 52.7–59.9 ms of synchronous API calls. No demonstrated whole-run speedup or renderer benefit. |
 | 1 | Selectively parse class-level coverage XML | Ignored prototype: **44.82 → 41.33 ms/report (3.49 ms / 7.8%)** on the captured 400-file report. About **0.16 s of ideal nine-lane capacity** over 400 reports; no measured end-to-end gain yet. |
-| 2 | Retain a validated SDK-support verdict | **Estimate: 30–60 ms per unchanged full refresh.** An earlier controlled comparison measured 64–68 ms for the repeated SDK check; validation overhead reduces the available saving. |
-| 3 | Specialize initial coverage-index restoration | **Estimate: 20–70 ms** on the 400-trace / 2,001-source fixture. Its approximately 226–227 ms store-installation cost is a component ceiling, not a predicted saving. |
+| Deferred | Retain a validated SDK-support verdict | A repeated SDK check cost **64–68 ms**, but existing contexts do not prove pre-Restore SDK selection. Required validation cost remains unmeasured; retain fresh checks. |
+| Implemented | Specialize initial coverage-index restoration | **194.90 → 119.89 ms (75.01 ms / 38.5%)** on a modeled 400-group / 2,001-source checkpoint. Component result, not measured whole-editor startup. |
 | 4 | Preserve sparse coverage through ingestion | **Measured component saving: 21–32 ms** per modeled 120-report batch; **estimated whole-run opportunity: 0–30 ms**. More promising for fewer temporary allocations than startup latency. |
-| 5 | Adapt project workers to wider graphs | **Unmeasured.** No demonstrated gain from raising the project limit on Core → App → Infra → Web → one test project. Test independent roots before changing the automatic policy. |
+| Evaluated | Adapt project workers to wider graphs | Eight roots: project limit 4 → 8 brought the cold first result **342 ms earlier**, with no whole-run gain. Keep the default; explicit higher limits remain available. |
 
 ### 1. Coverage presentation
 
@@ -67,9 +67,23 @@ There is **no demonstrated whole-suite speedup**: the optimized warm commands to
 
 [engine.ts:260](../src/services/engine.ts#L260) clears the successful SDK verdict on a new baseline; [engine.ts:711](../src/services/engine.ts#L711) subsequently runs `dotnet --version`. Reuse must validate command resolution, environment, `global.json` and installed SDK inventories. Failed checks must remain retryable. Ordinary warm manual runs often already retain this verdict, so they offer little additional opportunity.
 
+Further design review found that neither the evaluation-tool key nor source-analysis context supplies complete SDK-selection evidence before Restore. The former hashes the CLI/analyzer and checks SDK/host directory existence; the latter describes runtime assets, not SDK selection. Graph validation occurs after Restore and cannot justify skipping the earlier SDK check. Safely retaining a verdict needs evidence around the successful probe covering `global.json` ancestry, selected host/CLI assets, SDK search inventories and environment. Its cost is unmeasured and could consume the earlier 30–60 ms estimate. Fresh full-baseline checks remain the implementation.
+
 ### 3. Coverage restoration
 
-[coverage.ts:182](../src/core/coverage.ts#L182) installs a restored snapshot into a fresh store through machinery that also supports replacement. A specialized initial-load path may reduce temporary membership collections while preserving duplicate-group semantics, zero-hit ownership, historical versions, dependencies, cancellation and atomic installation. Keep the compact [maintenance fingerprints](../src/services/cache.ts#L136) unless measurements justify a memory tradeoff. Benchmark populated restoration separately from test execution and report retained memory as well as first coverage availability.
+[coverage.ts](../src/core/coverage.ts) now specializes first insertions into the private staged store used by `restorePackedAsync`. It avoids temporary source-ID sets and redundant published-ownership/dirty-state updates: source registration already marks every restored file dirty, and the stage has no published summaries. Duplicate groups still use the unchanged general replacement path. Source validation, bounded yields, cancellation and the revision-checked atomic publication remain intact; the synchronous restore API is unchanged.
+
+A fresh-child ABBA comparison against `bca2f0b` used actual captured geometry/hits with **synthetic group memberships**, written and read through the production cache format outside timing. These are modeled checkpoints, not caches from complete native 120/400-file runs. All four trials retained their samples; exact traces, coverage, dependency/module queries, freshness/removal transitions and empty durable deltas matched.
+
+| Checkpoint | Restore, before → after | Restore plus first summary, before → after |
+| --- | --- | --- |
+| 120 groups / 601 sources / 72,120 memberships | 22.39 → 13.94 ms | 30.01 → 21.49 ms |
+| 400 groups / 2,001 sources / 800,400 memberships | 194.90 → 119.89 ms | 261.66 → 186.83 ms |
+| 40 dense groups / 601 sources | 26.10 → 23.08 ms | 33.08 → 30.29 ms |
+
+The large sparse model saved **75.01 ms / 38.5% of restoration time**, with closely agreeing observations (baseline 193.36/196.43 ms, current 118.83/120.95 ms). First-summary time was effectively unchanged. An unmodified five-source/two-trace editor cache also passed parity, with sub-millisecond costs. The measurement excludes file reads, cache validation and result assertions, and includes diagnostic generator wrappers. Dense-case CPU results were mixed. Heap/RSS include sequential datasets, cache loading, verification and uncontrolled GC, so **no retained-memory or whole-startup improvement is claimed**.
+
+Seven [restoration regressions](../test/unit/coverageRestore.test.cjs) cover duplicate IDs/groups, skipped invalid groups, geometry unions, historical/zero-hit ownership, subsequent updates and cancellation or live replacement during staging. Compact [maintenance fingerprints](../src/services/cache.ts) remain unchanged.
 
 ### 4. Sparse coverage ingestion
 
@@ -83,7 +97,19 @@ The integration must preserve source hashes, zero-hit ownership, runtime-observe
 
 [concurrency.ts:4](../src/core/concurrency.ts#L4) caps automatic project workers at four; [test-file workers](../src/core/concurrency.ts#L9) already default to available CPUs minus one. Explicit limits exist for both. [engine.ts:361](../src/services/engine.ts#L361) shares the configured MSBuild budget across compatible contexts, and [projects.ts:198](../src/services/projects.ts#L198) already batches compatible build roots.
 
-Compare project limits of four and eight on eight or more independent test roots, holding file workers fixed. Measure first result, wall time, child CPU, memory and cancellation. Preserve SDK-context ordering and output-conflict waves. More cores cannot shorten a dependency chain without independent work, and nested workers must not multiply the configured budget.
+A completed ABBA comparison uses eight independent test roots sharing Core → App → Infra → Web, 120 files / 2,400 cases, coverage enabled, and a fixed nine file workers on the same 10-CPU machine. Only the explicit project limit changes: 4/8/8/4 in fresh children, each with an initial run and one unchanged full refresh at identical workspace/tool paths.
+
+| Measurement | Four project workers | Eight project workers |
+| --- | --- | --- |
+| Initial Preparing tests | 2.878 s | 2.376 s |
+| Initial first result | 5.557 s | 5.214 s |
+| Initial whole operation | 16.202 s | 16.794 s |
+| Refresh first result | 2.529 s | 2.778 s |
+| Refresh whole operation | 11.791 s | 13.400 s |
+
+The cold first result arrived **342 ms earlier (6.2%)**, but the initial whole-operation means increased 593 ms with overlapping samples. Refresh means increased 1.609 s; both eight-worker observations were slower than both four-worker observations. This is not a fully stabilized zero-miss comparison: repeat runs created **1/0 new private slots with four workers versus 2/1 with eight**, adding 5/0 versus 10/5 instrumentation commands. These were first-use slots under higher per-target concurrency, not eviction; retention stayed below 72 slots and 512 MiB. Existing runner logic already reuses idle lanes independently of global worker numbers, including stable private ordinals across runs.
+
+The different private-slot demand and native execution variation limit causal claims about project workers alone. Initial process-tree RSS means were 1,747 → 1,799 MiB; refresh means were 1,832 → 1,743 MiB, with no clear memory conclusion. All configured budgets were respected, actual outputs and DLL/PDB timestamps stayed unchanged, exact native/coverage/analysis facts matched, and every process/cache owner drained. Integrity probes were included in wall time and separately measured; their differences account for only 14 ms initial and 27 ms refresh. These findings support retaining the automatic project limit while allowing explicit higher limits for users who prioritize cold preparation. They do not establish a universal optimum or justify multiplying nested worker budgets.
 
 ## Larger experiments
 
@@ -117,6 +143,8 @@ Windows cache eligibility is now implemented with launch-specific identities. [e
 
 Windows preparation keys advance to version 4; ordinary POSIX keys remain version 3. POSIX tool resolution also preserves `..` until filesystem traversal, since normalizing it before a preceding symlink can identify the wrong executable. Real-launch regression coverage checks that distinction. Recovering missed reuse should preserve existing analysis/preparation benefits, but **no Windows timing gain is established**. Unsupported path forms and CLR/native injection overrides still decline reuse conservatively.
 
+[Project-evaluation identity](../src/services/projectEvaluationCache.ts) now also uses the shared direct-launch resolver for every inspection working directory. It declines contexts selecting different hosts and preserves fresh native-host/analyzer fingerprints. Five new resolver-wiring tests cover cwd-specific selection, POSIX symlink/backslash paths, Windows `Path`/cwd precedence and cancellation draining.
+
 The smaller Windows fixes are implemented: [output.ts](../src/services/output.ts) requests representable read/write directory access instead of repeatedly requesting unsupported POSIX execute bits, while retaining root clock advancement and mode restoration. [preparedOutputCache.ts](../src/services/preparedOutputCache.ts) recognizes forward-slash relative tool paths. These address concrete native CI failures; elapsed savings remain unmeasured. Fixture corrections preserve canonical-path, real mode-change and exact coverage assertions.
 
 ## Methodology and validation
@@ -126,6 +154,8 @@ Validation passed: `npm test` (build, lint and 316 unit tests) and `node --test 
 The subsequent decoration and Windows fixes pass `npm test` with **329 unit tests**, build and lint. The four-host editor comparison and the four-child resource prototype comparison both completed their exact-fact and cleanup assertions. [Native CI at `7e51806`](https://github.com/reginaldFerland/testy/actions/runs/34549351214) passed its complete build/unit/integration/package pipeline on macOS and Linux; Windows failed unit checks that prompted the path, permission and fixture fixes above. Native Windows validation of these fixes remains pending.
 
 The subsequent launch-identity changes pass build, lint and **351 unit tests**, with two Windows-only tests skipped on macOS. Focused native source-analysis and instrumentation integration checks pass **nine tests**, with one new Windows-only integration test skipped. [CI for the launch-identity commit `efad7a6`](https://github.com/reginaldFerland/testy/actions/runs/34552303910) has passed unit checks on all three platforms and is still running native integration. Full cross-platform validation remains pending. A local VSCE inventory check also verifies that package exclusions retain all 40 compiled JavaScript modules and required analyzer/process-host/observer assets while excluding diagnostic artifacts.
+
+The restoration and evaluation-resolver follow-up passes build, lint and **362 unit tests**, with three Windows-only tests skipped locally, plus **18 focused native integration tests**. The eight-project preflight and full comparison, and the restore component comparison, completed their parity and cleanup checks. Earlier CI at `213fbc0` completed 112/113 integrations on both Linux and macOS: Linux's 17-target fixture exceeded its 180-second aggregate timeout, while macOS exposed a cancellation timer that incorrectly included pre-abort Build/preparation. The fixture now measures the unchanged eight-second limit from the actual test-start abort, drains/disposes before cleanup, and gives the 51-run/51-discovery capacity scenario 300 seconds overall while retaining 60-second process limits and all assertions. Both corrected fixtures pass locally; native CI must validate them separately.
 
 The controlled workflows derive their Core → App → Infra → Web fixtures from the tracked [performance benchmark](../test/performance/benchmark.cjs), using MSTest, .NET 10, coverage enabled, four project workers and nine file workers. Both production comparisons use 120/400 files with 20 cases per file; the copied-resource comparison uses 120. Collector installation is outside controlled timing, and Build/Restore/discovery are inside. Variant source hashes, including the cache worker's semaphore module, are checked throughout. The real-editor profile uses the current implementation with three visible editors and an additional 400 zero-hit executable lines in a shared file. Its isolated copied artifact records inspector profiles and decoration counters without changing repository production code.
 

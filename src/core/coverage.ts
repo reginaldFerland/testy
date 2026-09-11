@@ -194,7 +194,11 @@ export class CoverageStore {
                     valid &&= staged.sources.has(id);
                     if (++count % 512 === 0) {yield;}
                 }
-                if (valid) {yield* staged.installation({ ...trace, reliable: false, stale: true });}
+                if (valid) {
+                    const restored = { ...trace, reliable: false, stale: true };
+                    if (staged.records.has(trace.groupId)) {yield* staged.installation(restored);}
+                    else {yield* staged.initialInstallation(restored);}
+                }
             }
             for (const [id, source] of staged.sources) {
                 if (!source.groups.size) {staged.sources.delete(id); staged.byFile.get(source.source.file)?.delete(id);}
@@ -375,6 +379,31 @@ export class CoverageStore {
     }
 
     private install(trace: StoredTrace): void { finish(this.installation(trace)); }
+
+    /** Only the private restore stage: no published summaries or prior group exist. */
+    private *initialInstallation(trace: StoredTrace): Generator<void, void> {
+        this.records.set(trace.groupId, trace); this.appliedStale.set(trace.groupId, !!trace.stale);
+        let count = 0;
+        for (const file of dependencyKeys(trace)) {
+            const groups = this.byDependency.get(file) ?? new Set<string>(); groups.add(trace.groupId); this.byDependency.set(file, groups);
+            if (++count % 512 === 0) {yield;}
+        }
+        for (const id of trace.sourceIds) {
+            const source = this.sources.get(id)!, previousSize = source.groups.size;
+            source.groups.add(trace.groupId);
+            // Duplicate IDs retain one owner and one stale contribution.
+            if (source.groups.size !== previousSize) {source.staleCount += Number(!!trace.stale);}
+            if (++count % 512 === 0) {yield;}
+        }
+        for (const file of trace.coverage) {
+            // Preserve last-entry wins, including the generic restore API's
+            // handling of contributions outside a trace's sourceIds.
+            this.sources.get(contentHash(`${file.file}\0${file.hash}`))?.hits.set(trace.groupId, file.lines);
+            if (++count % 512 === 0) {yield;}
+        }
+        // Registration already dirtied every source. The stage has no aggregates,
+        // owner arrays or durable delta to invalidate before its atomic publication.
+    }
 
     private *installation(trace: StoredTrace): Generator<void, void> {
         const previous = this.records.get(trace.groupId), wasStale = this.appliedStale.get(trace.groupId) ?? false, stale = !!trace.stale;
