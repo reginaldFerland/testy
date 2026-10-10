@@ -5,6 +5,7 @@ const path=require('node:path');
 const os=require('node:os');
 const {TestEngine}=require('../../out/services/engine');
 const {normalizePath}=require('../../out/core/paths');
+const {loadUi}=require('../unit/support/ui.cjs');
 
 async function fixture(t) {
  const temp=await fs.mkdtemp(path.join(os.tmpdir(),'testy regression '));t.after(()=>fs.rm(temp,{recursive:true,force:true}));
@@ -636,10 +637,7 @@ test('shared editorconfig saves must invalidate the projects they compile',{time
  const baseline=await f.run([],true);assert.equal(baseline.passed,3);assert.ok(f.engine.knownFiles.includes(config));
  const contents='root = true\n[*.cs]\ndotnet_diagnostic.CS0168.severity = error\n';
  await fs.writeFile(config,contents);
- const file=path.resolve('out/extension.js'),exports={},realRequire=require('node:module').createRequire(file);
- require('node:vm').runInNewContext((await fs.readFile(file,'utf8'))+'\nexports.Testy=Testy;',{
-  exports,require:name=>name==='vscode'?{}:name==='./configuration'?{}:realRequire(name),Buffer,setTimeout,clearTimeout
- });
+ const exports={Testy:loadUi().Testy};
  const requests=[],context={roots:[normalizePath(f.root)],disposed:false,engine:f.engine,scheduler:{request:(...args)=>requests.push(args)},
   config:{excludes:[],pattern:'**/*.{cs,csproj,sln,slnx,props,targets,runsettings,json,config,resx}'}};
  await exports.Testy.prototype.changed.call(context,{scheme:'file',fsPath:config},contents);
@@ -805,13 +803,11 @@ test('removing a workspace test folder stops execution while its referenced proj
 });
 
 async function editorInputs(f,trigger='fileSystem') {
- const file=path.resolve('out/extension.js'),exports={},real=require('node:module').createRequire(file),patterns=[],requests=[];
+ const exports={},patterns=[],requests=[];
  const vscode={RelativePattern:class {constructor(base,pattern){Object.assign(this,{base,pattern});}},workspace:{createFileSystemWatcher:pattern=>{
   patterns.push(pattern);return {dispose(){},onDidChange(){},onDidCreate(){},onDidDelete(){}};
  }}};
- require('node:vm').runInNewContext((await fs.readFile(file,'utf8'))+'\nexports.Testy=Testy;',{
-  exports,require:name=>name==='vscode'?vscode:name==='./configuration'?{}:real(name),Buffer,setTimeout,clearTimeout
- });
+ exports.Testy=loadUi({vscode}).Testy;
  const ui={roots:[normalizePath(f.root)],watchers:[],engine:f.engine,scheduler:{request:(...args)=>requests.push(args)},
   config:{trigger,excludes:[],pattern:require('../../package.json').contributes.configuration.properties['testy.fileWatcherPattern'].default}};
  const watch=()=>exports.Testy.prototype.watch.call(ui);f.state.inputsChanged=watch;watch();

@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import * as path from 'node:path';
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
 import { CoveredLine } from '../core/model';
@@ -6,6 +7,13 @@ import { pathNormalizer } from '../core/paths';
 type XmlNode = Record<string, unknown>;
 const record = (value: unknown): XmlNode => value && typeof value === 'object' ? value as XmlNode : {};
 const list = (value: unknown): XmlNode[] => (Array.isArray(value) ? value : value ? [value] : []).map(record);
+
+/** Cobertura `<sources>` entries, which relative class filenames are resolved against. */
+function sourceRoots(coverage: XmlNode, cwd: string): string[] {
+    const sources = record(coverage.sources).source;
+    return (Array.isArray(sources) ? sources : [sources]).map(source => typeof source === 'string' ? source : record(source)['#text'])
+        .filter((source): source is string => typeof source === 'string' && source.trim() !== '').map(source => path.resolve(cwd, source.trim()));
+}
 
 export function parseCobertura(xml: string, cwd: string, allowedFiles: ReadonlySet<string>): ReadonlyMap<string, readonly CoveredLine[]> {
     if (/<!DOCTYPE|<!ENTITY/i.test(xml) || XMLValidator.validate(xml) !== true) {throw new Error('The coverage report is not valid, safe XML.');}
@@ -16,10 +24,20 @@ export function parseCobertura(xml: string, cwd: string, allowedFiles: ReadonlyS
     const coverage = record(record(parser.parse(xml)).coverage);
     if (!coverage.packages) {throw new Error('The coverage report contains no packages.');}
     const files = new Map<string, Map<number, number>>(), normalize = pathNormalizer();
+    const roots = sourceRoots(coverage, cwd), resolved = new Map<string, string>();
+    // The first source root containing the file wins; otherwise keep resolving against cwd.
+    const resolve = (filename: string): string => {
+        let file = resolved.get(filename);
+        if (file === undefined) {
+            file = path.isAbsolute(filename) ? path.resolve(cwd, filename) : roots.map(root => path.resolve(root, filename)).find(candidate => existsSync(candidate)) ?? path.resolve(cwd, filename);
+            resolved.set(filename, file);
+        }
+        return file;
+    };
     for (const pkg of list(record(coverage.packages).package)) {
         for (const cls of list(record(pkg.classes).class)) {
             if (typeof cls.filename !== 'string') {continue;}
-            const file = normalize(path.resolve(cwd, cls.filename));
+            const file = normalize(resolve(cls.filename));
             if (!allowedFiles.has(file)) {continue;}
             const lines = files.get(file) ?? new Map<number, number>();
             for (const item of list(record(cls.lines).line)) {

@@ -3,19 +3,39 @@ import * as path from 'node:path';
 import { contentHash, normalizePath } from '../core/paths';
 import { Project } from '../core/model';
 import { ProcessOptions, requireSuccess, runProcess } from './process';
+import { analyzerServers, AnalyzerRequestFailed, AnalyzerServerUnavailable } from './analyzerServer';
+import { roslynIdentity } from './analysisContext';
+
+export { disposeAnalyzerServers } from './analyzerServer';
+
+/** Run one analyzer request. A long-lived server answers it when one can be used; otherwise
+ * (it could not start, crashed, or the protocol broke) a one-shot process does. One-shot
+ * responses are written to a file: stdout is a bounded diagnostic tail and cannot carry
+ * arbitrarily large results. */
+async function analyze(dotnet: string, analyzer: string, storage: string, prefix: string, request: string, operation: string, options: ProcessOptions): Promise<string> {
+    try {return await analyzerServers.request(dotnet, analyzer, request, options, await roslynIdentity(dotnet, options));}
+    catch (error) {
+        if (error instanceof AnalyzerRequestFailed) {throw new Error(`${operation} failed.\n${error.message}`);}
+        if (!(error instanceof AnalyzerServerUnavailable)) {throw error;}
+        options.signal?.throwIfAborted();
+    }
+    await fs.mkdir(storage, { recursive: true });
+    const directory = await fs.mkdtemp(path.join(storage, prefix));
+    try {
+        const input = path.join(directory, 'request.json'), output = path.join(directory, 'response.json');
+        await fs.writeFile(input, request);
+        // A process that serves one request never recoups the cost of Tier-0 instrumentation.
+        requireSuccess(await runProcess(dotnet, [analyzer, input, output], { ...options, output: undefined, env: { ...options.env, DOTNET_TieredPGO: '0' } }), operation);
+        return await fs.readFile(output, 'utf8');
+    } finally {await fs.rm(directory, { recursive: true, force: true });}
+}
 
 export async function sourceLocations(dotnet: string, analyzer: string, assembly: string, storage: string, options: ProcessOptions): Promise<ReadonlyMap<string, { file: string; line: number }>> {
-    await fs.mkdir(storage, { recursive: true });
-    const directory = await fs.mkdtemp(path.join(storage, 'symbols-'));
-    try {
-        const input = path.join(directory, 'assembly.json');
-        await fs.writeFile(input, JSON.stringify({ assembly }));
-        const result = requireSuccess(await runProcess(dotnet, [analyzer, input], { ...options, output: undefined }), 'Reading portable symbols');
-        const values = JSON.parse(result.stdout) as Record<string, { File?: string; Line?: number } | null>;
-        return new Map(Object.entries(values).filter((entry): entry is [string, { File: string; Line: number }] =>
-            typeof entry[1]?.File === 'string' && Number.isSafeInteger(entry[1]?.Line) && entry[1]!.Line! > 0)
-            .map(([key, value]) => [key, { file: normalizePath(value.File), line: value.Line }]));
-    } finally {await fs.rm(directory, { recursive: true, force: true });}
+    const output = await analyze(dotnet, analyzer, storage, 'symbols-', JSON.stringify({ assembly }), 'Reading portable symbols', options);
+    const values = JSON.parse(output) as Record<string, { file?: string; line?: number } | null>;
+    return new Map(Object.entries(values).filter((entry): entry is [string, { file: string; line: number }] =>
+        typeof entry[1]?.file === 'string' && Number.isSafeInteger(entry[1]?.line) && entry[1].line! > 0)
+        .map(([key, value]) => [key, { file: normalizePath(value.file), line: value.line }]));
 }
 
 export interface SourceShape {
@@ -25,6 +45,7 @@ export interface SourceShape {
     readonly excludedTypes: readonly string[];
 }
 
+const workers = (concurrency: number): number => Number.isFinite(concurrency) ? Math.max(1, Math.floor(concurrency)) : 1;
 const names = (value: unknown): value is string[] => Array.isArray(value) && value.every(name => typeof name === 'string');
 const aliasesEqual = (left: readonly string[], right: readonly string[]): boolean => {
     const expected = new Set(left), actual = new Set(right);
@@ -59,59 +80,46 @@ export async function sourceAnalysisBatch(dotnet: string, analyzer: string, file
         if (!selected.length) {return { aliases, analyses: new Map(), sourceHashes: new Map() };}
         files = selected; excludedAliases = aliases; aliasUpdate = undefined;
     }
-    await fs.mkdir(storage, { recursive: true });
-    const directory = await fs.mkdtemp(path.join(storage, 'analysis-'));
-    try {
-        const input = path.join(directory, 'files.json');
-        const request = JSON.stringify({ files, excludedAliases, aliasSources: aliasUpdate?.sources, allFiles: aliasUpdate?.allFiles,
-            concurrency: Number.isFinite(concurrency) ? Math.max(1, Math.floor(concurrency)) : 1, ...(provenance ? { provenance: true } : {}) });
-        await fs.writeFile(input, request);
-        const output = requireSuccess(await runProcess(dotnet, [analyzer, input], { ...options, output: undefined }), 'Analyzing C# declarations and aliases').stdout;
-        const parsed: unknown = JSON.parse(output);
-        const value = parsed as Partial<{ aliases: unknown; analyses: Record<string, unknown>; version: unknown; requestHash: unknown; sourceHashes: Record<string, unknown> }> | null;
-        if (!value || !names(value.aliases) || !value.analyses || typeof value.analyses !== 'object' || Array.isArray(value.analyses)) {
-            throw new Error('Invalid combined source analysis response.');
+    const request = JSON.stringify({ files, excludedAliases, aliasSources: aliasUpdate?.sources, allFiles: aliasUpdate?.allFiles,
+        concurrency: workers(concurrency), ...(provenance ? { provenance: true } : {}) });
+    const output = await analyze(dotnet, analyzer, storage, 'analysis-', request, 'Analyzing C# declarations and aliases', options);
+    const parsed: unknown = JSON.parse(output);
+    const value = parsed as Partial<{ aliases: unknown; analyses: Record<string, unknown>; version: unknown; requestHash: unknown; sourceHashes: Record<string, unknown> }> | null;
+    if (!value || !names(value.aliases) || !value.analyses || typeof value.analyses !== 'object' || Array.isArray(value.analyses)) {
+        throw new Error('Invalid combined source analysis response.');
+    }
+    if (!aliasUpdate && !aliasesEqual(value.aliases, excludedAliases)) {throw new Error('Unexpected source analysis aliases.');}
+    const selected = aliasUpdate && !aliasesEqual(value.aliases, excludedAliases) ? aliasUpdate.allFiles : files;
+    const expected = new Set(selected);
+    if (Object.keys(value.analyses).length !== expected.size) {throw new Error('Incomplete combined source analysis response.');}
+    if (provenance && (value.version !== 1 || value.requestHash !== contentHash(request).toUpperCase()
+        || !value.sourceHashes || typeof value.sourceHashes !== 'object' || Array.isArray(value.sourceHashes)
+        || Object.keys(value.sourceHashes).length !== expected.size)) {throw new Error('Invalid source analysis provenance.');}
+    const analyses = new Map<string, SourceShape | null>();
+    const sourceHashes = new Map<string, string>();
+    for (const file of expected) {
+        if (!Object.hasOwn(value.analyses, file)) {throw new Error('Incomplete combined source analysis response.');}
+        const shape = value.analyses[file];
+        if (shape !== null && !sourceShape(shape)) {throw new Error('Invalid combined source analysis record.');}
+        const normalized = normalizePath(file);
+        if (provenance) {
+            const hash = value.sourceHashes![file];
+            if (!Object.hasOwn(value.sourceHashes!, file) || (hash !== null && (typeof hash !== 'string' || !/^[A-F0-9]{64}$/.test(hash)))
+                || (shape !== null && hash === null)) {throw new Error('Invalid source analysis hash.');}
+            if (typeof hash === 'string') {sourceHashes.set(normalized, hash.toLowerCase());}
         }
-        if (!aliasUpdate && !aliasesEqual(value.aliases, excludedAliases)) {throw new Error('Unexpected source analysis aliases.');}
-        const selected = aliasUpdate && !aliasesEqual(value.aliases, excludedAliases) ? aliasUpdate.allFiles : files;
-        const expected = new Set(selected);
-        if (Object.keys(value.analyses).length !== expected.size) {throw new Error('Incomplete combined source analysis response.');}
-        if (provenance && (value.version !== 1 || value.requestHash !== contentHash(request).toUpperCase()
-            || !value.sourceHashes || typeof value.sourceHashes !== 'object' || Array.isArray(value.sourceHashes)
-            || Object.keys(value.sourceHashes).length !== expected.size)) {throw new Error('Invalid source analysis provenance.');}
-        const analyses = new Map<string, SourceShape | null>();
-        const sourceHashes = new Map<string, string>();
-        for (const file of expected) {
-            if (!Object.hasOwn(value.analyses, file)) {throw new Error('Incomplete combined source analysis response.');}
-            const shape = value.analyses[file];
-            if (shape !== null && !sourceShape(shape)) {throw new Error('Invalid combined source analysis record.');}
-            const normalized = normalizePath(file);
-            if (provenance) {
-                const hash = value.sourceHashes![file];
-                if (!Object.hasOwn(value.sourceHashes!, file) || (hash !== null && (typeof hash !== 'string' || !/^[A-F0-9]{64}$/.test(hash)))
-                    || (shape !== null && hash === null)) {throw new Error('Invalid source analysis hash.');}
-                if (typeof hash === 'string') {sourceHashes.set(normalized, hash.toLowerCase());}
-            }
-            analyses.set(normalized, shape);
-        }
-        options.signal?.throwIfAborted();
-        return { aliases: value.aliases, analyses, ...(provenance ? { sourceHashes } : {}) };
-    } finally {await fs.rm(directory, { recursive: true, force: true });}
+        analyses.set(normalized, shape);
+    }
+    options.signal?.throwIfAborted();
+    return { aliases: value.aliases, analyses, ...(provenance ? { sourceHashes } : {}) };
 }
 
 /** Parse global aliases with the same C# syntax rules as declaration analysis. */
 export async function sourceAliases(dotnet: string, analyzer: string, contents: readonly string[], storage: string, options: ProcessOptions): Promise<readonly string[]> {
     if (!contents.length) {return [];}
-    await fs.mkdir(storage, { recursive: true });
-    const directory = await fs.mkdtemp(path.join(storage, 'aliases-'));
-    try {
-        const input = path.join(directory, 'input.json');
-        await fs.writeFile(input, JSON.stringify({ aliasSources: contents }));
-        const result = requireSuccess(await runProcess(dotnet, [analyzer, input], { ...options, output: undefined }), 'Analyzing global C# aliases');
-        const aliases: unknown = JSON.parse(result.stdout);
-        if (!names(aliases)) {throw new Error('Invalid C# alias response.');}
-        return aliases;
-    } finally {await fs.rm(directory, { recursive: true, force: true });}
+    const aliases: unknown = JSON.parse(await analyze(dotnet, analyzer, storage, 'aliases-', JSON.stringify({ aliasSources: contents }), 'Analyzing global C# aliases', options));
+    if (!names(aliases)) {throw new Error('Invalid C# alias response.');}
+    return aliases;
 }
 
 /** Resolve cross-file exclusions using incremental syntax records, not rereads. */
@@ -130,23 +138,15 @@ export function resolveShapes(analyses: ReadonlyMap<string, SourceShape | null>,
 /** Declaration fingerprints catch dependencies that runtime coverage cannot see. */
 export async function sourceAnalyses(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: ProcessOptions, excludedAliases: readonly string[] = [], concurrency = 1): Promise<ReadonlyMap<string, SourceShape | null>> {
     if (!files.length) {return new Map();}
-    await fs.mkdir(storage, { recursive: true });
-    const directory = await fs.mkdtemp(path.join(storage, 'analysis-'));
-    try {
-        const input = path.join(directory, 'files.json');
-        await fs.writeFile(input, JSON.stringify({ files, excludedAliases, concurrency: Number.isFinite(concurrency) ? Math.max(1, Math.floor(concurrency)) : 1 }));
-        const output = requireSuccess(await runProcess(dotnet, [analyzer, input], { ...options, output: undefined }), 'Analyzing C# declarations').stdout;
-        const parsed: unknown = JSON.parse(output);
-        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {throw new Error('Invalid source analysis response.');}
-        const result = new Map<string, SourceShape | null>();
-        for (const file of files) {
-            const value = (parsed as Record<string, Partial<SourceShape> | null>)[file];
-            result.set(normalizePath(file), sourceShape(value) ? value : null);
-        }
-        return result;
-    } finally {
-        await fs.rm(directory, { recursive: true, force: true });
+    const output = await analyze(dotnet, analyzer, storage, 'analysis-', JSON.stringify({ files, excludedAliases, concurrency: workers(concurrency) }), 'Analyzing C# declarations', options);
+    const parsed: unknown = JSON.parse(output);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {throw new Error('Invalid source analysis response.');}
+    const result = new Map<string, SourceShape | null>();
+    for (const file of files) {
+        const value = (parsed as Record<string, Partial<SourceShape> | null>)[file];
+        result.set(normalizePath(file), sourceShape(value) ? value : null);
     }
+    return result;
 }
 
 export async function sourceShapes(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: ProcessOptions, excludedAliases: readonly string[] = [], concurrency = 1): Promise<ReadonlyMap<string, string | null>> {

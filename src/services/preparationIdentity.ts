@@ -1,6 +1,7 @@
 import * as path from 'node:path';
+import { helperPath } from './assets';
 import { ProcessOptions } from './process';
-import { resolveNodeExecutable } from './executable';
+import { ambiguousWindowsPath, resolveNodeExecutable, resolveOwnedCommand } from './executable';
 import { preparationToolIdentity } from './preparedOutputCache';
 
 interface PreparationTools extends Pick<ProcessOptions, 'signal' | 'dotnetHost' | 'cleanupDescendants'> {
@@ -25,13 +26,11 @@ export async function windowsPreparationTools(options: PreparationTools, env: No
     const owned = !!options.coverageTool && options.cleanupDescendants !== false;
     const instrumenter = async (): Promise<string | undefined> => {
         if (!owned) {return node(options.coverageTool);}
-        const command = options.coverageTool!;
-        // ProcessHost calls CreateProcessW with a null application name. Its
-        // bare-name search differs from Node's; explicit existing paths avoid it.
-        if (!path.isAbsolute(command) || !path.extname(command) || /["'\0]/.test(command)
-            || /^[/\\](?![/\\])/.test(command) || /[. ]$/.test(command)
-            || /^[/\\]{2}[?.][/\\]/.test(command)
-            || command.replace(/^[a-z]:[/\\]/i, '').includes(':')) {
+        const command = options.coverageTool;
+        // ProcessHost passes lpApplicationName explicitly: explicit paths as given, bare
+        // names from absolute PATH entries only. That differs from Node's search, so
+        // identity stays conservative and requires an explicit existing path.
+        if (!path.isAbsolute(command) || !path.extname(command) || /[. ]$/.test(command) || ambiguousWindowsPath(command)) {
             throw new Error(`Cannot identify owned preparation executable without an explicit path: ${command}`);
         }
         return asset(command);
@@ -40,8 +39,9 @@ export async function windowsPreparationTools(options: PreparationTools, env: No
     // up. Dotnet remains conservative extra context; the analyzer is file data.
     const results = await Promise.allSettled([
         node(options.dotnet), instrumenter(), asset(options.analyzer),
-        owned ? node(options.dotnetHost ?? 'dotnet') : Promise.resolve(undefined),
-        owned ? asset(path.join(__dirname, '../../dist/processhost/Testy.ProcessHost.dll')) : Promise.resolve(undefined)
+        // runProcess launches the owner through resolveOwnedCommand (PATH only, never the cwd).
+        owned ? resolveOwnedCommand(options.dotnetHost ?? 'dotnet', env, cwd).then(asset) : Promise.resolve(undefined),
+        owned ? asset(helperPath('processhost', 'Testy.ProcessHost.dll')) : Promise.resolve(undefined)
     ]);
     signal?.throwIfAborted();
     const [dotnetNode, collector, analyzerAsset, ownerNode, ownerAsset] = results.map(result => {

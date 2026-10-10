@@ -38,6 +38,13 @@ export class Scheduler {
 
     get isRunning(): boolean { return !!this.active; }
     get isPaused(): boolean { return this.paused; }
+    /** Accumulated changes as one batch, for running them on demand. */
+    get pendingBatch(): ChangeBatch {
+        return { files: [...this.pending.keys()], full: this.fullRevision !== undefined, ...(this.fullRevision !== undefined ? { generation: this.fullRevision } : {}) };
+    }
+
+    /** Stop the active run. Its changes stay pending for the next run. */
+    cancel(): void { this.active?.controller.abort(); }
 
     request(files: readonly string[], full = false): void {
         if (this.disposed) {return;}
@@ -116,7 +123,8 @@ export class Scheduler {
             if (job.controller.signal.aborted) { job.cleanup(); job.reject(new Cancelled()); this.pump(); return; }
             this.active = { kind: 'manual', controller: job.controller };
             this.publish();
-            void job.run(job.controller.signal).then(job.resolve, job.reject).finally(() => {
+            // An async wrapper keeps synchronous throws from wedging `active`.
+            void (async () => job.run(job.controller.signal))().then(job.resolve, job.reject).finally(() => {
                 job.cleanup(); this.active = undefined; this.publish(); this.pump();
             });
             return;
@@ -128,7 +136,7 @@ export class Scheduler {
         this.active = { kind: 'auto', controller };
         this.ready = false;
         this.publish();
-        void this.options.run({ files: [...snapshot.keys()], full: full !== undefined, ...(full !== undefined ? { generation: full } : {}) }, controller.signal).then(() => {
+        void (async () => this.options.run({ files: [...snapshot.keys()], full: full !== undefined, ...(full !== undefined ? { generation: full } : {}) }, controller.signal))().then(() => {
             if (controller.signal.aborted) {return;}
             for (const [file, revision] of snapshot) {if (this.pending.get(file) === revision) {this.pending.delete(file);}}
             if (this.fullRevision === full) {this.fullRevision = undefined;}

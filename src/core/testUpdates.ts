@@ -1,7 +1,16 @@
 export type TestNode = Readonly<Record<string, unknown>> & { readonly uid: string };
 
+/** A scalar protocol property as text; objects and missing values become empty. */
+export function nodeText(node: TestNode, key: string): string {
+    const value = node[key];
+    return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' ? String(value) : '';
+}
+
+/** The display name, or the UID when the provider sent none. */
+export const nodeName = (node: TestNode): string => nodeText(node, 'display-name') || node.uid;
+
 const isFailure = (node: TestNode): boolean => node['execution-state'] !== undefined
-    && !['passed', 'skipped', 'in-progress', 'discovered'].includes(String(node['execution-state']));
+    && !['passed', 'skipped', 'in-progress', 'discovered'].includes(nodeText(node, 'execution-state'));
 
 /** Rows may share a UID. Only an explicitly newer retry may replace a failure. */
 export function mergeTestUpdate(previous: TestNode | undefined, update: TestNode): TestNode {
@@ -13,7 +22,7 @@ export function mergeTestUpdate(previous: TestNode | undefined, update: TestNode
         const identity = Object.fromEntries(Object.entries(previous).filter(([key]) =>
             !key.startsWith('error.') && !key.startsWith('retry.') && !key.startsWith('time.')
             && !['execution-state', 'standardOutput', 'standardError'].includes(key)));
-        return { ...identity, ...update } as TestNode;
+        return { ...identity, ...update };
     }
     const merged = { ...previous, ...update };
     if (!previous['retry.is-superseded'] && !update['retry.is-superseded'] && isFailure(previous) && !isFailure(update)) {

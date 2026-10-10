@@ -1,21 +1,45 @@
 import * as fs from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { constants, Stats } from 'node:fs';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { Semaphore } from '../core/concurrency';
+import { Semaphore, walkTree } from '../core/concurrency';
 import { fileHash, PreparedOutput, removeOutput } from './output';
 import { claimRunOutputs, RunOutputLease } from './runOutputs';
-import { claimPreparedStorage, PreparedStorageLease } from './preparedStorage';
+import { claimPreparedStorage, PreparedStorageLease, PreparedStorageShrink, Retention } from './preparedStorage';
+import { uuidPattern as uuid } from '../core/paths';
 
 const readers = new Semaphore(8);
 interface Manifest { readonly hash: string; readonly bytes: number; }
+/** What a retained preparation costs against the byte budget: its template and its working copy. */
+const footprint = (template: Manifest): number => template.bytes * 2;
+
+/** A file hash and the metadata it was computed under. */
+interface HashRecord { readonly size: number; readonly mtimeMs: number; readonly ctimeMs: number; readonly ino: number; readonly hashedAt: number; readonly hash: string; }
+/** Hashes remembered within one session, by real path, so a preparation does not read unchanged files again. */
+export type HashMemo = Map<string, HashRecord>;
+/** A write in the same timestamp tick as the hashing could leave the metadata unchanged
+ * (FAT keeps two-second resolution), so only files that were already older are trusted. */
+const racyMs = 2_000;
+const memoLimit = 50_000;
+
+async function memoizedHash(file: string, stat: Stats, memo: HashMemo | undefined, signal?: AbortSignal): Promise<string> {
+    const known = memo?.get(file);
+    if (known && known.size === stat.size && known.mtimeMs === stat.mtimeMs && known.ctimeMs === stat.ctimeMs && known.ino === stat.ino
+        && stat.mtimeMs + racyMs < known.hashedAt) {return known.hash;}
+    const hashedAt = Date.now(), hash = await fileHash(file, signal);
+    if (memo) {
+        // The metadata read before hashing is kept: a later write changes it, so the entry cannot vouch for newer bytes.
+        memo.delete(file); memo.set(file, { size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, ino: stat.ino, hashedAt, hash });
+        if (memo.size > memoLimit) {memo.delete(memo.keys().next().value as string);}
+    }
+    return hash;
+}
 
 /** Follow the same links and exclusions as copyOutput, including executable modes. */
-export async function outputManifest(directory: string, signal?: AbortSignal, followLinks = true): Promise<Manifest> {
+export async function outputManifest(directory: string, signal?: AbortSignal, followLinks = true, memo?: HashMemo): Promise<Manifest> {
     const records: string[] = [];
     let bytes = 0;
     interface Job { readonly file: string; readonly relative: string; readonly ancestors: ReadonlySet<string>; }
-    const queued: Job[] = [{ file: directory, relative: '', ancestors: new Set() }];
     const visit = async ({ file, relative, ancestors }: Job): Promise<Job[]> => {
         signal?.throwIfAborted();
         if (!followLinks && (await fs.lstat(file)).isSymbolicLink()) {throw new Error('A retained preparation contains a symbolic link.');}
@@ -27,27 +51,14 @@ export async function outputManifest(directory: string, signal?: AbortSignal, fo
             return (await fs.readdir(real)).filter(name => name !== 'TestResults')
                 .map(name => ({ file: path.join(real, name), relative: path.join(relative, name), ancestors: next }));
         } else if (stat.isFile()) {
-            const hash = await fileHash(real, signal);
+            const hash = await memoizedHash(real, stat, memo, signal);
             bytes += stat.size;
             records.push(JSON.stringify([relative, 'file', stat.mode, stat.size, hash]));
             return [];
         } else {throw new Error(`Unsupported build output: ${file}`);}
     };
     // Metadata operations share the same bound as reads across all concurrent manifests.
-    await new Promise<void>((resolve, reject) => {
-        let active = 0, failed = false, failure: unknown;
-        const pump = (): void => {
-            if (failed) {queued.length = 0;}
-            while (active < 8 && queued.length) {
-                const job = queued.pop()!; active++;
-                void readers.run(signal, () => visit(job)).then(children => {if (!failed) {for (const child of children) {queued.push(child);}}})
-                    .catch(error => {if (!failed) {failed = true; failure = error;}})
-                    .finally(() => {active--; pump();});
-            }
-            if (!active && !queued.length) {if (failed) {reject(failure);} else {resolve();}}
-        };
-        pump();
-    });
+    await walkTree([{ file: directory, relative: '', ancestors: new Set<string>() }], visit, readers, signal);
     records.sort();
     return { hash: createHash('sha256').update(records.join('\n')).digest('hex'), bytes };
 }
@@ -77,10 +88,14 @@ export async function preparationToolIdentity(command: string | undefined, env: 
             }
             // Resolve each command in its actual working directory before sharing bytes.
             // Relative PATH entries can name different tools in different projects.
-            let identity = identities?.get(resolved);
+            // The cache can outlive a run, so a metadata stamp detects reinstalls.
+            const key = identities ? `${resolved}\0${await toolStamp(resolved)}` : resolved;
+            let identity = identities?.get(key);
             if (!identity) {
                 identity = hashPreparationTool(resolved, signal);
-                identities?.set(resolved, identity);
+                identities?.set(key, identity);
+                const pending = identity, cache = identities;
+                if (cache) {void pending.catch(() => {if (cache.get(key) === pending) {cache.delete(key);}});}
             }
             return await identity;
         } catch (error) {
@@ -90,6 +105,19 @@ export async function preparationToolIdentity(command: string | undefined, env: 
     }
     // A command without a verifiable executable must not produce a reusable entry.
     throw new Error(`Cannot identify preparation tool: ${command}`);
+}
+
+/** Cheap metadata covering the files hashPreparationTool reads: the command,
+ * its managed siblings, and each tool-store package directory. */
+async function toolStamp(resolved: string): Promise<string> {
+    const stat = async (file: string): Promise<string> => fs.stat(file, { bigint: true })
+        .then(value => `${value.size}:${value.mtimeNs}:${value.ctimeNs}:${value.ino}`, () => 'missing');
+    const directory = path.dirname(resolved), base = path.basename(resolved, path.extname(resolved));
+    const parts = [await stat(resolved), ...await Promise.all(['.dll', '.deps.json', '.runtimeconfig.json'].map(extension => stat(path.join(directory, base + extension))))];
+    const store = path.join(directory, '.store');
+    const packages = await fs.readdir(store).catch(() => [] as string[]);
+    parts.push(await stat(store), ...await Promise.all(packages.sort().map(async name => `${name}=${await stat(path.join(store, name))}`)));
+    return parts.join('|');
 }
 
 async function hashPreparationTool(resolved: string, signal?: AbortSignal): Promise<string> {
@@ -151,7 +179,11 @@ interface Entry {
     finish: () => void;
     uninitialized?: boolean;
 }
-export interface PreparedOutputLimits { readonly maxEntries?: number; readonly maxBytes?: number; readonly persist?: boolean; }
+export interface PreparedOutputLimits {
+    readonly maxEntries?: number; readonly maxBytes?: number; readonly persist?: boolean;
+    /** Diagnostics for optional caching steps that fall back silently. */
+    readonly log?: (text: string) => void;
+}
 interface StoredEntry {
     readonly directory: string;
     readonly key: string;
@@ -163,7 +195,6 @@ interface StoredEntry {
     readonly coveragePending?: boolean;
     readonly instrumented: readonly string[];
 }
-const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const sha256 = /^[0-9a-f]{64}$/i;
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 const relativeFile = (value: unknown): value is string => typeof value === 'string' && !!value && !path.isAbsolute(value)
@@ -186,13 +217,38 @@ function storedEntries(snapshot: unknown): readonly StoredEntry[] {
         directories.add(entry.directory);
         if (typeof entry.slot === 'string') {slots.add(entry.slot);}
     }
-    return snapshot.entries as unknown as readonly StoredEntry[];
+    return snapshot.entries as readonly StoredEntry[];
+}
+
+/** Drop the least recently used entries until the snapshot fits the target, as eviction does in memory. */
+function shrinkSnapshot(snapshot: unknown, target: Retention): PreparedStorageShrink | undefined {
+    let entries: readonly StoredEntry[];
+    try {entries = storedEntries(snapshot);} catch {return undefined;}
+    const kept = new Set(entries);
+    let bytes = entries.reduce((total, entry) => total + footprint(entry.template), 0);
+    for (const entry of [...entries].sort((left, right) => left.used - right.used)) {
+        if (kept.size <= target.entries && bytes <= target.bytes) {break;}
+        kept.delete(entry); bytes -= footprint(entry.template);
+    }
+    const retained = entries.filter(entry => kept.has(entry));
+    return { snapshot: { version: 1, entries: retained }, retention: { entries: retained.length, bytes },
+        removed: entries.filter(entry => !kept.has(entry)).map(entry => entry.directory) };
+}
+
+/** Slots shaped like [target, lane] are lanes of one target; any other slot stands alone. */
+function targetOf(slot: string | undefined): string {
+    try {
+        const parts: unknown = JSON.parse(slot ?? 'null');
+        if (Array.isArray(parts) && typeof parts[0] === 'string') {return parts[0];}
+    } catch { /* an opaque slot name */ }
+    return slot ?? '';
 }
 
 /** Exclusive artifacts; clean shutdown can park validated templates for another engine. */
 export class PreparedOutputCache {
     private readonly entries = new Set<Entry>();
     private readonly claimedSlots = new Set<string>();
+    private readonly hashes: HashMemo = new Map();
     private readonly pending = new Set<Promise<unknown>>();
     private owner?: Promise<RunOutputLease | PreparedStorageLease>;
     private closed = false;
@@ -201,7 +257,9 @@ export class PreparedOutputCache {
     private maxEntries: number;
     private readonly maxBytes: number;
     private readonly persist: boolean;
+    private readonly log: (text: string) => void;
     constructor(private readonly storage: string, private readonly identity: string, limits: PreparedOutputLimits = {}) {
+        this.log = limits.log ?? (() => undefined);
         this.maxEntries = limits.maxEntries ?? 16;
         this.maxBytes = limits.maxBytes ?? 512 * 1024 * 1024;
         this.persist = limits.persist ?? false;
@@ -236,8 +294,9 @@ export class PreparedOutputCache {
         try {
             this.owner ??= this.claimOwner(signal).catch(error => {this.owner = undefined; throw error;});
             root = (await this.owner).directory;
-        } catch {signal?.throwIfAborted(); return undefined;}
-        try {sourceManifest = await outputManifest(source, signal);} catch {signal?.throwIfAborted();}
+        } catch (error) {signal?.throwIfAborted(); this.log(`Prepared output storage unavailable; preparing without the cache. ${String(error)}\n`); return undefined;}
+        try {sourceManifest = await outputManifest(source, signal, true, this.hashes);}
+        catch (error) {signal?.throwIfAborted(); this.log(`Build output could not be fingerprinted; its preparation will not be reused. ${String(error)}\n`);}
         if (slot && this.claimedSlots.has(slot)) {return undefined;}
         if (slot) {this.claimedSlots.add(slot);}
         try {
@@ -249,14 +308,15 @@ export class PreparedOutputCache {
     }
 
     private async claimOwner(signal?: AbortSignal): Promise<RunOutputLease | PreparedStorageLease> {
-        if (!this.persist) {return claimRunOutputs(path.join(this.storage, 'prepared'), this.identity, signal);}
+        if (!this.persist) {return claimRunOutputs(path.join(this.storage, 'prepared'), this.identity, signal, this.log);}
         const owner = await claimPreparedStorage(path.join(this.storage, 'prepared-v2'), signal,
-            { maxEntries: this.maxEntries, maxBytes: this.maxBytes });
+            { maxEntries: this.maxEntries, maxBytes: this.maxBytes, shrink: shrinkSnapshot, log: this.log });
         try {
             if (owner.snapshot !== undefined) {
                 let saved: readonly StoredEntry[];
                 try {saved = storedEntries(owner.snapshot);}
-                catch {
+                catch (error) {
+                    this.log(`Retained preparations from a previous session were discarded. ${String(error)}\n`);
                     // Only extension-owned contents of the exclusively claimed container are removed.
                     for (const name of await fs.readdir(owner.directory)) {await removeOutput(path.join(owner.directory, name));}
                     return owner;
@@ -266,7 +326,7 @@ export class PreparedOutputCache {
                     const artifact: PreparedArtifact = { root, output: new PreparedOutput(path.join(root, 'template'), directory),
                         session: value.session, coverage: value.coverage, coveragePending: value.coveragePending,
                         instrumented: value.instrumented.map(file => path.join(directory, file)), reusable: true };
-                    return { key: value.key, slot: value.slot, artifact, template: value.template, bytes: value.template.bytes * 2,
+                    return { key: value.key, slot: value.slot, artifact, template: value.template, bytes: footprint(value.template),
                         active: false, retired: false, used: value.used, released: Promise.resolve(), finish: () => undefined, uninitialized: true };
                 });
                 for (const entry of entries) {this.entries.add(entry); this.clock = Math.max(this.clock, entry.used);}
@@ -280,18 +340,19 @@ export class PreparedOutputCache {
         const key = createHash('sha256').update(context).update(sourceManifest?.hash ?? randomUUID()).digest('hex');
         for (const entry of this.entries) {
             if (entry.slot !== slot || entry.active) {continue;}
-            if (entry.retired) {
-                if (slot) {try {await this.remove(entry);} catch {signal?.throwIfAborted(); return undefined;}}
+            if (entry.retired || entry.key !== key) {
+                // A slot names one directory; until its previous contents are gone,
+                // this preparation proceeds outside the cache instead of failing.
+                if (slot && !await this.tryRemove(entry, signal)) {return undefined;}
                 continue;
             }
-            if (entry.key !== key) {if (slot) {await this.remove(entry);} continue;}
             this.reserve(entry);
             try {
                 if (entry.uninitialized) {
                     const directory = await fs.lstat(entry.artifact.root);
                     if (!directory.isDirectory() || directory.isSymbolicLink()) {throw new Error('Invalid retained preparation directory.');}
                 }
-                if ((await outputManifest(entry.artifact.output.template, signal, !entry.uninitialized)).hash !== entry.template.hash) {throw new Error('Prepared output template changed.');}
+                if ((await outputManifest(entry.artifact.output.template, signal, !entry.uninitialized, this.hashes)).hash !== entry.template.hash) {throw new Error('Prepared output template changed.');}
                 if (entry.uninitialized) {
                     await removeOutput(entry.artifact.output.directory);
                     await entry.artifact.output.initialize(signal);
@@ -299,27 +360,40 @@ export class PreparedOutputCache {
                 } else {await entry.artifact.output.restore(signal);}
                 return this.lease(entry, true);
             } catch (error) {
-                await this.remove(entry);
                 signal?.throwIfAborted();
+                this.log(`Discarding a retained preparation: ${String(error)}\n`);
+                if (!await this.tryRemove(entry, signal) && slot) {return undefined;}
             }
         }
         const directory = path.join(root, slot ? createHash('sha256').update(slot).digest('hex') : randomUUID());
-        try {await fs.mkdir(directory);} catch {signal?.throwIfAborted(); return undefined;}
+        try {await fs.mkdir(directory);}
+        catch (error) {signal?.throwIfAborted(); this.log(`Prepared output slot unavailable; preparing without the cache. ${String(error)}\n`); return undefined;}
         let artifact: PreparedArtifact;
         try {artifact = await create(directory);} catch (error) {await removeOutput(directory); throw error;}
         let template: Manifest, unchanged = false;
         try {
-            template = await outputManifest(artifact.output.template, signal);
-            unchanged = !!sourceManifest && (await outputManifest(source, signal)).hash === sourceManifest.hash;
+            template = await outputManifest(artifact.output.template, signal, true, this.hashes);
+            // Files the first manifest hashed are not read again unless they changed since.
+            unchanged = !!sourceManifest && (await outputManifest(source, signal, true, this.hashes)).hash === sourceManifest.hash;
         } catch (error) {
             if (signal?.aborted) {await removeOutput(directory); throw error;}
             return this.temporary(artifact, slot);
         }
         const entry: Entry = { key, slot, artifact: unchanged ? artifact : { ...artifact, reusable: false }, template,
-            bytes: template.bytes * 2, active: false, retired: false, used: ++this.clock, released: Promise.resolve(), finish: () => undefined };
+            bytes: footprint(template), active: false, retired: false, used: ++this.clock, released: Promise.resolve(), finish: () => undefined };
         this.reserve(entry); this.entries.add(entry);
         await this.trim();
         return this.lease(entry, false);
+    }
+
+    /** Removal can fail on Windows while a lingering process holds a file. */
+    private async tryRemove(entry: Entry, signal?: AbortSignal): Promise<boolean> {
+        try {await this.remove(entry); return true;}
+        catch (error) {
+            signal?.throwIfAborted();
+            this.log(`A stale prepared output could not be removed yet; it will be retried. ${String(error)}\n`);
+            return false;
+        }
     }
 
     private reserve(entry: Entry): void {
@@ -344,7 +418,7 @@ export class PreparedOutputCache {
                     if (artifact.root !== entry.artifact.root || artifact.output.directory !== entry.artifact.output.directory
                         || artifact.output.template !== entry.artifact.output.template) {throw new Error('A prepared output upgrade must preserve its private paths.');}
                     entry.artifact = { ...artifact, reusable: entry.artifact.reusable && artifact.reusable };
-                    try {entry.template = await outputManifest(artifact.output.template, signal); entry.bytes = entry.template.bytes * 2;}
+                    try {entry.template = await outputManifest(artifact.output.template, signal, true, this.hashes); entry.bytes = footprint(entry.template);}
                     catch (error) {entry.retired = true; throw error;}
                 })());
                 return updating;
@@ -369,13 +443,16 @@ export class PreparedOutputCache {
             unclaim();
             entry.active = false; entry.used = ++this.clock;
             await this.trim();
-        } catch {await this.remove(entry);}
+        } catch (error) {
+            this.log(`A prepared output could not be retained. ${String(error)}\n`);
+            await this.tryRemove(entry);
+        }
         finally {unclaim(); finish();}
     }
 
     private async remove(entry: Entry): Promise<void> {
         const claimed = !!entry.slot && !this.claimedSlots.has(entry.slot);
-        if (claimed) {this.claimedSlots.add(entry.slot!);}
+        if (claimed) {this.claimedSlots.add(entry.slot);}
         this.entries.delete(entry);
         try {await removeOutput(entry.artifact.root);}
         catch (error) {
@@ -383,18 +460,49 @@ export class PreparedOutputCache {
             // Their templates may have been partially removed, so they cannot be reused.
             entry.retired = true; this.entries.add(entry); throw error;
         } finally {
-            if (claimed) {this.claimedSlots.delete(entry.slot!);}
+            if (claimed) {this.claimedSlots.delete(entry.slot);}
             entry.active = false; entry.finish();
         }
     }
 
+    /** Remove every idle prepared output; active leases are unaffected. */
+    evictIdle(signal?: AbortSignal): Promise<void> {
+        if (this.closed) {return Promise.resolve();}
+        return this.track((async () => {
+            for (const entry of [...this.entries]) {
+                if (entry.active || (entry.slot && this.claimedSlots.has(entry.slot)) || !this.entries.has(entry)) {continue;}
+                signal?.throwIfAborted();
+                await this.tryRemove(entry, signal);
+            }
+        })());
+    }
+
+    /** Active leases cannot be evicted, so idle entries share what they leave of the byte budget. When
+     * the leases alone exhaust it, the newest idle entry per target still survives (while those fit the
+     * budget together), instead of every release evicting everything the next run could reuse. */
     private async trim(): Promise<void> {
-        let bytes = [...this.entries].reduce((total, entry) => total + entry.bytes, 0);
-        for (const entry of [...this.entries].filter(entry => !entry.active).sort((left, right) => left.used - right.used)) {
+        const idle = [...this.entries].filter(entry => !entry.active).sort((left, right) => left.used - right.used);
+        const newest = new Map<string, Entry>();
+        for (const entry of idle) {if (!entry.retired) {newest.set(targetOf(entry.slot), entry);}}
+        let sparedBytes = 0;
+        const spared = new Set<Entry>();
+        for (const entry of [...newest.values()].sort((left, right) => right.used - left.used)) {
+            if (sparedBytes + entry.bytes > this.maxBytes) {continue;}
+            sparedBytes += entry.bytes; spared.add(entry);
+        }
+        const overBudget = (): boolean => {
+            let active = 0, retained = 0;
+            for (const entry of this.entries) {if (entry.active) {active += entry.bytes;} else {retained += entry.bytes;}}
+            return retained > Math.max(this.maxBytes - active, sparedBytes);
+        };
+        for (const entry of idle) {
             if (entry.active || (entry.slot && this.claimedSlots.has(entry.slot)) || !this.entries.has(entry)) {continue;}
-            if (this.entries.size <= this.maxEntries && bytes <= this.maxBytes) {break;}
-            try {await this.remove(entry); bytes -= entry.bytes;}
-            catch { /* Eviction cannot invalidate a newly admitted or concurrently reacquired lease. */ }
+            const crowded = this.entries.size > this.maxEntries;
+            if (!crowded && !overBudget()) {break;}
+            // The entry limit is firm; only byte pressure from active leases spares an entry.
+            if (!crowded && spared.has(entry)) {continue;}
+            // Eviction cannot invalidate a newly admitted or concurrently reacquired lease.
+            await this.tryRemove(entry);
         }
     }
 
@@ -428,15 +536,18 @@ export class PreparedOutputCache {
                     for (const name of await fs.readdir(owner.directory)) {
                         if (!directories.has(name)) {await removeOutput(path.join(owner.directory, name));}
                     }
-                    if (retained.length) {await owner.park(snapshot, { entries: retained.length, bytes: retained.reduce((sum, entry) => sum + entry.template.bytes, 0) });}
+                    if (retained.length) {await owner.park(snapshot, { entries: retained.length, bytes: retained.reduce((sum, entry) => sum + footprint(entry.template), 0) });}
                     else {await owner.dispose();}
                     this.entries.clear();
                     return;
-                } catch { /* Persistence is optional; a failed handoff removes the owned output below. */ }
+                } catch (error) {
+                    // Persistence is optional; a failed handoff removes the owned output below.
+                    this.log(`Prepared outputs could not be retained for the next session. ${String(error)}\n`);
+                }
             }
             const removed = await Promise.allSettled([...this.entries].map(entry => this.remove(entry)));
             const owners = await Promise.allSettled([Promise.resolve().then(async () => owner?.dispose())]);
-            const errors = [...removed, ...owners].filter((result): result is PromiseRejectedResult => result.status === 'rejected').map(result => result.reason);
+            const errors = [...removed, ...owners].filter((result): result is PromiseRejectedResult => result.status === 'rejected').map((result): unknown => result.reason);
             if (errors.length) {throw new AggregateError(errors, `Prepared output cleanup failed: ${errors.map(String).join('; ')}`);}
         })();
     }

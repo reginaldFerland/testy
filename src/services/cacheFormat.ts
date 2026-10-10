@@ -29,3 +29,7 @@ export function validTrace(value: unknown): value is StoredTrace {
                 });
         });
 }
+
+/** Bounds on what one restore loads; the oldest traces beyond them are discarded. */
+export interface CacheLimits { readonly maxTraces: number; readonly maxBytes: number; }
+export const defaultCacheLimits: CacheLimits = { maxTraces: 50_000, maxBytes: 256 * 1024 * 1024 };

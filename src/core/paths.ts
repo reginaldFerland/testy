@@ -1,37 +1,130 @@
 import * as path from 'node:path';
-import { realpathSync } from 'node:fs';
+import { lstatSync, readdirSync, realpathSync } from 'node:fs';
+import * as fsp from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { minimatch } from 'minimatch';
+import { Minimatch } from 'minimatch';
 
 export const defaultExcludes = [
     '**/bin/**', '**/obj/**', '**/TestResults/**', '**/node_modules/**', '**/.git/**',
     '**/.testy/**', '**/*.g.cs', '**/*.g.i.cs', '**/*.generated.cs', '**/*.designer.cs'
 ] as const;
 
-export function normalizePath(file: string): string {
+class TtlMap<T> {
+    private readonly entries = new Map<string, { readonly value: T; readonly expires: number }>();
+    constructor(private readonly limit: number, private readonly ttl: number) {}
+    get(key: string): T | undefined {
+        const entry = this.entries.get(key);
+        if (!entry) {return undefined;}
+        this.entries.delete(key);
+        if (entry.expires <= Date.now()) {return undefined;}
+        this.entries.set(key, entry); return entry.value;
+    }
+    set(key: string, value: T): void {
+        this.entries.delete(key);
+        this.entries.set(key, { value, expires: Date.now() + this.ttl });
+        if (this.entries.size > this.limit) {this.entries.delete(this.entries.keys().next().value!);}
+    }
+    clear(): void { this.entries.clear(); }
+}
+
+/** Directory realpaths only: leaf files are always resolved fresh, so created, deleted
+ * and retargeted files are seen immediately. The shared instance is bounded and expires.
+ * On macOS it also holds directory listings, used only to recover a leaf's on-disk case. */
+class DirectoryCache {
+    private readonly directories: TtlMap<string>;
+    private readonly listings: TtlMap<ReadonlyMap<string, string>>;
+    constructor(limit = Infinity, ttl = Infinity) {
+        this.directories = new TtlMap(limit, ttl); this.listings = new TtlMap(limit, ttl);
+    }
+    get(directory: string): string | undefined { return this.directories.get(directory); }
+    set(directory: string, real: string): void { this.directories.set(directory, real); }
+    listing(directory: string): ReadonlyMap<string, string> | undefined { return this.listings.get(directory); }
+    setListing(directory: string, names: ReadonlyMap<string, string>): void { this.listings.set(directory, names); }
+    clear(): void { this.directories.clear(); this.listings.clear(); }
+}
+
+/** Default APFS ignores case, so the exact name is looked up first (cached listing, then one
+ * fresh read for files created since) and only then mapped case-insensitively. */
+function onDiskName(cache: DirectoryCache, directory: string, name: string, names: readonly string[]): string {
+    const listing = new Map(names.map(entry => [entry.toLowerCase(), entry] as const));
+    cache.setListing(directory, listing);
+    return listing.get(name.toLowerCase()) ?? name;
+}
+
+const isListed = (cache: DirectoryCache, directory: string, name: string): boolean =>
+    cache.listing(directory)?.get(name.toLowerCase()) === name;
+
+const sharedDirectories = new DirectoryCache(4096, 2000);
+
+/** Drop shared directory resolutions, e.g. before a run that must observe new symlinks. */
+export function clearPathCache(): void { sharedDirectories.clear(); }
+
+function resolveDirectory(directory: string, cache: DirectoryCache): string {
+    const cached = cache.get(directory);
+    if (cached !== undefined) {return cached;}
+    try { const real = realpathSync.native(directory); cache.set(directory, real); return real; }
+    catch {
+        const parent = path.dirname(directory);
+        return parent === directory ? directory : path.join(resolveDirectory(parent, cache), path.basename(directory));
+    }
+}
+
+async function resolveDirectoryAsync(directory: string, cache: DirectoryCache): Promise<string> {
+    const cached = cache.get(directory);
+    if (cached !== undefined) {return cached;}
+    try { const real = await fsp.realpath(directory); cache.set(directory, real); return real; }
+    catch {
+        const parent = path.dirname(directory);
+        return parent === directory ? directory : path.join(await resolveDirectoryAsync(parent, cache), path.basename(directory));
+    }
+}
+
+function resolveLeaf(directory: string, name: string, cache: DirectoryCache): string {
+    const leaf = path.join(directory, name);
+    try {
+        if (lstatSync(leaf).isSymbolicLink()) {return realpathSync.native(leaf);}
+        if (process.platform !== 'darwin' || isListed(cache, directory, name)) {return leaf;}
+        return path.join(directory, onDiskName(cache, directory, name, readdirSync(directory)));
+    } catch { return leaf; }
+}
+
+async function resolveLeafAsync(directory: string, name: string, cache: DirectoryCache): Promise<string> {
+    const leaf = path.join(directory, name);
+    try {
+        if ((await fsp.lstat(leaf)).isSymbolicLink()) {return await fsp.realpath(leaf);}
+        if (process.platform !== 'darwin' || isListed(cache, directory, name)) {return leaf;}
+        return path.join(directory, onDiskName(cache, directory, name, await fsp.readdir(directory)));
+    } catch { return leaf; }
+}
+
+const canonicalSpelling = (resolved: string): string => {
+    const normalized = resolved.replace(/\\/g, '/');
+    return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+};
+
+function normalizeWith(file: string, cache: DirectoryCache): string {
     // PDBs and MSBuild may spell the same path through different symlink aliases
     // (notably /var and /private/var on macOS). Preserve that identity for new or
     // deleted files by resolving their nearest existing ancestor as well.
-    let parent = path.resolve(file);
-    const missing: string[] = [];
-    for (;;) {
-        try { parent = path.join(realpathSync.native(parent), ...missing); break; }
-        catch {
-            const next = path.dirname(parent);
-            if (next === parent) { parent = path.resolve(file); break; }
-            missing.unshift(path.basename(parent)); parent = next;
-        }
-    }
-    const normalized = parent.replace(/\\/g, '/');
-    return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+    const resolved = path.resolve(file), parent = path.dirname(resolved);
+    return canonicalSpelling(parent === resolved ? resolveDirectory(resolved, cache) : resolveLeaf(resolveDirectory(parent, cache), path.basename(resolved), cache));
+}
+
+export function normalizePath(file: string): string { return normalizeWith(file, sharedDirectories); }
+
+/** Same result as normalizePath without blocking the extension host on the filesystem. */
+export async function normalizePathAsync(file: string): Promise<string> {
+    const resolved = path.resolve(file), parent = path.dirname(resolved);
+    return canonicalSpelling(parent === resolved ? await resolveDirectoryAsync(resolved, sharedDirectories)
+        : await resolveLeafAsync(await resolveDirectoryAsync(parent, sharedDirectories), path.basename(resolved), sharedDirectories));
 }
 
 /** Scope this cache to one discovery/run so filesystem changes cannot outlive it. */
 export function pathNormalizer(): (file: string) => string {
-    const paths = new Map<string, string>();
+    const paths = new Map<string, string>(), directories = new DirectoryCache();
     return file => {
         let normalized = paths.get(file);
-        if (normalized === undefined) {normalized = normalizePath(file); paths.set(file, normalized);}
+        if (normalized === undefined) {normalized = normalizeWith(file, directories); paths.set(file, normalized);}
         return normalized;
     };
 }
@@ -41,10 +134,22 @@ export function isInside(file: string, folder: string): boolean {
     return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
 }
 
+const matchers = new Map<string, Minimatch>();
+function matcher(pattern: string): Minimatch {
+    let compiled = matchers.get(pattern);
+    if (!compiled) {
+        // Patterns come from settings, so the set is tiny; the bound only guards pathological churn.
+        if (matchers.size >= 512) {matchers.clear();}
+        compiled = new Minimatch(pattern, { dot: true, nocase: true }); matchers.set(pattern, compiled);
+    }
+    return compiled;
+}
+
 export function matchesPattern(file: string, pattern: string, roots: readonly string[] = []): boolean {
     const directory = /[/\\]$/.test(file);
     const candidates = [file, ...roots.filter(root => isInside(file, root)).map(root => path.relative(root, file) + (directory ? '/' : ''))];
-    return candidates.some(candidate => minimatch(candidate.replace(/\\/g, '/'), pattern, { dot: true, nocase: true }));
+    const compiled = matcher(pattern);
+    return candidates.some(candidate => compiled.match(candidate.replace(/\\/g, '/')));
 }
 
 export function isExcluded(file: string, excludes: readonly string[] = defaultExcludes, roots: readonly string[] = []): boolean {
@@ -96,7 +201,7 @@ export function testTargetKey(project: string, framework: string): string {
 }
 
 export function isConfigurationFile(file: string): boolean {
-    return /\.(csproj|sln|slnx|props|targets|runsettings|json|config|resx|editorconfig|globalconfig|ruleset)$/i.test(file);
+    return /\.(csproj|sln|slnx|slnf|props|targets|runsettings|json|config|resx|editorconfig|globalconfig|ruleset)$/i.test(file);
 }
 
 export function isCompilerConfiguration(file: string): boolean { return /\.(editorconfig|globalconfig|ruleset)$/i.test(file); }
@@ -111,3 +216,6 @@ export function sourceDirectories(files: readonly string[], directories: readonl
     for (const file of files) {(isInheritedConfiguration(file) ? configs : sources).add(path.dirname(file));}
     return directories.filter(directory => !configs.has(directory) || sources.has(directory));
 }
+
+/** Random UUIDs name extension-owned storage entries. */
+export const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

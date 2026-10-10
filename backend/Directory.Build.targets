@@ -1,0 +1,8 @@
+<Project>
+  <!-- Evaluated after each project body, so OutputType is known here. -->
+  <PropertyGroup Condition="'$(OutputType)' == 'Exe'">
+    <!-- Bundled tools run on whichever .NET 10+ runtime the user has. -->
+    <RollForward>Major</RollForward>
+    <UseAppHost>false</UseAppHost>
+  </PropertyGroup>
+</Project>

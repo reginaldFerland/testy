@@ -1,3 +1,4 @@
+// @ts-check
 const fs=require('node:fs/promises'),syncfs=require('node:fs'),path=require('node:path'),os=require('node:os'),vm=require('node:vm');
 const assert=require('node:assert/strict'),{createRequire}=require('node:module');
 const {CoverageReader}=require('../../out/services/coverageReader');
@@ -44,12 +45,12 @@ const {normalizePath}=require('../../out/core/paths');
   const elapsedMs=performance.now()-start;await session.dispose();durations.sort((a,b)=>a-b);
   console.log(JSON.stringify({kind:'runner-selection',projectCases:50000,testFiles:100,elapsedMs,medianFileMs:durations[50],maximumFileMs:durations.at(-1),scope:'actual run method with cached preparation and mocked MTP/output I/O'}));
 
-  const uiFile=path.resolve('out/extension.js'),uiRequire=createRequire(uiFile),uiExports={};let publications=0;
+  let publications=0;
   const vscode={Uri:{file:fsPath=>({fsPath})},FileCoverage:class {},window:{visibleTextEditors:[]}};
-  vm.runInNewContext(syncfs.readFileSync(uiFile,'utf8')+'\nexports.Testy=Testy;',{exports:uiExports,require:name=>name==='vscode'?vscode:name==='./configuration'?{}:uiRequire(name),Buffer,setTimeout,clearTimeout});
+  const coverageView=require('../unit/support/ui.cjs').loadUi({vscode}).CoverageView;
   const summaries=Array.from({length:5000},(_,i)=>({file:`/File${i}.cs`,stale:false,covered:1,total:1,lines:[{line:1,hits:1}]}));
-  const context={disposed:false,engine:{coverage:{summarize:()=>summaries},hashes:new Map()},productionSources:new Set(summaries.map(s=>s.file)),publishedCoverage:new Map(),details:new WeakMap(),activeRun:{addCoverage(){publications++;}},queueDecorations(){},updateStatus(){}};
-  start=performance.now();for(let i=0;i<100;i++)uiExports.Testy.prototype.publishCoverage.call(context);
+  const context={host:{disposed:false,activeRun:{addCoverage(){publications++;}},updateStatus(){}},engine:{coverage:{summarize:()=>summaries},hashes:new Map()},productionSources:new Set(summaries.map(s=>s.file)),owners:new Map(),items:new Map(),publishedCoverage:new Map(),details:new WeakMap(),queue(){}};
+  start=performance.now();for(let i=0;i<100;i++)coverageView.prototype.publish.call(context);
   assert.equal(publications,5000);
   console.log(JSON.stringify({kind:'coverage-publication',files:5000,callbacks:100,publications,elapsedMs:performance.now()-start,scope:'actual method with mocked VS Code API; excludes IPC'}));
  }finally{await reader.dispose();await fs.rm(root,{recursive:true,force:true});}

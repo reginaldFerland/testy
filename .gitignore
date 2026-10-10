@@ -10,3 +10,4 @@ backend/publish/
 .testy/
 
 .test-tools/
+.DS_Store

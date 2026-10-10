@@ -13,6 +13,8 @@ import { claimRunOutputs, RunOutputLease } from './runOutputs';
 import { RuntimeModule, RuntimeObservation } from './runtimeObservation';
 import { PreparedArtifact, PreparedArtifactLease, PreparedOutputCache, preparationToolIdentity } from './preparedOutputCache';
 import { windowsPreparationTools } from './preparationIdentity';
+import { stableEnvironment } from '../core/environment';
+import { nodeText } from '../core/testUpdates';
 
 export interface RunnerOptions extends ProcessOptions {
     readonly dotnet: string;
@@ -46,6 +48,8 @@ export interface RunnerOptions extends ProcessOptions {
     readonly onStarted?: (group: TestFile, id: string) => void;
     readonly onPrepared?: (project: string) => void;
     readonly onExpanded?: (groups: readonly TestFile[]) => void;
+    /** Attach a debugger to each test host before it runs. */
+    readonly debug?: (processId: number) => Promise<void>;
 }
 
 export async function discover(project: Project, options: RunnerOptions, discovered?: readonly TestNode[]): Promise<readonly TestFile[]> {
@@ -62,7 +66,7 @@ export async function discover(project: Project, options: RunnerOptions, discove
     options.signal?.throwIfAborted();
     for (let node of nodes) {
         if (!node['location.file'] && locations) {
-            const location = locations.get(`${node['location.type']}.${String(node['location.method'] ?? '').split('(')[0]}`);
+            const location = locations.get(`${nodeText(node, 'location.type')}.${nodeText(node, 'location.method').split('(')[0]}`);
             if (location && sources.has(location.file)) {node = { ...node, 'location.file': location.file, 'location.line-start': location.line };}
         }
         const test = convert(node), key = test.file ?? '';
@@ -78,16 +82,6 @@ export async function discover(project: Project, options: RunnerOptions, discove
     return groups;
 }
 
-/** Compatibility helper for callers that explicitly need a complete snapshot. */
-export async function sourceHashes(projects: readonly Project[]): Promise<ReadonlyMap<string, string>> {
-    const hashes = new Map<string, string>();
-    for (const file of new Set(projects.flatMap(project => [...project.sourceFiles]))) {
-        try { hashes.set(file, contentHash(await fs.readFile(file))); }
-        catch (error) {if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {throw error;}}
-    }
-    return hashes;
-}
-
 export function projectCoverageId(group: TestFile): string { return `project:${testFileId(group.project, group.framework)}`; }
 export interface FileRun {
     readonly results: readonly TestResult[];
@@ -100,6 +94,11 @@ interface Preparation {
     nodes: readonly TestNode[]; nativeById: ReadonlyMap<string, TestNode>;
     byKey: ReadonlyMap<string, readonly TestNode[]>; instrumented?: readonly string[]; groups?: readonly TestFile[]; runs: number;
     readonly lease?: PreparedArtifactLease;
+    /** An in-place coverage upgrade did not finish; the template must not be retained. */
+    interrupted?: { readonly error: unknown };
+    /** A collector using this instrumentation session was stopped or failed. Its
+     * session may retain partial state, so the template is not reused. */
+    collectorInterrupted?: boolean;
 }
 interface RunnerLane { readonly session: Promise<RunnerSession>; busy: boolean; }
 
@@ -188,12 +187,11 @@ export class RunnerSession {
     private lease?: Promise<RunOutputLease>;
     private disposed = false;
     private disposal?: Promise<void>;
-    private failed = false;
     private readonly toolContexts: Map<string, Promise<string>>;
     private readonly toolIdentities: Map<string, Promise<string>>;
     constructor(private readonly options: RunnerOptions) {
-        this.toolContexts = options.preparationTools ?? new Map();
-        this.toolIdentities = options.preparationToolIdentities ?? new Map();
+        this.toolContexts = options.preparationTools ?? new Map<string, Promise<string>>();
+        this.toolIdentities = options.preparationToolIdentities ?? new Map<string, Promise<string>>();
     }
 
     async discover(project: Project): Promise<readonly TestFile[]> {
@@ -204,7 +202,7 @@ export class RunnerSession {
         const pending = this.discoverProject(project);
         this.discoveries.set(key, pending);
         try {return await pending;}
-        catch (error) {this.failed = true; this.discoveries.delete(key); throw error;}
+        catch (error) {this.discoveries.delete(key); throw error;}
     }
 
     private async discoverProject(project: Project): Promise<readonly TestFile[]> {
@@ -289,7 +287,6 @@ export class RunnerSession {
         const pending = this.runInLane(groups, hashes, workerIndex);
         this.running.add(pending);
         try {return await pending;}
-        catch (error) {this.failed = true; throw error;}
         finally {this.running.delete(pending);}
     }
 
@@ -337,11 +334,10 @@ export class RunnerSession {
         }
         // Fallbacks and partial selections share canonical native IDs and output.
         // They must remain serial even when several pool workers request them.
+        // One failed batch does not reject its successors; each reports its own outcome.
         const previous = this.queues.get(key) ?? Promise.resolve();
         const execution = previous.then(() => this.execute(groups, hashes));
-        // Keep the rejection until every already-queued request has drained.
-        // Engine cancellation may arrive after this promise's next microtask.
-        const tail = execution.then(() => undefined);
+        const tail = execution.then(() => undefined, () => undefined);
         this.queues.set(key, tail);
         const clear = (): void => {if (this.queues.get(key) === tail) {this.queues.delete(key);}};
         void tail.then(clear, clear);
@@ -371,7 +367,13 @@ export class RunnerSession {
     private async execute(groups: readonly TestFile[], hashes: ReadonlyMap<string, string>): Promise<FileRun> {
         this.options.signal?.throwIfAborted();
         const initial = await this.prepare(groups[0]);
-        if (initial.coveragePending) {await this.prepareSelectedCoverage(groups[0], initial);}
+        // Later batches of a target whose template upgrade was interrupted fail
+        // fast; the template is in an unknown state until the next run.
+        if (initial.interrupted) {throw initial.interrupted.error;}
+        if (initial.coveragePending) {
+            try {await this.prepareSelectedCoverage(groups[0], initial);}
+            catch (error) {initial.interrupted = { error }; throw error;}
+        }
         const { preparation, selected, executedGroups, originals } = await this.resolve(groups);
         const group = groups[0], options = { ...this.options, cwd: path.dirname(group.project) };
         if (preparation.runs++) {await preparation.output.restore(options.signal);}
@@ -410,7 +412,9 @@ export class RunnerSession {
                     preparation.instrumented ?? [], options.env);
             } catch (error) {options.signal?.throwIfAborted(); options.output?.(`Runtime observation unavailable; retaining conservative dependencies. ${String(error)}\n`);}
         }
-        const nodes = await requestTests({
+        const collected = (work: Promise<readonly TestNode[]>): Promise<readonly TestNode[]> => preparation.coverage
+            ? work.catch(error => {preparation.collectorInterrupted = true; throw error;}) : work;
+        const nodes = await collected(requestTests({
             ...options, env: observation?.env ?? options.env, expectedTests: selected, assembly,
             args: ['--results-directory', path.join(preparation.root, `results-${preparation.runs}`), ...options.testArguments],
             wrapper: preparation.coverage ? {
@@ -423,7 +427,7 @@ export class RunnerSession {
                 if (node['execution-state'] === 'in-progress') {options.onStarted?.(item, node.uid);}
                 const result = testResult(node); if (result) {options.onResult?.(item, result, test);}
             }
-        }, 'run', completeProject ? undefined : selected);
+        }, 'run', completeProject ? undefined : selected));
         options.signal?.throwIfAborted();
         const results = nodes.map(originalNode).map(testResult).filter((result): result is TestResult => !!result);
         if (!results.length) {throw new Error(`No test results were received for ${group.file ?? group.project}.`);}
@@ -433,8 +437,7 @@ export class RunnerSession {
             try {
                 coverage.push(...await this.coverageReader.read(report, options.cwd, hashes, options.signal));
             } catch (error) {
-                options.signal?.throwIfAborted(); available = false;
-                this.failed = true;
+                options.signal?.throwIfAborted(); available = false; preparation.collectorInterrupted = true;
                 options.output?.(`Coverage unavailable for ${path.basename(group.project)}; test results are retained. ${String(error)}\n`);
             }
         }
@@ -471,13 +474,16 @@ export class RunnerSession {
             await Promise.allSettled([...this.running, ...this.discoveries.values(), ...this.preparations.values()]);
             const lanes = await Promise.allSettled([...this.lanes.values()].flatMap(lanes => lanes.map(lane => lane.session)));
             const actions = [() => this.coverageReader.dispose(), ...lanes.filter((lane): lane is PromiseFulfilledResult<RunnerSession> => lane.status === 'fulfilled')
+                // Cancelled or failed runs keep templates that were only discovered or
+                // whose executions completed: reacquiring a lease revalidates the
+                // template bytes. Interrupted upgrades and collector sessions are discarded.
                 .map(lane => () => lane.value.dispose()), ...[...this.prepared.values()].map(preparation => () => preparation.lease
-                ? preparation.lease.release(!this.failed && !this.options.signal?.aborted) : removeOutput(preparation.root))];
+                ? preparation.lease.release(!preparation.interrupted && !preparation.collectorInterrupted) : removeOutput(preparation.root))];
             // Every private owner must be released even if another owner's cleanup fails.
             const cleaned = await Promise.allSettled(actions.map(action => Promise.resolve().then(action)));
             this.prepared.clear();
             const outputs = await Promise.allSettled([Promise.resolve().then(() => this.outputLease?.dispose())]);
-            const errors = [...cleaned, ...outputs].filter((result): result is PromiseRejectedResult => result.status === 'rejected').map(result => result.reason);
+            const errors = [...cleaned, ...outputs].filter((result): result is PromiseRejectedResult => result.status === 'rejected').map((result): unknown => result.reason);
             if (errors.length) {throw new AggregateError(errors, `Test runner cleanup failed: ${errors.map(String).join('; ')}`);}
         })();
     }
@@ -487,7 +493,7 @@ export class RunnerSession {
     private async outputRoot(): Promise<string> {
         if (this.options.outputRoot) {return this.options.outputRoot;}
         if (!this.lease) {
-            this.lease = claimRunOutputs(this.options.storage, this.options.identity, this.options.signal);
+            this.lease = claimRunOutputs(this.options.storage, this.options.identity, this.options.signal, this.options.output);
         }
         try {this.outputLease = await this.lease; return this.outputLease.directory;}
         catch (error) {this.lease = undefined; throw error;}
@@ -598,8 +604,7 @@ export class RunnerSession {
 
     private preparationEnvironment(): NodeJS.ProcessEnv {
         const env = { ...process.env, ...this.options.env };
-        if (this.options.managedCoverageTool) {env.SHLVL = undefined; env.VSCODE_PID = undefined;}
-        return env;
+        return this.options.managedCoverageTool ? stableEnvironment(env) : env;
     }
 
     private async createArtifact(group: TestFile, source: string, root: string): Promise<PreparedArtifact> {
@@ -664,9 +669,4 @@ export class RunnerSession {
         }
         return { coverage, instrumented };
     }
-}
-
-export async function runTestFile(group: TestFile, hashes: ReadonlyMap<string, string>, options: RunnerOptions): Promise<FileRun> {
-    const session = new RunnerSession(options);
-    try {return await session.run([group], hashes);} finally {await session.dispose();}
 }

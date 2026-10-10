@@ -1,3 +1,4 @@
+// @ts-check
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const {mergeTestUpdate}=require('../../out/core/testUpdates');

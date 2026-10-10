@@ -5,6 +5,11 @@
         { "type": "npm", "script": "build:observer", "problemMatcher": "$msCompile" },
         { "type": "npm", "script": "build:process-host", "problemMatcher": "$msCompile" },
         { "type": "npm", "script": "watch", "problemMatcher": "$tsc-watch", "isBackground": true, "presentation": { "reveal": "never" } },
-        { "label": "Prepare extension", "dependsOrder": "sequence", "dependsOn": ["npm: build:analyzer", "npm: build:process-host", "npm: build:observer", "npm: watch"], "group": { "kind": "build", "isDefault": true }, "problemMatcher": [] }
+        {
+            "type": "npm", "script": "watch:bundle", "isBackground": true, "presentation": { "reveal": "never" },
+            "problemMatcher": { "owner": "esbuild", "fileLocation": "relative", "pattern": { "regexp": "^✘ \\[ERROR\\] (.+?):(\\d+):(\\d+): (.*)$", "file": 1, "line": 2, "column": 3, "message": 4 },
+                "background": { "activeBegins": true, "beginsPattern": "^\\[watch\\] build started", "endsPattern": "^\\[watch\\] build finished" } }
+        },
+        { "label": "Prepare extension", "dependsOrder": "sequence", "dependsOn": ["npm: build:analyzer", "npm: build:process-host", "npm: build:observer", "npm: watch", "npm: watch:bundle"], "group": { "kind": "build", "isDefault": true }, "problemMatcher": [] }
     ]
 }

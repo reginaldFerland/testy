@@ -1,12 +1,17 @@
 import { ChildProcess, spawn } from 'node:child_process';
-import * as path from 'node:path';
+import { helperPath, scriptPath } from './assets';
 import { randomUUID } from 'node:crypto';
 import { cleanupPosixOwner } from './posixProcesses';
 import { OutputTail } from '../core/outputTail';
+import { resolveOwnedCommand } from './executable';
 
 export class Cancelled extends Error {
     constructor() { super('Run cancelled'); this.name = 'AbortError'; }
 }
+
+/** Exit code and stderr prefix of Testy.ProcessHost's own failures (backend/Testy.ProcessHost/Program.cs). */
+const processHostFailure = 125;
+const processHostMarker = 'Testy could not own the process tree:';
 
 export interface ProcessResult {
     readonly code: number;
@@ -32,20 +37,32 @@ export interface OwnedProcess {
     stop(): void;
 }
 
+/** Variables that make every .NET process load code. The owner is itself a .NET
+ * process, so it receives them under another name and restores them for the
+ * command alone (see Testy.ProcessHost). */
+const ownerHidden = new Set(['DOTNET_STARTUP_HOOKS', 'TESTY_RUNTIME_OBSERVATION']);
+const ownerHiddenPrefix = 'TESTY_CHILD_ENV_';
+
+function hideFromOwner(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return Object.fromEntries(Object.entries(env).map(([name, value]) =>
+        ownerHidden.has(name.toUpperCase()) ? [ownerHiddenPrefix + name.toUpperCase(), value] : [name, value]));
+}
+
 /** Every subprocess tree has an owner. Never use global process-name cancellation. */
 export function startProcess(command: string, args: readonly string[], options: ProcessOptions): OwnedProcess {
     options.signal?.throwIfAborted();
     const windowsOwner = process.platform === 'win32' && options.cleanupDescendants !== false;
     const posixOwner = process.platform !== 'win32';
     const owner = randomUUID();
+    const started = Date.now();
     const env: NodeJS.ProcessEnv = { ...process.env, DOTNET_CLI_TELEMETRY_OPTOUT: '1', TESTINGPLATFORM_TELEMETRY_OPTOUT: '1', DOTNET_NOLOGO: '1', ...options.env, TESTY_PROCESS_OWNER: owner };
     const executable = windowsOwner ? options.dotnetHost ?? 'dotnet' : posixOwner ? process.execPath : command;
-    const arguments_ = windowsOwner ? [path.join(__dirname, '../../dist/processhost/Testy.ProcessHost.dll'), command, ...args]
-        : posixOwner ? [path.join(__dirname, 'posixOwner.js')] : [...args];
+    const arguments_ = windowsOwner ? [helperPath('processhost', 'Testy.ProcessHost.dll'), command, ...args]
+        : posixOwner ? [scriptPath('posixOwner')] : [...args];
     const child = spawn(executable, arguments_, {
         cwd: options.cwd, shell: false, detached: process.platform !== 'win32',
         windowsHide: true, stdio: [windowsOwner || posixOwner ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-        env: posixOwner ? { ...env, TESTY_PROCESS_OWNER: undefined, ELECTRON_RUN_AS_NODE: '1' } : env
+        env: posixOwner ? { ...env, TESTY_PROCESS_OWNER: undefined, ELECTRON_RUN_AS_NODE: '1' } : windowsOwner ? hideFromOwner(env) : env
     });
     let cancelled = false;
     let timedOut = false;
@@ -57,7 +74,7 @@ export function startProcess(command: string, args: readonly string[], options: 
     let posixCleanup: Promise<void> | undefined;
     const cleanPosix = (): void => {
         if (posixCleanup) {return;}
-        posixCleanup = cleanupPosixOwner(owner);
+        posixCleanup = cleanupPosixOwner(owner, started);
         void posixCleanup.catch(() => undefined); teardowns.push(posixCleanup);
     };
     let windowsKillStarted = false;
@@ -113,7 +130,7 @@ export function startProcess(command: string, args: readonly string[], options: 
             // exit 2 already completed cleanup in the supervisor.
             if (posixOwner && (signal || ((code === 1 || code === 127) && (cancelled || options.cleanupDescendants !== false)))) {cleanPosix();}
         });
-        child.once('close', async code => {
+        child.once('close', code => {
             closed = true;
             clearTimeout(timeout);
             // Kill any remaining descendants of our own detached process group
@@ -121,15 +138,21 @@ export function startProcess(command: string, args: readonly string[], options: 
             if (cancelled && !windowsOwner && !posixOwner) {killTree(true);}
             if (killTimer) {clearTimeout(killTimer);}
             options.signal?.removeEventListener('abort', stop);
-            let cleanupError: unknown;
-            try {await Promise.all(teardowns);} catch (error) {
-                cleanupError = error; options.output?.(`Process cleanup failed: ${String(error)}\n`);
-            }
+            void Promise.all(teardowns).then((): unknown => undefined, (error: unknown) => {
+                options.output?.(`Process cleanup failed: ${String(error)}\n`); return error;
+            }).then(cleanupError => settle(code, cleanupError), reject);
+        });
+        const settle = (code: number | null, cleanupError: unknown): void => {
             if (timedOut) {reject(new Error(`The command exceeded its time limit: ${command}`));}
             else if (cancelled) {reject(new Cancelled());}
-            else if (cleanupError) {reject(cleanupError);}
+            else if (cleanupError !== undefined) {reject(cleanupError instanceof Error ? cleanupError : new Error('Process cleanup failed.', { cause: cleanupError }));}
+            else if (windowsOwner && code === processHostFailure && stderr.text().includes(processHostMarker)) {
+                // The host never started the command; do not report this as the command's own failure.
+                const text = stderr.text();
+                reject(new Error(`Could not start ${command}: ${text.slice(text.indexOf(processHostMarker) + processHostMarker.length).trim()}`));
+            }
             else {resolve({ code: code ?? -1, stdout: stdout.text(), stderr: stderr.text() });}
-        });
+        };
     });
     options.signal?.addEventListener('abort', stop, { once: true });
     if (options.signal?.aborted) {stop();}
@@ -141,6 +164,12 @@ export function startProcess(command: string, args: readonly string[], options: 
 }
 
 export async function runProcess(command: string, args: readonly string[], options: ProcessOptions): Promise<ProcessResult> {
+    // startProcess is synchronous, so the Windows owner's bare host name is resolved from
+    // absolute PATH entries here; libuv would otherwise search the workspace first.
+    if (process.platform === 'win32' && options.cleanupDescendants !== false) {
+        const dotnetHost = await resolveOwnedCommand(options.dotnetHost ?? 'dotnet', options.env, options.cwd);
+        return startProcess(command, args, { ...options, dotnetHost }).done;
+    }
     return startProcess(command, args, options).done;
 }
 

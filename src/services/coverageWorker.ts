@@ -14,7 +14,7 @@ export interface CoverageResponse {
     readonly files?: readonly { readonly file: string; readonly values: Float64Array }[];
 }
 
-parentPort?.on('message', async (request: CoverageRequest) => {
+async function handle(request: CoverageRequest): Promise<void> {
     try {
         const xml = await fs.readFile(request.report, 'utf8');
         const parsed = parseCobertura(xml, request.cwd, new Set(request.allowedFiles));
@@ -25,8 +25,11 @@ parentPort?.on('message', async (request: CoverageRequest) => {
         });
         // Transfer compact buffers, rather than cloning hundreds of thousands
         // of line objects back onto the extension host in a single operation.
-        parentPort!.postMessage({ id: request.id, files } satisfies CoverageResponse, files.map(file => file.values.buffer as ArrayBuffer));
+        parentPort!.postMessage({ id: request.id, files } satisfies CoverageResponse, files.map(file => file.values.buffer));
     } catch (error) {
         parentPort!.postMessage({ id: request.id, error: error instanceof Error ? error.message : String(error) } satisfies CoverageResponse);
     }
-});
+}
+
+// handle() reports every failure back to the requester.
+parentPort?.on('message', (request: CoverageRequest) => {void handle(request);});

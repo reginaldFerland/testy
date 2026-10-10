@@ -1,0 +1,16 @@
+{
+	// Type-checks test files that opt in with `// @ts-check` against the
+	// declarations tsc emits to out/. Run `npm run typecheck:tests` after compiling.
+	"compilerOptions": {
+		"module": "Node16",
+		"target": "ES2022",
+		"lib": ["ES2022"],
+		"allowJs": true,
+		"resolveJsonModule": true,
+		"checkJs": false,
+		"noEmit": true,
+		"strict": false,
+		"types": ["node"]
+	},
+	"include": ["test/**/*.cjs"]
+}

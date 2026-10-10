@@ -143,6 +143,9 @@ test('Windows source analysis uses direct Path lookup and declines ambiguous own
  t.after(()=>io.rm(root,{recursive:true,force:true}));
  await io.mkdir(cwd);await io.mkdir(path.join(root,'host','fxr','10.0.0'),{recursive:true});await io.mkdir(path.join(root,'shared','Microsoft.NETCore.App','10.0.0'),{recursive:true});
  await io.writeFile(host,Buffer.from('4d5a01020304','hex'));await io.writeFile(analyzer,'analysis helper fixture');
+ // The helper loads Roslyn from an SDK beside the host.
+ await io.mkdir(path.join(root,'sdk','10.0.100','Roslyn','bincore'),{recursive:true});
+ for(const name of ['Microsoft.CodeAnalysis.dll','Microsoft.CodeAnalysis.CSharp.dll'])await io.writeFile(path.join(root,'sdk','10.0.100','Roslyn','bincore',name),'Roslyn fixture');
  await io.writeFile(analyzer.replace('.dll','.runtimeconfig.json'),JSON.stringify({runtimeOptions:{framework:{name:'Microsoft.NETCore.App',version:'10.0.0'}}}));
  // Identity-only fixture: fake native bytes are never executed. Preserve the
  // explicit decline tests for CLR/native injection in sourceAnalysisProvenance.

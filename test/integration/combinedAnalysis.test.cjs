@@ -2,6 +2,7 @@ const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const analysis=require('../../out/services/analysis'),processes=require('../../out/services/process');
+const {analyzerServers}=require('../../out/services/analyzerServer');
 const {TestEngine}=require('../../out/services/engine');
 const {normalizePath}=require('../../out/core/paths');
 
@@ -15,7 +16,11 @@ test('combined Roslyn analysis matches separate calls through alias additions, e
  const analyzer=path.resolve('dist/analyzer/Testy.Analysis.dll'),options={cwd:storage};
  const aliases=await analysis.sourceAliases('dotnet',analyzer,[source],storage,options);
  const expected=await analysis.sourceAnalyses('dotnet',analyzer,files,storage,options,aliases,4);
- const run=processes.runProcess,calls=[];processes.runProcess=async(...args)=>{calls.push(args);return run(...args);};t.after(()=>{processes.runProcess=run;});
+ // A request is one helper invocation, whether the long-lived analyzer or a one-shot process serves it.
+ const run=processes.runProcess,serve=analyzerServers.request,calls=[];
+ processes.runProcess=async(...args)=>{calls.push(args);return run(...args);};
+ analyzerServers.request=async(...args)=>{calls.push(args);return serve.apply(analyzerServers,args);};
+ t.after(()=>{processes.runProcess=run;analyzerServers.request=serve;});
  const initial=await analysis.sourceAnalysisBatch('dotnet',analyzer,[files[0]],storage,options,[],4,{sources:[source],allFiles:files});
  assert.equal(calls.length,1,'alias extraction and all declaration analysis share one process');
  assert.deepEqual(initial.aliases,aliases);assert.deepEqual(initial.analyses,expected);

@@ -1,29 +1,49 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { Project } from '../core/model';
-import { defaultExcludes, isExcluded, normalizePath, pathNormalizer, testTargetKey } from '../core/paths';
+import { defaultExcludes, isExcluded, matchesPattern, normalizePath, normalizePathAsync, pathNormalizer, testTargetKey } from '../core/paths';
+import { parseSolution } from '../core/solution';
 import { mapConcurrent } from '../core/concurrency';
 import { ProcessOptions, requireSuccess, runProcess } from './process';
 import { EvaluationInputs, evaluationInputs } from './projectEvaluationCache';
 
-export async function findProjects(roots: readonly string[], excludes: readonly string[] = defaultExcludes, signal?: AbortSignal, concurrency = 16): Promise<readonly string[]> {
+export async function findProjects(roots: readonly string[], excludes: readonly string[] = defaultExcludes, signal?: AbortSignal, concurrency = 16,
+    onSkipped?: (directory: string, error: Error) => void): Promise<readonly string[]> {
     const result = new Set<string>();
     const visited = new Set<string>();
     let pending = [...roots];
     while (pending.length) {
-        const directories = pending.filter(directory => {
-            const key = normalizePath(directory);
-            if (visited.has(key)) {return false;}
-            visited.add(key); return true;
+        // Keys are real paths, so symlink cycles and aliased directories are visited once.
+        const keys = await mapConcurrent(pending, concurrency, signal, directory => normalizePathAsync(directory));
+        const directories = pending.filter((_directory, index) => {
+            if (visited.has(keys[index])) {return false;}
+            visited.add(keys[index]); return true;
         });
         const next = await mapConcurrent(directories, concurrency, signal, async (directory, _index, workerSignal) => {
             const children: string[] = [];
-            for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+            let entries;
+            try {entries = await fs.readdir(directory, { withFileTypes: true });}
+            catch (error) {
+                // Unreadable directories (volumes owned by another user, races with
+                // deletion) cannot contain projects Testy could build anyway.
+                if (!roots.some(root => normalizePath(root) === normalizePath(directory))
+                    && ['EACCES', 'EPERM', 'ENOENT', 'ENOTDIR', 'ELOOP'].includes((error as NodeJS.ErrnoException).code ?? '')) {
+                    onSkipped?.(directory, error as Error); return children;
+                }
+                throw error;
+            }
+            for (const entry of entries) {
                 workerSignal.throwIfAborted();
                 const file = path.join(directory, entry.name);
-                if (isExcluded(entry.isDirectory() ? `${file}/` : file, excludes, roots)) {continue;}
-                if (entry.isDirectory()) {children.push(file);}
-                else if (entry.isFile() && entry.name.endsWith('.csproj')) {result.add(normalizePath(file));}
+                let directoryEntry = entry.isDirectory(), fileEntry = entry.isFile();
+                if (entry.isSymbolicLink?.()) {
+                    // A Dirent describes the link itself; follow it (broken links are skipped).
+                    try {const target = await fs.stat(file); directoryEntry = target.isDirectory(); fileEntry = target.isFile();}
+                    catch {continue;}
+                }
+                if (isExcluded(directoryEntry ? `${file}/` : file, excludes, roots)) {continue;}
+                if (directoryEntry) {children.push(file);}
+                else if (fileEntry && /\.csproj$/i.test(entry.name)) {result.add(await normalizePathAsync(file));}
             }
             return children;
         });
@@ -44,6 +64,37 @@ function sdkConfigurationCandidates(file: string): readonly string[] {
         if (parent === directory) {return files;}
         directory = parent;
     }
+}
+
+export interface EntryPointFilter {
+    /** A .sln, .slnx or .slnf whose projects limit the workspace entry points. */
+    readonly solution?: string;
+    readonly include?: readonly string[];
+    readonly exclude?: readonly string[];
+}
+
+/** Limit discovered entry points to a solution and include/exclude globs. Returns the
+ * files that define the filter too, so edits to them refresh the project structure. */
+export async function filterEntryPoints(found: readonly string[], filter: EntryPointFilter, roots: readonly string[], signal?: AbortSignal): Promise<{ readonly entryPoints: readonly string[]; readonly inputs: readonly string[] }> {
+    let entryPoints = found;
+    const inputs: string[] = [];
+    if (filter.solution) {
+        const solution = normalizePath(filter.solution);
+        inputs.push(solution);
+        let content: string;
+        try {content = await fs.readFile(solution, { encoding: 'utf8', signal });}
+        catch (error) {signal?.throwIfAborted(); throw new Error(`testy.solution could not be read: ${solution}. ${(error as Error).message}`);}
+        const listed = parseSolution(solution, content);
+        if (listed.solution) {inputs.push(normalizePath(listed.solution));}
+        const allowed = new Set(listed.projects.map(normalizePath));
+        entryPoints = entryPoints.filter(file => allowed.has(file));
+    }
+    if (filter.include?.length) {entryPoints = entryPoints.filter(file => filter.include!.some(pattern => matchesPattern(file, pattern, roots)));}
+    if (filter.exclude?.length) {entryPoints = entryPoints.filter(file => !filter.exclude!.some(pattern => matchesPattern(file, pattern, roots)));}
+    if (found.length && !entryPoints.length) {
+        throw new Error('testy.solution and testy.projects exclude every project in the workspace. Check those settings.');
+    }
+    return { entryPoints, inputs };
 }
 
 export function sdkConfigurationFiles(file: string): readonly string[] {
@@ -122,6 +173,15 @@ const xml = (value: string): string => value.replace(/&/g, '&amp;').replace(/"/g
 const escapeMsbuild = (value: string): string => value.replace(/[%;,"$@'()*?]/g, character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
 const parallelism = (value: number): number => Math.max(1, Number.isFinite(value) ? Math.trunc(value) : 1);
 
+/** A test project that Testy cannot run is kept in the graph so it still builds
+ * and its sources keep their ownership, but it is never discovered or executed. */
+export function unsupportedTestReason(project: Pick<Project, 'file' | 'framework' | 'isTestProject'> & { readonly isMtp?: boolean }): string | undefined {
+    if (!project.isTestProject) {return undefined;}
+    if (project.isMtp === false) {return `${path.basename(project.file)} (${project.framework}) uses VSTest; Testy requires Microsoft.Testing.Platform.`;}
+    if (Number(/^net(\d+)\./.exec(project.framework)?.[1] ?? 0) < 10) {return `${path.basename(project.file)} targets ${project.framework}; Testy requires .NET 10 or later.`;}
+    return undefined;
+}
+
 /** Evaluate shared dependencies once, retaining each entry point's exact snapshot.
  * All files must select the SDK used by options.cwd (see sdkContextGroups). */
 export async function evaluateProjects(dotnet: string, files: readonly string[], configuration: string, options: ProcessOptions, analyzer: string, concurrency = 1): Promise<ReadonlyMap<string, readonly Project[]>> {
@@ -131,8 +191,13 @@ export async function evaluateProjects(dotnet: string, files: readonly string[],
     try {
         const input = path.join(directory, 'input.json'), output = path.join(directory, 'output.json'), query = path.join(directory, 'query.proj');
         await fs.writeFile(input, JSON.stringify({ files: [...new Set(files)], configuration, concurrency: parallelism(concurrency) }));
-        await fs.writeFile(query, `<Project><UsingTask TaskName="Testy.Analysis.ProjectGraphTask" AssemblyFile="${xml(analyzer)}"/><Target Name="Inspect"><ProjectGraphTask RequestFile="${xml(input)}" OutputFile="${xml(output)}"/></Target></Project>`);
-        requireSuccess(await runProcess(dotnet, ['msbuild', query, '-nologo', '-target:Inspect', `-maxcpucount:${parallelism(concurrency)}`], { ...options, output: undefined }), `Inspecting ${files.length} project${files.length === 1 ? '' : 's'}`);
+        // Attribute values are expanded by MSBuild, so '%', '$(' and ';' in a path need escaping too.
+        const attribute = (value: string): string => xml(escapeMsbuild(value));
+        await fs.writeFile(query, `<Project><UsingTask TaskName="Testy.Analysis.ProjectGraphTask" AssemblyFile="${attribute(analyzer)}"/><Target Name="Inspect"><ProjectGraphTask RequestFile="${attribute(input)}" OutputFile="${attribute(output)}"/></Target></Project>`);
+        // The task DLL must not stay loaded in a reused node or MSBuild server,
+        // which would lock the extension's files and serve a stale task after updates.
+        requireSuccess(await runProcess(dotnet, ['msbuild', query, '-nologo', '-nodeReuse:false', '-target:Inspect', `-maxcpucount:${parallelism(concurrency)}`],
+            { ...options, output: undefined, env: { ...options.env, DOTNET_CLI_USE_MSBUILD_SERVER: '0', MSBUILDNOINPROCNODE: undefined } }), `Inspecting ${files.length} project${files.length === 1 ? '' : 's'}`);
         const graph = JSON.parse(await fs.readFile(output, { encoding: 'utf8', signal: options.signal })) as {
             projects: (Project & { isMtp: boolean })[];
             roots: { file: string; contexts: string[]; entryPoints: string[]; evaluation?: (string | EvaluationInputs)[] }[];
@@ -140,8 +205,7 @@ export async function evaluateProjects(dotnet: string, files: readonly string[],
         };
         const normalize = pathNormalizer();
         const projects = new Map(graph.projects.map(project => {
-            if (project.isTestProject && !project.isMtp) {throw new Error(`${path.basename(project.file)} uses VSTest. Testy requires a Microsoft.Testing.Platform test project.`);}
-            if (project.isTestProject && Number(/^net(\d+)\./.exec(project.framework)?.[1] ?? 0) < 10) {throw new Error(`${path.basename(project.file)} targets ${project.framework}. Testy requires test projects targeting .NET 10 or later.`);}
+            const unsupported = unsupportedTestReason(project);
             const paths = (files: readonly string[]): string[] => [...new Set(files.map(normalize))];
             const analysisFiles = paths(project.sourceFiles);
             const normalized: Project = { ...project, file: normalize(project.file), assembly: normalize(project.assembly), runner: 'mtp',
@@ -149,7 +213,8 @@ export async function evaluateProjects(dotnet: string, files: readonly string[],
                 sourceFiles: analysisFiles.filter(file => !isExcluded(file)),
                 inputs: paths([...project.inputs ?? [], ...sdkConfigurationCandidates(project.file)]).filter(file => !isExcluded(file)),
                 outputDirectories: paths(project.outputDirectories ?? []),
-                references: paths(project.references), binaryReferences: paths(project.binaryReferences ?? []) };
+                references: paths(project.references), binaryReferences: paths(project.binaryReferences ?? []),
+                ...unsupported ? { unsupported } : {} };
             return [contextId(normalized), normalized] as const;
         }));
         const result = new Map<string, readonly Project[]>();
@@ -268,6 +333,30 @@ function outputOverlap(): (left: string, right: string) => boolean {
     };
 }
 
+/** Proper ancestors of a normalized directory, nearest first. */
+function ancestors(directory: string): string[] {
+    const result: string[] = [];
+    for (let index = directory.lastIndexOf('/'); index > 0; index = directory.lastIndexOf('/', index - 1)) {result.push(directory.slice(0, index));}
+    return result;
+}
+
+/** Finds entries whose directory equals, contains, or lies inside a queried directory,
+ * in time proportional to path depth rather than the number of entries. */
+class DirectoryIndex<T> {
+    private readonly exact = new Map<string, T[]>();
+    private readonly below = new Map<string, T[]>();
+    add(directory: string, value: T): void {
+        const add = (map: Map<string, T[]>, key: string): void => {const values = map.get(key); if (values) {values.push(value);} else {map.set(key, [value]);}};
+        add(this.exact, directory);
+        for (const ancestor of ancestors(directory)) {add(this.below, ancestor);}
+    }
+    *overlapping(directory: string): Generator<T> {
+        yield* this.exact.get(directory) ?? [];
+        yield* this.below.get(directory) ?? [];
+        for (const ancestor of ancestors(directory)) {yield* this.exact.get(ancestor) ?? [];}
+    }
+}
+
 /** Freeze a test binary before another context can overwrite any part of its output. */
 export function buildSnapshotTargets(projects: readonly Project[], roots: readonly Project[] = buildRoots(projects)): ReadonlySet<string> {
     const contexts = buildContexts(projects);
@@ -281,7 +370,14 @@ export function buildSnapshotTargets(projects: readonly Project[], roots: readon
  * consumers across waves so snapshots remain valid and binary inputs stay stable. */
 export function buildWaves(projects: readonly Project[], roots: readonly Project[] = buildRoots(projects), sdkByFile?: ReadonlyMap<string, string>): readonly (readonly Project[])[] {
     const contexts = buildContexts(projects), byId = new Map(contexts.map(project => [contextId(project), project]));
-    const overlaps = outputOverlap();
+    const normalize = pathNormalizer(), directory = (value: string): string => normalize(value).replace(/\/$/, '');
+    const written = new Map<string, readonly string[]>();
+    const writes = (project: Project): readonly string[] => {
+        const id = contextId(project);
+        let directories = written.get(id);
+        if (!directories) {directories = [...new Set(outputDirectories(project).map(directory))]; written.set(id, directories);}
+        return directories;
+    };
     const byFile = new Map<string, Project[]>(), byAssembly = new Map<string, Project[]>();
     for (const project of contexts) {
         const files = byFile.get(project.file) ?? []; files.push(project); byFile.set(project.file, files);
@@ -298,29 +394,47 @@ export function buildWaves(projects: readonly Project[], roots: readonly Project
                 ? project.contextReferences.map(id => byId.get(id)).filter((node): node is Project => !!node)
                 : project.references.flatMap(file => byFile.get(file) ?? [])));
         }
-        return { root, writes: [...writes.values()], binaries, reads: [...binaries].map(assembly => path.dirname(assembly)) };
+        return { root, writes: [...writes.values()], binaries, reads: [...new Set([...binaries].map(assembly => directory(path.dirname(assembly))))] };
     });
+    const rootIndex = new Map(plans.map((plan, index) => [contextId(plan.root), index]));
+    // Index every plan's writes and reads once, then look up only overlapping entries.
+    interface Write { readonly plan: number; readonly context: string; }
+    const writesByDirectory = new DirectoryIndex<Write>(), readsByDirectory = new DirectoryIndex<number>();
+    const writesByFile = new Map<string, Write[]>();
+    plans.forEach((plan, index) => {
+        for (const project of plan.writes) {
+            const write = { plan: index, context: contextId(project) };
+            for (const output of writes(project)) {writesByDirectory.add(output, write);}
+            const files = writesByFile.get(project.file) ?? []; files.push(write); writesByFile.set(project.file, files);
+        }
+        for (const read of plan.reads) {readsByDirectory.add(read, index);}
+    });
+    const sameSdk = (left: number, right: number): boolean => !sdkByFile || (sdkByFile.has(plans[left].root.file) && sdkByFile.has(plans[right].root.file)
+        && sdkByFile.get(plans[left].root.file) === sdkByFile.get(plans[right].root.file));
     const predecessors = plans.map(() => new Set<number>());
-    for (let index = 0; index < plans.length; index++) {
-        const plan = plans[index];
+    const order = (left: number, right: number): void => {
+        if (left === right) {return;}
+        if (left < right) {predecessors[right].add(left);} else {predecessors[left].add(right);}
+    };
+    plans.forEach((plan, index) => {
         for (const assembly of plan.binaries) {
             const producers = byAssembly.get(assembly) ?? [], producer = producers.find(project => project.entryPoint) ?? producers[0];
             if (!producer) {continue;}
-            const dependency = plans.findIndex(candidate => contextId(candidate.root) === contextId(producer));
-            if (dependency !== -1 && dependency !== index) {predecessors[index].add(dependency);}
+            const dependency = rootIndex.get(contextId(producer));
+            if (dependency !== undefined && dependency !== index) {predecessors[index].add(dependency);}
         }
-        for (let earlier = 0; earlier < index; earlier++) {
-            const other = plans[earlier];
-            const sameSdk = !sdkByFile || (sdkByFile.has(plan.root.file) && sdkByFile.has(other.root.file)
-                && sdkByFile.get(plan.root.file) === sdkByFile.get(other.root.file));
-            const competingWrites = plan.writes.some(a => other.writes.some(b =>
-                !(sameSdk && contextId(a) === contextId(b)) && (a.file === b.file
-                    || outputDirectories(a).some(left => outputDirectories(b).some(right => overlaps(left, right))))));
-            const competingReads = plan.reads.some(read => other.writes.some(project => outputDirectories(project).some(write => overlaps(read, write))))
-                || other.reads.some(read => plan.writes.some(project => outputDirectories(project).some(write => overlaps(read, write))));
-            if (competingWrites || competingReads) {predecessors[index].add(earlier);}
+        for (const project of plan.writes) {
+            const context = contextId(project);
+            // The same exact context under the same SDK is one shared build, not a conflict.
+            const competing = (other: Write): boolean => other.plan !== index && !(sameSdk(index, other.plan) && other.context === context);
+            for (const other of writesByFile.get(project.file) ?? []) {if (competing(other)) {order(index, other.plan);}}
+            for (const output of writes(project)) {
+                for (const other of writesByDirectory.overlapping(output)) {if (competing(other)) {order(index, other.plan);}}
+                // A plan reading a binary output must not overlap a build that writes it.
+                for (const reader of readsByDirectory.overlapping(output)) {order(index, reader);}
+            }
         }
-    }
+    });
     const complete = new Set<number>(), result: Project[][] = [];
     while (complete.size !== roots.length) {
         const ready = plans.map((_plan, index) => index).filter(index => !complete.has(index) && [...predecessors[index]].every(dependency => complete.has(dependency)));
@@ -333,8 +447,12 @@ export function buildWaves(projects: readonly Project[], roots: readonly Project
 /** Compare the evaluated information for each physical project independent of
  * serialization order and its entry-point role in a particular snapshot. */
 function graphState(graph: readonly Project[]): ReadonlyMap<string, string> {
-    const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
-        : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => [key, canonical(value)])) : value;
+    const ordinal = (a: string, b: string): number => a < b ? -1 : a > b ? 1 : 0;
+    // Serialize each element once; sorting then compares cached keys, not fresh JSON.
+    const canonical = (value: unknown): unknown => Array.isArray(value)
+        ? value.map(item => { const canonicalItem = canonical(item); return { canonicalItem, key: JSON.stringify(canonicalItem) }; })
+            .sort((a, b) => ordinal(a.key, b.key)).map(item => item.canonicalItem)
+        : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => ordinal(a, b)).map(([key, value]) => [key, canonical(value)])) : value;
     const byFile = new Map<string, string[]>();
     for (const project of graph) {
         const records = byFile.get(project.file) ?? [];
@@ -388,9 +506,4 @@ export async function refreshProjectSnapshotBatches(
         }}
     }
     return next;
-}
-
-export function buildProperties(project: Project): string[] {
-    const escape = (value: string): string => value.replace(/[%;,"]/g, character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
-    return Object.entries(project.properties ?? {}).map(([key, value]) => `-property:${key}=${escape(value)}`);
 }

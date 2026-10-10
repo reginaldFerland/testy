@@ -6,11 +6,12 @@ import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { Project } from '../core/model';
 import type { EvaluationEntry, EvaluationInputs, EvaluationQuery } from './projectEvaluationCache';
 import { withLock } from './lock';
+import { syncDirectory } from './jsonWriter';
+import { uuidPattern as uuid } from '../core/paths';
 
 export interface EvaluationStorageLimits { readonly maxEntries?: number; readonly maxBytes?: number; }
 const maximumEntries = 128, maximumBytes = 32 * 1024 * 1024, maximumItems = 131072, maximumNodes = 4096;
 const filename = 'project-evaluations-v1.json';
-const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const hash = (value: string): string => createHash('sha256').update(value).digest('hex');
 const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.length <= 32768 && !value.includes('\0');
@@ -30,10 +31,12 @@ function limits(options: EvaluationStorageLimits): { maxEntries: number; maxByte
 
 function validProject(value: unknown, depth = 0): value is Project {
     if (depth > 8 || !record(value) || !fields(value, ['file', 'framework', 'assembly', 'assemblyName', 'assemblies', 'isTestProject', 'isMtp', 'runner',
-        'sourceFiles', 'analysisFiles', 'references', 'binaryReferences', 'outputDirectories', 'inputs', 'entryPoint', 'properties', 'contextId', 'contextReferences', 'contexts'])) {return false;}
+        'sourceFiles', 'analysisFiles', 'references', 'binaryReferences', 'outputDirectories', 'inputs', 'entryPoint', 'properties', 'contextId', 'contextReferences', 'contexts', 'unsupported'])) {return false;}
     return absolute(value.file) && text(value.framework) && absolute(value.assembly) && value.runner === 'mtp'
-        && typeof value.isTestProject === 'boolean' && (!value.isTestProject || Number(/^net(\d+)\./.exec(value.framework)?.[1] ?? 0) >= 10)
-        && optional(value.isMtp, item => typeof item === 'boolean' && (!value.isTestProject || item))
+        && typeof value.isTestProject === 'boolean' && optional(value.unsupported, text)
+        // Unsupported test projects are retained with a reason; any other test project must be runnable.
+        && (!value.isTestProject || value.unsupported !== undefined || Number(/^net(\d+)\./.exec(value.framework)?.[1] ?? 0) >= 10)
+        && optional(value.isMtp, item => typeof item === 'boolean' && (!value.isTestProject || value.unsupported !== undefined || item))
         && optional(value.assemblyName, text) && array(value.sourceFiles, absolute) && array(value.references, absolute)
         && ['assemblies', 'analysisFiles', 'binaryReferences', 'outputDirectories', 'inputs'].every(key => optional(value[key], item => array(item, absolute)))
         && optional(value.entryPoint, item => typeof item === 'boolean') && optional(value.properties, strings)
@@ -181,7 +184,11 @@ export async function writeEvaluationSnapshot(storage: string, entries: Readonly
         }
         try {
             await fs.writeFile(temporary, contents, { flag: 'wx', mode: 0o600, signal });
+            // The bytes must be durable before the rename can make them the snapshot.
+            const handle = await fs.open(temporary, 'r+');
+            try {await handle.sync();} finally {await handle.close();}
             signal?.throwIfAborted(); await fs.rename(temporary, file);
+            await syncDirectory(storage);
         } finally {await fs.unlink(temporary).catch(() => undefined);}
     });
 }

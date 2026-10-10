@@ -18,6 +18,9 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
     [Required] public string RequestFile { get; set; } = "";
     [Required] public string OutputFile { get; set; } = "";
 
+    // MSBuild values keep the backslashes of the project's authoring platform.
+    private static string FullPath(string value, string directory) => Path.GetFullPath(value.Replace('\\', Path.DirectorySeparatorChar), directory);
+
     public override bool Execute()
     {
         try
@@ -26,7 +29,7 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
             var files = request.RootElement.TryGetProperty("files", out var entries)
                 ? entries.Deserialize<string[]>()! : [request.RootElement.GetProperty("file").GetString()!];
             var configuration = request.RootElement.GetProperty("configuration").GetString()!;
-            var concurrency = request.RootElement.TryGetProperty("concurrency", out var workers) ? Math.Max(1, workers.GetInt32()) : 1;
+            var concurrency = request.RootElement.TryGetProperty("concurrency", out var workers) ? Math.Clamp(workers.GetInt32(), 1, Environment.ProcessorCount) : 1;
             var inputs = new ConcurrentDictionary<ProjectInstance, string[]>();
             var evaluationInputs = new ConcurrentDictionary<ProjectInstance, EvaluationInputs.Snapshot>();
             var sharedInputs = new EvaluationInputs.Shared();
@@ -34,14 +37,25 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
             var entryPoints = files.Select(file => new ProjectGraphEntryPoint(file, new Dictionary<string, string> { ["Configuration"] = configuration }));
             var graph = new ProjectGraph(entryPoints, collection, (projectFile, properties, projects) =>
             {
+                // Each project gets its own context because the file system facade
+                // records the inputs of exactly one evaluation for reuse validation.
+                // A context shared across projects would also share MSBuild's glob
+                // expansion cache, hiding enumerations (for example a glob in a
+                // common Directory.Build.props) from every later project's record.
+                // Resolver state is fingerprinted once via sharedInputs, and parsed
+                // import XML is still shared through the ProjectCollection.
                 var fileSystem = new EvaluationInputs(sharedInputs);
                 var project = Project.FromFile(projectFile, new ProjectOptions { GlobalProperties = properties, ProjectCollection = projects,
                     EvaluationContext = EvaluationContext.Create(EvaluationContext.SharingPolicy.Shared, fileSystem) });
                 var instance = project.CreateProjectInstance();
                 try { evaluationInputs[instance] = fileSystem.Complete(project); }
-                catch (Exception error) { evaluationInputs[instance] = new(false, [], new Dictionary<string, string>(), [], [], "", error.Message); }
+                catch (Exception error) { evaluationInputs[instance] = new(false, [], new Dictionary<string, string>(), [], [], "", $"{error.GetType().Name}: {error.Message}"); }
                 inputs[instance] = project.Imports.Select(import => import.ImportedProject.FullPath)
                     .Concat(new[] { project.FullPath }).Distinct().ToArray();
+                // The graph only needs the immutable instance. Unloading keeps the
+                // collection from retaining every evaluated Project for the task's
+                // lifetime; parsed import XML stays cached for other projects.
+                projects.UnloadProject(project);
                 return instance;
             }, concurrency, CancellationToken.None);
             static IEnumerable<ProjectGraphNode> Targets(ProjectGraphNode node) => string.IsNullOrEmpty(node.ProjectInstance.GetPropertyValue("TargetFramework"))
@@ -76,33 +90,34 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
                     }
                     compilerConfigs.Add(Path.Combine(project.Directory, ".globalconfig"));
                     var ruleSet = project.GetPropertyValue("CodeAnalysisRuleSet");
-                    if (!string.IsNullOrWhiteSpace(ruleSet)) { compilerConfigs.Add(Path.GetFullPath(ruleSet, project.Directory)); }
+                    if (!string.IsNullOrWhiteSpace(ruleSet)) { compilerConfigs.Add(FullPath(ruleSet, project.Directory)); }
                     return new
                     {
                         file = project.FullPath,
                         framework = project.GetPropertyValue("TargetFramework"),
                         assembly = project.GetPropertyValue("TargetPath"),
                         assemblyName = project.GetPropertyValue("AssemblyName"),
-                        outputDirectories = new[] { "TargetDir", "OutputPath", "IntermediateOutputPath", "BaseIntermediateOutputPath", "MSBuildProjectExtensionsPath" }
+                        outputDirectories = EvaluationInputs.OutputProperties
                             .Select(project.GetPropertyValue).Where(value => !string.IsNullOrWhiteSpace(value))
-                            .Select(value => Path.GetFullPath(value, project.Directory))
-                            .Append(Path.GetDirectoryName(project.GetPropertyValue("TargetPath")) ?? project.Directory).Distinct().ToArray(),
+                            .Select(value => Path.TrimEndingDirectorySeparator(FullPath(value, project.Directory)))
+                            .Append(Path.GetDirectoryName(project.GetPropertyValue("TargetPath")) ?? project.Directory).Distinct().Order(StringComparer.Ordinal).ToArray(),
                         isTestProject = project.GetPropertyValue("IsTestProject").Equals("true", StringComparison.OrdinalIgnoreCase)
                             || project.GetPropertyValue("IsTestingPlatformApplication").Equals("true", StringComparison.OrdinalIgnoreCase),
                         isMtp = project.GetPropertyValue("IsTestingPlatformApplication").Equals("true", StringComparison.OrdinalIgnoreCase),
                         properties = project.GlobalProperties,
                         contextId = identities[node],
-                        contextReferences = node.ProjectReferences.SelectMany(Targets).Select(reference => identities[reference]).Distinct().ToArray(),
+                        contextReferences = node.ProjectReferences.SelectMany(Targets).Select(reference => identities[reference]).Distinct().Order(StringComparer.Ordinal).ToArray(),
                         sourceFiles = Items("Compile"),
                         inputs = inputs[project].Concat(Items("Content")).Concat(Items("None")).Concat(Items("EmbeddedResource"))
                             .Concat(Items("AdditionalFiles")).Concat(Items("EditorConfigFiles")).Concat(Items("GlobalAnalyzerConfigFiles"))
                             .Concat(Items("AnalyzerConfigFiles")).Concat(compilerConfigs)
-                            .Where(input => !input.StartsWith(project.GetPropertyValue("MSBuildToolsPath") + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)).Distinct().ToArray(),
-                        references = node.ProjectReferences.Select(reference => reference.ProjectInstance.FullPath).Where(reference => reference != project.FullPath).Distinct().ToArray(),
+                            .Where(input => !input.StartsWith(project.GetPropertyValue("MSBuildToolsPath") + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                            .Distinct().Order(StringComparer.Ordinal).ToArray(),
+                        references = node.ProjectReferences.Select(reference => reference.ProjectInstance.FullPath).Where(reference => reference != project.FullPath).Distinct().Order(StringComparer.Ordinal).ToArray(),
                         binaryReferences = project.GetItems("Reference").Select(item => item.GetMetadataValue("HintPath"))
-                            .Where(value => value.Length > 0).Select(value => Path.GetFullPath(value, project.Directory)).Distinct().ToArray()
+                            .Where(value => value.Length > 0).Select(value => FullPath(value, project.Directory)).Distinct().Order(StringComparer.Ordinal).ToArray()
                     };
-                }).ToArray();
+                }).OrderBy(project => project.contextId, StringComparer.Ordinal).ToArray();
             var comparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
             var roots = files.Distinct(comparer).Select(file =>
             {
@@ -118,18 +133,19 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
                 {
                     file = Path.GetFullPath(file),
                     contexts = reachable.Where(node => !string.IsNullOrEmpty(node.ProjectInstance.GetPropertyValue("TargetFramework")))
-                        .Select(node => identities[node]).Order().ToArray(),
-                    entryPoints = entryNodes.SelectMany(Targets).Select(node => identities[node]).Distinct().Order().ToArray(),
-                    evaluation = reachable.Select(node => identities[node]).ToArray()
+                        .Select(node => identities[node]).Order(StringComparer.Ordinal).ToArray(),
+                    entryPoints = entryNodes.SelectMany(Targets).Select(node => identities[node]).Distinct().Order(StringComparer.Ordinal).ToArray(),
+                    evaluation = reachable.Select(node => identities[node]).Order(StringComparer.Ordinal).ToArray()
                 };
             }).ToArray();
-            var evaluations = graph.ProjectNodes.ToDictionary(node => identities[node], node => evaluationInputs[node.ProjectInstance]);
+            var evaluations = graph.ProjectNodes.OrderBy(node => identities[node], StringComparer.Ordinal)
+                .ToDictionary(node => identities[node], node => evaluationInputs[node.ProjectInstance]);
             File.WriteAllText(OutputFile, JsonSerializer.Serialize(new { projects, roots, evaluations }));
             return true;
         }
         catch (Exception error)
         {
-            Log.LogErrorFromException(error, showStackTrace: false);
+            Log.LogErrorFromException(error, showStackTrace: true);
             return false;
         }
     }

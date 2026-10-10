@@ -1,4 +1,4 @@
-import * as path from 'node:path';
+import { scriptPath } from './assets';
 import { Worker } from 'node:worker_threads';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { CoveredLine, FileCoverage } from '../core/model';
@@ -11,47 +11,66 @@ interface Pending {
     readonly reject: (error: Error) => void;
 }
 
-/** A run reuses one parser worker; cancellation terminates its synchronous work. */
+/** A run reuses one parser worker. Cancelling a read drops only that request; the
+ * worker, which parses synchronously, is terminated once nothing else awaits it. */
 export class CoverageReader {
     private worker: Worker | undefined;
+    private disposed = false;
     private readonly pending = new Map<number, Pending>();
     private sequence = 0;
 
     async read(report: string, cwd: string, hashes: ReadonlyMap<string, string>, signal?: AbortSignal): Promise<readonly FileCoverage[]> {
         signal?.throwIfAborted();
+        if (this.disposed) {throw new Cancelled();}
         const worker = this.worker ?? this.start(), id = ++this.sequence;
-        const abort = (): void => {this.fail(worker, new Cancelled()); void worker.terminate();};
-        signal?.addEventListener('abort', abort, { once: true });
+        let abort = (): void => {};
+        let response: CoverageResponse;
         try {
-            const response = await new Promise<CoverageResponse>((resolve, reject) => {
-                this.pending.set(id, { worker, resolve, reject });
+            response = await new Promise<CoverageResponse>((resolve, reject) => {
+                const entry: Pending = { worker, resolve, reject };
+                // A late reply finds no entry and is ignored.
+                abort = (): void => {
+                    if (this.pending.get(id) !== entry) {return;}
+                    this.pending.delete(id); reject(new Cancelled()); this.retire(worker);
+                };
+                this.pending.set(id, entry);
+                signal?.addEventListener('abort', abort, { once: true });
                 worker.postMessage({ id, report, cwd, allowedFiles: [...hashes.keys()] } satisfies CoverageRequest);
             });
-            if (response.error) {throw new Error(response.error);}
-            const files: FileCoverage[] = [];
-            let converted = 0;
-            for (const file of response.files ?? []) {
-                const lines: CoveredLine[] = [];
-                for (let index = 0; index < file.values.length; index += 2) {
-                    if (++converted % 4096 === 0) {await yieldTurn(); signal?.throwIfAborted();}
-                    lines.push({ line: file.values[index], hits: file.values[index + 1] });
-                }
-                files.push({ file: file.file, hash: hashes.get(file.file)!, lines });
-            }
-            signal?.throwIfAborted();
-            return files;
         } finally {
+            // Conversion below observes the signal itself and must not stop a shared worker.
             this.pending.delete(id); signal?.removeEventListener('abort', abort);
         }
+        if (response.error) {throw new Error(response.error);}
+        const files: FileCoverage[] = [];
+        let converted = 0;
+        for (const file of response.files ?? []) {
+            const lines: CoveredLine[] = [];
+            for (let index = 0; index < file.values.length; index += 2) {
+                if (++converted % 4096 === 0) {await yieldTurn(); signal?.throwIfAborted();}
+                lines.push({ line: file.values[index], hits: file.values[index + 1] });
+            }
+            files.push({ file: file.file, hash: hashes.get(file.file)!, lines });
+        }
+        signal?.throwIfAborted();
+        return files;
     }
 
     async dispose(): Promise<void> {
+        this.disposed = true;
         const worker = this.worker;
         if (worker) {this.fail(worker, new Cancelled()); await worker.terminate();}
     }
 
+    /** Stop a worker that no remaining request is waiting on. */
+    private retire(worker: Worker): void {
+        for (const pending of this.pending.values()) {if (pending.worker === worker) {return;}}
+        if (this.worker === worker) {this.worker = undefined;}
+        void worker.terminate();
+    }
+
     private start(): Worker {
-        const worker = new Worker(path.join(__dirname, 'coverageWorker.js'));
+        const worker = new Worker(scriptPath('coverageWorker'));
         this.worker = worker;
         worker.on('message', (response: CoverageResponse) => this.pending.get(response.id)?.resolve(response));
         worker.on('error', error => this.fail(worker, error));

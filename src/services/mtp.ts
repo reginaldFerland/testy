@@ -3,8 +3,10 @@ import { randomUUID } from 'node:crypto';
 import { createMessageConnection, MessageConnection, StreamMessageReader, StreamMessageWriter } from 'vscode-jsonrpc/node';
 import { DiscoveredTest, TestResult } from '../core/model';
 import { normalizePath, pathNormalizer } from '../core/paths';
-import { mergeTestUpdate, TestNode } from '../core/testUpdates';
-import { OwnedProcess, ProcessOptions, startProcess } from './process';
+import { nodeTraits } from '../core/traits';
+import { mergeTestUpdate, nodeName, nodeText, TestNode } from '../core/testUpdates';
+import { OwnedProcess, ProcessOptions, ProcessResult, startProcess } from './process';
+import { resolveOwnedCommand } from './executable';
 
 export type { TestNode } from '../core/testUpdates';
 interface TestUpdates { readonly runId: string; readonly changes: readonly { readonly node: TestNode }[] | null; }
@@ -18,6 +20,57 @@ export interface MtpOptions extends ProcessOptions {
     readonly wrapper?: { readonly command: string; readonly args: readonly string[] };
     readonly onNode?: (node: TestNode) => void;
     readonly expectedTests?: readonly TestNode[];
+    /** Run under a debugger: the host waits until this attaches to the reported process. */
+    readonly debug?: (processId: number) => Promise<void>;
+}
+
+/** After a complete result stream, how long the host may take to exit. A coverage
+ * collector writes its report after the host exits, so it receives longer. */
+export const mtpTiming = { exitGraceMs: 10_000, wrappedExitGraceMs: 120_000,
+    /** How long the host may take to connect; a collector's cold start is slower. Never beyond the process timeout. */
+    connectMs: 30_000, wrappedConnectMs: 120_000,
+    /** How long a host waiting for a debugger may take to report its process ID. */
+    attachMs: 60_000 };
+
+/** MTP's exit code when no test matched the request, e.g. because the selected IDs no longer exist. */
+const zeroTestsRan = 8;
+
+/** The exit result, or undefined after stopping a process that did not exit in time. */
+async function exitWithin(owned: OwnedProcess, graceMs: number): Promise<ProcessResult | undefined> {
+    let timer: NodeJS.Timeout | undefined;
+    const expired = new Promise<undefined>(resolve => {timer = setTimeout(() => resolve(undefined), graceMs);});
+    try {
+        const result = await Promise.race([owned.done, expired]);
+        if (result) {return result;}
+    } finally {clearTimeout(timer);}
+    owned.stop();
+    await owned.done.catch(() => undefined);
+    return undefined;
+}
+
+/** MTP prints the waiting process's ID when TESTINGPLATFORM_WAIT_ATTACH_DEBUGGER=1.
+ * The spawned process may be an owner or wrapper, so its own PID is not the host's.
+ * Never resolves: a failed attach rejects, and a successful one lets the host connect. */
+function attachWhenWaiting(owned: OwnedProcess, attach: (processId: number) => Promise<void>): Promise<never> {
+    return new Promise<never>((_resolve, reject) => {
+        let text = '';
+        // Only the wait for the ID is bounded; once a debugger attaches, the user sets the pace.
+        const timer = setTimeout(() => {
+            owned.child.stdout?.off('data', listener);
+            reject(new Error(`The test application did not report a process ID for the debugger within ${Math.round(mtpTiming.attachMs / 1000)} seconds.`));
+        }, mtpTiming.attachMs);
+        const stop = (): void => clearTimeout(timer);
+        function listener(chunk: Buffer | string): void {
+            text = (text + chunk.toString()).slice(-4096);
+            const match = /Process\s*Id\s*[:=]\s*(\d+)/i.exec(text);
+            if (!match) {return;}
+            stop();
+            owned.child.stdout?.off('data', listener);
+            attach(Number(match[1])).catch(reject);
+        }
+        owned.child.stdout?.on('data', listener);
+        owned.done.then(stop, stop);
+    });
 }
 
 /** MTP's IDE protocol, transported over a loopback socket using Content-Length framing. */
@@ -29,16 +82,34 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
     let process: OwnedProcess | undefined;
     let connectionTimer: NodeJS.Timeout | undefined;
     let closeTimer: NodeJS.Timeout | undefined;
+    let lingering = false;
     try {
         await new Promise<void>((resolve, reject) => {
             server.once('error', reject);
             server.listen(0, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); });
         });
         const port = (server.address() as net.AddressInfo).port;
+        // MTP's protocol has no handshake secret: the client port is the only
+        // rendezvous, so a local process could connect first and impersonate the
+        // test host. The real host always connects exactly once, so any second
+        // connection means one of them was not ours and the results are discarded.
+        const debugging = operation === 'run' ? options.debug : undefined;
+        let rejectIntrusion: (error: Error) => void = () => undefined;
+        const intrusion = new Promise<never>((_resolve, reject) => {rejectIntrusion = reject;});
+        void intrusion.catch(() => undefined);
         const connected = new Promise<net.Socket>((resolve, reject) => {
-            connectionTimer = setTimeout(() => reject(new Error('The test application did not connect to Testy. Use a .NET 10+ Microsoft.Testing.Platform project.')), 30_000);
+            // A debugged host connects only after the debugger attaches. A coverage
+            // collector's cold start is slower, but nothing outlives the process timeout.
+            if (!debugging) {
+                const limit = Math.min(options.wrapper ? mtpTiming.wrappedConnectMs : mtpTiming.connectMs, options.timeoutMs ?? 600_000);
+                connectionTimer = setTimeout(() => reject(new Error('The test application did not connect to Testy. Use a .NET 10+ Microsoft.Testing.Platform project.')), limit);
+            }
             server.on('connection', candidate => {
-                if (socket) { candidate.destroy(); return; }
+                if (socket) {
+                    candidate.destroy();
+                    rejectIntrusion(new Error('Another local process connected to the test port; the results of this test run were discarded.'));
+                    return;
+                }
                 socket = candidate;
                 clearTimeout(connectionTimer);
                 resolve(candidate);
@@ -46,12 +117,18 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
             server.once('error', reject);
         });
         const args = [options.assembly, '--server', '--client-port', String(port), ...options.args ?? []];
-        const ownedOptions = { ...options, cleanupDescendants: true };
-        process = options.wrapper
-            ? startProcess(options.wrapper.command, [...options.wrapper.args, options.dotnet, ...args], ownedOptions)
-            : startProcess(options.dotnet, args, ownedOptions);
+        const ownedOptions = { ...options, cleanupDescendants: true, env: debugging ? { ...options.env, TESTINGPLATFORM_WAIT_ATTACH_DEBUGGER: '1' } : options.env };
+        // The Windows owner must not search the workspace for a bare command name.
+        const dotnet = await resolveOwnedCommand(options.dotnet, ownedOptions.env, options.cwd);
+        const wrapper = options.wrapper && await resolveOwnedCommand(options.wrapper.command, ownedOptions.env, options.cwd);
+        const hostOptions = { ...ownedOptions, dotnetHost: await resolveOwnedCommand(options.dotnetHost ?? 'dotnet', ownedOptions.env, options.cwd) };
+        process = wrapper
+            ? startProcess(wrapper, [...options.wrapper.args, dotnet, ...args], hostOptions)
+            : startProcess(dotnet, args, hostOptions);
+        const attached = debugging ? attachWhenWaiting(process, debugging) : new Promise<never>(() => undefined);
+        void attached.catch(() => undefined);
         const peer = await Promise.race([
-            connected,
+            connected, intrusion, attached,
             process.done.then(result => { throw new Error(`The test application exited before connecting (exit ${result.code}).\n${result.stderr || result.stdout}`); })
         ]);
         // Some MTP server versions count incoming JSON characters as bytes.
@@ -59,8 +136,8 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
         // unambiguous for both those peers and conforming UTF-8 readers.
         const writer = new StreamMessageWriter(peer, { contentTypeEncoder: {
             name: 'application/json',
-            encode: async message => Buffer.from(JSON.stringify(message).replace(/[\u007f-\uffff]/g,
-                character => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`), 'utf8')
+            encode: message => Promise.resolve(Buffer.from(JSON.stringify(message).replace(/[\u007f-\uffff]/g,
+                character => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`), 'utf8'))
         } });
         rpc = createMessageConnection(new StreamMessageReader(peer), writer);
         // Closing a transport does not itself reject vscode-jsonrpc's pending
@@ -72,7 +149,7 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
             throw new Error(`The test application exited during ${operation} (exit ${result.code}).\n${result.stderr || result.stdout}`);
         });
         void exited.catch(() => undefined);
-        const request = <T>(method: string, parameters: object): Promise<T> => Promise.race([rpc!.sendRequest<T>(method, parameters), exited]);
+        const request = <T>(method: string, parameters: object): Promise<T> => Promise.race([rpc!.sendRequest<T>(method, parameters), exited, intrusion]);
         const nodes = new Map<string, TestNode>();
         const pendingOutput = new Map<string, { stdout: string[]; stderr: string[] }>();
         const runId = randomUUID();
@@ -112,24 +189,32 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
         await request(operation === 'discover' ? 'testing/discoverTests' : 'testing/runTests', { runId, ...(tests ? { tests } : {}) });
         if (!completed) {throw new Error('The test runner ended without a complete test update stream.');}
         await rpc.sendNotification('exit', {});
-        const result = await process.done;
-        if (result.code !== 0 && (operation === 'discover' || result.code !== 2)) {throw new Error(`The test application failed during ${operation} (exit ${result.code}).\n${result.stderr || result.stdout}`);}
+        // Every result has arrived. A host kept alive by a lingering foreground
+        // thread must not hold the batch until the run timeout and lose them.
+        const result = await Promise.race([exitWithin(process, options.wrapper ? mtpTiming.wrappedExitGraceMs : mtpTiming.exitGraceMs), intrusion]);
+        if (!result) {
+            lingering = true;
+            options.output?.(`The test application did not exit after completing ${operation}; it was stopped and its results were kept.\n`);
+        } else if (result.code !== 0 && (operation === 'discover' || (result.code !== 2 && result.code !== zeroTestsRan))) {throw new Error(`The test application failed during ${operation} (exit ${result.code}).\n${result.stderr || result.stdout}`);}
         if (operation === 'discover') {
             const failure = [...nodes.values()].find(node => ['failed', 'errored'].includes(testResult(node)?.outcome ?? ''));
-            if (failure) {throw new Error(`Test discovery failed: ${failure['display-name'] ?? failure.uid}. ${failure['error.message'] ?? ''}`);}
+            if (failure) {throw new Error(`Test discovery failed: ${nodeName(failure)}. ${nodeText(failure, 'error.message')}`);}
         }
         const failedGroup = [...nodes.values()].find(node => node['node-type'] === 'group' && ['failed', 'errored'].includes(testResult(node)?.outcome ?? ''));
-        if (operation === 'run' && failedGroup) {throw new Error(`The test group failed: ${failedGroup['display-name'] ?? failedGroup.uid}. ${failedGroup['error.message'] ?? ''}`);}
-        if (operation === 'run' && result.code === 2 && ![...nodes.values()].some(node => {
+        if (operation === 'run' && failedGroup) {throw new Error(`The test group failed: ${nodeName(failedGroup)}. ${nodeText(failedGroup, 'error.message')}`);}
+        if (operation === 'run' && result?.code === 2 && ![...nodes.values()].some(node => {
             if (node['node-type'] === 'group') {return false;}
             const outcome = testResult(node)?.outcome;
             return outcome === 'failed' || outcome === 'errored';
         })) {throw new Error('MTP reported a failing run (exit 2), but did not provide a matching failed test result. The run cannot be reported as passing.');}
+        // Nothing ran: the caller's handling of missing results applies, and an
+        // incomplete-stream error would only hide the reason.
+        if (operation === 'run' && result?.code === zeroTestsRan && ![...nodes.values()].some(node => node['node-type'] !== 'group')) {return [];}
         if (operation === 'run') {assertComplete([...nodes.values()], options.expectedTests ?? tests ?? [], options.onNode);}
         options.signal?.throwIfAborted();
         return [...nodes.values()].filter(node => node['node-type'] !== 'group');
     } catch (error) {
-        if (process?.interruption) {throw process.interruption;}
+        if (process?.interruption && !lingering) {throw process.interruption;}
         throw error;
     } finally {
         clearTimeout(connectionTimer);
@@ -157,7 +242,7 @@ export function assertComplete(nodes: readonly TestNode[], expected: readonly Te
     const unfinished = leaves.filter(node => !node['retry.is-superseded'] && !isTerminal(node) && !replaced(node));
     const missing = expected.filter(node => !isTerminal(byId.get(node.uid) ?? node) && !replaced(node));
     if (unfinished.length || missing.length) {
-        const names = [...new Set([...unfinished, ...missing].map(node => String(node['display-name'] ?? node.uid)))];
+        const names = [...new Set([...unfinished, ...missing].map(node => nodeName(node)))];
         for (const node of new Map([...unfinished, ...missing].map(node => [node.uid, node])).values()) {
             onIncomplete?.({ ...node, 'execution-state': 'error', 'error.message': 'The test runner ended without a terminal outcome for this test.' });
         }
@@ -185,11 +270,15 @@ export function testConverter(normalize = pathNormalizer()): (node: TestNode) =>
 }
 
 function testMetadata(node: TestNode, normalize: (file: string) => string): DiscoveredTest {
+    const traits = nodeTraits(node);
     return {
-        id: node.uid, name: String(node['display-name'] ?? node.uid),
+        id: node.uid, name: nodeName(node),
         fullyQualifiedName: qualifiedName(node),
         file: typeof node['location.file'] === 'string' ? normalize(node['location.file']) : undefined,
         line: typeof node['location.line-start'] === 'number' ? Math.max(1, node['location.line-start']) : 1,
+        ...(typeof node['location.line-end'] === 'number' && typeof node['location.line-start'] === 'number' && node['location.line-end'] >= node['location.line-start']
+            ? { endLine: node['location.line-end'] } : {}),
+        ...traits ? { traits } : {},
         node
     };
 }
@@ -198,11 +287,14 @@ export function testResult(node: TestNode): TestResult | undefined {
     if (!isTerminal(node)) {return undefined;}
     const state = node['execution-state'];
     return {
-        id: node.uid, name: String(node['display-name'] ?? node.uid), fullyQualifiedName: qualifiedName(node),
+        id: node.uid, name: nodeName(node), fullyQualifiedName: qualifiedName(node),
         outcome: state === 'passed' ? 'passed' : state === 'failed' ? 'failed' : state === 'skipped' ? 'skipped' : 'errored',
         duration: Number(node['time.duration-ms'] ?? 0),
         message: typeof node['error.message'] === 'string' ? node['error.message'] : undefined,
         stack: typeof node['error.stacktrace'] === 'string' ? node['error.stacktrace'] : undefined,
+        // Some frameworks (MSTest) send both values empty and describe them in the message instead.
+        ...(typeof node['assert.expected'] === 'string' && typeof node['assert.actual'] === 'string' && (node['assert.expected'] || node['assert.actual'])
+            ? { expected: node['assert.expected'], actual: node['assert.actual'] } : {}),
         output: [node.standardOutput, node.standardError].filter(value => typeof value === 'string' && value.length).join('\n'), node
     };
 }

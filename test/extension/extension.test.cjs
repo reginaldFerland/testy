@@ -1,3 +1,4 @@
+// @ts-check
 const {suite,test} = require('mocha');
 const assert = require('node:assert/strict');
 const vscode = require('vscode');

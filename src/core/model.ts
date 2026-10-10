@@ -22,6 +22,8 @@ export interface Project {
     readonly contextReferences?: readonly string[];
     /** Individual evaluated producers retained when ownership is merged. */
     readonly contexts?: readonly Project[];
+    /** Why a test project cannot run under Testy (VSTest, or older than .NET 10). */
+    readonly unsupported?: string;
 }
 
 export interface DiscoveredTest {
@@ -30,6 +32,10 @@ export interface DiscoveredTest {
     readonly fullyQualifiedName: string;
     readonly file?: string;
     readonly line: number;
+    /** Last line of the test's declaration, when the provider reports it. */
+    readonly endLine?: number;
+    /** Provider traits and categories, offered as Test Explorer tags. */
+    readonly traits?: readonly { readonly key: string; readonly value: string }[];
     /** Preserve provider properties required when sending a selected test back. */
     readonly node: Readonly<Record<string, unknown>>;
 }
@@ -82,6 +88,14 @@ export interface TestResult {
     readonly duration: number;
     readonly message?: string;
     readonly stack?: string;
+    /** Assertion values for a diff, when the framework reports them. */
+    readonly expected?: string;
+    readonly actual?: string;
     readonly output?: string;
     readonly node?: Readonly<Record<string, unknown>>;
+}
+
+/** A test project Testy can discover and run: an MTP entry point on .NET 10 or later. */
+export function isTestTarget(project: Project): boolean {
+    return project.isTestProject && project.entryPoint !== false && !project.unsupported;
 }

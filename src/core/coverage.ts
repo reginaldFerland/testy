@@ -302,6 +302,16 @@ export class CoverageStore {
         return this.cached;
     }
 
+    /** The displayed version of a file's lines, with hits from only the given test files. */
+    contribution(file: string, groupIds: ReadonlySet<string>, hashes: ReadonlyMap<string, string>): readonly CoveredLine[] | undefined {
+        const versions = [...this.byFile.get(file) ?? []].map(id => this.sources.get(id)).filter((source): source is SourceRecord => !!source);
+        const displayed = versions.find(version => version.source.hash === hashes.get(file)) ?? versions[versions.length - 1];
+        if (!displayed) {return undefined;}
+        const hits = new Map<number, number>();
+        for (const id of groupIds) {for (const line of displayed.hits.get(id) ?? []) {hits.set(line.line, Math.max(hits.get(line.line) ?? 0, line.hits));}}
+        return displayed.source.lines.map(line => ({ line, hits: hits.get(line) ?? 0 }));
+    }
+
     summary(file: string, hashes: ReadonlyMap<string, string>): CoverageSummary | undefined {
         this.updateHashes(hashes);
         finish(this.dirtySources());
@@ -372,7 +382,7 @@ export class CoverageStore {
         const previous = this.sources.get(source.id);
         const lines = merged ? source.lines : previous ? finish(sortedUnion(previous.source.lines, source.lines)) : canonical ? source.lines : finish(sortedUnion([], source.lines));
         if (previous && lines.length === previous.source.lines.length) {return;}
-        this.sources.set(source.id, { source: { ...source, lines }, groups: previous?.groups ?? new Set(), hits: previous?.hits ?? new Map(),
+        this.sources.set(source.id, { source: { ...source, lines }, groups: previous?.groups ?? new Set(), hits: previous?.hits ?? new Map<string, readonly CoveredLine[]>(),
             staleCount: previous?.staleCount ?? 0, aggregateVersion: (previous?.aggregateVersion ?? 0) + 1 });
         const versions = this.byFile.get(source.file) ?? new Set<string>(); versions.add(source.id); this.byFile.set(source.file, versions);
         this.changedSources.add(source.id); this.removedSources.delete(source.id); this.dirty(source.file); this.version++;

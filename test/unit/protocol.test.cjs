@@ -7,6 +7,7 @@ const {createRequire}=require('node:module');
 const {EventEmitter}=require('node:events');
 const {PassThrough}=require('node:stream');
 const {requestTests,testResult}=require('../../out/services/mtp');
+const {loadUi}=require('./support/ui.cjs');
 
 test('MTP transport preserves explicit retry outcomes and rejects inconsistent failure exits',async()=>{
  const options={dotnet:process.execPath,assembly:path.resolve('test/fixtures/mtp-peer.cjs'),cwd:process.cwd(),timeoutMs:5000};
@@ -26,13 +27,11 @@ test('MTP reports timeouts and early process exits instead of RPC disposal error
  await assert.rejects(requestTests({...options,timeoutMs:5000,env:{TESTY_EXIT_DURING:'41'}},'run'),/exit 41.*\ncontrolled process failure/);
 });
 
-function uiPrototype(vscode={}) {
- const file=path.resolve('out/extension.js'), realRequire=createRequire(file), exports={};
- vm.runInNewContext(fs.readFileSync(file,'utf8')+'\nexports.Testy=Testy;',{
-  exports,require:name=>name==='vscode'?vscode:name==='./configuration'?{}:realRequire(name),Buffer,setTimeout,clearTimeout
- });
- return exports.Testy.prototype;
+function prototypes(vscode={}) {
+ const ui=loadUi({vscode});
+ return{Testy:ui.Testy.prototype,tree:ui.TestTree.prototype,coverage:ui.CoverageView.prototype,status:ui.module('ui/statusBar').StatusBar.prototype};
 }
+function uiPrototype(vscode={}) {return prototypes(vscode).Testy;}
 
 test('generated deletions retain classification while ordinary recreations trigger testing',async t=>{
  const io=require('node:fs/promises'),{SourceTracker}=require('../../out/services/sources'),{normalizePath}=require('../../out/core/paths');
@@ -87,16 +86,17 @@ test('save invalidation preserves historical test outcomes until final selection
 
 test('coverage publication sends only changed line data and a fresh snapshot per run',()=>{
  let calls=0;
- const proto=uiPrototype({Uri:{file:fsPath=>({fsPath})},FileCoverage:class {},window:{visibleTextEditors:[]}});
+ const proto=prototypes({Uri:{file:fsPath=>({fsPath})},FileCoverage:class {},window:{visibleTextEditors:[]}}).coverage;
  const lines=[{line:1,hits:1}],summary={file:'/Code.cs',covered:1,total:1,stale:false,lines,groupIds:['one']};
  let summaries=[summary];
- const context={disposed:false,engine:{coverage:{summarize:()=>summaries},hashes:new Map()},productionSources:new Set(['/Code.cs']),
-  publishedCoverage:new Map(),details:new WeakMap(),activeRun:{addCoverage(){calls++;}},queueDecorations(){},updateStatus(){}};
- proto.publishCoverage.call(context);proto.publishCoverage.call(context);assert.equal(calls,1);
- summaries=[{...summary,groupIds:['one','two']}];proto.publishCoverage.call(context);assert.equal(calls,1,'new attribution with identical line data needs no UI publication');
- summaries=[{...summary,covered:0,lines:[{line:1,hits:0}]}];proto.publishCoverage.call(context);assert.equal(calls,2);
- context.publishedCoverage.clear();proto.publishCoverage.call(context);assert.equal(calls,3,'each run needs its retained snapshot');
- context.activeRun=undefined;context.publishedCoverage.clear();proto.publishCoverage.call(context);assert.equal(calls,3,'do not allocate publications outside a run');
+ const host={disposed:false,activeRun:{addCoverage(){calls++;}},updateStatus(){}};
+ const context={host,engine:{coverage:{summarize:()=>summaries},hashes:new Map()},productionSources:new Set(['/Code.cs']),owners:new Map(),items:new Map(),
+  publishedCoverage:new Map(),details:new WeakMap(),queue(){}};
+ proto.publish.call(context);proto.publish.call(context);assert.equal(calls,1);
+ summaries=[{...summary,groupIds:['one','two']}];proto.publish.call(context);assert.equal(calls,1,'new attribution with identical line data needs no UI publication');
+ summaries=[{...summary,covered:0,lines:[{line:1,hits:0}]}];proto.publish.call(context);assert.equal(calls,2);
+ context.publishedCoverage.clear();proto.publish.call(context);assert.equal(calls,3,'each run needs its retained snapshot');
+ host.activeRun=undefined;context.publishedCoverage.clear();proto.publish.call(context);assert.equal(calls,3,'do not allocate publications outside a run');
 });
 
 test('save-mode directory events expand known paths and trigger structural discovery',async()=>{
@@ -114,12 +114,13 @@ test('save-mode directory events expand known paths and trigger structural disco
 });
 
 test('runtime-only result IDs are registered and selected for manual reruns',async()=>{
- const proto=uiPrototype();let selected;
+ const {Testy:proto,tree:treeProto}=prototypes();let selected;
  const item={id:'file:runtime',children:{forEach:()=>{}}};
- const context={disposed:false,items:new Map([['file:runtime',item]]),testIds:new Map(),treeFiles:new Map(),setOutcome:()=>{},updateStatus:()=>{},
+ const tree={host:{disposed:false,activeRun:undefined,roots:[],updateStatus:()=>{}},items:new Map([['file:runtime',item]]),testIds:new Map(),treeFiles:new Map(),setOutcome:()=>{}};
+ const context={tree,
   scheduler:{runManual:async callback=>callback(new AbortController().signal)},bindCancellation:()=>({controller:new AbortController(),dispose:()=>{}}),
   execute:async(_batch,_signal,_request,selection)=>selected=selection};
- proto.publishResult.call(context,{id:'file',file:'/workspace/Test.cs'},{id:'runtime',name:'Runtime case',outcome:'passed'});
+ treeProto.publishResult.call(tree,{id:'file',file:'/workspace/Test.cs'},{id:'runtime',name:'Runtime case',outcome:'passed'});
  await proto.manual.call(context,{include:[item]},{},false);
  assert.equal(selected.groups.has('file'),true);assert.equal(selected.tests.get('file').has('runtime'),true);
 });
@@ -202,7 +203,7 @@ test('runtime rows cannot conceal another unfinished row or ambiguously replace 
 test('manual UI captures containers without freezing their old child IDs',async()=>{
  const proto=uiPrototype();let selection;
  const leaf={id:'leaf',children:{forEach:()=>{}}},file={id:'file:g',children:{forEach:callback=>callback(leaf)}},project={id:'project:/Tests.csproj',children:{forEach:callback=>callback(file)}};
- const context={testIds:new Map([['leaf',{group:'g',test:'old'}]]),bindCancellation:()=>({controller:new AbortController(),dispose(){}}),
+ const context={tree:{testIds:new Map([['leaf',{group:'g',test:'old'}]])},bindCancellation:()=>({controller:new AbortController(),dispose(){}}),
   scheduler:{runManual:async callback=>callback(new AbortController().signal)},execute:async(_batch,_signal,_request,manual)=>selection=manual,reportError:error=>{throw error;}};
  await proto.manual.call(context,{include:[file],exclude:[leaf]}, {},false);
  assert.equal(selection.groups.has('g'),true);assert.equal(selection.tests.has('g'),false);assert.equal(selection.exclude.tests.get('g').has('old'),true);
@@ -223,16 +224,16 @@ test('save mode never plans watchers and unchanged filesystem discovery never re
 });
 
 test('status context commands are emitted only for pause state changes',()=>{
- const values=[],proto=uiPrototype({commands:{executeCommand:(_command,_key,value)=>values.push(value)}});
- const context={engine:{groups:[]},scheduler:{isPaused:false},passed:0,failed:0,status:{}};
- for(let i=0;i<20000;i++)proto.updateStatus.call(context);
- context.scheduler.isPaused=true;proto.updateStatus.call(context);proto.updateStatus.call(context);
+ const values=[],proto=prototypes({commands:{executeCommand:(_command,key,value)=>{if(key==='testy.paused')values.push(value);}}}).status;
+ const context={item:{}},model={paused:false,running:false,scheduling:'idle',phase:undefined,lastError:'',lastSummary:undefined,passed:0,failed:0,hasTests:false,coverageSuffix:'',continuousOverride:false};
+ for(let i=0;i<20000;i++)proto.update.call(context,model);
+ proto.update.call(context,{...model,paused:true});proto.update.call(context,{...model,paused:true});
  assert.deepEqual(values,[false,true]);
 });
 
 test('MTP output is published once across metadata updates while preserving rows, retries and pre-terminal output',async()=>{
- const output=[],proto=uiPrototype();
- const context={testIds:new Map(),treeFiles:new Map(),items:new Map([['g:row',{}]]),setOutcome(){},updateStatus(){},activeRun:{passed(){},appendOutput:text=>output.push(text)}};
+ const output=[],proto=prototypes().tree;
+ const context={host:{disposed:false,roots:[],updateStatus(){},activeRun:{passed(){},appendOutput:text=>output.push(text)}},testIds:new Map(),treeFiles:new Map(),items:new Map([['g:row',{}]]),setOutcome(){}};
  const updates=[{uid:'row','execution-state':'in-progress',standardOutput:'before '},
   {uid:'row','execution-state':'passed',standardOutput:'done\n'}, {uid:'row','time.duration-ms':12},
   {uid:'row','execution-state':'passed',standardOutput:'same row text\n'},
@@ -283,13 +284,14 @@ test('editor coverage refresh yields during shared-file aggregation and never fa
  // changes alone can now reuse the warmed line cache. Other owners remain stale.
  await store.replaceAsync([{...traces[0],timestamp:2,coverage:[{file,hash:'v1',lines:[{line:1,hits:2},...lines.slice(1)]}]}],live);
  store.summary=()=>assert.fail('editor must not calculate synchronously');
- const proto=uiPrototype({Range:class{}}),calls=[];
+ const proto=prototypes({Range:class{}}).coverage,calls=[];
  const editor={document:{uri:{fsPath:file},lineCount:1000,isDirty:false},setDecorations:(kind,lines)=>calls.push([kind,lines.length])};
- const context={config:{showCoverage:true},engine:{coverage:store,hashes},decorations:{covered:'covered',uncovered:'uncovered',stale:'stale'},lifetime:new AbortController()};
+ const host={disposed:false,config:{showCoverage:true},lifetime:new AbortController()};
+ const context={host,engine:{coverage:store,hashes},decorations:{covered:'covered',uncovered:'uncovered',stale:'stale'}};
  const aggregation=store.summarizeAsync(hashes);let beats=0;const timer=setInterval(()=>beats++,1);
  try{await proto.decorate.call(context,[editor]);await aggregation;}finally{clearInterval(timer);}
  assert.ok(beats>0,'the editor path must let timers run');assert.deepEqual(calls,[['covered',0],['uncovered',0],['stale',1000]]);
  store.markStale(live);calls.length=0;context.engine.coverage={summarizeAsync:async(_hashes,signal)=>{await new Promise(resolve=>setImmediate(resolve));signal.throwIfAborted();return[];}};
- const pending=proto.decorate.call(context,[editor]);context.disposed=true;context.lifetime.abort();
+ const pending=proto.decorate.call(context,[editor]);host.disposed=true;host.lifetime.abort();
  await assert.rejects(pending,{name:'AbortError'});assert.equal(calls.length,0,'disposing must prevent late editor writes');
 });

@@ -1,3 +1,4 @@
+// @ts-check
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');

@@ -3,7 +3,7 @@ import { BigIntStats, constants, createReadStream, createWriteStream } from 'nod
 import * as path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { createHash } from 'node:crypto';
-import { mapConcurrent, Semaphore } from '../core/concurrency';
+import { mapConcurrent, Semaphore, walkTree } from '../core/concurrency';
 
 const copyWorkers = new Semaphore(8);
 const metadataWorkers = new Semaphore(8);
@@ -13,7 +13,8 @@ const directoryAccess = process.platform === 'win32' ? 0o600 : 0o700;
 async function copyFile(source: string, destination: string, signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
     await fs.mkdir(path.dirname(destination), { recursive: true });
-    try { await fs.copyFile(source, destination, constants.COPYFILE_FICLONE_FORCE); }
+    // Clone where supported; otherwise libuv falls back to a kernel copy.
+    try { await fs.copyFile(source, destination, constants.COPYFILE_FICLONE); }
     catch (error) {
         if (!['ENOTSUP', 'EXDEV', 'EINVAL', 'ENOSYS'].includes((error as NodeJS.ErrnoException).code ?? '')) {throw error;}
         await pipeline(createReadStream(source), createWriteStream(destination, { mode: (await fs.stat(source)).mode }), { signal });
@@ -24,8 +25,6 @@ async function copyFile(source: string, destination: string, signal?: AbortSigna
 /** Dereference output links into private copies; never instrument their targets. */
 export async function copyOutput(source: string, destination: string, signal?: AbortSignal, ancestors: ReadonlySet<string> = new Set()): Promise<void> {
     interface Copy { readonly source: string; readonly destination: string; readonly ancestors: ReadonlySet<string>; }
-    const queued: Copy[] = [{ source, destination, ancestors }];
-    let active = 0, failed = false, failure: unknown;
     const copy = async (job: Copy): Promise<Copy[]> => {
         signal?.throwIfAborted();
         const resolved = await fs.realpath(job.source), stat = await fs.stat(resolved);
@@ -37,19 +36,7 @@ export async function copyOutput(source: string, destination: string, signal?: A
             .map(name => ({ source: path.join(resolved, name), destination: path.join(job.destination, name), ancestors: next }));
     };
     // One pool for the whole tree, not eight workers per recursive directory.
-    await new Promise<void>((resolve, reject) => {
-        const pump = (): void => {
-            if (failed) {queued.length = 0;}
-            while (active < 8 && queued.length) {
-                const job = queued.pop()!; active++;
-                void copyWorkers.run(signal, () => copy(job)).then(children => {if (!failed) {for (const child of children) {queued.push(child);}}})
-                    .catch(error => {if (!failed) {failed = true; failure = error;}})
-                    .finally(() => {active--; pump();});
-            }
-            if (!active && !queued.length) {if (failed) {reject(failure);} else {resolve();}}
-        };
-        pump();
-    });
+    await walkTree([{ source, destination, ancestors }], copy, copyWorkers, signal);
 }
 
 /** Only call for extension-owned output. Never follow links while repairing permissions. */
@@ -108,7 +95,7 @@ async function inventory(directory: string, signal?: AbortSignal, repairAccess =
 
 export async function fileHash(file: string, signal?: AbortSignal): Promise<string> {
     const hash = createHash('sha256');
-    for await (const chunk of createReadStream(file, { signal })) {hash.update(chunk);}
+    for await (const chunk of createReadStream(file, { signal })) {hash.update(chunk as Buffer);}
     return hash.digest('hex');
 }
 
@@ -130,7 +117,7 @@ export class PreparedOutput {
 
     async restore(signal?: AbortSignal): Promise<void> {
         const root = await metadataWorkers.run(signal, () => fs.lstat(this.directory, { bigint: true }))
-            .catch(error => {if (error?.code === 'ENOENT') {return undefined;} throw error;});
+            .catch((error: NodeJS.ErrnoException) => {if (error?.code === 'ENOENT') {return undefined;} throw error;});
         if (!root?.isDirectory() || root.isSymbolicLink()) {
             await removeOutput(this.directory); await this.initialize(signal); return;
         }

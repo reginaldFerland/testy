@@ -1,6 +1,93 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Debug profile:** debug tests from Test Explorer (requires the C# extension). Each selected project runs in one process without coverage, and the run timeout does not apply.
+- **Continuous run:** Test Explorer's continuous run is supported. While automatic testing is paused, a continuous run keeps its selected tests running after changes.
+- **Native coverage view:** coverage appears in Test Explorer's coverage view with per-line statement ranges, can be filtered per test file and project, and retained coverage is published even without a run.
+- **Status bar menu:** pause or resume, run affected tests now, refresh, cancel the current run, clear coverage, reset caches and baseline, and show output.
+- **New commands:** **Run Affected Tests Now**, **Cancel Current Run**, **Clear Coverage**, **Reset Caches and Baseline**, and separate **Pause**/**Resume** buttons in Test Explorer.
+- **Project filtering:** `testy.solution` limits Testy to the projects of a `.sln`, `.slnx` or `.slnf`; `testy.projects.include` and `testy.projects.exclude` filter projects by glob.
+- **Problems panel:** build errors and warnings are listed there and cleared after the next successful build.
+- **Better failures:** expected/actual diffs when the framework reports them, clickable stack frames, and a message location on the failing line in your code.
+- **Test tree:** project and framework tags for filtering, and test ranges that span the declaration when the framework reports it.
+- **Walkthrough and localization:** a getting-started walkthrough covers prerequisites, the first baseline, coverage, pausing and debugging; all strings are localizable.
+- A one-time notice explains duplicate test entries when C# Dev Kit is also installed.
+- **Export Coverage:** write the current coverage as LCOV or Cobertura XML for other tools.
+- **Why did this run?** Each selected test file shows why it ran (for example, it covers a changed file, or a project fallback), in the run output, the log and Test Explorer.
+- **Configuration profiles:** `testy.additionalConfigurations` adds Run and Run with coverage profiles that build with another MSBuild configuration, such as `Release`.
+- **Trait tags:** test traits and categories become Test Explorer tags (`trait:Key=Value`, `category:Value`).
+- Establishing a baseline shows progress with a percentage in the status bar.
+- Build errors are shown on the affected project items in Test Explorer, with a link to the output.
+
+### Changed
+
+- Pausing automatic testing is remembered per workspace and no longer edits `.vscode/settings.json`; `testy.autoRun` is now only the default.
+- Test Explorer's refresh button rediscovers tests without running them. **Refresh and Run All C# Tests** still rebuilds and runs everything.
+- Gutter coverage markers are optional (`testy.showCoverage` now defaults to `false`).
+- Output uses a log channel with levels (**Developer: Set Log Level…**).
+- The extension is bundled into a single module, and activation no longer waits for the coverage cache to be restored, so startup is faster and the package smaller.
+- `testy.dotnetPath` and `testy.coverageToolPath` are machine-overridable. Other settings are window-scoped because one engine serves every folder of a workspace.
+- Prepared test outputs are kept after cancelled runs instead of being rebuilt, and file copies use the operating system's fast copy path.
+- Preparation tool fingerprints are cached between runs instead of rehashing the collector and SDK each time.
+- Retained preparation templates are rebuilt once after upgrading, because their environment identity changed.
+- Status bar progress text is localizable.
+- The manifest declares its license, keywords, links and a workspace extension kind for remote development.
+- The .NET helpers restore only from nuget.org with lock files, and packaged builds are reproducible. NuGet vulnerability advisories stay warnings instead of failing packaging, and helper stack traces include line numbers.
+- The analyzer starts faster and uses less memory; its diagnostics are UTF-8.
+- Source analysis runs in a long-lived helper process, so repeated analyses take milliseconds instead of about 150 ms each; it falls back to one process per request if the helper cannot start.
+- The analyzer uses the Roslyn compiler of your installed .NET SDK instead of bundling it, shrinking the package from about 3.8 MB to 0.3 MB. After an SDK update that changes Roslyn, the first run may select a few extra tests.
+
+### Fixed
+
+- VSTest projects and test targets older than .NET 10 are skipped and listed in Output instead of stopping the whole workspace; multi-targeted test projects keep their .NET 10+ targets.
+- A failing test batch no longer stops the rest of the run. Its tests are reported as errored, and failed batches are shown in the status bar and output.
+- Source analysis no longer fails on very large repositories or assemblies whose results exceeded the output buffer.
+- One unreadable source file, embedded PDB, or permission-denied directory no longer fails analysis or project discovery for everything.
+- Saved project evaluations are reused after an editor restart instead of always being re-evaluated.
+- Locks and private outputs left by crashed windows are recovered even when their process ID has been reused, such as after a reboot or in containers; a long-running holder no longer makes other windows time out.
+- A test host that hangs after finishing keeps its results instead of failing at the timeout.
+- Failing to delete a stale cache slot falls back to a fresh preparation instead of failing the run.
+- Cancelling one caller no longer cancels other callers waiting on the same SDK check.
+- Build planning for solutions with hundreds of test projects no longer stalls the editor.
+- Paths containing `%`, `$(` or `;` no longer break project inspection, and inspection no longer leaves MSBuild nodes holding the bundled analyzer.
+- A second local connection to a test host's port is detected and the run discarded.
+- Windows process-host failures are reported as start-up errors rather than test failures, and test processes inherit only their standard handles.
+- The bundled analyzer compiles against the minimum supported MSBuild API, so it no longer risks missing-method failures on older .NET 10 SDK feature bands.
+- Assembly loads that occur while the runtime observer is writing its log are deferred instead of risking a garbled log line.
+- Analyzer and process-host errors include full exception details in Output.
+- Output directories, `HintPath` and rule-set paths are resolved correctly on macOS and Linux when MSBuild values contain backslashes.
+- A running window no longer loses a shared-storage lock when its heartbeat pauses (sleep, a busy extension host), and shutdown no longer waits forever on a stuck lock holder.
+- A crashed owner whose process ID was reused is recognized on macOS.
+- Corrupt coverage-cache entries are discarded and re-learned, so cache pruning no longer stops; the coverage cache is capped and maintained incrementally, and caches are fsynced before replacing the previous file.
+- A prepared-output file that cannot be deleted (for example, held by antivirus) no longer disables the cache, damaged owner records are reclaimed, and partial trimming keeps the newest preparations.
+- Cancelling one coverage read no longer cancels others sharing the parser.
+- A test run whose selected tests no longer exist (MTP exit code 8) no longer reports a host failure. The connect timeout is longer under the coverage collector, and debugging fails clearly if the host never reports its process ID.
+- Runtime observation no longer fails when an unrelated .NET process, such as an MSBuild node, is killed mid-run.
+- On Windows, `dotnet`, the coverage collector and commands run by the process owner are resolved from PATH, never from the workspace.
+- Project discovery finds `.csproj` files regardless of extension case and follows symlinked directories, with cycle protection.
+- A briefly locked source file no longer fails the whole refresh.
+- Relative file names in Cobertura reports are resolved against the report's `<sources>`.
+- Debugging in multi-root workspaces attaches in the folder that contains the tests.
+- Project analysis output is deterministic and explains why evaluation reuse is unavailable.
+
+### Internal
+
+- Type-aware ESLint (including floating-promise checks) and stricter TypeScript checks are enforced; opted-in tests are type-checked.
+- `global.json` pins the .NET SDK; shared .NET build settings live in `backend/Directory.Build.props`/`.targets`, with deterministic builds and English-only resources.
+- Engine run orchestration is split into phases, duplicated helpers are consolidated, and dead code is removed.
+- Regression tests are organized by topic, and the VS Code test runner is updated for current VS Code builds.
+- Faster path normalization, file-event handling, project-evaluation validation, prepared-output hashing and POSIX process cleanup on large workspaces.
+- `extension.ts` is split into a controller and UI presenters (`src/controller.ts`, `src/ui/*`).
+- Test files are linted; the .NET helpers build with the recommended analyzer rules and have their own xUnit tests (`npm run test:dotnet`).
+- Cancelling source analysis now also interrupts Roslyn parsing.
+- There is no CI; validation is local (see CONTRIBUTING).
+
 ## 1.2.0
+
+Faster repeated runs: smarter scheduling, reuse of prepared outputs, project evaluations and source analysis across runs and restarts.
 
 - Schedule idle project runners before creating additional workers within a project, and redistribute spare capacity as projects finish.
 - Reuse validated prepared outputs between runs, with fresh discovery, isolated collector sessions, bounded retention, and cleanup on shutdown.
@@ -37,6 +124,8 @@
 - Add deep dependency-graph benchmarks and concurrency regressions.
 
 ## 1.0.0
+
+First release with Testy's own Test Explorer integration, affected test selection, and retained coverage on .NET 10+ and MTP.
 
 - Track evaluated shared build inputs and preserve MSBuild reference-property contexts.
 - Preserve manual container scopes through discovery and honor individual-case exclusions.

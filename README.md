@@ -2,138 +2,144 @@
 
 Fast feedback for C# without rerunning the whole suite after every save.
 
-Testy runs your tests through **.NET 10+ and Microsoft.Testing.Platform (MTP)**, learns which source files each test file exercises, and runs the affected files when you save. Results appear in VS Code's Test Explorer. Coverage stays available across partial runs.
+Testy runs your tests through **.NET 10+ and Microsoft.Testing.Platform (MTP)**, learns which source files each test file exercises, and reruns only the affected test files when you save. Results appear in VS Code's Test Explorer, and coverage stays available across partial runs.
+
+## Features
+
+- **Affected tests on save.** Edits rerun every test file known to exercise the changed code, with a conservative project-wide fallback whenever impact is uncertain.
+- **Retained coverage.** Each test file keeps its own coverage contribution, so partial runs never erase coverage from other tests. Coverage appears in Test Explorer's native coverage view and can be filtered by test file or project.
+- **Test Explorer integration.** Run, debug, or continuously run individual tests, files, and projects. Failures show expected/actual diffs when the framework reports them, plus clickable stack frames.
+- **Build problems in the Problems panel.** Compiler errors and warnings from Testy's builds are listed there and cleared after the next successful build.
+- **Parallel and cached.** Discovery, builds, and test files run concurrently, and prepared outputs and project evaluations are reused safely across runs and restarts.
+- **No C# Dev Kit required.** Testy talks to MTP directly.
+
+## Requirements
+
+- VS Code 1.99 or later.
+- [.NET SDK 10](https://dotnet.microsoft.com/download) or later. If your workspace has a `global.json`, it must select a supported SDK.
+- C# test projects that target .NET 10 or later and use [Microsoft.Testing.Platform](https://learn.microsoft.com/en-us/dotnet/core/testing/microsoft-testing-platform-intro). MSTest, xUnit v3 (MTP v2), and NUnit with the MTP adapter are tested. VSTest projects and test targets older than .NET 10 are skipped and listed in Output.
+- A trusted workspace. Testy builds and runs workspace code, so it does not start in Restricted Mode.
+- NuGet access on first use, to install Microsoft's `dotnet-coverage` collector (unless you set `testy.coverageToolPath`).
+- Portable debug symbols (the .NET default) for source mapping and coverage.
+- The [C# extension](https://marketplace.visualstudio.com/items?itemName=ms-dotnettools.csharp), only for debugging tests.
 
 ## Getting started
 
-1. Install the .NET 10 SDK or later and use an MTP-enabled C# test project. Testy does not require C# Dev Kit.
-2. Open the workspace in VS Code and trust it. Testy builds, discovers, and runs all C# tests to establish the initial baseline.
-3. Save a source file. Testy cancels its previous automatic run, waits briefly for edits to settle, then builds and runs affected test files.
+1. Open a folder or workspace that contains MTP test projects, and trust it.
+2. Testy builds, discovers, and runs every test file once to establish a baseline. The status bar shows a baseline progress indicator with a percentage (no popup); cancel it with **Testy: Cancel Current Run** or the stop button in Test Explorer. The **Get started with Testy** walkthrough covers the same steps.
+3. Save a source file. Testy cancels its previous automatic run, waits briefly for edits to settle, then builds and runs the affected test files.
 
-Click the Testy status item to pause or resume automatic testing. Use **Testy: Refresh and Run All C# Tests** to build, rediscover, and replace the baseline. Individual tests, files and projects can also be run from Test Explorer. Container runs include tests added since the last discovery and honor explicit exclusions. Saves never cancel a manually initiated run.
+Saves never cancel a run you started manually. Changes are accumulated across cancelled runs, and an interrupted baseline resumes where it stopped.
 
-Coverage collection is enabled by default. On first use, Testy installs a pinned version of Microsoft's `dotnet-coverage` tool into its own storage. This requires access to NuGet; it does not add packages to your projects. You can supply an existing collector through `testy.coverageToolPath`. If setup fails, tests continue with conservative selection and the status tooltip explains that coverage is unavailable.
+## Commands
 
-## How affected selection works
+Click the Testy status bar item to open its action menu. Every action is also available from the Command Palette:
 
-Testy discovers tests in isolated outputs per project and target framework, then runs selected test files concurrently in separate processes. During affected runs, projects needed only for discovery avoid coverage instrumentation; newly selected projects are prepared before execution. Source analysis overlaps runner preparation within the configured project worker budget. The scheduler uses idle project runners first and assigns spare workers to busier projects. Each worker reuses its own output and collector session; files mutated by tests are restored from that worker's pristine template before reuse. Test targets that share output directories with another framework or reference context are saved before another build can overwrite them. Testy records the workspace source files that execution reaches, including indirect calls, and keeps a separate coverage contribution for each test file. Later changes select every test file known to have exercised the changed code.
+| Command | What it does |
+| --- | --- |
+| **Testy: Pause Automatic Testing** / **Resume Automatic Testing** | Stop or restart runs on save. Remembered per workspace without changing your settings. |
+| **Testy: Run Affected Tests Now** | Run the tests affected by pending changes immediately. |
+| **Testy: Refresh and Run All C# Tests** | Rebuild, rediscover, and run everything to replace the baseline. |
+| **Testy: Cancel Current Run** | Cancel the active run. |
+| **Testy: Clear Coverage** | Discard retained coverage. |
+| **Testy: Export Coverage…** | Write the current merged coverage as LCOV or Cobertura XML (default `coverage/testy.lcov` or `coverage/testy.cobertura.xml` in the first workspace folder), with paths relative to the workspace. Stale coverage is not exported. |
+| **Testy: Reset Caches and Baseline** | Delete learned coverage, saved project evaluations, and prepared test outputs, then establish a fresh baseline. |
+| **Testy: Show Output** | Open the Testy log, including build output and why each selection was made. |
+| **Testy: Show Actions** | Open the status bar menu. |
 
-Prepared outputs are cached between runs and can survive a clean editor shutdown. Testy validates the complete build output, preparation tools, environment, and configuration before reusing instrumentation, and runs fresh discovery on every run. Shutdown drains active work, deletes working copies and reports, and retains only pristine templates. Another editor instance can claim those templates exclusively; live instances never share mutable outputs or collector sessions. The entry allowance starts at 16 and grows to accommodate the test-file worker budget across prepared targets. Active caches and the combined retained templates each remain bounded by 512 MiB, with active work temporarily exempt. Least recently used idle entries are evicted, and outputs from crashed active owners are discarded. Startup still performs build checks and establishes a fresh baseline; saved coverage supplies history while that runs. Custom collectors retain their complete environment, so editor environment changes can invalidate their preparations.
+The refresh button in Test Explorer rediscovers tests without running them. Test items are tagged by project and framework (`project:<name>`, `framework:<tfm>`) for filtering. Traits reported by the test framework (xUnit traits, NUnit `Category`, MSTest `TestCategory`) become `trait:<key>=<value>` tags, plus `category:<value>` for category traits, so you can filter Test Explorer with, for example, `@testy:trait:Category=Integration`. Spaces in tag values appear as `_`.
 
-Project evaluations can also be reused within the editor session and across restarts after validating the files, existence checks, and directory searches MSBuild used. Saved evaluations are bounded to 128 project roots and 32 MiB. A full refresh or startup still checks the SDK and runs Restore before validating an existing evaluation, so generated imports and restored assets remain authoritative. Changes to imports, SDKs, file inventories, configuration, environment, or evaluation tools require fresh evaluation. Unsupported custom evaluation logic and unavailable or invalid saved evaluations use normal evaluation. Builds continue to use MSBuild's incremental checks.
+## Debugging tests
 
-Successful source analyses are retained within the editor session, including across full refreshes. Reuse requires matching source bytes, alias inputs, and analyzer context. Generated sources are checked after Build, and partial declarations and exclusions are resolved against the current projects. Incomplete analysis is retried; custom CLI wrappers or injected runtime components use fresh analysis.
+Use the **Debug** profile in Test Explorer. Testy starts the test host, waits for it to report its process ID, and attaches the `coreclr` debugger. Debug runs use one process per project, run without coverage, and are not limited by `testy.timeoutSeconds`. The C# extension must be installed; Testy offers to install it if it is missing.
 
-The bundled collector instruments independent workspace DLLs concurrently during initial preparation when project workers are available. This shares the existing preparation budget with source analysis and discovery. Each private test-file worker still prepares one DLL at a time, and warm prepared-output cache hits skip instrumentation.
+## Build configurations
 
-Workspace assemblies loaded from original build outputs, other paths, or memory are also recorded, including loads in child .NET processes that inherit and support the startup hook. When a load bypasses the instrumented copy, Testy records a dependency on the loaded project. Changes and new source files in that project rerun the calling test file, even without a `ProjectReference`. Those loads do not themselves supply line coverage. If runtime observation is incomplete, retained coverage stays visible and selection becomes conservative.
+List extra configurations in `testy.additionalConfigurations` (for example `["Release"]`) to get **Run (Release)** and **Run with coverage (Release)** profiles next to the defaults. A manual run through one of them builds, discovers and runs with that configuration for that run only. Automatic runs always use `testy.buildConfiguration`, and the profiles are not the default. Coverage learned under another configuration is shown, but it is not trusted to narrow later selections: the affected files are conservatively rerun and relearned by the next automatic run.
 
-A collector command can succeed without instrumenting a module, for example when its symbols are missing. Testy verifies that the assembly bytes changed and retains project dependencies for skipped modules, so their callers cannot be silently omitted.
+## Continuous run
 
-When target frameworks share an output directory, Testy snapshots each target immediately after building it. Discovery, test execution, and portable symbols use that target's copy.
+The Run profile supports Test Explorer's continuous run. While automatic testing is paused, a continuous run keeps the selected tests running after changes.
 
-New or unknown source files, project/configuration changes, missing coverage, and incomplete or failing traces use a conservative fallback: all test files in the affected project and its dependent test projects. A bundled Roslyn analyzer also detects declaration changes, including constants, signatures, attributes, and initializers that can affect consumers without appearing in runtime coverage. Edits in coverage-excluded methods or hidden regions also force fallback. Recorded runtime dependencies and workspace binary references are included even without a `ProjectReference`. Evaluated imports, resources and additional build inputs are tracked across consuming projects. MSBuild applies reference-specific properties when building dependencies. Ordinary method-body edits use the recorded traces. Choose `testy.runMode: "all"` to always run the complete suite.
+## Coverage
 
-The first baseline requires separate test-file runs for attribution. Independent files run concurrently, including files in the same test project. Complete projects in run-all mode, and runs without collection, batch tests by project. Compatible build roots share an MSBuild invocation so their shared dependencies can be reused. Project discovery runs concurrently; files whose provider identities cannot be safely mapped to another worker use their original runner. Partial selections and exclusions also use that runner. Subsequent runs build the affected roots and execute only selected test files. Source files with hidden or remapped `#line` regions use conservative project selection because coverage may not identify their physical methods. For unobserved external dependencies, changes to databases, services, environment variables, or data outside the watched files require a full refresh.
+Coverage collection is enabled by default (`testy.runWithCoverage`). Fresh coverage appears in Test Explorer's coverage view and can be filtered per test file or project. Coverage retained from earlier sessions is published after startup checks, or at the first run if automatic testing is paused.
 
-Changes are accumulated across cancelled runs. Completed, version-checked test files are checkpointed during the baseline, so cancellation resumes unfinished work. An interrupted test file never replaces its previous contribution. Instrumentation happens in temporary copies, so a cancelled collector cannot modify your normal build outputs.
-
-## Coverage and results
+Optional gutter markers (`testy.showCoverage`, off by default) also show coverage that is **stale** because a source file, contributing test, or dependency changed since it was collected:
 
 - A **filled green circle** marks a covered line.
 - A **red ring** marks an uncovered line.
-- An **amber diamond** marks coverage that is stale or belongs to an unsaved version of the file.
+- An **amber diamond** marks stale coverage, or coverage of an unsaved version of the file.
 
-Rerunning a file replaces its coverage contribution while retaining contributions from other tests. Deleted tests lose their contributions. Coverage from different versions of a source file is never combined into a misleading green result. A manually selected subset of a test file does not overwrite that file's complete coverage contribution. Manual runs without collection preserve the existing impact map. Editing a contributing test or dependency marks retained production coverage stale, even if the production file itself is unchanged.
+On first use, Testy installs a pinned version of `dotnet-coverage` into its own storage; it never adds packages to your projects. If setup fails, tests continue with conservative selection and the status tooltip explains why coverage is unavailable.
 
-A manual subset of files in run-all mode collects separate file contributions. The previous project aggregate remains visible as stale history until every file has been relearned or the whole project runs again. The same retention applies when switching from run-all to affected mode. Outcomes for tests outside the final affected selection remain available.
+## How affected selection works
 
-Some frameworks report deferred theory rows under one shared test identity; Testy preserves a failure if another row subsequently passes. Testy maps runtime-only rows using provider identities, source paths, and unambiguous type/method metadata. If a row cannot be selected individually after discovery, Testy runs its containing file. Rows whose file cannot be identified appear under **Unmapped runtime tests** and rerun their project. Output explains the expanded selection.
+During the baseline, every test file runs separately under coverage. Testy records which workspace source files each test file reaches, including indirect calls and assemblies loaded at runtime. Later saves select every test file known to exercise the changed code.
 
-Explicit exclusions still apply to that fallback. If a runtime-only exclusion cannot be honored by the provider, the run reports the limitation before executing tests. An unavailable coverage cache is reported in Output and does not prevent a fresh startup baseline.
+When impact can't be proven from coverage, Testy falls back to all test files in the affected project and its dependent test projects. This happens for new or unknown files, project or configuration changes, missing coverage, and incomplete traces. A Roslyn analyzer, using the compiler of your installed .NET SDK, also catches declaration changes such as constants, signatures, and attributes that affect consumers without showing up in runtime coverage. Set `testy.runMode` to `all` to always run the complete suite.
 
-A manual test selection preserves failures from unselected runtime rows. Their outcomes change only when those rows run again or a complete run establishes that they no longer exist.
+Each run explains itself. When a test file is queued, Testy writes a line such as `Selected CalculatorTests.cs: covers Calculator.cs (changed)` to the run output and the Testy log, and shows the same reason as the file's description in Test Explorer while the run is active. The reason is one of: the changed files its coverage trace links to it (the first three, then a count), its own file changed, a named project fallback (configuration change, no coverage trace yet, a change that could not be analyzed precisely), baseline, manual run, or run-all mode.
 
-Overlapping manual selections run each discovered test once after fallback expansion. A complete refresh removes runtime rows that no longer exist, including when the project runs file by file or resumes from a completed checkpoint. Partial or cancelled refreshes retain unresolved rows until the remaining project files finish.
-
-Test failures include their messages and stack traces in Test Explorer. The status item shows progress, passing/failing totals, and fresh production-code line coverage. **Testy: Show Output** includes build output and explains each selection.
+See [How Testy works](docs/how-it-works.md) for the full details: caching, evaluation reuse, runtime observation, theory rows, generated files, and process cleanup.
 
 ## Settings
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `testy.autoRun` | `true` | Establish a baseline on open and run automatically. |
+| `testy.autoRun` | `true` | Establish a baseline on open and run automatically. Pausing is stored per workspace and overrides this default. |
 | `testy.runMode` | `affected` | `affected` or `all`. |
-| `testy.trigger` | `save` | Editor saves, or `fileSystem` for external disk changes too. |
+| `testy.trigger` | `save` | `save` for editor saves, or `fileSystem` to include external disk changes and branch switches. |
 | `testy.debounceTime` | `500` | Delay after the latest change, in milliseconds. |
-| `testy.runWithCoverage` | `true` | Collect coverage; disabling it uses project fallback. |
-| `testy.showCoverage` | `true` | Show coverage gutter markers. |
+| `testy.runWithCoverage` | `true` | Collect coverage. Disabling it uses project fallback. |
+| `testy.showCoverage` | `false` | Also show coverage and stale markers in editor gutters. |
+| `testy.solution` | (empty) | Optional `.sln`, `.slnx`, or `.slnf` whose projects limit the entry points. `${workspaceFolder}` is supported. |
+| `testy.projects.include` | `[]` | Globs for entry-point projects to include, for example `tests/**/*.csproj`. |
+| `testy.projects.exclude` | `[]` | Globs for entry-point projects to exclude. Exclusions win over inclusions. |
 | `testy.exclude` | `[]` | Additional file patterns to ignore. |
-| `testy.fileWatcherPattern` | Source and configuration files | Customize which files can trigger runs. |
-| `testy.buildConfiguration` | `Debug` | MSBuild configuration. |
-| `testy.maxParallelProjects` | `0` | Worker budget for initial project preparation, builds, source analysis, and discovery. |
-| `testy.maxParallelTestFiles` | `0` | Worker budget for test-file execution and private runner preparation; a project batch uses one worker. |
-| `testy.dotnetPath` | `dotnet` | Path to the CLI executable. |
+| `testy.fileWatcherPattern` | Source and configuration files | Which files can trigger runs. |
+| `testy.buildConfiguration` | `Debug` | MSBuild configuration for automatic runs and the default profiles. |
+| `testy.additionalConfigurations` | `[]` | Extra MSBuild configurations such as `Release`. Each adds `Run (Release)` and `Run with coverage (Release)` profiles that build and run manual selections with that configuration. |
+| `testy.maxParallelProjects` | `0` (automatic) | Workers for initial project preparation, builds, source analysis, and discovery. |
+| `testy.maxParallelTestFiles` | `0` (automatic) | Workers for test-file execution. Use `1` for tests that share databases, ports, or other external resources. |
+| `testy.dotnetPath` | `dotnet` | Path to the .NET CLI. *Machine-overridable.* |
 | `testy.testArguments` | `[]` | Additional MTP arguments, such as framework settings. |
-| `testy.timeoutSeconds` | `600` | Limit for each build, discovery, or test-file run. |
-| `testy.coverageToolPath` | Automatic | Optional existing `dotnet-coverage` executable. |
+| `testy.timeoutSeconds` | `600` | Limit for each build, discovery, or test-file run. Debug runs are not limited. |
+| `testy.coverageToolPath` | Automatic | Existing `dotnet-coverage` executable. *Machine-overridable.* |
 
-Concurrency settings use `0` for automatic. Test-file workers use `max(1, available CPUs - 1)`; initial project preparation uses `max(1, min(4, available CPUs - 1))` because builds and source analysis can also schedule internal parallel work. For example, a machine with 10 available CPUs uses 4 project workers and 9 test-file workers. Each additional file worker can prepare its own isolated runner and consumes additional memory. Use `1` for sequential operation or an explicit positive integer to choose either limit. These settings apply on the next run without clearing learned coverage. Test frameworks retain their own internal scheduling. Tests that share databases, fixed ports, or other external resources may require `testy.maxParallelTestFiles: 1`; private outputs isolate files in the build output, not external resources. Output reports the resolved limits, phase timings, and any identity or build-output constraints on parallelism.
+One engine serves every folder of a multi-root workspace, so settings other than the two executable paths are window-scoped: set them in user or workspace settings, not per folder. With `0`, test-file workers use available CPUs minus one, and project workers use up to four while reserving one CPU.
 
-Generated files and build outputs (`bin`, `obj`, `TestResults`, `*.g.cs`, `*.generated.cs`, `*.designer.cs`, and files with an auto-generated header in the first 2,048 bytes) do not trigger test runs. Observed generated headers remain recognized through deletion and rename; a refresh or save that sees ordinary content clears that classification. Header-marked outputs and configured `testy.exclude` patterns are also excluded from input hashes, so a generator that rewrites them during a build does not restart the baseline. Ignored Compile inputs still supply global aliases and partial-type coverage-exclusion metadata for conservative source analysis. Evaluated generator inputs remain tracked unless explicitly excluded. Directory events honor the same exclusions as their children. VS Code file renames and deletions are handled in both trigger modes.
+## Remote, WSL, and dev containers
 
-Generated headers must be declarations in leading comments. A marker such as `"<auto-generated/>"` inside a handwritten test or an explanatory comment does not exclude that file. Inherited `.editorconfig` files, global analyzer configuration, and configured rulesets are tracked as compiler inputs. Creating or deleting a previously absent configuration also invalidates the consuming projects, including changes that arrive while tests run.
+Testy runs where your workspace files live. In Remote - SSH, WSL, or a dev container, install the .NET 10 SDK on the remote side, and the C# extension there too if you want to debug. The `dotnet-coverage` download also happens on the remote side.
 
-Saved and on-disk generated headers use the same 2,048-byte prefix, including UTF-8 and UTF-16 files with a BOM in either byte order. Removing a generated header makes the file an ordinary tracked input again.
+## Using Testy with C# Dev Kit
 
-Filesystem mode also watches evaluated source files and build inputs linked from outside the workspace, including known inputs outside the usual file-pattern extensions. Excluding a referenced project from discovery does not prevent MSBuild from building that required dependency.
+Testy does not need C# Dev Kit, but they can be installed together. If both are enabled, Test Explorer shows two trees for the same tests, and both extensions build your projects. Testy shows a one-time notice when it detects Dev Kit. To avoid duplicate work, disable Dev Kit's testing for the workspace, or disable one of the extensions there.
 
-External input watchers are installed before builds and discovery, allowing a corrected linked file to recover a failed run. Inherited `global.json` candidates are tracked before SDK validation, so correcting an invalid initial SDK pin also triggers recovery. SDK file creation and deletion participate in input-version checks.
+## Troubleshooting
 
-## Requirements and boundaries
+- **Something looks wrong.** Run **Testy: Show Output**. The log includes build output, resolved worker limits, phase timings, and why each test was selected. Use **Developer: Set Log Level…** and choose Testy for more detail.
+- **A project's tests are missing.** VSTest projects and test targets older than .NET 10 are skipped and listed in Output. Check `testy.solution` and `testy.projects.*` too.
+- **Coverage is unavailable.** The status tooltip explains why. If NuGet access is blocked, install `dotnet-coverage` yourself and set `testy.coverageToolPath`.
+- **Results seem stale or selections too narrow.** Run **Testy: Reset Caches and Baseline**, or **Refresh and Run All C# Tests** after changing external data, services, or environment variables.
+- **A test batch could not run.** The status bar shows batch errors. The affected tests are marked errored, the remaining batches continue, and Output has the details.
+- **Tests interfere with each other.** Set `testy.maxParallelTestFiles` to `1`.
 
-- VS Code 1.99 or later, with a trusted local workspace or a remote extension host that has the .NET CLI.
-- .NET SDK 10 or later; test projects must target .NET 10 or later and enable MTP. Referenced production libraries may target compatible earlier frameworks.
-- An MTP test framework that supports the standard discovery and execution server protocol. Integration tests cover MSTest 4.3.3, xUnit v3 3.2.0 with MTP v2, and NUnit 4.4.0 with adapter 6.3.0.
-- Portable debug symbols for source mapping and coverage. A missing source location causes conservative selection.
+## Known limitations
 
-Test discovery is scoped to projects inside the opened workspace folders. Referenced projects outside those folders are built as dependencies, but their tests are not discovered. A build failure stops the current batch, including independent projects.
+- Test projects must use MTP on .NET 10 or later. Testy does not migrate VSTest projects.
+- Only tests inside the opened workspace folders are discovered. Referenced projects outside them are built but not searched for tests.
+- Changes to databases, services, environment variables, or unwatched data are invisible to affected selection; use a full refresh.
+- Code reached through external services, or child processes that suppress .NET startup hooks, can't be traced. Use `testy.runMode: "all"` if your tests rely on that.
+- Coverage is line-based; branch coverage isn't reported.
+- Source files with hidden or remapped `#line` regions use project fallback.
+- Debugging requires the C# extension.
 
-When an evaluated project stops being a test target or leaves the workspace, its test inventory, runtime rows, coverage and baseline checkpoints are removed. Required references still build as dependencies. These removals persist even if a subsequent build fails.
+## Contributing
 
-Source analysis can inspect generated declarations only when they appear in evaluated Compile inputs. If a source generator applies coverage-exclusion metadata through compiler-only output, use `testy.runMode: "all"`. Changes to external services, environment variables, and unwatched data require a full refresh.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing, and benchmarking. Design and validation notes live in [docs](docs/).
 
-Child execution that suppresses startup hooks or runs through an external service cannot supply module dependencies. Use run-all mode when tests rely on workspace code executed that way.
+## License
 
-Testy cleans up owned test processes after completion, cancellation, and extension-host failure. On Windows, a Job Object contains descendants. On macOS and Linux, an independent supervisor watches the extension host’s control pipe and combines process groups with an inherited ownership marker to find detached children. The supervisor uses VS Code’s bundled runtime; no separate Node installation is required. Programs that deliberately remove that marker and detach, or launch work through an external service, must manage that work's lifetime themselves.
-
-Private run output carries process ownership metadata. Startup and subsequent runs reclaim output left by dead hosts while preserving live windows' output. Unmarked directories created by older versions are preserved because their ownership cannot be verified.
-
-Testy does not migrate VSTest projects or edit their package references. A project using VSTest gets an actionable setup error. If your workspace uses a `global.json`, it must select a supported SDK. Microsoft documents [MTP setup](https://learn.microsoft.com/en-us/dotnet/core/testing/microsoft-testing-platform-intro) and the [.NET 10 CLI integration](https://learn.microsoft.com/en-us/dotnet/core/tools/dotnet-test-mtp).
-
-## Development
-
-```sh
-npm ci
-npm test
-npm run test:integration
-npm run test:extension
-npm run package
-# Optional 4,800-case deep dependency graph benchmark (three serial/automatic pairs):
-npm run benchmark
-# Optional report parsing, output reuse, identity lookup, and UI publication probes:
-npm run benchmark:responsiveness
-node test/performance/cache-and-results.cjs
-node test/performance/cache-membership.cjs
-node test/performance/live-updates.cjs
-node test/performance/discovery.cjs
-```
-
-Compilation builds TypeScript, the bundled .NET source analyzer, the Windows process owner, and the runtime observer. The observer uses a .NET startup hook compatible with the collector and managed child runtimes; it does not edit workspace packages or build outputs. Integration tests copy the sample workspace into a temporary directory, build it, modify its source, and assert the selected test identities, failure results, retained coverage, constant-change fallback, and cancellation. Set `TESTY_COVERAGE_TOOL` to an existing collector executable to reuse it in tests. The extension-host suite downloads an isolated VS Code build and exercises actual saves, pause/resume, refresh, and external linked-file events. Set `TESTY_VSCODE_PATH` to use an existing VS Code executable instead.
-
-The analyzer bundles pinned, portable Roslyn NuGet assemblies. Unit validation rejects platform-specific managed binaries, so a VSIX built on one OS can use the same analyzer on another.
-
-For interactive development, open this repository in VS Code and press **F5**. The launch task builds the bundled .NET helpers before starting the TypeScript watcher. Open `test/fixtures/ImpactDemo` in the Extension Development Host, save a source edit, and inspect Test Explorer and **Testy: Show Output**. To test the installable artifact, use **Extensions: Install from VSIX…** and choose `testy-1.2.0.vsix`; reload the window afterward. No publication is needed.
-
-See [validation evidence](docs/1.0-validation.md) for measured performance and platform limits.
-The [latest performance review](docs/performance-review.md) records optimization measurements and remaining candidates.
+See [LICENSE](LICENSE) and [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).

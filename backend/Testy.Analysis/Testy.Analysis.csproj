@@ -2,18 +2,23 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
-    <RollForward>Major</RollForward>
-    <UseAppHost>false</UseAppHost>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- Ordinal comparisons only (hashes, paths, identifiers), so skip loading ICU. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- The server amortizes Tier-0 instrumentation over many requests. The one-shot
+         fallback (a short-lived process) turns it off with DOTNET_TieredPGO=0. -->
+    <TieredPGO>true</TieredPGO>
   </PropertyGroup>
   <ItemGroup>
-    <Reference Include="Microsoft.Build" HintPath="$(MSBuildToolsPath)/Microsoft.Build.dll" Private="false" />
-    <Reference Include="Microsoft.Build.Framework" HintPath="$(MSBuildToolsPath)/Microsoft.Build.Framework.dll" Private="false" />
-    <Reference Include="Microsoft.Build.Utilities.Core" HintPath="$(MSBuildToolsPath)/Microsoft.Build.Utilities.Core.dll" Private="false" />
-    <!-- SDK copies can contain native code for the build machine. The extension
-         ships one portable analyzer, including when installed on another OS. -->
-    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.9.0" />
+    <InternalsVisibleTo Include="Testy.Backend.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The task runs inside the user's SDK MSBuild. Compile against the oldest
+         supported .NET 10 SDK's MSBuild API and never ship a copy of it. -->
+    <PackageReference Include="Microsoft.Build" Version="18.0.2" ExcludeAssets="runtime" />
+    <PackageReference Include="Microsoft.Build.Framework" Version="18.0.2" ExcludeAssets="runtime" />
+    <PackageReference Include="Microsoft.Build.Utilities.Core" Version="18.0.2" ExcludeAssets="runtime" />
+    <!-- Syntax APIs only. Roslyn is loaded at run time from the installed SDK (RoslynLoader). Compile
+         against 5.0, the oldest supported (SDK 10.0.100 ships it), and never ship a copy. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.0.0" ExcludeAssets="runtime" />
   </ItemGroup>
 </Project>

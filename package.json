@@ -1,11 +1,29 @@
 {
   "name": "testy",
-  "displayName": "Testy",
-  "description": "Automatic affected C# tests and live, retained code coverage for .NET 10+ and Microsoft.Testing.Platform.",
+  "displayName": "%displayName%",
+  "description": "%description%",
   "repository": {
     "url": "https://github.com/reginaldFerland/testy",
     "type": "git"
   },
+  "bugs": {
+    "url": "https://github.com/reginaldFerland/testy/issues"
+  },
+  "homepage": "https://github.com/reginaldFerland/testy#readme",
+  "license": "MIT",
+  "keywords": [
+    "csharp",
+    "dotnet",
+    "test",
+    "testing",
+    "unit test",
+    "code coverage",
+    "microsoft.testing.platform",
+    "test explorer",
+    "xunit",
+    "nunit",
+    "mstest"
+  ],
   "publisher": "reginaldFerland",
   "version": "1.2.0",
   "icon": "testy.png",
@@ -20,39 +38,161 @@
     "workspaceContains:**/*.sln",
     "workspaceContains:**/*.slnx"
   ],
-  "main": "./out/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./dist/extension.js",
+  "l10n": "./l10n",
   "contributes": {
     "commands": [
       {
         "command": "testy.refreshTests",
-        "title": "Refresh and Run All C# Tests",
+        "title": "%command.refreshTests%",
         "category": "Testy",
         "icon": "$(refresh)"
       },
       {
+        "command": "testy.runAffected",
+        "title": "%command.runAffected%",
+        "category": "Testy",
+        "icon": "$(play)"
+      },
+      {
         "command": "testy.toggleAutoRun",
-        "title": "Pause or Resume Automatic Testing",
+        "title": "%command.toggleAutoRun%",
+        "category": "Testy"
+      },
+      {
+        "command": "testy.pause",
+        "title": "%command.pause%",
         "category": "Testy",
         "icon": "$(debug-pause)"
       },
       {
+        "command": "testy.resume",
+        "title": "%command.resume%",
+        "category": "Testy",
+        "icon": "$(debug-start)"
+      },
+      {
+        "command": "testy.cancelRun",
+        "title": "%command.cancelRun%",
+        "category": "Testy",
+        "icon": "$(debug-stop)",
+        "enablement": "testy.running"
+      },
+      {
+        "command": "testy.clearCoverage",
+        "title": "%command.clearCoverage%",
+        "category": "Testy",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "testy.exportCoverage",
+        "title": "%command.exportCoverage%",
+        "category": "Testy",
+        "icon": "$(export)"
+      },
+      {
+        "command": "testy.resetCaches",
+        "title": "%command.resetCaches%",
+        "category": "Testy",
+        "icon": "$(trash)"
+      },
+      {
         "command": "testy.showOutput",
-        "title": "Show Output",
+        "title": "%command.showOutput%",
         "category": "Testy",
         "icon": "$(output)"
+      },
+      {
+        "command": "testy.showMenu",
+        "title": "%command.showMenu%",
+        "category": "Testy"
       }
     ],
     "menus": {
       "view/title": [
         {
+          "command": "testy.runAffected",
+          "when": "view == workbench.view.testing && testy.active",
+          "group": "navigation@testy1"
+        },
+        {
+          "command": "testy.pause",
+          "when": "view == workbench.view.testing && testy.active && !testy.paused",
+          "group": "navigation@testy2"
+        },
+        {
+          "command": "testy.resume",
+          "when": "view == workbench.view.testing && testy.active && testy.paused",
+          "group": "navigation@testy2"
+        },
+        {
           "command": "testy.refreshTests",
-          "when": "view == workbench.view.testing",
-          "group": "navigation@testy"
+          "when": "view == workbench.view.testing && testy.active",
+          "group": "testy@1"
+        },
+        {
+          "command": "testy.clearCoverage",
+          "when": "view == workbench.view.testing && testy.active",
+          "group": "testy@2"
+        },
+        {
+          "command": "testy.exportCoverage",
+          "when": "view == workbench.view.testing && testy.active",
+          "group": "testy@3"
+        },
+        {
+          "command": "testy.resetCaches",
+          "when": "view == workbench.view.testing && testy.active",
+          "group": "testy@4"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "testy.refreshTests",
+          "when": "testy.active"
+        },
+        {
+          "command": "testy.runAffected",
+          "when": "testy.active"
         },
         {
           "command": "testy.toggleAutoRun",
-          "when": "view == workbench.view.testing",
-          "group": "navigation@testy"
+          "when": "testy.active"
+        },
+        {
+          "command": "testy.pause",
+          "when": "testy.active && !testy.paused"
+        },
+        {
+          "command": "testy.resume",
+          "when": "testy.active && testy.paused"
+        },
+        {
+          "command": "testy.cancelRun",
+          "when": "testy.active && testy.running"
+        },
+        {
+          "command": "testy.clearCoverage",
+          "when": "testy.active"
+        },
+        {
+          "command": "testy.exportCoverage",
+          "when": "testy.active"
+        },
+        {
+          "command": "testy.resetCaches",
+          "when": "testy.active"
+        },
+        {
+          "command": "testy.showOutput",
+          "when": "testy.active"
+        },
+        {
+          "command": "testy.showMenu",
+          "when": "testy.active"
         }
       ]
     },
@@ -62,150 +202,283 @@
         "testy.autoRun": {
           "type": "boolean",
           "default": true,
-          "description": "Automatically establish a baseline on open and run affected tests after changes."
+          "markdownDescription": "%config.autoRun%",
+          "scope": "window",
+          "order": 0
         },
         "testy.runMode": {
           "type": "string",
           "default": "affected",
-          "description": "Choose affected test files or the entire C# suite.",
           "enum": [
             "affected",
             "all"
           ],
           "enumDescriptions": [
-            "Use recorded code usage, with project fallback when information is incomplete.",
-            "Run every C# test file after a change."
-          ]
+            "%config.runMode.affected%",
+            "%config.runMode.all%"
+          ],
+          "markdownDescription": "%config.runMode%",
+          "scope": "window",
+          "order": 1
         },
         "testy.trigger": {
           "type": "string",
           "default": "save",
-          "description": "Choose which changes trigger automatic tests.",
           "enum": [
             "save",
             "fileSystem"
           ],
           "enumDescriptions": [
-            "Editor saves, plus files renamed or deleted through VS Code.",
-            "All matching disk changes, including external edits and branch switches."
-          ]
+            "%config.trigger.save%",
+            "%config.trigger.fileSystem%"
+          ],
+          "markdownDescription": "%config.trigger%",
+          "scope": "window",
+          "order": 2
         },
         "testy.debounceTime": {
           "type": "number",
           "default": 500,
-          "description": "Milliseconds to wait after the latest change before rebuilding and testing.",
           "minimum": 0,
-          "maximum": 60000
+          "maximum": 60000,
+          "markdownDescription": "%config.debounceTime%",
+          "scope": "window",
+          "order": 3
         },
         "testy.runWithCoverage": {
           "type": "boolean",
           "default": true,
-          "description": "Collect and retain code coverage. Disabling coverage uses conservative project selection."
+          "markdownDescription": "%config.runWithCoverage%",
+          "scope": "window",
+          "order": 4
         },
         "testy.showCoverage": {
           "type": "boolean",
-          "default": true,
-          "description": "Show covered, uncovered, and stale coverage markers in editor gutters."
+          "default": false,
+          "markdownDescription": "%config.showCoverage%",
+          "scope": "window",
+          "order": 5
+        },
+        "testy.solution": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "%config.solution%",
+          "scope": "window",
+          "order": 6
+        },
+        "testy.projects.include": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "markdownDescription": "%config.projects.include%",
+          "scope": "window",
+          "order": 7
+        },
+        "testy.projects.exclude": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "markdownDescription": "%config.projects.exclude%",
+          "scope": "window",
+          "order": 8
         },
         "testy.fileWatcherPattern": {
           "type": "string",
-          "default": "**/*.{cs,csproj,sln,slnx,props,targets,runsettings,json,config,resx,editorconfig,globalconfig,ruleset}",
-          "description": "Files whose changes can trigger tests."
+          "default": "**/*.{cs,csproj,sln,slnx,slnf,props,targets,runsettings,json,config,resx,editorconfig,globalconfig,ruleset}",
+          "markdownDescription": "%config.fileWatcherPattern%",
+          "scope": "window",
+          "order": 9
         },
         "testy.exclude": {
           "type": "array",
           "default": [],
-          "description": "Additional glob patterns to ignore. Generated files, bin, obj, TestResults, node_modules, and .git are always excluded.",
           "items": {
             "type": "string"
-          }
+          },
+          "markdownDescription": "%config.exclude%",
+          "scope": "window",
+          "order": 10
         },
         "testy.buildConfiguration": {
           "type": "string",
           "default": "Debug",
-          "description": "MSBuild configuration used for builds and test discovery."
+          "markdownDescription": "%config.buildConfiguration%",
+          "scope": "window",
+          "order": 11
         },
         "testy.maxParallelProjects": {
           "type": "integer",
           "default": 0,
           "minimum": 0,
-          "description": "Worker limit for initial project preparation, builds, source analysis, and discovery. 0 automatically uses up to four workers while reserving one CPU; 1 runs sequentially. Applies on the next run."
+          "markdownDescription": "%config.maxParallelProjects%",
+          "scope": "window",
+          "order": 12
         },
         "testy.maxParallelTestFiles": {
           "type": "integer",
           "default": 0,
           "minimum": 0,
-          "description": "Worker limit for test-file execution and private runner preparation. Project-wide batches each use one worker. 0 uses available CPUs minus one, with at least one worker; 1 runs sequentially. Tests sharing external resources may need 1. Applies on the next run."
+          "markdownDescription": "%config.maxParallelTestFiles%",
+          "scope": "window",
+          "order": 13
         },
         "testy.dotnetPath": {
           "type": "string",
           "default": "dotnet",
-          "description": "Path to the .NET 10+ CLI executable."
+          "markdownDescription": "%config.dotnetPath%",
+          "scope": "machine-overridable",
+          "order": 14
         },
         "testy.testArguments": {
           "type": "array",
           "default": [],
-          "description": "Additional MTP application arguments. Discovery, filtering, and connection arguments are managed by Testy.",
           "items": {
             "type": "string"
-          }
+          },
+          "markdownDescription": "%config.testArguments%",
+          "scope": "window",
+          "order": 15
         },
         "testy.timeoutSeconds": {
           "type": "number",
           "default": 600,
-          "description": "Maximum duration for an individual build, discovery, or test-file run.",
           "minimum": 10,
-          "maximum": 86400
+          "maximum": 86400,
+          "markdownDescription": "%config.timeoutSeconds%",
+          "scope": "window",
+          "order": 16
         },
         "testy.coverageToolPath": {
           "type": "string",
           "default": "",
-          "description": "Optional path to dotnet-coverage. By default, Testy installs a pinned collector into its own storage on first use."
+          "markdownDescription": "%config.coverageToolPath%",
+          "scope": "machine-overridable",
+          "order": 17
+        },
+        "testy.additionalConfigurations": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "markdownDescription": "%config.additionalConfigurations%",
+          "scope": "window",
+          "order": 18
         }
       }
-    }
+    },
+    "walkthroughs": [
+      {
+        "id": "testy.gettingStarted",
+        "title": "%walkthrough.title%",
+        "description": "%walkthrough.description%",
+        "steps": [
+          {
+            "id": "prerequisites",
+            "title": "%walkthrough.prerequisites.title%",
+            "description": "%walkthrough.prerequisites.description%",
+            "media": {
+              "markdown": "media/walkthrough/prerequisites.md"
+            },
+            "completionEvents": []
+          },
+          {
+            "id": "trust",
+            "title": "%walkthrough.trust.title%",
+            "description": "%walkthrough.trust.description%",
+            "media": {
+              "markdown": "media/walkthrough/trust.md"
+            },
+            "completionEvents": []
+          },
+          {
+            "id": "baseline",
+            "title": "%walkthrough.baseline.title%",
+            "description": "%walkthrough.baseline.description%",
+            "media": {
+              "markdown": "media/walkthrough/baseline.md"
+            },
+            "completionEvents": [
+              "onCommand:testy.showOutput"
+            ]
+          },
+          {
+            "id": "coverage",
+            "title": "%walkthrough.coverage.title%",
+            "description": "%walkthrough.coverage.description%",
+            "media": {
+              "markdown": "media/walkthrough/coverage.md"
+            },
+            "completionEvents": [
+              "onSettingChanged:testy.showCoverage"
+            ]
+          },
+          {
+            "id": "pause",
+            "title": "%walkthrough.pause.title%",
+            "description": "%walkthrough.pause.description%",
+            "media": {
+              "markdown": "media/walkthrough/pause.md"
+            },
+            "completionEvents": [
+              "onCommand:testy.showMenu"
+            ]
+          }
+        ]
+      }
+    ]
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./ && npm run build:analyzer && npm run build:process-host && npm run build:observer",
-    "build:observer": "dotnet build backend/Testy.RuntimeObserver/Testy.RuntimeObserver.csproj --configuration Release --output dist/observer --nologo",
-    "build:process-host": "dotnet build backend/Testy.ProcessHost/Testy.ProcessHost.csproj --configuration Release --output dist/processhost --nologo",
-    "build:analyzer": "dotnet build backend/Testy.Analysis/Testy.Analysis.csproj --configuration Release --output dist/analyzer --nologo",
+    "vscode:prepublish": "npm run build:dotnet:release && npm run bundle -- --production",
+    "compile": "tsc -p ./ && npm run bundle && npm run build:dotnet",
+    "bundle": "node esbuild.mjs",
+    "watch:bundle": "node esbuild.mjs --watch",
+    "build:dotnet": "npm run build:analyzer && npm run build:process-host && npm run build:observer",
+    "build:dotnet:release": "npm run build:analyzer -- -p:TESTY_RELEASE=true && npm run build:process-host -- -p:TESTY_RELEASE=true && npm run build:observer -- -p:TESTY_RELEASE=true",
+    "build:observer": "node -e \"require('fs').rmSync('dist/observer', { recursive: true, force: true })\" && dotnet build backend/Testy.RuntimeObserver/Testy.RuntimeObserver.csproj --configuration Release --output dist/observer --nologo",
+    "build:process-host": "node -e \"require('fs').rmSync('dist/processhost', { recursive: true, force: true })\" && dotnet build backend/Testy.ProcessHost/Testy.ProcessHost.csproj --configuration Release --output dist/processhost --nologo",
+    "build:analyzer": "node -e \"require('fs').rmSync('dist/analyzer', { recursive: true, force: true })\" && dotnet build backend/Testy.Analysis/Testy.Analysis.csproj --configuration Release --output dist/analyzer --nologo",
     "watch": "tsc -watch -p ./",
-    "pretest": "npm run compile && npm run lint",
-    "lint": "eslint src",
+    "pretest": "npm run compile && npm run lint && npm run typecheck:tests",
+    "lint": "eslint src test *.mjs",
+    "typecheck:tests": "tsc -p tsconfig.tests.json",
     "test": "node --test test/unit/*.test.cjs",
     "test:integration": "npm run compile && node --test test/integration/*.test.cjs",
+    "test:dotnet": "dotnet test backend/Testy.Backend.Tests --nologo",
     "test:extension": "vscode-test",
     "package": "vsce package",
     "benchmark": "npm run compile && node test/performance/benchmark.cjs",
-    "benchmark:responsiveness": "npm run compile && node test/performance/responsiveness.cjs"
+    "benchmark:responsiveness": "npm run compile && node test/performance/responsiveness.cjs",
+    "l10n:export": "npx @vscode/l10n-dev export --outDir ./l10n ./src"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "20.x",
     "@types/vscode": "^1.99.0",
-    "@typescript-eslint/eslint-plugin": "^8.31.1",
-    "@typescript-eslint/parser": "^8.31.1",
-    "@vscode/test-cli": "^0.0.10",
-    "@vscode/test-electron": "^2.5.2",
+    "@vscode/l10n-dev": "^0.0.35",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.2",
     "eslint": "^9.25.1",
-    "typescript": "^5.8.3"
-  },
-  "dependencies": {
     "fast-xml-parser": "^5.11.1",
     "minimatch": "^10.2.6",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.71.1",
     "vscode-jsonrpc": "^9.0.2"
   },
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": false,
-      "description": "Testy builds and executes workspace code automatically."
+      "description": "%capabilities.untrusted%"
     },
     "virtualWorkspaces": {
       "supported": false,
-      "description": "Testy requires the .NET CLI and local workspace files."
+      "description": "%capabilities.virtual%"
     }
   }
 }

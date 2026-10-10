@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto';
+import type { BigIntStats, Dirent } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { Project } from '../core/model';
 import { mapConcurrent } from '../core/concurrency';
 import { EvaluationStorageLimits, readEvaluationSnapshot, writeEvaluationSnapshot } from './projectEvaluationStorage';
-import { resolveNodeExecutable } from './executable';
+import { isNativeExecutable, resolveNodeExecutable } from './executable';
 
 export interface EvaluationQuery {
     readonly kind: 'file' | 'directory' | 'exists' | 'files' | 'directories' | 'entries' | 'mtime' | 'imports';
@@ -60,9 +61,7 @@ export async function evaluationToolContext(dotnet: string, analyzer: string, di
         const unique = [...new Set(hosts)];
         if (unique.length !== 1) {return undefined;}
         const executable = unique[0].split('\0')[0], root = path.dirname(executable), bytes = await fs.readFile(executable, { signal });
-        const magic = bytes.subarray(0, 4).toString('hex');
-        if (!['dotnet', 'dotnet.exe'].includes(path.basename(executable).toLowerCase())
-            || !(magic.startsWith('4d5a') || ['7f454c46', 'cffaedfe', 'feedfacf', 'cefaedfe', 'feedface', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca'].includes(magic))
+        if (!['dotnet', 'dotnet.exe'].includes(path.basename(executable).toLowerCase()) || !isNativeExecutable(bytes)
             || !(await fs.stat(path.join(root, 'sdk'))).isDirectory() || !(await fs.stat(path.join(root, 'host', 'fxr'))).isDirectory()) {return undefined;}
         const analyzerIdentity = await fingerprint(analyzer);
         signal?.throwIfAborted();
@@ -82,23 +81,64 @@ function configurationCandidates(file: string): string[] {
     }
 }
 
+/** A file whose timestamps are this close to the read could change without moving them. */
+const racyMs = 2000;
+const hashCapacity = 16384;
+
+/** Content hashes reused across validation passes while a file's identity and
+ * timestamps are unchanged. Anything uncertain is hashed again. */
+class HashMemo {
+    private readonly known = new Map<string, { readonly stamp: string; readonly digest: string }>();
+    private static stamp(stat: BigIntStats): string { return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':'); }
+    get(file: string, stat: BigIntStats): string | undefined {
+        const entry = this.known.get(file);
+        if (!entry || entry.stamp !== HashMemo.stamp(stat)) {return undefined;}
+        this.known.delete(file); this.known.set(file, entry); return entry.digest;
+    }
+    /** `readAt` is taken before the read, so a later edit always postdates the recorded timestamps. */
+    set(file: string, stat: BigIntStats, digest: string, readAt: number): void {
+        const changed = Number((stat.mtimeNs > stat.ctimeNs ? stat.mtimeNs : stat.ctimeNs) / 1_000_000n);
+        this.known.delete(file);
+        if (!(readAt - changed > racyMs)) {return;}
+        this.known.set(file, { stamp: HashMemo.stamp(stat), digest });
+        if (this.known.size > hashCapacity) {this.known.delete(this.known.keys().next().value!);}
+    }
+    clear(): void { this.known.clear(); }
+}
+
 /** A validation pass shares filesystem reads across all requested root closures. */
 class Validation {
     private readonly files = new Map<string, Promise<string>>();
     private readonly queries = new Map<string, Promise<string>>();
     private readonly realPaths = new Map<string, Promise<string>>();
-    constructor(private readonly signal?: AbortSignal) {}
+    private readonly listings = new Map<string, Promise<Dirent[]>>();
+    constructor(private readonly signal?: AbortSignal, private readonly memo?: HashMemo) {}
     file(file: string): Promise<string> {
         const key = lexical(file), previous = this.files.get(key);
         if (previous) {return previous;}
         const promise = (async () => {
             this.signal?.throwIfAborted();
             try {
-                const [bytes, stat, actual] = await Promise.all([fs.readFile(file, { signal: this.signal }), fs.stat(file), this.realPath(file)]);
-                return `${actual}:${stat.mode}:${digest(bytes)}`;
+                const actualPath = this.realPath(file);
+                void actualPath.catch(() => undefined);
+                // Stat first: a file edited while it is read then differs from the stat on record.
+                const stat = await fs.stat(file, { bigint: true }), readAt = Date.now();
+                let hash = this.memo?.get(key, stat);
+                if (hash === undefined) {
+                    hash = digest(await fs.readFile(file, { signal: this.signal }));
+                    this.memo?.set(key, stat, hash, readAt);
+                }
+                return `${await actualPath}:${stat.mode}:${hash}`;
             } catch (error) {if (missing(error)) {return 'missing';} throw error;}
         })();
         this.files.set(key, promise); return promise;
+    }
+    /** One listing per directory per pass, shared by every query that walks it. */
+    private list(directory: string): Promise<Dirent[]> {
+        const previous = this.listings.get(directory);
+        if (previous) {return previous;}
+        const pending = fs.readdir(directory, { withFileTypes: true });
+        this.listings.set(directory, pending); return pending;
     }
     private realPath(file: string): Promise<string> {
         const previous = this.realPaths.get(file);
@@ -128,7 +168,7 @@ class Validation {
         while (pending.length) {
             const directory = pending.pop()!;
             let entries;
-            try {entries = await fs.readdir(directory, { withFileTypes: true });}
+            try {entries = await this.list(directory);}
             catch (error) {if (query.kind === 'imports' && missing(error)) {continue;} throw error;}
             for (const entry of entries) {
                 this.signal?.throwIfAborted();
@@ -194,10 +234,18 @@ export class ProjectEvaluationCache {
     private revision = 0;
     private dirty = false;
     private pending = Promise.resolve();
-    constructor(private readonly storage?: string, private readonly limits: EvaluationStorageLimits = {}) {}
+    private readonly hashes = new HashMemo();
+    constructor(private readonly storage?: string, private readonly limits: EvaluationStorageLimits = {},
+        private readonly log: (text: string) => void = () => undefined) {}
     retain(files: readonly string[]): void {
         this.live = new Set(files);
         for (const file of this.entries.keys()) {if (!this.live.has(file)) {this.entries.delete(file); this.dirty = true; this.revision++;}}
+    }
+    /** Forget every evaluation, including the saved snapshot. */
+    async clear(signal?: AbortSignal): Promise<void> {
+        this.loaded = true; this.live = undefined;
+        this.entries.clear(); this.hashes.clear(); this.dirty = true; this.revision++;
+        await this.save(signal);
     }
     private async load(signal?: AbortSignal): Promise<void> {
         if (!this.storage || this.loaded) {return;}
@@ -214,16 +262,24 @@ export class ProjectEvaluationCache {
                 }
             }
             this.loaded = true;
-        } catch {signal?.throwIfAborted(); /* An absent, corrupt or unreadable snapshot is a retryable miss. */}
+        } catch (error) {
+            signal?.throwIfAborted();
+            // An absent, corrupt or unreadable snapshot is a retryable miss.
+            this.log(`Saved project evaluations unavailable; evaluating projects. ${String(error)}\n`);
+        }
     }
     async get(files: readonly string[], context: string, signal?: AbortSignal): Promise<ReadonlyMap<string, readonly Project[]>> {
         signal?.throwIfAborted(); await this.load(signal);
-        const validation = new Validation(signal), result = new Map<string, EvaluationEntry>();
+        const validation = new Validation(signal, this.hashes), result = new Map<string, EvaluationEntry>();
         await mapConcurrent(files, 4, signal, async file => {
             const entry = this.entries.get(file);
             if (!entry || entry.context !== context) {return;}
             try {if (await validation.stamp(entry.graph, entry.inputs, signal) === entry.stamp && this.entries.get(file) === entry) {result.set(file, entry);}}
-            catch {signal?.throwIfAborted(); /* An unreadable input requires normal inspection. */}
+            catch (error) {
+                signal?.throwIfAborted();
+                // An unreadable input requires normal inspection.
+                this.log(`Project evaluation for ${path.basename(file)} could not be validated; evaluating it again. ${String(error)}\n`);
+            }
         });
         // An earlier completed root may be retired or superseded while a sibling
         // is still validating. Recheck every captured entry at final publication.
@@ -231,7 +287,7 @@ export class ProjectEvaluationCache {
     }
     async put(graphs: ReadonlyMap<string, readonly Project[]>, context: string, signal?: AbortSignal, dotnetRoot?: string): Promise<void> {
         signal?.throwIfAborted(); await this.load(signal);
-        const validation = new Validation(signal), staged = new Map<string, EvaluationEntry>(), revision = ++this.revision;
+        const validation = new Validation(signal, this.hashes), staged = new Map<string, EvaluationEntry>(), revision = ++this.revision;
         for (const file of graphs.keys()) {this.replacements.set(file, revision);}
         try {
         await mapConcurrent([...graphs], 4, signal, async ([file, graph]) => {
@@ -241,7 +297,11 @@ export class ProjectEvaluationCache {
                 const stamp = await validation.stamp(graph, inputs, signal);
                 if (stamp) {staged.set(file, { graph, inputs, context, stamp,
                     projectInputs: this.storage ? await validation.projectInputs(graph, inputs, signal) : undefined });}
-            } catch {signal?.throwIfAborted(); /* Caching must not turn a successful inspection into a failure. */}
+            } catch (error) {
+                signal?.throwIfAborted();
+                // Caching must not turn a successful inspection into a failure.
+                this.log(`Project evaluation for ${path.basename(file)} will not be reused. ${String(error)}\n`);
+            }
         });
         signal?.throwIfAborted();
         for (const file of graphs.keys()) {
@@ -264,7 +324,11 @@ export class ProjectEvaluationCache {
                 await writeEvaluationSnapshot(this.storage!, new Map(this.entries), this.limits, signal);
                 this.loaded = true;
                 if (this.revision === revision) {this.dirty = false;}
-            } catch {signal?.throwIfAborted(); /* Persistence is optional; retry after the next admission or clean disposal. */}
+            } catch (error) {
+                signal?.throwIfAborted();
+                // Persistence is optional; retry after the next admission or clean disposal.
+                this.log(`Project evaluations could not be saved. ${String(error)}\n`);
+            }
         });
         this.pending = saving; await saving;
     }

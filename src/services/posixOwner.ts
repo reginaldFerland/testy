@@ -17,7 +17,7 @@ interface Launch {
 process.stdout.on('error', () => undefined);
 process.stderr.on('error', () => undefined);
 const control = createInterface({ input: process.stdin });
-let child: ChildProcess | undefined, launch: Launch | undefined;
+let child: ChildProcess | undefined, launch: Launch | undefined, launched: number | undefined;
 let stopping = false, finishing = false;
 let escalation: NodeJS.Timeout | undefined;
 
@@ -46,7 +46,7 @@ async function finish(code: number): Promise<void> {
     try {
         if (launch && (stopping || launch.cleanupDescendants)) {
             signalTree('SIGKILL');
-            await cleanupPosixOwner(launch.owner);
+            await cleanupPosixOwner(launch.owner, launched);
         }
     } catch (error) {process.stderr.write(`Process cleanup failed: ${String(error)}\n`); code = 1;}
     // Descendants may inherit output handles. Cleanup must finish before we
@@ -62,6 +62,7 @@ control.on('line', line => {
         const env: NodeJS.ProcessEnv = { ...process.env, TESTY_PROCESS_OWNER: launch.owner };
         if (launch.electronRunAsNode === undefined) {delete env.ELECTRON_RUN_AS_NODE;}
         else {env.ELECTRON_RUN_AS_NODE = launch.electronRunAsNode;}
+        launched = Date.now();
         child = spawn(launch.command, launch.args, { shell: false, detached: true, stdio: ['ignore', 'inherit', 'inherit'], env });
         child.once('error', error => {process.stderr.write(`${error.message}\n`); void finish(127);});
         child.once('exit', code => {void finish(code ?? 1);});

@@ -1,14 +1,24 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { withLock } from './lock';
+import { LockTimeoutError, lockTiming, withLock } from './lock';
 import { removeOutput } from './output';
-
-const identityPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+import { uuidPattern as identityPattern } from '../core/paths';
+import { currentProcessStamp, isProcessAlive, isProcessStamp, ProcessStamp, unreadableOwnerExpired } from './processStamp';
 const suffix = '.owner.json';
 const maximumMetadataBytes = 4 * 1024 * 1024;
-interface Retention { readonly entries: number; readonly bytes: number; }
-export interface PreparedStorageLimits { readonly maxEntries?: number; readonly maxBytes?: number; }
+export interface Retention { readonly entries: number; readonly bytes: number; }
+/** A parked snapshot reduced to fit a budget, and the entry directories it no longer references. */
+export interface PreparedStorageShrink { readonly snapshot: unknown; readonly retention: Retention; readonly removed: readonly string[]; }
+export interface PreparedStorageLimits {
+    readonly maxEntries?: number; readonly maxBytes?: number;
+    /** Drops the oldest entries of a parked snapshot to fit the target, instead of discarding the whole
+     * container. Returns nothing when no entry fits or the snapshot is not understood. */
+    readonly shrink?: (snapshot: unknown, target: Retention) => PreparedStorageShrink | undefined;
+    /** Diagnostics for cleanup that is skipped and retried later. */
+    readonly log?: (text: string) => void;
+}
+interface Budget { readonly maxEntries: number; readonly maxBytes: number; readonly shrink?: PreparedStorageLimits['shrink']; readonly log: (text: string) => void; }
 export interface PreparedStorageLease {
     readonly directory: string;
     readonly snapshot?: unknown;
@@ -23,6 +33,8 @@ interface Owner {
     readonly identity: string;
     readonly token: string;
     readonly pid: number;
+    /** Distinguishes a live owner from an unrelated process that reused its PID. */
+    readonly process?: ProcessStamp;
     readonly state: 'active' | 'parked';
     readonly parkedAt?: number;
     readonly snapshot?: unknown;
@@ -43,18 +55,23 @@ function parked(owner: Owner): owner is Parked {
         && Object.hasOwn(owner, 'snapshot');
 }
 
-async function readOwner(storage: string, identity: string): Promise<Owner | undefined> {
+/** 'unreadable' marks metadata that no version can parse (damaged or oversized). Unknown
+ * versions and shapes may belong to another release, so they are never reclaimed. */
+async function readOwner(storage: string, identity: string): Promise<Owner | 'unreadable' | undefined> {
     try {
         const file = path.join(storage, identity + suffix);
         const stat = await fs.lstat(file);
-        if (!stat.isFile() || stat.isSymbolicLink() || stat.size > maximumMetadataBytes) {return undefined;}
+        if (!stat.isFile() || stat.isSymbolicLink()) {return undefined;}
+        if (stat.size > maximumMetadataBytes) {return 'unreadable';}
         const value = JSON.parse(await fs.readFile(file, 'utf8')) as Owner;
         if (!value || value.version !== 1 || value.identity !== identity || typeof value.token !== 'string' || !identityPattern.test(value.token)
             || !count(value.pid) || (value.state !== 'active' && value.state !== 'parked')
-            || (value.state === 'active' ? value.pid === 0 : value.pid !== 0)) {return undefined;}
+            || (value.state === 'active' ? value.pid === 0 : value.pid !== 0)
+            || (value.process !== undefined && !isProcessStamp(value.process))) {return undefined;}
         return value;
     } catch (error) {
-        if (error instanceof SyntaxError || (error as NodeJS.ErrnoException).code === 'ENOENT') {return undefined;}
+        if (error instanceof SyntaxError) {return 'unreadable';}
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {return undefined;}
         throw error;
     }
 }
@@ -76,13 +93,20 @@ async function writeOwner(storage: string, owner: Owner, fresh = false): Promise
     }
 }
 
-async function discard(storage: string, owner: Owner): Promise<void> {
-    await removeOutput(path.join(storage, owner.identity));
-    await fs.rm(path.join(storage, owner.identity + suffix), { force: true });
+async function discard(storage: string, identity: string): Promise<void> {
+    await removeOutput(path.join(storage, identity));
+    await fs.rm(path.join(storage, identity + suffix), { force: true });
+}
+
+/** Removal fails on Windows while antivirus or a lingering process holds a file. The
+ * owner record outlives a failed removal, so the next storage operation retries it. */
+async function tryDiscard(storage: string, identity: string, log: Budget['log']): Promise<boolean> {
+    try {await discard(storage, identity); return true;}
+    catch (error) {log(`A retained prepared output could not be removed yet; it will be retried. ${String(error)}\n`); return false;}
 }
 
 /** Unknown formats and possibly live owners are never reclaimed. */
-async function inventory(storage: string, signal?: AbortSignal): Promise<Parked[]> {
+async function inventory(storage: string, log: Budget['log'], signal?: AbortSignal): Promise<Parked[]> {
     const result: Parked[] = [];
     for (const name of await fs.readdir(storage)) {
         signal?.throwIfAborted();
@@ -94,46 +118,75 @@ async function inventory(storage: string, signal?: AbortSignal): Promise<Parked[
         const identity = name.slice(0, -suffix.length);
         if (!name.endsWith(suffix) || !identityPattern.test(identity)) {continue;}
         const owner = await readOwner(storage, identity);
+        if (owner === 'unreadable') {
+            // No process can be checked, so only age says the record was abandoned.
+            if (await unreadableOwnerExpired(path.join(storage, name))) {await tryDiscard(storage, identity, log);}
+            continue;
+        }
         if (!owner) {continue;}
         if (owner.state === 'active') {
-            try {process.kill(owner.pid, 0);}
-            catch (error) {if ((error as NodeJS.ErrnoException).code === 'ESRCH') {await discard(storage, owner);}}
+            if (!await isProcessAlive(owner.pid, owner.process)) {await tryDiscard(storage, identity, log);}
             continue;
         }
         const stat = await fs.lstat(path.join(storage, identity)).catch(error => {
             if ((error as NodeJS.ErrnoException).code === 'ENOENT') {return undefined;} throw error;
         });
         if (!parked(owner) || !stat?.isDirectory() || stat.isSymbolicLink() || !owner.retention.entries) {
-            await discard(storage, owner); continue;
+            await tryDiscard(storage, identity, log); continue;
         }
         result.push(owner);
     }
     return result;
 }
 
-async function trim(storage: string, owners: Parked[], limits: Required<PreparedStorageLimits>): Promise<Parked[]> {
+/** Publish the reduced snapshot before deleting what it dropped, so no snapshot names a deleted directory. */
+async function shrinkOwner(storage: string, owner: Parked, target: Retention, budget: Budget): Promise<Parked | undefined> {
+    const reduced = target.entries ? budget.shrink?.(owner.snapshot, target) : undefined;
+    if (!reduced || !validRetention(reduced.retention) || !reduced.retention.entries) {return undefined;}
+    const shrunk: Parked = { ...owner, snapshot: reduced.snapshot, retention: reduced.retention };
+    try {await writeOwner(storage, shrunk);}
+    catch (error) {budget.log(`A retained preparation container could not be reduced. ${String(error)}\n`); return undefined;}
+    const container = path.join(storage, owner.identity);
+    for (const name of reduced.removed) {
+        const directory = path.join(container, name);
+        if (path.dirname(directory) !== container) {continue;}
+        // An unreferenced leftover is removed by whichever session adopts and parks the container next.
+        try {await removeOutput(directory);}
+        catch (error) {budget.log(`A dropped preparation could not be removed yet. ${String(error)}\n`);}
+    }
+    return shrunk;
+}
+
+async function trim(storage: string, owners: Parked[], budget: Budget): Promise<Parked[]> {
     owners.sort((a, b) => a.parkedAt - b.parkedAt || a.identity.localeCompare(b.identity));
-    let entries = owners.reduce((total, owner) => total + owner.retention.entries, 0);
-    let bytes = owners.reduce((total, owner) => total + owner.retention.bytes, 0);
-    while (owners.length && (entries > limits.maxEntries || bytes > limits.maxBytes)) {
-        const owner = owners[0];
-        await discard(storage, owner);
-        owners.shift(); entries -= owner.retention.entries; bytes -= owner.retention.bytes;
+    const total = (pick: (owner: Parked) => number): number => owners.reduce((sum, owner) => sum + pick(owner), 0);
+    for (let index = 0; index < owners.length;) {
+        const excessEntries = total(owner => owner.retention.entries) - budget.maxEntries;
+        const excessBytes = total(owner => owner.retention.bytes) - budget.maxBytes;
+        if (excessEntries <= 0 && excessBytes <= 0) {break;}
+        const owner = owners[index];
+        // The oldest container gives up its oldest entries first and goes whole only when none fit.
+        const shrunk = await shrinkOwner(storage, owner, { entries: Math.max(0, owner.retention.entries - Math.max(0, excessEntries)),
+            bytes: Math.max(0, owner.retention.bytes - Math.max(0, excessBytes)) }, budget);
+        if (shrunk) {owners[index++] = shrunk; continue;}
+        // A container that cannot be removed now is not adopted either; the next claim retries it.
+        await tryDiscard(storage, owner.identity, budget.log); owners.splice(index, 1);
     }
     return owners;
 }
 
 /** Cleanly parked containers transfer exclusively, in place. Crashed active owners never transfer. */
 export async function claimPreparedStorage(storage: string, signal?: AbortSignal, options: PreparedStorageLimits = {}): Promise<PreparedStorageLease> {
-    const limits = { maxEntries: options.maxEntries ?? 16, maxBytes: options.maxBytes ?? 512 * 1024 * 1024 };
+    const limits = { maxEntries: options.maxEntries ?? 16, maxBytes: options.maxBytes ?? 512 * 1024 * 1024, shrink: options.shrink,
+        log: options.log ?? ((): void => undefined) };
     if (!count(limits.maxEntries) || !count(limits.maxBytes)) {throw new Error('Invalid prepared output storage limit.');}
     const token = randomUUID();
     const claimed = await withLock(`${storage}.lock`, signal, async () => {
         await fs.mkdir(storage, { recursive: true });
-        const candidates = await trim(storage, await inventory(storage, signal), limits);
+        const candidates = await trim(storage, await inventory(storage, limits.log, signal), limits);
         const previous = candidates.at(-1);
         signal?.throwIfAborted();
-        const owner: Owner = { version: 1, identity: previous?.identity ?? randomUUID(), token, pid: process.pid, state: 'active' };
+        const owner: Owner = { version: 1, identity: previous?.identity ?? randomUUID(), token, pid: process.pid, process: await currentProcessStamp(), state: 'active' };
         await writeOwner(storage, owner, !previous);
         if (!previous) {
             try {await fs.mkdir(path.join(storage, owner.identity));}
@@ -145,11 +198,19 @@ export async function claimPreparedStorage(storage: string, signal?: AbortSignal
     const finish = (work: (owner: Owner) => Promise<void>): Promise<void> => {
         const next = pending.catch(() => undefined).then(async () => {
             if (closed) {return;}
-            await withLock(`${storage}.lock`, undefined, async () => {
-                const current = await readOwner(storage, claimed.owner.identity);
-                if (!current || current.state !== 'active' || current.token !== token || current.pid !== process.pid) {closed = true; return;}
-                await work(current); closed = true;
-            });
+            try {
+                await withLock(`${storage}.lock`, undefined, async () => {
+                    const current = await readOwner(storage, claimed.owner.identity);
+                    if (!current || current === 'unreadable' || current.state !== 'active' || current.token !== token || current.pid !== process.pid) {closed = true; return;}
+                    await work(current); closed = true;
+                }, { timeoutMs: lockTiming.cleanupWaitMs });
+            } catch (error) {
+                if (!(error instanceof LockTimeoutError)) {throw error;}
+                // A hung holder must not block shutdown. The container stays marked active, so it is
+                // reclaimed once this process has exited.
+                limits.log(`Prepared output storage is busy; leaving this session's outputs for later reclaim. ${String(error)}\n`);
+                closed = true;
+            }
         });
         pending = next; return next;
     };
@@ -162,15 +223,17 @@ export async function claimPreparedStorage(storage: string, signal?: AbortSignal
         park(snapshot, retention) {
             if (!validRetention(retention)) {return Promise.reject(new Error('Invalid prepared output retention.'));}
             return finish(async owner => {
-                if (!retention.entries || retention.entries > limits.maxEntries || retention.bytes > limits.maxBytes) {
-                    await discard(storage, owner); return;
+                const fits = retention.entries <= limits.maxEntries && retention.bytes <= limits.maxBytes;
+                // An empty budget keeps nothing, and without a way to shrink it an oversized container is not worth publishing.
+                if (!retention.entries || !limits.maxEntries || (!fits && (!limits.shrink || !limits.maxBytes))) {
+                    await discard(storage, owner.identity); return;
                 }
-                await writeOwner(storage, { ...owner, state: 'parked', pid: 0, parkedAt: Date.now(), snapshot, retention });
+                await writeOwner(storage, { ...owner, state: 'parked', pid: 0, process: undefined, parkedAt: Date.now(), snapshot, retention });
                 // Ownership has ended even if trimming another container fails.
                 closed = true;
-                try {await trim(storage, await inventory(storage), limits);}
+                try {await trim(storage, await inventory(storage, limits.log), limits);}
                 catch { /* Retry pruning on the next storage operation; never revoke a published transfer. */ }
             });
         },
-        dispose: () => finish(owner => discard(storage, owner)) };
+        dispose: () => finish(owner => discard(storage, owner.identity)) };
 }

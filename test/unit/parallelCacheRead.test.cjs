@@ -55,11 +55,13 @@ function observe(worker,t){
   release(key){worker.postMessage({release:key});},releaseAll(){worker.postMessage({all:true});}};
 }
 
-function expected(sources,traces,warnings=[]){
+// File times are environmental; the snapshot reports one entry per trace.
+async function settled(probe){const {stats,...rest}=await probe.result;assert.equal(stats.length,rest.traces.length);return rest;}
+function expected(sources,traces,warnings=[],{corrupt=[],evicted=[],complete=!warnings.length}={}){
  const indices=new Map(sources.map((source,index)=>[source.id,index]));
  return{sources:sources.map(source=>({...source,lines:Float64Array.from([...new Set(source.lines)].sort((a,b)=>a-b))})),
   traces:traces.map(trace=>({...trace,sourceIds:Uint32Array.from(trace.sourceIds.map(id=>indices.get(id))),coverage:trace.coverage.map(file=>({
-   file:file.file,hash:file.hash,values:Float64Array.from(file.lines.flatMap(line=>[line.line,line.hits]))}))})),warnings,complete:!warnings.length};
+   file:file.file,hash:file.hash,values:Float64Array.from(file.lines.flatMap(line=>[line.line,line.hits]))}))})),warnings,corrupt,evicted,complete};
 }
 
 test('one four-read pool spans both cache tables and preserves exact inventory order despite reversed completion',{timeout:10000},async t=>{
@@ -76,12 +78,12 @@ test('one four-read pool spans both cache tables and preserves exact inventory o
  assert.equal(probe.events.find(event=>event.event==='completed').key,initial[3].key);
  probe.releaseAll();const snapshot=await probe.result;
  assert.equal(probe.active,0);assert.equal(probe.peak,4);assert.equal(probe.events.filter(event=>event.event==='admitted').length,8);
- assert.deepEqual(snapshot,expected([...sources].reverse(),[...traces].reverse()));
+ assert.deepEqual(await settled({result:Promise.resolve(snapshot)}),expected([...sources].reverse(),[...traces].reverse()));
 });
 
 test('out-of-order corrupt and missing records retain warning order, valid records and incomplete-cache pruning protection',{timeout:10000},async t=>{
  const sources=[source(0),source(1)],traces=[trace(0,sources.slice(0,1))],{root,directory}=await fixture(t,sources,traces);
- const brokenSource=`${'a'.repeat(64)}.json`,missingSource=`${'b'.repeat(64)}.json`,brokenTrace=`${'c'.repeat(64)}.json`,invalidTrace=`${'d'.repeat(64)}.json`;
+ const brokenSource=`${'a'.repeat(64)}.json`,missingSource=`${'b'.repeat(64)}.json`,brokenTrace=`${'c'.repeat(64)}.json`,invalidTrace=`${contentHash('group1')}.json`;
  await fs.writeFile(path.join(directory,'sources',brokenSource),'{broken');
  await fs.writeFile(path.join(directory,'traces',brokenTrace),'{broken');
  await fs.writeFile(path.join(directory,'traces',invalidTrace),JSON.stringify({...trace(1,sources),coverage:[{file:sources[0].file,hash:'v1',lines:[{line:999,hits:1}]}]}));
@@ -94,22 +96,25 @@ test('out-of-order corrupt and missing records retain warning order, valid recor
  probe.release(path.join('traces',brokenTrace));
  await probe.wait(()=>probe.events.some(event=>event.event==='completed'&&event.key===path.join('traces',brokenTrace)));
  probe.releaseAll();
- const warnings=[brokenSource,missingSource,brokenTrace].map(name=>`Ignoring an unreadable coverage cache entry: ${name}`);
- warnings.push('Ignoring invalid coverage cache records; preserving source geometry until the cache is fully readable.');
- assert.deepEqual(await probe.result,expected(sources,traces,warnings));
+ // Unparseable records are discarded; the unreadable source leaves every reference unknown.
+ const warnings=[`Discarding a corrupt coverage cache entry: ${brokenSource}`,`Ignoring an unreadable coverage cache entry: ${missingSource}`,
+  `Discarding a corrupt coverage cache entry: ${brokenTrace}`,'Ignoring invalid coverage cache records; preserving source geometry until the cache is fully readable.'];
+ assert.deepEqual(await settled(probe),expected(sources,traces,warnings,{corrupt:[`sources/${brokenSource}`,`traces/${brokenTrace}`],complete:false}));
  const restored=new CoverageStore(),messages=[];await new CoverageCache(root,text=>messages.push(text)).restore(restored,t.signal);
  assert.deepEqual([...restored.traces.keys()],['group0']);assert.ok(messages.length>=3);
- await fs.access(path.join(directory,'sources',`${sources[1].id}.json`));
+ // Corrupt and dangling records are removed, so the valid set is authoritative and unused geometry is pruned.
+ for(const name of [path.join('sources',brokenSource),path.join('traces',brokenTrace),path.join('traces',invalidTrace),path.join('sources',`${sources[1].id}.json`)])await assert.rejects(fs.access(path.join(directory,name)),{code:'ENOENT'});
+ await fs.access(path.join(directory,'sources',`${sources[0].id}.json`));
  assert.equal(restored.summary(sources[0].file,new Map([[sources[0].file,'v1']])).stale,true);
 });
 
 test('missing tables are empty while unreadable tables mark the snapshot incomplete',{timeout:10000},async t=>{
  const {directory}=await fixture(t,[],[]);await fs.rm(path.join(directory,'sources'),{recursive:true});
  let worker=new threads.Worker(workerFile,{workerData:directory}),probe=observe(worker,t);
- assert.deepEqual(await probe.result,expected([],[]));
+ assert.deepEqual(await settled(probe),expected([],[]));
  await fs.rm(path.join(directory,'traces'),{recursive:true});await fs.writeFile(path.join(directory,'traces'),'not a directory');
  worker=new threads.Worker(workerFile,{workerData:directory});probe=observe(worker,t);
- const snapshot=await probe.result;assert.equal(snapshot.complete,false);assert.deepEqual(snapshot.sources,[]);assert.deepEqual(snapshot.traces,[]);
+ const snapshot=await settled(probe);assert.equal(snapshot.complete,false);assert.deepEqual(snapshot.sources,[]);assert.deepEqual(snapshot.traces,[]);
  assert.equal(snapshot.warnings.length,1);assert.match(snapshot.warnings[0],/^Unable to read the coverage cache: .*ENOTDIR/);
 });
 

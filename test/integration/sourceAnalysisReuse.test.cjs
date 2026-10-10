@@ -4,6 +4,7 @@ const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:
 const {constants}=require('node:fs');
 const {createHash}=require('node:crypto');
 const analysis=require('../../out/services/analysis'),processes=require('../../out/services/process');
+const {analyzerServers}=require('../../out/services/analyzerServer');
 const {sourceAnalysisContext}=require('../../out/services/analysisContext');
 const {TestEngine}=require('../../out/services/engine');
 const {normalizePath}=require('../../out/core/paths');
@@ -40,8 +41,9 @@ test('Roslyn provenance hashes the exact UTF-8, BOM, UTF-16 and UTF-32 bytes whi
  for(const bytes of [Buffer.concat([Buffer.from([0xef,0xbb,0xbf]),Buffer.from(request)]),
   Buffer.concat([Buffer.from([0xff,0xfe]),Buffer.from(request,'utf16le')])]){
   await fs.writeFile(requestFile,bytes);
-  const response=await processes.runProcess('dotnet',[analyzer,requestFile],options);assert.equal(response.code,0,response.stderr);
-  const value=JSON.parse(response.stdout);assert.equal(value.requestHash,hash(bytes).toUpperCase());assert.deepEqual(value.analyses[files[0]],legacy.get(keys[0]));
+  const responseFile=path.join(directory,'encoded-response.json');
+  const response=await processes.runProcess('dotnet',[analyzer,requestFile,responseFile],options);assert.equal(response.code,0,response.stderr);
+  const value=JSON.parse(await fs.readFile(responseFile,'utf8'));assert.equal(value.requestHash,hash(bytes).toUpperCase());assert.deepEqual(value.analyses[files[0]],legacy.get(keys[0]));
  }
 });
 
@@ -84,7 +86,10 @@ async function fixture(t,{copyAnalyzer=false}={}){
   }
   return run(command,args,options);
  };
- t.after(async()=>{control.abort();analysis.sourceAnalysisBatch=batch;processes.runProcess=run;for(const cleanup of cleanups)await cleanup();await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
+ // Requests are served by the long-lived analyzer unless it cannot start.
+ const servers=analyzerServers,serve=servers.request;
+ servers.request=async(dotnet_,helper,request,...rest)=>{const value=JSON.parse(request);if(value.files)requests.push(value);return serve.call(servers,dotnet_,helper,request,...rest);};
+ t.after(async()=>{control.abort();analysis.sourceAnalysisBatch=batch;processes.runProcess=run;servers.request=serve;for(const cleanup of cleanups)await cleanup();await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
  assert.ok(await sourceAnalysisContext(dotnet,analyzer,{cwd:root,signal}),'real reuse fixture requires ordinary installed dotnet and bundled analyzer assets');
  return{temp,root,storage,analyzer,engine,config,signal,output,results,requests,batch,cleanup:fn=>cleanups.push(fn),
   file:relative=>normalizePath(path.join(root,relative)),

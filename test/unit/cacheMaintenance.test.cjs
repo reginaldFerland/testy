@@ -53,7 +53,7 @@ test('changed memberships reclaim old geometry even when retryDelta loses remove
  const aborted=new AbortController();aborted.abort();await assert.rejects(f.cache.save(failed,aborted.signal),{name:'AbortError'});
  store.retryDelta(failed);const retried=store.takeDelta();assert.deepEqual(retried.removedSources,[]);
  await f.cache.save(retried,t.signal);await fs.access(f.sourceFile(a));await f.fill(126);
- assert.equal(f.reads,1);await missing(f.sourceFile(a));await fs.access(f.sourceFile(b));
+ assert.equal(f.reads,0);await missing(f.sourceFile(a));await fs.access(f.sourceFile(b));
  assert.equal(JSON.parse(await fs.readFile(f.traceFile('one'),'utf8')).coverage[0].hash,'v2');await f.clean();
 });
 
@@ -61,27 +61,27 @@ test('trace removals prune only geometry without any remaining cache owner',asyn
  const f=await fixture(t),a=source(0);
  await f.cache.save(delta([a],[trace('one',[a]),trace('two',[a])]),t.signal);
  await f.cache.save(delta([],[],['one']),t.signal);await f.fill(126);
- assert.equal(f.reads,1);await fs.access(f.sourceFile(a));await missing(f.traceFile('one'));
+ assert.equal(f.reads,0);await fs.access(f.sourceFile(a));await missing(f.traceFile('one'));
  await f.cache.save(delta([],[],['two']),t.signal);await f.fill(127);
- assert.equal(f.reads,2);await missing(f.sourceFile(a));await f.clean();
+ assert.equal(f.reads,0);await missing(f.sourceFile(a));await f.clean();
 });
 
 test('source-only and mixed unreferenced additions stay dirty while live geometry unions survive',async t=>{
  const f=await fixture(t),a=source(0),orphan=source(1),b=source(2),extra=source(3);
  await f.cache.save(delta([a],[trace('one',[a])]),t.signal);
  await f.cache.save(delta([orphan]),t.signal);await f.fill(126);
- assert.equal(f.reads,1);await missing(f.sourceFile(orphan));await fs.access(f.sourceFile(a));
+ assert.equal(f.reads,0);await missing(f.sourceFile(orphan));await fs.access(f.sourceFile(a));
  await f.cache.save(delta([source(0,'v1',[1,2,3])]),t.signal);await f.fill(127);
- assert.equal(f.reads,1,'expanding an already-live source does not create an orphan');
+ assert.equal(f.reads,0,'expanding an already-live source does not create an orphan');
  assert.deepEqual(JSON.parse(await fs.readFile(f.sourceFile(a),'utf8')).lines,[1,2,3]);
  await f.cache.save(delta([b,extra],[trace('two',[b])]),t.signal);await f.fill(127);
- assert.equal(f.reads,2);await missing(f.sourceFile(extra));await fs.access(f.sourceFile(a));await fs.access(f.sourceFile(b));await f.clean();
+ assert.equal(f.reads,0);await missing(f.sourceFile(extra));await fs.access(f.sourceFile(a));await fs.access(f.sourceFile(b));await f.clean();
 });
 
 test('duplicate trace publications in one delta detect the displaced source membership',async t=>{
  const f=await fixture(t),a=source(0),b=source(1);
  await f.cache.save(delta([a,b],[trace('one',[a]),trace('one',[b],2)]),t.signal);await f.fill(127);
- assert.equal(f.reads,1);await missing(f.sourceFile(a));await fs.access(f.sourceFile(b));
+ assert.equal(f.reads,0);await missing(f.sourceFile(a));await fs.access(f.sourceFile(b));
  assert.deepEqual(JSON.parse(await fs.readFile(f.traceFile('one'),'utf8')),trace('one',[b],2));await f.clean();
 });
 
@@ -115,8 +115,8 @@ test('an interrupted prune retains dirty state and retries the remaining orphane
   if(orphans.some(source=>String(file)===f.sourceFile(source))){deleted++;control.abort();}return result;
  };
  try{await assert.rejects(f.cache.save(delta([], [trace('tick',[])]),signal),{name:'AbortError'});}finally{fs.rm=remove;}
- assert.equal(deleted,1);assert.equal(f.reads,1);await f.clean();await f.fill(128);
- assert.equal(f.reads,2);for(const orphan of orphans)await missing(f.sourceFile(orphan));await fs.access(f.sourceFile(a));await f.clean();
+ assert.equal(deleted,1);assert.equal(f.reads,0);await f.clean();await f.fill(128);
+ assert.equal(f.reads,1);for(const orphan of orphans)await missing(f.sourceFile(orphan));await fs.access(f.sourceFile(a));await f.clean();
 });
 
 test('an unreadable prune directory cannot be mistaken for a complete cleanup',async t=>{
@@ -125,15 +125,17 @@ test('an unreadable prune directory cannot be mistaken for a complete cleanup',a
  const list=fs.readdir;let denied=0;
  fs.readdir=async function(directory,...args){if(String(directory)===path.join(f.directory,'sources')){denied++;throw Object.assign(new Error('controlled unreadable source directory'),{code:'EACCES'});}return list.call(this,directory,...args);};
  try{await f.fill(1);}finally{fs.readdir=list;}
- assert.equal(denied,1);assert.equal(f.reads,1);await fs.access(f.sourceFile(orphan));await f.fill(128);
- assert.equal(f.reads,2);await missing(f.sourceFile(orphan));await fs.access(f.sourceFile(a));await f.clean();
+ assert.equal(denied,1);assert.equal(f.reads,0);await fs.access(f.sourceFile(orphan));await f.fill(128);
+ assert.equal(f.reads,1);await missing(f.sourceFile(orphan));await fs.access(f.sourceFile(a));await f.clean();
 });
 
-test('an incomplete snapshot protects orphaned geometry and remains dirty after repair',async t=>{
+test('an unreadable record protects orphaned geometry until it is repaired',async t=>{
  const f=await fixture(t),a=source(0),orphan=source(1);
  await f.cache.save(delta([a],[trace('one',[a])]),t.signal);await f.cache.save(delta([orphan]),t.signal);
- const broken=path.join(f.directory,'traces',`${'a'.repeat(64)}.json`);await fs.writeFile(broken,'{broken');await f.fill(126);
+ // Only a record that cannot be read at all leaves its references unknown.
+ const blocked=path.join(f.directory,'traces',`${'a'.repeat(64)}.json`);await fs.mkdir(blocked);
+ await f.cache.restore(new CoverageStore(),t.signal);
  assert.equal(f.reads,1);assert.ok(f.warnings.some(text=>text.includes('unreadable')));await fs.access(f.sourceFile(orphan));
- await fs.rm(broken);await f.fill(128);
+ await fs.rmdir(blocked);await f.cache.restore(new CoverageStore(),t.signal);
  assert.equal(f.reads,2);await missing(f.sourceFile(orphan));await fs.access(f.sourceFile(a));await f.clean();
 });

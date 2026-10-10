@@ -3,7 +3,35 @@ import * as path from 'node:path';
 import { contentHash } from '../core/paths';
 import { ProcessOptions } from './process';
 import { preparationToolIdentity } from './preparedOutputCache';
-import { resolveNodeExecutable } from './executable';
+import { ambiguousWindowsPath, isNativeExecutable, resolveNodeExecutable } from './executable';
+
+/** The Roslyn builds the helper can load: those of every SDK installed beside the host (see
+ * RoslynLoader, which picks one). An SDK installed, removed or updated changes the analysis tool, and
+ * fingerprints from different Roslyn versions are not interchangeable. Undefined when none exists.
+ * TESTY_ROSLYN_DIR names a single Roslyn directory instead. */
+export async function roslynInventory(root: string, env: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<string | undefined> {
+    const stat = (file: string): Promise<string | undefined> => fs.stat(file, { bigint: true })
+        .then(value => `${value.size}:${value.mtimeNs}:${value.ctimeNs}:${value.ino}`, () => undefined);
+    const configured = env.TESTY_ROSLYN_DIR;
+    const directories = configured ? [path.resolve(configured)]
+        : (await fs.readdir(path.join(root, 'sdk')).catch(() => [] as string[])).sort().map(name => path.join(root, 'sdk', name, 'Roslyn', 'bincore'));
+    const records = await Promise.all(directories.map(async directory =>
+        [directory, await stat(path.join(directory, 'Microsoft.CodeAnalysis.dll')), await stat(path.join(directory, 'Microsoft.CodeAnalysis.CSharp.dll'))]));
+    signal?.throwIfAborted();
+    const usable = records.filter(([, common, csharp]) => common && csharp);
+    return usable.length ? JSON.stringify([await fs.realpath(root), usable]) : undefined;
+}
+
+/** Names the Roslyn a direct launch of the helper would load, for keying its long-lived
+ * processes. Empty when the host is not an ordinary installation (the helper then
+ * still finds its own Roslyn, but nothing can vouch for which). */
+export async function roslynIdentity(dotnet: string, options: ProcessOptions): Promise<string> {
+    const env = { ...process.env, ...options.env };
+    try {
+        const host = await resolveNodeExecutable(dotnet, env, options.cwd, options.signal);
+        return (host && await roslynInventory(path.dirname(host), env, options.signal)) || '';
+    } catch {options.signal?.throwIfAborted(); return '';}
+}
 
 /** Testy's syntax helper is pure for its source/alias inputs under an ordinary
  * installed CLR. Treat supported CLR implementation semantics as platform
@@ -21,20 +49,19 @@ export async function sourceAnalysisContext(dotnet: string, analyzer: string, op
         // Windows owner, whose bare-command search does not match libuv.
         let host: string | undefined;
         if (process.platform === 'win32' && options.cleanupDescendants !== false) {
-            if (!path.isAbsolute(dotnet) || !path.extname(dotnet) || /["'\0]/.test(dotnet)
-                || /^[/\\](?![/\\])/.test(dotnet) || /^[/\\]{2}[?.][/\\]/.test(dotnet)) {return undefined;}
+            if (!path.isAbsolute(dotnet) || !path.extname(dotnet) || ambiguousWindowsPath(dotnet)) {return undefined;}
             if (!(await fs.stat(dotnet)).isFile()) {return undefined;}
             host = await fs.realpath(dotnet);
         } else {host = await resolveNodeExecutable(dotnet, env, options.cwd, signal);}
         if (!host || !['dotnet', 'dotnet.exe'].includes(path.basename(host).toLowerCase())) {return undefined;}
-        const bytes = await fs.readFile(host, { signal }), magic = bytes.subarray(0, 4).toString('hex');
-        if (!(magic.startsWith('4d5a') || ['7f454c46', 'cffaedfe', 'feedfacf', 'cefaedfe', 'feedface', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca'].includes(magic))) {return undefined;}
+        const bytes = await fs.readFile(host, { signal });
+        if (!isNativeExecutable(bytes)) {return undefined;}
         const root = path.dirname(host), actualAnalyzer = await fs.realpath(path.resolve(options.cwd, analyzer));
         const base = actualAnalyzer.slice(0, -path.extname(actualAnalyzer).length);
         // Development probing can resolve dependencies from arbitrary external
         // directories. The shipped helper has one ordinary shared framework.
-        if (await fs.stat(`${base}.runtimeconfig.dev.json`).then(() => true, error => {
-            if (['ENOENT', 'ENOTDIR'].includes(error.code)) {return false;} throw error;
+        if (await fs.stat(`${base}.runtimeconfig.dev.json`).then(() => true, (error: NodeJS.ErrnoException) => {
+            if (['ENOENT', 'ENOTDIR'].includes(error.code ?? '')) {return false;} throw error;
         })) {return undefined;}
         const runtime = JSON.parse(await fs.readFile(`${base}.runtimeconfig.json`, 'utf8')) as { runtimeOptions?: {
             framework?: { name?: string }; frameworks?: unknown; includedFrameworks?: unknown; additionalProbingPaths?: unknown;
@@ -55,9 +82,12 @@ export async function sourceAnalysisContext(dotnet: string, analyzer: string, op
             if (!records.length) {return undefined;}
             inventories.push([await fs.realpath(directory), records]);
         }
+        // The helper does not ship Roslyn; fingerprints come from the SDK's.
+        const roslyn = await roslynInventory(root, env, signal);
+        if (!roslyn) {return undefined;}
         const assets = await preparationToolIdentity(actualAnalyzer, env, signal, options.cwd);
         signal?.throwIfAborted();
-        return contentHash(JSON.stringify([1, host, contentHash(bytes), assets, inventories, await fs.realpath(options.cwd),
+        return contentHash(JSON.stringify([2, host, contentHash(bytes), assets, inventories, roslyn, await fs.realpath(options.cwd),
             Object.entries(env).sort(([left], [right]) => left.localeCompare(right))]));
     } catch {signal?.throwIfAborted(); return undefined;}
 }

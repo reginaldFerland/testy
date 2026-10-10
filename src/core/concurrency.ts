@@ -35,7 +35,10 @@ export async function mapConcurrent<T, R>(
                 if (index >= items.length) {return;}
                 try {results[index] = await work(items[index], index, controller.signal, worker);}
                 catch (error) {
-                    if (!failed) {failed = true; failure = error; controller.abort(error); onFailure?.(error);}
+                    if (!failed) {failed = true; failure = error; controller.abort(error);
+                        // A notification failure must not bypass draining admitted work.
+                        try {onFailure?.(error);} catch { /* Preserve the first worker failure. */ }
+                    }
                     return;
                 }
             }
@@ -164,4 +167,25 @@ export class Semaphore {
         const next = this.waiting.shift();
         if (next) {next();} else {this.active--;}
     }
+}
+
+/** Breadth-unordered tree walk with one bounded pool for the whole tree. Each
+ * visit returns its children; the first failure stops admission and is thrown
+ * after every admitted visit has settled. */
+export function walkTree<T>(roots: readonly T[], visit: (job: T) => Promise<readonly T[]>, budget: Semaphore, signal?: AbortSignal, width = 8): Promise<void> {
+    const queued = [...roots];
+    let active = 0, failed = false, failure: unknown;
+    return new Promise<void>((resolve, reject) => {
+        const pump = (): void => {
+            if (failed) {queued.length = 0;}
+            while (active < width && queued.length) {
+                const job = queued.pop()!; active++;
+                void budget.run(signal, () => visit(job)).then(children => {if (!failed) {queued.push(...children);}})
+                    .catch(error => {if (!failed) {failed = true; failure = error;}})
+                    .finally(() => {active--; pump();});
+            }
+            if (!active && !queued.length) {if (failed) {reject(failure);} else {resolve();}}
+        };
+        pump();
+    });
 }

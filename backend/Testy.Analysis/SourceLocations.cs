@@ -3,20 +3,27 @@ using System.Reflection.PortableExecutable;
 
 static class SourceLocations
 {
-    public record Location(string File, int Line);
+    public sealed record Location(string File, int Line);
 
     // Use compiled metadata and portable symbols when the provider omits source
     // locations. Overloads spanning multiple files remain deliberately unknown.
-    public static Dictionary<string, Location?> Read(string assembly)
+    public static Dictionary<string, Location?> Read(string assembly, CancellationToken cancellationToken)
     {
         using var stream = File.OpenRead(assembly);
         using var pe = new PEReader(stream);
         var metadata = pe.GetMetadataReader();
-        using var symbols = MetadataReaderProvider.FromPortablePdbStream(File.OpenRead(Path.ChangeExtension(assembly, ".pdb")));
+        // Handles embedded PDBs and the CodeView path, and verifies the PDB ID
+        // so stale symbols cannot report wrong source lines.
+        if (!pe.TryOpenAssociatedPortablePdb(assembly, OpenSymbols, out var provider, out _) || provider is null)
+        {
+            throw new InvalidDataException($"No matching portable PDB for {assembly}.");
+        }
+        using var symbols = provider;
         var pdb = symbols.GetMetadataReader();
         var result = new Dictionary<string, Location?>();
         foreach (var handle in metadata.MethodDefinitions)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var method = metadata.GetMethodDefinition(handle);
             var debug = pdb.GetMethodDebugInformation(handle.ToDebugInformationHandle());
             var points = debug.GetSequencePoints().Where(point => !point.IsHidden).ToArray();
@@ -34,6 +41,8 @@ static class SourceLocations
         }
         return result;
     }
+
+    static Stream? OpenSymbols(string path) => File.Exists(path) ? File.OpenRead(path) : null;
 
     static string TypeName(MetadataReader metadata, TypeDefinitionHandle handle)
     {

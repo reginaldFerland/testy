@@ -1,3 +1,4 @@
+// @ts-check
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {CoverageStore}=require('../../out/core/coverage'),{CoverageCache}=require('../../out/services/cache');
 (async()=>{

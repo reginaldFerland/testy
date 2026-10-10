@@ -14,7 +14,7 @@ async function fixture(t){
  const run=processes.runProcess,calls=[];let respond;
  processes.runProcess=async(command,args,options)=>{
   const bytes=await fs.readFile(args[1]),request=JSON.parse(bytes);calls.push({request,options,bytes});
-  return{code:0,stdout:JSON.stringify(await respond(request,bytes,options)),stderr:''};
+  await fs.writeFile(args[2],JSON.stringify(await respond(request,bytes,options)));return{code:0,stdout:'',stderr:''};
  };
  t.after(async()=>{processes.runProcess=run;await fs.rm(directory,{recursive:true,force:true});});
  const valid=(request,bytes)=>({version:1,requestHash:hash(bytes).toUpperCase(),aliases:request.excludedAliases,
@@ -75,22 +75,42 @@ async function toolFixture(t){
  await fs.writeFile(analyzer.replace('.dll','.runtimeconfig.json'),JSON.stringify({runtimeOptions:{framework:{name:'Microsoft.NETCore.App',version:'10.0.0'}}}));
  await fs.writeFile(analyzer.replace('.dll','.deps.json'),JSON.stringify({targets:{net10:{Roslyn:{runtime:{'lib/Microsoft.CodeAnalysis.CSharp.dll':{}}}}}}));
  const asset=path.join(path.dirname(analyzer),'Microsoft.CodeAnalysis.CSharp.dll');await fs.writeFile(asset,'Roslyn version A');
+ // Roslyn is not shipped with the helper; it is read from an SDK beside the host.
+ const sdk=async version=>{const roslyn=path.join(directory,'sdk',version,'Roslyn','bincore');await fs.mkdir(roslyn,{recursive:true});
+  for(const name of ['Microsoft.CodeAnalysis.dll','Microsoft.CodeAnalysis.CSharp.dll'])await fs.writeFile(path.join(roslyn,name),`${name} from ${version}`);return roslyn;};
+ const roslyn=await sdk('10.0.100');
  // The host fixture models ordinary installed hosting independently of CI CLR overrides.
  const runtimeOverride=/^(?:CORECLR_|COR_|COMPlus_|DOTNET_(?:STARTUP_HOOKS|ADDITIONAL_DEPS|SHARED_STORE|ROOT(?:_|$)|MULTILEVEL_LOOKUP|ROLL_FORWARD|RUNTIME_ID))/i;
  const nativeInjection=/^(?:LD_(?:PRELOAD|LIBRARY_PATH|AUDIT|ORIGIN_PATH)|DYLD_(?:INSERT_LIBRARIES|(?:FALLBACK_|VERSIONED_)?(?:LIBRARY|FRAMEWORK)_PATH|ROOT_PATH|IMAGE_SUFFIX|SHARED_CACHE_DIR))$/i;
  const env=Object.fromEntries(Object.keys(process.env).filter(key=>runtimeOverride.test(key)||nativeInjection.test(key)).map(key=>[key,undefined]));
  const context=(extra={})=>sourceAnalysisContext(host,analyzer,{cwd:directory,env:{...env,...extra}});
- return{directory,host,analyzer,asset,context,env};
+ return{directory,host,analyzer,asset,roslyn,sdk,context,env};
 }
 
 test('fresh syntax context detects analyzer assets, native host, runtime inventories, and environment changes',async t=>{
  const f=await toolFixture(t);let previous=await f.context();assert.ok(previous);assert.equal(await f.context(),previous);
  for(const change of [()=>fs.writeFile(f.asset,'Roslyn version B'),()=>fs.appendFile(f.host,'host update'),
-  ()=>fs.mkdir(path.join(f.directory,'shared/Microsoft.NETCore.App/11.0.0'))]){
+  ()=>fs.mkdir(path.join(f.directory,'shared/Microsoft.NETCore.App/11.0.0')),
+  // The Roslyn the helper loads comes from the SDKs: an update, or a newer SDK, changes fingerprints.
+  ()=>fs.writeFile(path.join(f.roslyn,'Microsoft.CodeAnalysis.CSharp.dll'),'Roslyn from an SDK update'),()=>f.sdk('10.0.200'),
+  ()=>fs.rm(path.join(f.directory,'sdk','10.0.200'),{recursive:true})]){
   await change();const next=await f.context();assert.ok(next);assert.notEqual(next,previous);previous=next;
  }
  assert.notEqual(await f.context({TESTY_CONTEXT_TEST:'changed'}),previous);
  assert.ok(await f.context({MSBuildSDKsPath:'an unchanged MSBuild-only setting'}),'syntax analysis does not invoke an MSBuild SDK resolver');
+});
+
+test('syntax context requires a Roslyn in an SDK beside the host and follows TESTY_ROSLYN_DIR',async t=>{
+ const f=await toolFixture(t),before=await f.context();assert.ok(before);
+ const other=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy roslyn override ')));t.after(()=>fs.rm(other,{recursive:true,force:true}));
+ assert.equal(await f.context({TESTY_ROSLYN_DIR:other}),undefined,'an override without Roslyn cannot be vouched for');
+ for(const name of ['Microsoft.CodeAnalysis.dll','Microsoft.CodeAnalysis.CSharp.dll'])await fs.writeFile(path.join(other,name),`${name} override`);
+ const overridden=await f.context({TESTY_ROSLYN_DIR:other});assert.ok(overridden);assert.notEqual(overridden,before);
+ await fs.appendFile(path.join(other,'Microsoft.CodeAnalysis.dll'),'changed');assert.notEqual(await f.context({TESTY_ROSLYN_DIR:other}),overridden);
+ await fs.rm(path.join(f.roslyn,'Microsoft.CodeAnalysis.dll'));
+ assert.equal(await f.context(),undefined,'a Roslyn that is incomplete cannot be vouched for');
+ await fs.rm(path.join(f.directory,'sdk'),{recursive:true});
+ assert.equal(await f.context(),undefined,'no SDK means no reusable context');
 });
 
 test('custom host wrappers, injected CLR inputs and development probing decline reusable syntax context',async t=>{

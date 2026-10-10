@@ -2,16 +2,22 @@ const test=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os'),vm=require('node:vm');
 const {createRequire}=require('node:module'),{randomUUID}=require('node:crypto');
 const {normalizePath,contentHash}=require('../../out/core/paths');
+const {stableEnvironment}=require('../../out/core/environment');
 
 function deferred(){let resolve;const promise=new Promise(done=>{resolve=done;});return{promise,resolve};}
 async function identityFixture(config={}){
  const file=path.resolve('out/services/preparationIdentity.js'),realRequire=createRequire(file),exports={};
  const resolved=new Map([['dotnet','C:\\tools\\dotnet.exe'],['collector','C:\\tools\\collector.exe'],['other-host','C:\\other\\dotnet.exe']]);
  const versions=new Map(),calls=[],hashes=[];
- vm.runInNewContext(await fs.readFile(file,'utf8'),{exports,__dirname:'C:\\repo\\out\\services',require:name=>name==='node:path'?path.win32:
-  name==='./executable'?{resolveNodeExecutable:async(command,env,cwd,signal)=>{
+ // Helper paths resolve against the module's own directory, so evaluate them with the same Windows root.
+ const assets={};vm.runInNewContext(await fs.readFile(path.resolve('out/services/assets.js'),'utf8'),{exports:assets,__dirname:'C:\\repo\\out\\services',require:name=>name==='node:path'?path.win32:realRequire(name)});
+ vm.runInNewContext(await fs.readFile(file,'utf8'),{exports,__dirname:'C:\\repo\\out\\services',require:name=>name==='node:path'?path.win32:name==='./assets'?assets:
+  name==='./executable'?{ambiguousWindowsPath:realRequire('./executable').ambiguousWindowsPath,resolveNodeExecutable:async(command,env,cwd,signal)=>{
    signal?.throwIfAborted();calls.push({command,env,cwd});await config.resolve?.(command);
    return resolved.get(command)??(path.win32.isAbsolute(command)?command:undefined);
+  },resolveOwnedCommand:async command=>{
+   const found=resolved.get(command)??(path.win32.isAbsolute(command)?command:undefined);
+   if(!found)throw new Error(`Cannot find ${command} on PATH`);return found;
   }}:name==='./preparedOutputCache'?{preparationToolIdentity:async(file,env,signal,cwd,identities)=>{
    signal?.throwIfAborted();assert.equal(path.win32.isAbsolute(file),true,'only explicitly resolved file paths reach asset hashing');
    hashes.push({file,env,cwd,identities});await config.hash?.(file);signal?.throwIfAborted();
@@ -152,7 +158,7 @@ test('explicit standalone owned collectors retain cache eligibility and invalida
 
 test('POSIX preparation contexts retain the exact version-three key while Windows uses a new proof version',async t=>{
  const f=await runnerFixture(t,{platform:'linux'}),session=f.create({analyzer:'analyzer.dll'}),group={project:f.project.file,framework:f.project.framework,assembly:f.project.assembly};
- const context=await session.preparationContext(group),env={...f.fakeProcess.env,SHLVL:undefined,VSCODE_PID:undefined};
+ const context=await session.preparationContext(group),env=stableEnvironment({...f.fakeProcess.env});
  const tools=contentHash(JSON.stringify({tools:['legacy:dotnet','legacy:collector','legacy:analyzer.dll'],
   env:Object.entries(env).sort(([left],[right])=>left.localeCompare(right)),arguments:[],assemblies:[f.project.assembly],
   runtime:process.version,platform:'linux',architecture:process.arch}));

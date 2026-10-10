@@ -1,16 +1,17 @@
-import * as path from 'node:path';
+import { scriptPath } from './assets';
 import { Worker } from 'node:worker_threads';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { CoverageSource, StoredTrace } from '../core/coverage';
 import { CoveredLine } from '../core/model';
 import type { CacheSnapshot } from './cacheWorker';
+import { CacheLimits, defaultCacheLimits } from './cacheFormat';
+
+export type CacheContents = Pick<CacheSnapshot, 'stats' | 'warnings' | 'corrupt' | 'evicted' | 'complete'> & { sources: CoverageSource[]; traces: StoredTrace[] };
 
 /** Parsing and validation are interruptible even for dense, valid cache records. */
-export async function readCache(directory: string, signal?: AbortSignal): Promise<{
-    sources: CoverageSource[]; traces: StoredTrace[]; warnings: readonly string[]; complete: boolean;
-}> {
+export async function readCache(directory: string, signal?: AbortSignal, limits: CacheLimits = defaultCacheLimits): Promise<CacheContents> {
     signal?.throwIfAborted();
-    const worker = new Worker(path.join(__dirname, 'cacheWorker.js'), { workerData: directory });
+    const worker = new Worker(scriptPath('cacheWorker'), { workerData: { directory, limits } });
     let abort = (): void => {};
     try {
         const snapshot = await new Promise<CacheSnapshot>((resolve, reject) => {
@@ -48,6 +49,6 @@ export async function readCache(directory: string, signal?: AbortSignal): Promis
             traces.push({ ...trace, sourceIds, coverage });
         }
         signal?.throwIfAborted();
-        return { sources, traces, warnings: snapshot.warnings, complete: snapshot.complete };
+        return { sources, traces, stats: snapshot.stats, warnings: snapshot.warnings, corrupt: snapshot.corrupt, evicted: snapshot.evicted, complete: snapshot.complete };
     } finally {signal?.removeEventListener('abort', abort); await worker.terminate();}
 }

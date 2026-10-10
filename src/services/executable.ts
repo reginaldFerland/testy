@@ -14,6 +14,22 @@ export function processEnvironmentValue(env: NodeJS.ProcessEnv, name: string): s
     return key === undefined ? undefined : env[key];
 }
 
+/** Windows path forms whose meaning depends on more than the string: quotes or
+ * NUL, device namespaces (\\?\, \\.\), drive- or root-relative paths, and
+ * alternate data streams. Identity checks decline these instead of guessing. */
+export function ambiguousWindowsPath(value: string): boolean {
+    return /["'\0]/.test(value)
+        || /^[/\\]{2}[?.][/\\]/.test(value)
+        || /^[a-z]:(?![/\\])/i.test(value) || /^[/\\](?![/\\])/.test(value)
+        || value.replace(/^[a-z]:[/\\]/i, '').includes(':');
+}
+
+/** PE, ELF, and Mach-O (thin and universal) headers identify a native host binary. */
+export function isNativeExecutable(bytes: Buffer): boolean {
+    const magic = bytes.subarray(0, 4).toString('hex');
+    return magic.startsWith('4d5a') || ['7f454c46', 'cffaedfe', 'feedfacf', 'cefaedfe', 'feedface', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca'].includes(magic);
+}
+
 /** Resolve ordinary shell:false Node launches, never a ProcessHost-owned command.
  * Unsupported Windows search forms decline identity; callers may still launch.
  * Node/libuv ignores PATHEXT and tries .com before .exe in each directory.
@@ -26,11 +42,7 @@ export async function resolveNodeExecutable(command: string, env: NodeJS.Process
     if (process.platform === 'win32') {
         // Per-drive current directories and quoted PATH parsing require extra
         // platform evidence. Keep those uncommon cases outside this cache guard.
-        const ambiguousPath = (value: string): boolean => /["'\0]/.test(value)
-            || /^[/\\]{2}[?.][/\\]/.test(value)
-            || /^[a-z]:(?![/\\])/i.test(value) || /^[/\\](?![/\\])/.test(value)
-            || value.replace(/^[a-z]:[/\\]/i, '').includes(':');
-        if (ambiguousPath(command) || ambiguousPath(cwd) || !path.isAbsolute(cwd)
+        if (ambiguousWindowsPath(command) || ambiguousWindowsPath(cwd) || !path.isAbsolute(cwd)
             || /[. ]$/.test(command)) {return undefined;}
         const name = path.basename(command), dot = name.indexOf('.');
         const hasExtension = dot >= 0 && dot < name.length - 1;
@@ -48,7 +60,7 @@ export async function resolveNodeExecutable(command: string, env: NodeJS.Process
             const search = processEnvironmentValue(env, 'PATH') ?? processEnvironmentValue(process.env, 'PATH');
             if (search === undefined || /["'\0]/.test(search)) {return undefined;}
             const directories = search.split(';').filter(Boolean);
-            if (directories.some(ambiguousPath)) {return undefined;}
+            if (directories.some(ambiguousWindowsPath)) {return undefined;}
             candidates = [cwd, ...directories.map(directory => path.resolve(cwd, directory))]
                 .flatMap(directory => names.map(name => path.join(directory, name)));
         }
@@ -94,4 +106,23 @@ export async function resolveNodeExecutable(command: string, env: NodeJS.Process
     }
     signal?.throwIfAborted();
     return undefined;
+}
+
+/** Resolve a bare command for a launch that must never search the workspace: the
+ * Windows owner's CreateProcess would try the current directory before PATH.
+ * Explicit paths pass through; bare names resolve on PATH alone. */
+export async function resolveOwnedCommand(command: string, env: NodeJS.ProcessEnv | undefined, cwd: string): Promise<string> {
+    if (process.platform !== 'win32' || /[/\\]/.test(command) || path.isAbsolute(command)) {return command;}
+    const search = processEnvironmentValue({ ...process.env, ...env }, 'PATH') ?? '';
+    const dot = command.indexOf('.', 1);
+    const names = dot >= 0 && dot < command.length - 1 ? [command] : [`${command}.com`, `${command}.exe`];
+    for (const directory of search.split(path.delimiter)) {
+        // Relative entries would resolve against the workspace.
+        if (!directory || !path.isAbsolute(directory)) {continue;}
+        for (const name of names) {
+            const candidate = path.join(directory, name);
+            try {if ((await fs.stat(candidate)).isFile()) {return candidate;}} catch { /* Try the next candidate. */ }
+        }
+    }
+    throw new Error(`Cannot find ${command} on PATH; the working directory ${cwd} is not searched. Configure an absolute path.`);
 }

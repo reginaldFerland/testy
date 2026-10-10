@@ -270,13 +270,14 @@ test('secondary discovery failure surfaces without falling back or deleting an a
  assert.equal(f.state.runs.length,1);f.state.release.resolve();await primary;
 });
 
-test('an execution failure drains already queued primary work without starting it',async t=>{
+test('an execution failure does not reject queued primary work, which runs and reports its own outcome',async t=>{
  const f=await fixture(t,{holdPrimary:true,failRun:(_call,count)=>count===1}),groups=await f.session.discover(f.project);
  const first=f.session.run([groups[0]],f.hashes);await f.state.primaryStarted.promise;
  const queued=f.session.run([groups[1]],f.hashes),outcomes=Promise.allSettled([first,queued]);
- f.state.release.resolve();assert.ok((await outcomes).every(result=>result.status==='rejected'&&/controlled execution failure/.test(result.reason.message)));
- assert.equal(f.state.runs.length,1,'queued primary work must stop before MTP starts');
- assert.equal((await f.session.run([groups[1]],f.hashes)).results.length,1,'a later explicit run may retry once the failed queue has drained');
+ f.state.release.resolve();const [failed,succeeded]=await outcomes;
+ assert.equal(failed.status,'rejected');assert.match(failed.reason.message,/controlled execution failure/);
+ assert.equal(succeeded.status,'fulfilled');assert.equal(succeeded.value.results.length,1);
+ assert.equal(f.state.runs.length,2,'queued primary work still starts after an earlier batch fails');
 });
 
 test('shared cancellation stops active lanes and disposal waits before removing their output',async t=>{

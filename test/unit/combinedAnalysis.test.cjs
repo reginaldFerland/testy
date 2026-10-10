@@ -1,3 +1,4 @@
+// @ts-check
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
@@ -12,7 +13,7 @@ async function fixture(t) {
  processes.runProcess=async(command,args,options)=>{
   const request=JSON.parse(await fs.readFile(args[1],'utf8'));calls.push({command,args,options,request});
   const value=await respond(request,options);
-  return typeof value==='string'?{code:0,stdout:value,stderr:''}:{code:0,stdout:JSON.stringify(value),stderr:''};
+  await fs.writeFile(args[2],typeof value==='string'?value:JSON.stringify(value));return{code:0,stdout:'',stderr:''};
  };
  t.after(async()=>{processes.runProcess=run;await fs.rm(directory,{recursive:true,force:true});});
  return{directory,files,keys:files.map(normalizePath),calls,respond:value=>{respond=value;},

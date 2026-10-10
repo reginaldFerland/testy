@@ -1,12 +1,9 @@
 // Real engine/UI/transport methods; synthetic scale, with VS Code rendering mocked.
-const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),{createRequire}=require('node:module');
+const path=require('node:path');
 const assert=require('node:assert/strict'),{setTimeout:delay}=require('node:timers/promises');
 const {TestEngine}=require('../../out/services/engine'),{ProjectIndex}=require('../../out/core/selection');
 const {startProcess}=require('../../out/services/process'),{requestTests}=require('../../out/services/mtp');
-const file=path.resolve('out/extension.js'),realRequire=createRequire(file),exports_={};
-vm.runInNewContext(fs.readFileSync(file,'utf8')+'\nexports.Testy=Testy;',{
- exports:exports_,require:name=>name==='vscode'?{Uri:{file:fsPath=>({fsPath})},Range:class{}}:name==='./configuration'?{}:realRequire(name),Buffer,setTimeout,clearTimeout
-});
+const {loadUi}=require('../unit/support/ui.cjs'),testTree=loadUi({vscode:{Uri:{file:fsPath=>({fsPath})},Range:class{}}}).TestTree;
 async function measure(callback) {
  let previous=performance.now(),maxTimerGapMs=0,ticks=0;
  const timer=setInterval(()=>{const now=performance.now();maxTimerGapMs=Math.max(maxTimerGapMs,now-previous);previous=now;ticks++;},1);
@@ -17,13 +14,13 @@ async function measure(callback) {
  for(const count of [50000,100000]) {
   const groups=Array.from({length:100},(_,i)=>({id:`g${i}`,project:'/w/Tests.csproj',framework:'net10.0',file:`/w/Test${i}.cs`,tests:Array.from({length:count/100},(_,j)=>({id:`t${j}`,name:`Case ${j}`,file:`/w/Test${i}.cs`,line:1}))}));
   let replacements=0;
-  const context={items:new Map(),testIds:new Map(),treeFiles:new Map(),treeProjects:new Map(),treeRoots:[],engine:{projects:[],knownTests:g=>TestEngine.prototype.knownTests.call({runtime:new Map()},g)},watch(){},updateStatus(){},setOutcome(){},
-   controller:{items:{replace(){replacements++;}},createTestItem(id,label,uri){return{id,label,uri,children:{replace(){replacements++;}}};}},item:exports_.Testy.prototype.item};
-  const initial=await measure(()=>exports_.Testy.prototype.updateTree.call(context,groups));
+  const context={items:new Map(),testIds:new Map(),treeFiles:new Map(),treeProjects:new Map(),treeRoots:[],engine:{knownTests:g=>TestEngine.prototype.knownTests.call({runtime:new Map()},g)},host:{disposed:false,activeRun:undefined,roots:[],updateStatus(){}},setOutcome(){},
+   controller:{items:{replace(){replacements++;}},createTestItem(id,label,uri){return{id,label,uri,children:{replace(){replacements++;}}};}},item:testTree.prototype.item};
+  const initial=await measure(()=>testTree.prototype.update.call(context,groups));
   const before=replacements,unchanged=[];
-  for(let i=0;i<3;i++)unchanged.push(await measure(()=>exports_.Testy.prototype.updateTree.call(context,groups)));
+  for(let i=0;i<3;i++)unchanged.push(await measure(()=>testTree.prototype.update.call(context,groups)));
   const rediscovered=groups.map(group=>({...group,tests:group.tests.map(test=>({...test}))}));
-  const discovery=await measure(()=>exports_.Testy.prototype.updateTree.call(context,rediscovered));assert.equal(replacements,before);
+  const discovery=await measure(()=>testTree.prototype.update.call(context,rediscovered));assert.equal(replacements,before);
   console.log(JSON.stringify({kind:'tree',count,initial,unchanged,rediscovered:discovery,unchangedReplacements:replacements-before}));
  }
  const engine=new TestEngine({roots:['/w'],storage:osUnused(),tools:osUnused(),analyzer:'unused',configuration:()=>({mode:'affected'}),events:{coverage(){},output(){}}});

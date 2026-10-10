@@ -1,31 +1,17 @@
-.vscode/**
-.vscode-test/**
-src/**
-test/**
-docs/**
-backend/**
-scripts/**
-github/**
-.gitignore
-.npmrc
-vsc-extension-quickstart.md
-**/tsconfig*.json
-**/eslint.config.mjs
-**/*.map
-**/*.ts
-**/tsconfig.tsbuildinfo
-**/.vscode-test.*
-# Keep compiled runtime modules, excluding diagnostics and copied fixtures.
-out/**
-!out/extension.js
-!out/configuration.js
-!out/core/*.js
-!out/services/*.js
-package-lock.json
-pnpm-lock.yaml
-dist/analyzer/Testy.Analysis
-dist/analyzer/Testy.Analysis.exe
-dist/**/*.pdb
-
-.test-tools/**
-.github/**
+# Allowlist: the packaged extension is the bundled JavaScript and .NET helpers
+# in dist/, media/, l10n/ and the manifest files. vsce re-includes anything a
+# negated pattern matches, so list exactly what ships.
+**
+!package.json
+!package.nls.json
+!README.md
+!CHANGELOG.md
+!LICENSE
+!THIRD-PARTY-NOTICES.txt
+!testy.png
+!media/**
+!l10n/**
+!dist/*.js
+!dist/*/*.dll
+!dist/*/*.deps.json
+!dist/*/*.runtimeconfig.json

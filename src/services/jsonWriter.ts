@@ -1,3 +1,14 @@
+import * as fs from 'node:fs/promises';
+
+/** Persist a directory's entries (a completed rename) where the platform allows
+ * it. Windows cannot open directories for this and reports EISDIR or EPERM. */
+export async function syncDirectory(directory: string): Promise<void> {
+    let handle: fs.FileHandle | undefined;
+    try {handle = await fs.open(directory, 'r'); await handle.sync();}
+    catch (error) {if (!['EISDIR', 'EPERM', 'EACCES', 'EINVAL', 'ENOTSUP', 'EBADF'].includes((error as NodeJS.ErrnoException).code ?? '')) {throw error;}}
+    finally {await handle?.close();}
+}
+
 /** Stream JSON in bounded chunks so dense traces never need one host-blocking
  * JSON.stringify or a second full-size string allocation. Values are JSON data. */
 export function* jsonChunks(value: unknown): Generator<string> {
