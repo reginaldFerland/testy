@@ -45,6 +45,11 @@ export default tseslint.config(
             // Cancellation and cleanup paths deliberately propagate the caught
             // value (often an AbortSignal reason) unchanged.
             '@typescript-eslint/prefer-promise-reject-errors': ['error', { allowThrowingUnknown: true, allowThrowingAny: true }],
+            '@typescript-eslint/switch-exhaustiveness-check': 'error',
+            '@typescript-eslint/return-await': ['error', 'in-try-catch'],
+            '@typescript-eslint/no-unnecessary-condition': 'error',
+            '@typescript-eslint/use-unknown-in-catch-callback-variable': 'error',
+            '@typescript-eslint/no-unnecessary-type-conversion': 'error',
             curly: 'error',
             eqeqeq: 'error',
             'no-throw-literal': 'error',

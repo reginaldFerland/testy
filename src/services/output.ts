@@ -60,6 +60,13 @@ function stampValue(stat: BigIntStats): string {
     return `${stat.isSymbolicLink() ? 'link' : stat.isDirectory() ? 'dir' : 'file'}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}:${stat.dev}:${stat.ino}:${stat.mode}`;
 }
 
+/** The change time (ctimeNs) of a stampValue. */
+function stampTime(value: string): bigint {
+    const time = value.split(':')[3];
+    if (time === undefined) {throw new Error(`Malformed output stamp: ${value}`);}
+    return BigInt(time);
+}
+
 async function stamp(file: string, signal?: AbortSignal): Promise<string> {
     return metadataWorkers.run(signal, async () => stampValue(await fs.lstat(file, { bigint: true })));
 }
@@ -117,7 +124,7 @@ export class PreparedOutput {
 
     async restore(signal?: AbortSignal): Promise<void> {
         const root = await metadataWorkers.run(signal, () => fs.lstat(this.directory, { bigint: true }))
-            .catch((error: NodeJS.ErrnoException) => {if (error?.code === 'ENOENT') {return undefined;} throw error;});
+            .catch((error: unknown) => {if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {return undefined;} throw error;});
         if (!root?.isDirectory() || root.isSymbolicLink()) {
             await removeOutput(this.directory); await this.initialize(signal); return;
         }
@@ -139,7 +146,7 @@ export class PreparedOutput {
             // Earlier timestamps prove the filesystem clock advanced before
             // tests started. Only the newest timestamp cohort can hide a write
             // in the same tick; compare its bytes when metadata is unchanged.
-            if (!changed && BigInt(previous.split(':')[3]) === this.collisionTime) {
+            if (!changed && stampTime(previous) === this.collisionTime) {
                 let expected = this.templateHashes.get(file);
                 if (!expected) {expected = await fileHash(path.join(this.template, file), signal); this.templateHashes.set(file, expected);}
                 changed = expected !== await fileHash(path.join(this.directory, file), signal);
@@ -158,7 +165,7 @@ export class PreparedOutput {
         }
         // Advancing the root clock retires same-tick file cohorts. Keep this
         // write when needed, including on coarse-timestamp filesystems.
-        const advance = [...restored.values()].some(value => !value.startsWith('dir:') && BigInt(value.split(':')[3]) >= this.collisionTime);
+        const advance = [...restored.values()].some(value => !value.startsWith('dir:') && stampTime(value) >= this.collisionTime);
         if (advance || Number(snapshot.root.split(':').at(-1)) !== this.rootMode) {
             await metadataWorkers.run(signal, () => fs.chmod(this.directory, this.rootMode));
         }
@@ -170,7 +177,7 @@ export class PreparedOutput {
 
     private advanceClock(root: string): void {
         for (const value of [...this.stamps.values(), root]) {
-            const time = BigInt(value.split(':')[3]);
+            const time = stampTime(value);
             if (time > this.collisionTime) {this.collisionTime = time;}
         }
     }

@@ -16,7 +16,7 @@ function editor(config={}) {
    createFileSystemWatcher:pattern=>{patterns.push(pattern);return {...disposable(),onDidChange(){},onDidCreate(){},onDidDelete(){}};}}
  };
  const {Testy}=loadUi({vscode,stubs:{configuration:{configuration:()=>({enabled:true,trigger:'save',showCoverage:false,debounce:100,
-   pattern:require('../../package.json').contributes.configuration.properties['testy.fileWatcherPattern'].default,excludes:[],...config})}}});
+   pattern:require('../../package.json').contributes.configuration.properties['testy.fileWatcherPattern'].default,excludes:[],folderConflicts:[],additionalConfigurations:[],...config})}}});
  const state=()=>{const values=new Map();return{get:key=>values.get(key),update:async(key,value)=>{values.set(key,value);}};};
  const ui=new Testy({extensionUri:{},storageUri:{fsPath:os.tmpdir()},globalStorageUri:{fsPath:os.tmpdir()},extensionPath:process.cwd(),workspaceState:state(),globalState:state()},['/workspace']);
  return {ui,invalidated,patterns,handlers};
@@ -26,7 +26,7 @@ test('manual leaf results preserve unselected runtime failures until those rows 
  const {selectManual}=require('../../out/services/engine'),{ui,invalidated}=editor();t.after(()=>ui.dispose());
  const node=id=>({id,name:id,node:{uid:id},line:1}),ordinary=node('ordinary'),row=node('deferred-failure');
  const group={id:'file-id',project:'/workspace/Tests.csproj',framework:'net10.0',file:'/workspace/Tests.cs',tests:[ordinary]};
- ui.engine.groups=[group];ui.engine.runtime.set(group.id,new Map([[row.id,row]]));
+ ui.engine.groups=[group];ui.engine.runtime.rows.set(group.id,new Map([[row.id,row]]));
  for(const test of [ordinary,row])ui.tree.items.set(`${group.id}:${test.id}`,{id:`${group.id}:${test.id}`});
  ui.tree.setOutcome(`${group.id}:${ordinary.id}`,'passed');ui.tree.setOutcome(`${group.id}:${row.id}`,'failed');
  const groups=selectManual([group],{groups:new Set([group.id]),tests:new Map([[group.id,new Set([ordinary.id])]])},g=>ui.engine.knownTests(g));

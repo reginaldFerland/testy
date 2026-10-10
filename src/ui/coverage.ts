@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'node:fs/promises';
 import { Configuration } from '../configuration';
-import { CoverageSummary } from '../core/coverage';
+import { CoverageSummary, declarationHits } from '../core/coverage';
 import { normalizePath } from '../core/paths';
 import { TestEngine } from '../services/engine';
 
@@ -51,8 +51,10 @@ export class CoverageView {
 
     constructor(extensionUri: vscode.Uri, private readonly controller: vscode.TestController, private readonly profile: vscode.TestRunProfile,
         private readonly engine: TestEngine, private readonly items: ReadonlyMap<string, vscode.TestItem>, private readonly host: CoverageHost) {
+        // Distinct shapes per state; colours per theme kind (high contrast themes use the matching variant).
+        const icon = (kind: string, theme: string): vscode.Uri => vscode.Uri.joinPath(extensionUri, 'media', `${kind}-${theme}.svg`);
         this.decorations = Object.fromEntries(['covered', 'uncovered', 'stale'].map(kind => [kind, vscode.window.createTextEditorDecorationType({
-            gutterIconPath: vscode.Uri.joinPath(extensionUri, 'media', `${kind}.svg`), gutterIconSize: 'contain'
+            gutterIconSize: 'contain', light: { gutterIconPath: icon(kind, 'light') }, dark: { gutterIconPath: icon(kind, 'dark') }
         })])) as typeof this.decorations;
         this.bind(profile);
     }
@@ -61,14 +63,14 @@ export class CoverageView {
     bind(profile: vscode.TestRunProfile): void {
         profile.loadDetailedCoverage = async (_run, coverage, token) => {
             const summary = this.details.get(coverage);
-            return summary ? this.statements(summary.file, summary.lines, token) : [];
+            return summary ? this.detail(summary, summary.lines, token) : [];
         };
         profile.loadDetailedCoverageForTest = async (_run, coverage, item, token) => {
             const summary = this.details.get(coverage);
             if (!summary) {return [];}
             const owners = new Set(summary.groupIds.filter(id => this.owners.get(id) === item.id));
             const lines = this.engine.coverage.contribution(summary.file, owners, this.engine.hashes);
-            return lines ? this.statements(summary.file, lines, token) : [];
+            return lines ? this.detail(summary, lines, token) : [];
         };
     }
 
@@ -77,17 +79,25 @@ export class CoverageView {
 
     hide(): void { this.hidden = true; this.suffix = ''; this.queue(vscode.window.visibleTextEditors); }
 
-    /** Statement ranges span each line's code, from its first non-blank character. */
-    private async statements(file: string, lines: CoverageSummary['lines'], token?: vscode.CancellationToken): Promise<vscode.StatementCoverage[]> {
-        let text: string[] = [];
-        try {text = (await fs.readFile(file, 'utf8')).split(/\r?\n/);} catch { /* Deleted file: fall back to line starts. */ }
+    /** Statements span each line's code from its first non-blank character; declarations span their methods.
+     * An open editor's text wins over the disk copy, so ranges fit what is shown; lines past its end are dropped. */
+    private async detail(summary: CoverageSummary, lines: CoverageSummary['lines'], token?: vscode.CancellationToken): Promise<vscode.FileCoverageDetail[]> {
+        const open = vscode.workspace.textDocuments.find(document => document.uri.scheme === 'file' && normalizePath(document.uri.fsPath) === summary.file);
+        let text: string[] | undefined = open?.getText().split(/\r?\n/);
+        if (!text) {try {text = (await fs.readFile(summary.file, 'utf8')).split(/\r?\n/);} catch { /* Deleted file: fall back to line starts. */ }}
         if (token?.isCancellationRequested) {return [];}
-        return lines.map(line => {
-            const source = text[line.line - 1] ?? '', first = source.search(/\S/);
-            const range = first < 0 ? new vscode.Position(line.line - 1, 0)
-                : new vscode.Range(line.line - 1, first, line.line - 1, source.trimEnd().length);
+        const source = (line: number): string => text?.[line - 1] ?? '', exists = (line: number): boolean => !open || line <= open.lineCount;
+        const statements: vscode.FileCoverageDetail[] = lines.filter(line => exists(line.line)).map(line => {
+            const code = source(line.line), first = code.search(/\S/);
+            const range = first < 0 ? new vscode.Position(line.line - 1, 0) : new vscode.Range(line.line - 1, first, line.line - 1, code.trimEnd().length);
             return new vscode.StatementCoverage(line.hits, range);
         });
+        const declarations = declarationHits(lines, summary.declarations ?? []).filter(({ declaration }) => exists(declaration.start))
+            .map(({ declaration, hits }) => {
+                const end = open ? Math.min(declaration.end, open.lineCount) : declaration.end, first = Math.max(0, source(declaration.start).search(/\S/));
+                return new vscode.DeclarationCoverage(declaration.name, hits, new vscode.Range(declaration.start - 1, first, end - 1, source(end).trimEnd().length));
+            });
+        return [...statements, ...declarations];
     }
 
     publish(): void {
@@ -104,10 +114,13 @@ export class CoverageView {
             if (this.productionSources.has(summary.file)) {total += summary.total; covered += summary.covered;}
             if (!run) {continue;}
             const previous = this.publishedCoverage.get(summary.file);
-            if (previous?.lines === summary.lines && previous.covered === summary.covered && previous.total === summary.total) {continue;}
+            if (previous?.lines === summary.lines && previous.declarations === summary.declarations
+                && previous.covered === summary.covered && previous.total === summary.total) {continue;}
             const owners = [...new Set(summary.groupIds.map(id => this.owners.get(id)))].map(id => id ? this.items.get(id) : undefined)
                 .filter((item): item is vscode.TestItem => !!item);
-            const coverage = new vscode.FileCoverage(vscode.Uri.file(summary.file), { covered: summary.covered, total: summary.total }, undefined, undefined, owners.length ? owners : undefined);
+            const methods = summary.declarations ? declarationHits(summary.lines, summary.declarations) : [];
+            const coverage = new vscode.FileCoverage(vscode.Uri.file(summary.file), { covered: summary.covered, total: summary.total }, undefined,
+                methods.length ? { covered: methods.filter(method => method.hits > 0).length, total: methods.length } : undefined, owners.length ? owners : undefined);
             this.details.set(coverage, summary); this.publishedCoverage.set(summary.file, summary); run.addCoverage(coverage);
             this.nativePublished = true;
         }
@@ -122,7 +135,7 @@ export class CoverageView {
         if (this.rendering) {return;}
         this.renderTimer ??= setTimeout(() => {
             this.renderTimer = undefined;
-            void this.render().catch(error => this.host.reportError(error));
+            void this.render().catch((error: unknown) => this.host.reportError(error));
         }, 50);
     }
 
@@ -141,15 +154,15 @@ export class CoverageView {
     async decorate(editors: readonly vscode.TextEditor[] = vscode.window.visibleTextEditors): Promise<void> {
         const { host } = this;
         if (host.disposed) {return;}
-        // Read the setting again after each await: it can change while summaries are prepared.
-        const visible = (): boolean => host.config.showCoverage && !this.hidden;
+        // Read the state again after each await: it can change while summaries are prepared.
+        const disposed = (): boolean => host.disposed, visible = (): boolean => host.config.showCoverage && !this.hidden;
         let hashes: ReadonlyMap<string, string>;
         let summaries: readonly CoverageSummary[];
         do {
             hashes = this.engine.hashes;
             summaries = visible() ? await this.engine.coverage.summarizeAsync(hashes, host.lifetime.signal) : [];
-        } while (!host.disposed && visible() && hashes !== this.engine.hashes);
-        if (host.disposed) {return;}
+        } while (!disposed() && visible() && hashes !== this.engine.hashes);
+        if (disposed()) {return;}
         if (this.decorationIndex?.summaries !== summaries) {
             this.decorationIndex = { summaries, files: new Map(summaries.map(summary => [summary.file, summary])) };
         }

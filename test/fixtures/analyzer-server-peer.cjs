@@ -30,6 +30,13 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         case 'fail': return out(`{"id":${id},"error":${JSON.stringify('boom\nwith lines')}}`);
         case 'crash': return process.exit(3);
         case 'garbage': return out('nonsense');
+        // A response line that never ends.
+        case 'unterminated': {
+            process.stdout.write(`{"id":${id},"result":"`);
+            const chunk = 'x'.repeat(16 * 1024);
+            setInterval(() => process.stdout.write(chunk), 1);
+            return undefined;
+        }
         case 'hang': return undefined;
         case 'slow': {
             // Finishes on its own, or earlier when cancelled; `stubborn` ignores the cancel.

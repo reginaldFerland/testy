@@ -58,6 +58,20 @@ test('reads after dispose are rejected and never start a worker',async t=>{
  await f.reader.dispose();
 });
 
+test('the allowed file list is sent once per worker and again only for a different snapshot',async t=>{
+ const f=await fixture(t),small=await f.write('small.xml',3);
+ assert.equal((await f.reader.read(small,f.root,f.hashes))[0].lines.length,3);
+ const worker=f.reader.worker,post=worker.postMessage.bind(worker),messages=[];
+ worker.postMessage=(message,...rest)=>{messages.push(message);return post(message,...rest);};
+ const kinds=()=>messages.map(message=>'files' in message?'files':'request');
+ assert.equal((await f.reader.read(small,f.root,f.hashes))[0].lines.length,3);
+ assert.deepEqual(kinds(),['request']);
+ const files=await f.reader.read(small,f.root,new Map([[f.file,'v2']]));
+ assert.deepEqual(kinds(),['request','files','request']);
+ assert.equal(files[0].hash,'v2');
+ assert.equal((await f.reader.read(small,f.root,new Map())).length,0,'a file outside the current snapshot is not reported');
+});
+
 test('dispose rejects reads that are still pending',async t=>{
  const f=await fixture(t),big=await f.write('big.xml',150000);
  const reading=f.reader.read(big,f.root,f.hashes),rejected=assert.rejects(reading,{name:'AbortError'});

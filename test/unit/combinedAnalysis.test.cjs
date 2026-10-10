@@ -5,19 +5,23 @@ const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:
 const analysis=require('../../out/services/analysis'),processes=require('../../out/services/process');
 const {normalizePath}=require('../../out/core/paths');
 
+/** @typedef {{files:string[],[key:string]:unknown}} Request */
+/** @typedef {(request:Request,options:unknown)=>unknown} Responder */
 const shape={signature:'A'.repeat(64),body:'B'.repeat(64),partialTypes:['N:C`0'],excludedTypes:[]};
+/** @param {import('node:test').TestContext} t */
 async function fixture(t) {
  const directory=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy combined analysis ')));
  const files=['Aliases.cs','Body.cs'].map(name=>path.join(directory,name));
- const calls=[],run=processes.runProcess;let respond;
+ const calls=/** @type {{command:string,args:readonly string[],options:import('../../out/services/process').ProcessOptions,request:Request}[]} */([]),run=processes.runProcess;
+ /** @type {Responder} */let respond=()=>undefined;
  processes.runProcess=async(command,args,options)=>{
   const request=JSON.parse(await fs.readFile(args[1],'utf8'));calls.push({command,args,options,request});
   const value=await respond(request,options);
   await fs.writeFile(args[2],typeof value==='string'?value:JSON.stringify(value));return{code:0,stdout:'',stderr:''};
  };
  t.after(async()=>{processes.runProcess=run;await fs.rm(directory,{recursive:true,force:true});});
- return{directory,files,keys:files.map(normalizePath),calls,respond:value=>{respond=value;},
-  batch:(files_,aliases,update,options={})=>analysis.sourceAnalysisBatch('dotnet','analyzer.dll',files_,directory,{cwd:directory,...options},aliases,4,update)};
+ return{directory,files,keys:files.map(normalizePath),calls,respond:(/** @type {Responder} */value)=>{respond=value;},
+  batch:(/** @type {string[]} */files_,/** @type {string[]} */aliases,/** @type {import('../../out/services/analysis').SourceAliasUpdate|undefined} */update,options={})=>analysis.sourceAnalysisBatch('dotnet','analyzer.dll',files_,directory,{cwd:directory,...options},aliases,4,update)};
 }
 
 test('combined requests preserve the worker budget and return every source affected by changed aliases',async t=>{

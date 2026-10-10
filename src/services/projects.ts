@@ -1,7 +1,7 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { Project } from '../core/model';
-import { defaultExcludes, isExcluded, matchesPattern, normalizePath, normalizePathAsync, pathNormalizer, testTargetKey } from '../core/paths';
+import { defaultExcludes, isExcluded, isInside, matchesPattern, normalizePath, normalizePathAsync, normalizePathsAsync, pathNormalizer, preparePathNormalizer, testTargetKey } from '../core/paths';
 import { parseSolution } from '../core/solution';
 import { mapConcurrent } from '../core/concurrency';
 import { ProcessOptions, requireSuccess, runProcess } from './process';
@@ -14,11 +14,11 @@ export async function findProjects(roots: readonly string[], excludes: readonly 
     let pending = [...roots];
     while (pending.length) {
         // Keys are real paths, so symlink cycles and aliased directories are visited once.
-        const keys = await mapConcurrent(pending, concurrency, signal, directory => normalizePathAsync(directory));
-        const directories = pending.filter((_directory, index) => {
-            if (visited.has(keys[index])) {return false;}
-            visited.add(keys[index]); return true;
-        });
+        const keyed = await mapConcurrent(pending, concurrency, signal, async directory => ({ directory, key: await normalizePathAsync(directory) }));
+        const directories = keyed.filter(({ key }) => {
+            if (visited.has(key)) {return false;}
+            visited.add(key); return true;
+        }).map(({ directory }) => directory);
         const next = await mapConcurrent(directories, concurrency, signal, async (directory, _index, workerSignal) => {
             const children: string[] = [];
             let entries;
@@ -26,7 +26,8 @@ export async function findProjects(roots: readonly string[], excludes: readonly 
             catch (error) {
                 // Unreadable directories (volumes owned by another user, races with
                 // deletion) cannot contain projects Testy could build anyway.
-                if (!roots.some(root => normalizePath(root) === normalizePath(directory))
+                const [skipped, ...normalizedRoots] = await normalizePathsAsync([directory, ...roots], workerSignal);
+                if (skipped !== undefined && !normalizedRoots.includes(skipped)
                     && ['EACCES', 'EPERM', 'ENOENT', 'ENOTDIR', 'ELOOP'].includes((error as NodeJS.ErrnoException).code ?? '')) {
                     onSkipped?.(directory, error as Error); return children;
                 }
@@ -36,7 +37,7 @@ export async function findProjects(roots: readonly string[], excludes: readonly 
                 workerSignal.throwIfAborted();
                 const file = path.join(directory, entry.name);
                 let directoryEntry = entry.isDirectory(), fileEntry = entry.isFile();
-                if (entry.isSymbolicLink?.()) {
+                if (entry.isSymbolicLink()) {
                     // A Dirent describes the link itself; follow it (broken links are skipped).
                     try {const target = await fs.stat(file); directoryEntry = target.isDirectory(); fileEntry = target.isFile();}
                     catch {continue;}
@@ -68,9 +69,11 @@ function sdkConfigurationCandidates(file: string): readonly string[] {
 
 export interface EntryPointFilter {
     /** A .sln, .slnx or .slnf whose projects limit the workspace entry points. */
-    readonly solution?: string;
-    readonly include?: readonly string[];
-    readonly exclude?: readonly string[];
+    readonly solution?: string | undefined;
+    /** Solutions that limit only the entry points inside `root`. */
+    readonly solutions?: readonly { readonly file: string; readonly root: string }[] | undefined;
+    readonly include?: readonly string[] | undefined;
+    readonly exclude?: readonly string[] | undefined;
 }
 
 /** Limit discovered entry points to a solution and include/exclude globs. Returns the
@@ -78,16 +81,17 @@ export interface EntryPointFilter {
 export async function filterEntryPoints(found: readonly string[], filter: EntryPointFilter, roots: readonly string[], signal?: AbortSignal): Promise<{ readonly entryPoints: readonly string[]; readonly inputs: readonly string[] }> {
     let entryPoints = found;
     const inputs: string[] = [];
-    if (filter.solution) {
-        const solution = normalizePath(filter.solution);
+    for (const { file, root } of [...filter.solution ? [{ file: filter.solution, root: undefined }] : [], ...filter.solutions ?? []]) {
+        const solution = await normalizePathAsync(file);
         inputs.push(solution);
         let content: string;
         try {content = await fs.readFile(solution, { encoding: 'utf8', signal });}
         catch (error) {signal?.throwIfAborted(); throw new Error(`testy.solution could not be read: ${solution}. ${(error as Error).message}`);}
         const listed = parseSolution(solution, content);
-        if (listed.solution) {inputs.push(normalizePath(listed.solution));}
-        const allowed = new Set(listed.projects.map(normalizePath));
-        entryPoints = entryPoints.filter(file => allowed.has(file));
+        if (listed.solution) {inputs.push(await normalizePathAsync(listed.solution));}
+        const allowed = new Set(await normalizePathsAsync(listed.projects, signal));
+        const scope = root === undefined ? undefined : await normalizePathAsync(root);
+        entryPoints = entryPoints.filter(project => allowed.has(project) || (scope !== undefined && !isInside(project, scope)));
     }
     if (filter.include?.length) {entryPoints = entryPoints.filter(file => filter.include!.some(pattern => matchesPattern(file, pattern, roots)));}
     if (filter.exclude?.length) {entryPoints = entryPoints.filter(file => !filter.exclude!.some(pattern => matchesPattern(file, pattern, roots)));}
@@ -203,7 +207,10 @@ export async function evaluateProjects(dotnet: string, files: readonly string[],
             roots: { file: string; contexts: string[]; entryPoints: string[]; evaluation?: (string | EvaluationInputs)[] }[];
             evaluations?: Readonly<Record<string, EvaluationInputs>>;
         };
-        const normalize = pathNormalizer();
+        // Every path in the graph, resolved before the synchronous mapping below.
+        const normalize = await preparePathNormalizer([...files, ...graph.roots.map(root => root.file), ...graph.projects.flatMap(project => [
+            project.file, project.assembly, ...project.sourceFiles, ...project.inputs ?? [], ...sdkConfigurationCandidates(project.file),
+            ...project.outputDirectories ?? [], ...project.references, ...project.binaryReferences ?? []])], options.signal);
         const projects = new Map(graph.projects.map(project => {
             const unsupported = unsupportedTestReason(project);
             const paths = (files: readonly string[]): string[] => [...new Set(files.map(normalize))];
@@ -383,7 +390,11 @@ export function buildWaves(projects: readonly Project[], roots: readonly Project
         const files = byFile.get(project.file) ?? []; files.push(project); byFile.set(project.file, files);
         const assemblies = byAssembly.get(project.assembly) ?? []; assemblies.push(project); byAssembly.set(project.assembly, assemblies);
     }
-    const plans = roots.map(root => {
+    interface Plan {
+        readonly root: Project; readonly index: number; readonly predecessors: Set<Plan>;
+        readonly writes: readonly Project[]; readonly binaries: ReadonlySet<string>; readonly reads: readonly string[];
+    }
+    const plans = roots.map((root, index): Plan => {
         const pending = [root], writes = new Map<string, Project>(), binaries = new Set<string>();
         while (pending.length) {
             const project = pending.pop()!, id = contextId(project);
@@ -394,52 +405,52 @@ export function buildWaves(projects: readonly Project[], roots: readonly Project
                 ? project.contextReferences.map(id => byId.get(id)).filter((node): node is Project => !!node)
                 : project.references.flatMap(file => byFile.get(file) ?? [])));
         }
-        return { root, writes: [...writes.values()], binaries, reads: [...new Set([...binaries].map(assembly => directory(path.dirname(assembly))))] };
+        return { root, index, predecessors: new Set<Plan>(), writes: [...writes.values()], binaries, reads: [...new Set([...binaries].map(assembly => directory(path.dirname(assembly))))] };
     });
-    const rootIndex = new Map(plans.map((plan, index) => [contextId(plan.root), index]));
+    const rootPlan = new Map(plans.map(plan => [contextId(plan.root), plan]));
     // Index every plan's writes and reads once, then look up only overlapping entries.
-    interface Write { readonly plan: number; readonly context: string; }
-    const writesByDirectory = new DirectoryIndex<Write>(), readsByDirectory = new DirectoryIndex<number>();
+    interface Write { readonly plan: Plan; readonly context: string; }
+    const writesByDirectory = new DirectoryIndex<Write>(), readsByDirectory = new DirectoryIndex<Plan>();
     const writesByFile = new Map<string, Write[]>();
-    plans.forEach((plan, index) => {
+    for (const plan of plans) {
         for (const project of plan.writes) {
-            const write = { plan: index, context: contextId(project) };
+            const write = { plan, context: contextId(project) };
             for (const output of writes(project)) {writesByDirectory.add(output, write);}
             const files = writesByFile.get(project.file) ?? []; files.push(write); writesByFile.set(project.file, files);
         }
-        for (const read of plan.reads) {readsByDirectory.add(read, index);}
-    });
-    const sameSdk = (left: number, right: number): boolean => !sdkByFile || (sdkByFile.has(plans[left].root.file) && sdkByFile.has(plans[right].root.file)
-        && sdkByFile.get(plans[left].root.file) === sdkByFile.get(plans[right].root.file));
-    const predecessors = plans.map(() => new Set<number>());
-    const order = (left: number, right: number): void => {
+        for (const read of plan.reads) {readsByDirectory.add(read, plan);}
+    }
+    const sameSdk = (left: Plan, right: Plan): boolean => !sdkByFile || (sdkByFile.has(left.root.file) && sdkByFile.has(right.root.file)
+        && sdkByFile.get(left.root.file) === sdkByFile.get(right.root.file));
+    // The later root waits for the earlier one.
+    const order = (left: Plan, right: Plan): void => {
         if (left === right) {return;}
-        if (left < right) {predecessors[right].add(left);} else {predecessors[left].add(right);}
+        if (left.index < right.index) {right.predecessors.add(left);} else {left.predecessors.add(right);}
     };
-    plans.forEach((plan, index) => {
+    for (const plan of plans) {
         for (const assembly of plan.binaries) {
             const producers = byAssembly.get(assembly) ?? [], producer = producers.find(project => project.entryPoint) ?? producers[0];
             if (!producer) {continue;}
-            const dependency = rootIndex.get(contextId(producer));
-            if (dependency !== undefined && dependency !== index) {predecessors[index].add(dependency);}
+            const dependency = rootPlan.get(contextId(producer));
+            if (dependency !== undefined && dependency !== plan) {plan.predecessors.add(dependency);}
         }
         for (const project of plan.writes) {
             const context = contextId(project);
             // The same exact context under the same SDK is one shared build, not a conflict.
-            const competing = (other: Write): boolean => other.plan !== index && !(sameSdk(index, other.plan) && other.context === context);
-            for (const other of writesByFile.get(project.file) ?? []) {if (competing(other)) {order(index, other.plan);}}
+            const competing = (other: Write): boolean => other.plan !== plan && !(sameSdk(plan, other.plan) && other.context === context);
+            for (const other of writesByFile.get(project.file) ?? []) {if (competing(other)) {order(plan, other.plan);}}
             for (const output of writes(project)) {
-                for (const other of writesByDirectory.overlapping(output)) {if (competing(other)) {order(index, other.plan);}}
+                for (const other of writesByDirectory.overlapping(output)) {if (competing(other)) {order(plan, other.plan);}}
                 // A plan reading a binary output must not overlap a build that writes it.
-                for (const reader of readsByDirectory.overlapping(output)) {order(index, reader);}
+                for (const reader of readsByDirectory.overlapping(output)) {order(plan, reader);}
             }
         }
-    });
-    const complete = new Set<number>(), result: Project[][] = [];
-    while (complete.size !== roots.length) {
-        const ready = plans.map((_plan, index) => index).filter(index => !complete.has(index) && [...predecessors[index]].every(dependency => complete.has(dependency)));
+    }
+    const complete = new Set<Plan>(), result: Project[][] = [];
+    while (complete.size !== plans.length) {
+        const ready = plans.filter(plan => !complete.has(plan) && [...plan.predecessors].every(dependency => complete.has(dependency)));
         if (!ready.length) {throw new Error('Build roots have conflicting dependency order.');}
-        result.push(ready.map(index => roots[index])); ready.forEach(index => complete.add(index));
+        result.push(ready.map(plan => plan.root)); ready.forEach(plan => complete.add(plan));
     }
     return result;
 }

@@ -8,9 +8,9 @@ const {AnalyzerServers,AnalyzerServerUnavailable,AnalyzerRequestFailed}=require(
 const {sourceAliases,disposeAnalyzerServers}=require('../../out/services/analysis');
 
 const peer=path.resolve('test/fixtures/analyzer-server-peer.cjs'),node=process.execPath;
-const alive=pid=>{try{process.kill(pid,0);return true;}catch{return false;}};
-const until=async(condition,message)=>{for(let index=0;index<200;index++){if(await condition())return;await new Promise(resolve=>setTimeout(resolve,25));}assert.fail(message);};
-const send=(servers,mode,options={},extra={})=>servers.request(node,peer,JSON.stringify({mode,...extra}),{cwd:os.tmpdir(),...options}).then(JSON.parse);
+const alive=(/** @type {number} */pid)=>{try{process.kill(pid,0);return true;}catch{return false;}};
+const until=async(/** @type {() => unknown} */condition,/** @type {string} */message)=>{for(let index=0;index<200;index++){if(await condition())return;await new Promise(resolve=>setTimeout(resolve,25));}assert.fail(message);};
+const send=(/** @type {InstanceType<typeof AnalyzerServers>} */servers,/** @type {string} */mode,options={},extra={})=>servers.request(node,peer,JSON.stringify({mode,...extra}),{cwd:os.tmpdir(),...options}).then(JSON.parse);
 
 test('one server answers concurrent requests by id, resolves relative paths from the request cwd and shares its process',async t=>{
  const servers=new AnalyzerServers();t.after(()=>servers.dispose());
@@ -26,7 +26,7 @@ test('servers are keyed by working directory and environment, and replaced when 
  t.after(()=>fs.rm(directory,{recursive:true,force:true}));
  const servers=new AnalyzerServers();t.after(()=>servers.dispose());
  const helper=path.join(directory,'peer.cjs');await fs.copyFile(peer,helper);
- const ask=(options={},identity)=>servers.request(node,helper,JSON.stringify({mode:'echo'}),{cwd:directory,...options},identity).then(JSON.parse);
+ const ask=(options={},/** @type {string|undefined} */identity=undefined)=>servers.request(node,helper,JSON.stringify({mode:'echo'}),{cwd:directory,...options},identity).then(JSON.parse);
  const first=await ask(),again=await ask();
  assert.equal(first.pid,again.pid);
  const other=await ask({cwd:os.tmpdir()}),marked=await ask({env:{PEER_MARK:'a'}}),changed=await ask({env:{PEER_MARK:'b'}});
@@ -99,6 +99,14 @@ test('protocol violations stop the server and report it unavailable',async t=>{
  const {pid}=await send(servers,'echo');
  await assert.rejects(send(servers,'garbage'),AnalyzerServerUnavailable);
  await until(()=>!alive(pid),'the misbehaving server kept running');
+});
+
+test('a response line beyond the length limit stops the server instead of buffering without bound',async t=>{
+ const servers=new AnalyzerServers({maxLineLength:256*1024});t.after(()=>servers.dispose());
+ const {pid}=await send(servers,'echo');
+ await assert.rejects(send(servers,'unterminated'),error=>error instanceof AnalyzerServerUnavailable&&/longer than 262144 characters/.test(error.message));
+ await until(()=>!alive(pid),'the overflowing server kept running');
+ assert.equal(servers.size,0);
 });
 
 test('requests that cannot be one line are not sent',async t=>{

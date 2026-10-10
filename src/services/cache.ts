@@ -1,7 +1,7 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { CoverageDelta, CoverageSource, CoverageStore } from '../core/coverage';
+import { CoverageDelta, CoverageSource, CoverageStore, mergeDeclarations } from '../core/coverage';
 import { contentHash } from '../core/paths';
 import { mapConcurrent } from '../core/concurrency';
 import { withLock } from './lock';
@@ -47,7 +47,7 @@ export class CoverageCache {
     private epoch: string | undefined;
     private readonly knownSources = new Map<string, CoverageSource>();
     /** Present only while it provably matches the directory; any doubt discards it. */
-    private index?: TraceIndex;
+    private index: TraceIndex | undefined;
     private readonly unsynced = new Set<string>();
     constructor(storage: string, private readonly output: (text: string) => void, private readonly limits: CacheLimits = defaultCacheLimits) { this.directory = path.join(storage, 'coverage-v2'); }
 
@@ -90,6 +90,7 @@ export class CoverageCache {
                 });
                 // Geometry is durable before any trace names it.
                 await this.flush(signal);
+                // Serial: a delta may repeat a trace, and a failure must leave every earlier trace published.
                 for (const trace of delta.traces) {
                     const bytes = await this.write('traces', contentHash(trace.groupId), trace, signal);
                     this.index?.set(contentHash(trace.groupId), trace.sourceIds, bytes);
@@ -117,13 +118,19 @@ export class CoverageCache {
         }
         if (previous === source) {return false;}
         const lines = previous ? await finishAsync(sortedUnion(previous.lines, source.lines), signal) : source.lines;
-        const merged = lines.length === source.lines.length ? source : { ...source, lines };
-        if (!previous || lines.length !== previous.lines.length) {await this.write('sources', source.id, merged, signal);}
+        const declarations = mergeDeclarations(previous?.declarations, source.declarations);
+        const merged = lines.length === source.lines.length && declarations === source.declarations ? source : { ...source, lines, ...declarations ? { declarations } : {} };
+        if (!previous || lines.length !== previous.lines.length || declarations !== previous.declarations) {await this.write('sources', source.id, merged, signal);}
         this.knownSources.set(source.id, merged);
         return !previous;
     }
 
-    /** Publish before mutation so even an interrupted other writer invalidates our memo. */
+    /** Publish before mutation so even an interrupted other writer invalidates our memo.
+     * The epoch only coordinates live writers, which observe it through the shared page
+     * cache, so it is replaced atomically but not synced: after a crash no writer retains
+     * a memo for a lost epoch to invalidate. Records are still synced one by one, since a
+     * rename can otherwise become durable before its data, and every sync of a directory's
+     * renames is batched into one flush per phase. */
     private async beginWrite(signal?: AbortSignal): Promise<void> {
         signal?.throwIfAborted();
         await fs.mkdir(this.directory, { recursive: true });
@@ -132,7 +139,7 @@ export class CoverageCache {
         catch {signal?.throwIfAborted();}
         if (!current || current !== this.epoch) {this.knownSources.clear(); this.invalidateMaintenance();}
         const next = randomUUID();
-        await this.write('', 'epoch', next, signal); this.epoch = next;
+        await this.write('', 'epoch', next, signal, false); this.epoch = next;
     }
 
     private invalidateMaintenance(): void { this.index = undefined; }
@@ -172,12 +179,13 @@ export class CoverageCache {
     /** Only a complete validated snapshot and finished prune can prove later additions safe. */
     private async finishMaintenance(snapshot: Pick<CacheContents, 'traces' | 'stats'>, complete: boolean, signal?: AbortSignal): Promise<void> {
         if (!complete) {this.invalidateMaintenance(); return;}
-        const index = new TraceIndex(), order = snapshot.traces.map((_, position) => position).sort((a, b) => snapshot.stats[a].mtimeMs - snapshot.stats[b].mtimeMs);
+        // Stats are in trace order; a trace without one cannot be ordered and stays out of the index.
+        const index = new TraceIndex(), order = snapshot.traces.flatMap((trace, position) => {const stat = snapshot.stats[position]; return stat ? [{ trace, stat }] : [];})
+            .sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs);
         await finishAsync((function* () {
             let count = 0;
-            for (const position of order) {
-                const trace = snapshot.traces[position];
-                index.set(contentHash(trace.groupId), trace.sourceIds, snapshot.stats[position].bytes);
+            for (const { trace, stat } of order) {
+                index.set(contentHash(trace.groupId), trace.sourceIds, stat.bytes);
                 count += trace.sourceIds.length + 1;
                 if (count >= 4096) {count = 0; yield;}
             }
@@ -207,8 +215,9 @@ export class CoverageCache {
         for (const directory of directories) {signal?.throwIfAborted(); await syncDirectory(directory);}
     }
 
-    /** Atomically publish a JSON record; resolves to its size in bytes. */
-    private async write(kind: string, id: string, value: unknown, signal?: AbortSignal): Promise<number> {
+    /** Atomically publish a JSON record; resolves to its size in bytes. A durable record is
+     * synced before its rename and its directory joins the next flush. */
+    private async write(kind: string, id: string, value: unknown, signal?: AbortSignal, durable = true): Promise<number> {
         signal?.throwIfAborted();
         const destination = path.join(this.directory, kind, `${id}.json`);
         const temporary = `${destination}.${randomUUID()}.tmp`;
@@ -217,9 +226,10 @@ export class CoverageCache {
             handle = await fs.open(temporary, 'w');
             for (const chunk of jsonChunks(value)) {signal?.throwIfAborted(); await handle.writeFile(chunk); bytes += Buffer.byteLength(chunk);}
             // The data must be durable before the rename can make it the record.
-            await handle.sync(); await handle.close(); handle = undefined;
+            if (durable) {await handle.sync();}
+            await handle.close(); handle = undefined;
             signal?.throwIfAborted(); await fs.rename(temporary, destination);
-            this.unsynced.add(path.dirname(destination));
+            if (durable) {this.unsynced.add(path.dirname(destination));}
         }
         finally { await handle?.close(); await fs.rm(temporary, { force: true }); }
         return bytes;

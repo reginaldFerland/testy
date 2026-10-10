@@ -80,8 +80,8 @@ static partial class ProcessOwner
             Check(Native.InitializeProcThreadAttributeList(attributes, 1, 0, ref size));
             handleList = Marshal.AllocHGlobal(IntPtr.Size * handles.Count);
             for (var index = 0; index < handles.Count; index++) { Marshal.WriteIntPtr(handleList, index * IntPtr.Size, handles[index]); }
-            Check(Native.UpdateProcThreadAttribute(attributes, 0, (IntPtr)0x20002 /* HANDLE_LIST */, handleList,
-                (IntPtr)(IntPtr.Size * handles.Count), IntPtr.Zero, IntPtr.Zero));
+            Check(Native.UpdateProcThreadAttribute(attributes, 0, 0x20002 /* HANDLE_LIST */, handleList,
+                IntPtr.Size * handles.Count, IntPtr.Zero, IntPtr.Zero));
             startup.AttributeList = attributes;
             // Suspend before assignment: even a very short-lived parent cannot
             // create an unowned child between CreateProcess and job assignment.
@@ -96,7 +96,10 @@ static partial class ProcessOwner
                 environment, null, ref startup, out process));
             if (!Native.AssignProcessToJobObject(job, process.Process))
             {
-                var error = Marshal.GetLastWin32Error(); Native.TerminateProcess(process.Process, 1);
+                var error = Marshal.GetLastWin32Error();
+                // Best effort: the child is still suspended and has run no code. If terminating it fails
+                // too, the assignment error is the one to report; there is nothing further to try.
+                _ = Native.TerminateProcess(process.Process, 1);
                 throw new Win32Exception(error);
             }
             Check(Native.ResumeThread(process.Thread) != uint.MaxValue);
@@ -111,7 +114,7 @@ static partial class ProcessOwner
             Check(Native.GetExitCodeProcess(process.Process, out var exitCode));
             Check(Native.TerminateJobObject(job, 1));
             var deadline = Environment.TickCount64 + (long)TerminationTimeout.TotalMilliseconds;
-            for (;;)
+            while (true)
             {
                 Check(Native.QueryInformationJobObject(job, 1, out var accounting, (uint)Marshal.SizeOf<Accounting>(), IntPtr.Zero));
                 if (accounting.ActiveProcesses == 0) { break; }

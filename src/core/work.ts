@@ -15,9 +15,10 @@ export async function finishAsync<T>(work: Generator<void, T>, signal?: AbortSig
 /** Bounded sorting/merging also handles a single unusually large source file. */
 export function* sortedUnion(a: readonly number[], b: readonly number[]): Generator<void, readonly number[]> {
     if (a === b) {return a;}
+    // The index loops below read only within their checked bounds.
     let ordered = true, count = 0;
     for (const input of [a, b]) {for (let index = 1; index < input.length; index++) {
-        if (input[index - 1] > input[index]) {ordered = false; break;}
+        if (input[index - 1]! > input[index]!) {ordered = false; break;}
         if (++count % 4096 === 0) {yield;}
     }}
     if (ordered) {
@@ -30,7 +31,7 @@ export function* sortedUnion(a: readonly number[], b: readonly number[]): Genera
         const merged: number[] = [];
         let i = 0, j = 0;
         while (i < a.length || j < b.length) {
-            const value = j >= b.length || (i < a.length && a[i] <= b[j]) ? a[i++] : b[j++];
+            const value = j >= b.length || (i < a.length && a[i]! <= b[j]!) ? a[i++]! : b[j++]!;
             if (value !== merged[merged.length - 1]) {merged.push(value);}
             if (++count % 4096 === 0) {yield;}
         }
@@ -45,11 +46,12 @@ export function* sortedUnion(a: readonly number[], b: readonly number[]): Genera
     while (runs.length > 1) {
         const next: number[][] = [];
         for (let index = 0; index < runs.length; index += 2) {
-            if (!runs[index + 1]) {next.push(runs[index]); continue;}
-            const left = runs[index], right = runs[index + 1], merged: number[] = [];
+            const left = runs[index]!, right = runs[index + 1];
+            if (!right) {next.push(left); continue;}
+            const merged: number[] = [];
             let i = 0, j = 0, count = 0;
             while (i < left.length || j < right.length) {
-                const value = j >= right.length || (i < left.length && left[i] <= right[j]) ? left[i++] : right[j++];
+                const value = j >= right.length || (i < left.length && left[i]! <= right[j]!) ? left[i++]! : right[j++]!;
                 if (value !== merged[merged.length - 1]) {merged.push(value);}
                 if (++count % 4096 === 0) {yield;}
             }

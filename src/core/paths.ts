@@ -33,6 +33,8 @@ class TtlMap<T> {
 class DirectoryCache {
     private readonly directories: TtlMap<string>;
     private readonly listings: TtlMap<ReadonlyMap<string, string>>;
+    /** Asynchronous resolutions in flight, so concurrent lookups share one realpath. */
+    readonly resolving = new Map<string, Promise<string>>();
     constructor(limit = Infinity, ttl = Infinity) {
         this.directories = new TtlMap(limit, ttl); this.listings = new TtlMap(limit, ttl);
     }
@@ -40,7 +42,7 @@ class DirectoryCache {
     set(directory: string, real: string): void { this.directories.set(directory, real); }
     listing(directory: string): ReadonlyMap<string, string> | undefined { return this.listings.get(directory); }
     setListing(directory: string, names: ReadonlyMap<string, string>): void { this.listings.set(directory, names); }
-    clear(): void { this.directories.clear(); this.listings.clear(); }
+    clear(): void { this.directories.clear(); this.listings.clear(); this.resolving.clear(); }
 }
 
 /** Default APFS ignores case, so the exact name is looked up first (cached listing, then one
@@ -69,14 +71,22 @@ function resolveDirectory(directory: string, cache: DirectoryCache): string {
     }
 }
 
-async function resolveDirectoryAsync(directory: string, cache: DirectoryCache): Promise<string> {
+function resolveDirectoryAsync(directory: string, cache: DirectoryCache): Promise<string> {
     const cached = cache.get(directory);
-    if (cached !== undefined) {return cached;}
-    try { const real = await fsp.realpath(directory); cache.set(directory, real); return real; }
-    catch {
-        const parent = path.dirname(directory);
-        return parent === directory ? directory : path.join(await resolveDirectoryAsync(parent, cache), path.basename(directory));
+    if (cached !== undefined) {return Promise.resolve(cached);}
+    let resolving = cache.resolving.get(directory);
+    if (!resolving) {
+        resolving = (async () => {
+            try { const real = await fsp.realpath(directory); cache.set(directory, real); return real; }
+            catch {
+                const parent = path.dirname(directory);
+                return parent === directory ? directory : path.join(await resolveDirectoryAsync(parent, cache), path.basename(directory));
+            }
+        })();
+        const settled = resolving, forget = (): void => {if (cache.resolving.get(directory) === settled) {cache.resolving.delete(directory);}};
+        cache.resolving.set(directory, settled); void settled.then(forget, forget);
     }
+    return resolving;
 }
 
 function resolveLeaf(directory: string, name: string, cache: DirectoryCache): string {
@@ -110,13 +120,43 @@ function normalizeWith(file: string, cache: DirectoryCache): string {
     return canonicalSpelling(parent === resolved ? resolveDirectory(resolved, cache) : resolveLeaf(resolveDirectory(parent, cache), path.basename(resolved), cache));
 }
 
+async function normalizeWithAsync(file: string, cache: DirectoryCache): Promise<string> {
+    const resolved = path.resolve(file), parent = path.dirname(resolved);
+    return canonicalSpelling(parent === resolved ? await resolveDirectoryAsync(resolved, cache)
+        : await resolveLeafAsync(await resolveDirectoryAsync(parent, cache), path.basename(resolved), cache));
+}
+
 export function normalizePath(file: string): string { return normalizeWith(file, sharedDirectories); }
 
 /** Same result as normalizePath without blocking the extension host on the filesystem. */
-export async function normalizePathAsync(file: string): Promise<string> {
-    const resolved = path.resolve(file), parent = path.dirname(resolved);
-    return canonicalSpelling(parent === resolved ? await resolveDirectoryAsync(resolved, sharedDirectories)
-        : await resolveLeafAsync(await resolveDirectoryAsync(parent, sharedDirectories), path.basename(resolved), sharedDirectories));
+export function normalizePathAsync(file: string): Promise<string> { return normalizeWithAsync(file, sharedDirectories); }
+
+/** A pathNormalizer whose paths are resolved up front without blocking the extension host:
+ * each distinct path once, with bounded concurrency, through one scoped directory cache.
+ * A path that was not supplied is still resolved, synchronously, when it is looked up. */
+export async function preparePathNormalizer(files: Iterable<string>, signal?: AbortSignal, concurrency = 16): Promise<(file: string) => string> {
+    const directories = new DirectoryCache(), paths = new Map<string, string>(), pending = [...new Set(files)];
+    let next = 0;
+    signal?.throwIfAborted();
+    await Promise.all(Array.from({ length: Math.min(concurrency, pending.length) }, async () => {
+        for (let file = pending[next++]; file !== undefined; file = pending[next++]) {
+            paths.set(file, await normalizeWithAsync(file, directories));
+            signal?.throwIfAborted();
+        }
+    }));
+    // Normalization is idempotent: results (such as test IDs built from normalized files) are their own.
+    for (const normalized of [...paths.values()]) {if (!paths.has(normalized)) {paths.set(normalized, normalized);}}
+    return file => {
+        let normalized = paths.get(file);
+        if (normalized === undefined) {normalized = normalizeWith(file, directories); paths.set(file, normalized);}
+        return normalized;
+    };
+}
+
+/** normalizePath for many paths, resolved asynchronously and deduplicated. */
+export async function normalizePathsAsync(files: readonly string[], signal?: AbortSignal): Promise<string[]> {
+    const normalize = await preparePathNormalizer(files, signal);
+    return files.map(normalize);
 }
 
 /** Scope this cache to one discovery/run so filesystem changes cannot outlive it. */
@@ -155,6 +195,10 @@ export function matchesPattern(file: string, pattern: string, roots: readonly st
 export function isExcluded(file: string, excludes: readonly string[] = defaultExcludes, roots: readonly string[] = []): boolean {
     return excludes.some(pattern => matchesPattern(file, pattern, roots));
 }
+
+/** Locale-independent string order for identities: localeCompare varies with the ICU
+ * data and locale of the editor host, which would change persisted hashes. */
+export function compareCodeUnits(left: string, right: string): number { return left < right ? -1 : left > right ? 1 : 0; }
 
 export function contentHash(content: string | Buffer): string {
     return createHash('sha256').update(content).digest('hex');

@@ -8,8 +8,9 @@ namespace Testy.Analysis;
 //   in:  {"id":1,"cwd":"/work","request":{...one-shot request...}}   {"cancel":1}
 //   out: {"ready":1,"roslyn":"version from directory"}   {"id":1,"result":<one-shot response>}   {"id":1,"error":"text"}
 // Requests run concurrently and answer in completion order. A cancelled request
-// answers with an error. The process exits when stdin closes, so it cannot
-// outlive an extension host that died without cleaning up.
+// answers with an error. Malformed requests, and requests reusing the id of one
+// still running, are logged to stderr and not answered. The process exits when
+// stdin closes, so it cannot outlive an extension host that died without cleaning up.
 // Only source analysis is served: graph evaluation stays in per-request MSBuild
 // processes because its cache validity depends on a fresh evaluation.
 static class AnalyzerServer
@@ -44,30 +45,39 @@ static class AnalyzerServer
             }
             catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { line = $"{{\"id\":{id},\"error\":\"cancelled\"}}"; }
             catch (Exception exception) { line = $"{{\"id\":{id},\"error\":{JsonSerializer.Serialize(exception.ToString())}}}"; }
-            finally { running.TryRemove(id, out _); cancellation.Dispose(); document.Dispose(); }
+            finally { running.TryRemove(KeyValuePair.Create(id, cancellation)); cancellation.Dispose(); document.Dispose(); }
             try { await Write(line); }
             catch (IOException) { /* The host closed the pipe; the read loop sees EOF. */ }
         }
-        SourceAnalysis.Warm();
+        await SourceAnalysis.WarmAsync();
         await Write($"{{\"ready\":1,\"roslyn\":{JsonSerializer.Serialize(SourceAnalysis.Describe())}}}");
         using var reader = new StreamReader(input, new UTF8Encoding(false));
         while (await reader.ReadLineAsync() is { } line)
         {
             if (line.Length == 0) { continue; }
+            // Owned here until Serve takes it.
+            JsonDocument? document = null;
             try
             {
-                var document = JsonDocument.Parse(line);
+                document = JsonDocument.Parse(line);
                 var root = document.RootElement;
                 if (root.TryGetProperty("cancel", out var cancel))
                 {
                     if (running.TryGetValue(cancel.GetInt64(), out var target)) { try { target.Cancel(); } catch (ObjectDisposedException) { } }
-                    document.Dispose();
                     continue;
                 }
                 var id = root.GetProperty("id").GetInt64();
                 var cancellation = new CancellationTokenSource();
-                running[id] = cancellation;
-                var task = Task.Run(() => Serve(id, document, cancellation));
+                // An answer carrying a duplicate id would settle the caller's earlier request, so none is sent.
+                if (!running.TryAdd(id, cancellation))
+                {
+                    cancellation.Dispose();
+                    Console.Error.WriteLine($"Ignored a request with the duplicate id {id}.");
+                    continue;
+                }
+                var owned = document;
+                document = null;
+                var task = Task.Run(() => Serve(id, owned, cancellation));
                 tasks[task] = 0;
                 _ = task.ContinueWith(finished => tasks.TryRemove(finished, out _), TaskScheduler.Default);
             }
@@ -75,6 +85,7 @@ static class AnalyzerServer
             {
                 Console.Error.WriteLine($"Ignored a malformed request: {exception.Message}");
             }
+            finally { document?.Dispose(); }
         }
         foreach (var source in running.Values) { try { source.Cancel(); } catch (ObjectDisposedException) { } }
         await Task.WhenAll(tasks.Keys);

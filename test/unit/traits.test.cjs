@@ -28,7 +28,7 @@ test('test items carry trait tags, cached across rebuilds, and notice trait chan
  const {TestTree}=loadUi({vscode:{Uri:{file:fsPath=>({fsPath})},Range:class{}}});
  const context={items:new Map(),testIds:new Map(),treeFiles:new Map(),treeProjects:new Map(),treeRoots:[],outcomes:new Map(),passed:0,failed:0,
   engine:{knownTests:group=>group.tests},host:{disposed:false,activeRun:undefined,roots:[],updateStatus(){}},setOutcome:TestTree.prototype.setOutcome,item:TestTree.prototype.item,
-  controller:{items:collection(),createTestItem:(id,label,uri)=>({id,label,uri,children:collection()})}};
+  controller:{items:collection(),createTestItem:(id,label,uri)=>({id,label,uri,tags:[],children:collection()})}};
  const node=traits=>discoveredTest({uid:'t1','display-name':'Adds','location.file':'/Tests.cs','location.line-start':3,'location.type':'Calc','location.method':'Adds',traits});
  const group=traits=>({id:'g',project:'/Tests.csproj',framework:'net10.0',assembly:'/Tests.dll',file:'/Tests.cs',tests:[node(traits)]});
  await TestTree.prototype.update.call(context,[group([{key:'TestCategory',value:'Integration'}])]);

@@ -140,10 +140,10 @@ public sealed class JsonContractTests : IDisposable
             {"id":2,"request":{}}
             {"id":3,"cwd":{{{cwd}}},"request":{"aliasSources":[]}}
 
-            """));
+            """), TestContext.Current.CancellationToken);
         var answers = new[] { await Next(), await Next(), await Next() };
         await requests.Writer.CompleteAsync();
-        Assert.Equal(0, await server.WaitAsync(TimeSpan.FromSeconds(60)));
+        Assert.Equal(0, await server.WaitAsync(TimeSpan.FromSeconds(60), TestContext.Current.CancellationToken));
         using (ready)
         {
             Assert.Equal(["ready", "roslyn"], Names(ready.RootElement));

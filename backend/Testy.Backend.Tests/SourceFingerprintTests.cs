@@ -28,7 +28,7 @@ public class SourceFingerprintTests
         }
         """;
 
-    private static SourceShape Shape(string text) => SourceAnalysis.Analyze(text) ?? throw new InvalidOperationException("The source did not parse.");
+    private static async Task<SourceShape> Shape(string text) => await SourceAnalysis.AnalyzeAsync(text) ?? throw new InvalidOperationException("The source did not parse.");
 
     [Theory]
     [InlineData("public int M(int x) { return x; }", "public int M(int x) { return x + 1; }")]
@@ -39,11 +39,11 @@ public class SourceFingerprintTests
     [InlineData("public int Expr(int x) => x;", "public int Expr(int x) => x * x;")]
     [InlineData("public int Accessors { get => 1; set { F = value; } }", "public int Accessors { get => 2; set { F = value + 1; } }")]
     [InlineData("int Twice(int y) => y * 2;", "int Twice(int y) => y * 3;")]
-    public void AnExecutableBodyEditKeepsTheSignatureButChangesTheBody(string before, string after)
+    public async Task AnExecutableBodyEditKeepsTheSignatureButChangesTheBody(string before, string after)
     {
         Assert.Contains(before, Baseline, StringComparison.Ordinal);
-        var original = Shape(Baseline);
-        var edited = Shape(Baseline.Replace(before, after, StringComparison.Ordinal));
+        var original = await Shape(Baseline);
+        var edited = await Shape(Baseline.Replace(before, after, StringComparison.Ordinal));
         Assert.Equal(original.Signature, edited.Signature);
         Assert.NotEqual(original.Body, edited.Body);
     }
@@ -75,44 +75,44 @@ public class SourceFingerprintTests
     [InlineData("using System;", "using System;\nusing System.IO;")]
     // Constructors run no caller-visible declaration but stay in the signature.
     [InlineData("public D() { F = 1; }", "public D() { F = 2; }")]
-    public void ADeclarationEditChangesTheSignature(string before, string after)
+    public async Task ADeclarationEditChangesTheSignature(string before, string after)
     {
         Assert.Contains(before, Baseline, StringComparison.Ordinal);
-        var original = Shape(Baseline);
-        var edited = Shape(Baseline.Replace(before, after, StringComparison.Ordinal));
+        var original = await Shape(Baseline);
+        var edited = await Shape(Baseline.Replace(before, after, StringComparison.Ordinal));
         Assert.NotEqual(original.Signature, edited.Signature);
         Assert.NotEqual(original.Body, edited.Body);
     }
 
     [Fact]
-    public void PreprocessorDirectivesChangeTheSignatureEvenInsideABody()
+    public async Task PreprocessorDirectivesChangeTheSignatureEvenInsideABody()
     {
-        var original = Shape(Baseline);
-        var edited = Shape(Baseline.Replace("public int M(int x) { return x; }", "public int M(int x) {\n#if DEBUG\n return x;\n#else\n return x;\n#endif\n }", StringComparison.Ordinal));
+        var original = await Shape(Baseline);
+        var edited = await Shape(Baseline.Replace("public int M(int x) { return x; }", "public int M(int x) {\n#if DEBUG\n return x;\n#else\n return x;\n#endif\n }", StringComparison.Ordinal));
         Assert.NotEqual(original.Signature, edited.Signature);
     }
 
     [Fact]
-    public void WhitespaceOnlyEditsChangeNothing()
+    public async Task WhitespaceOnlyEditsChangeNothing()
     {
-        var original = Shape(Baseline);
-        var edited = Shape(Baseline.Replace("{", "{  \r\n\r\n", StringComparison.Ordinal).Replace("public ", "public  ", StringComparison.Ordinal));
+        var original = await Shape(Baseline);
+        var edited = await Shape(Baseline.Replace("{", "{  \r\n\r\n", StringComparison.Ordinal).Replace("public ", "public  ", StringComparison.Ordinal));
         Assert.Equal(original, edited, new ShapeComparer());
     }
 
     [Fact]
-    public void SignatureDiffersFromBodyWhenThereIsAnExecutableBody()
+    public async Task SignatureDiffersFromBodyWhenThereIsAnExecutableBody()
     {
-        var shape = Shape(Baseline);
+        var shape = await Shape(Baseline);
         Assert.NotEqual(shape.Signature, shape.Body);
         Assert.Matches("^[0-9A-F]{64}$", shape.Signature);
         Assert.Matches("^[0-9A-F]{64}$", shape.Body);
     }
 
     [Fact]
-    public void SyntaxErrorsHaveNoShape()
+    public async Task SyntaxErrorsHaveNoShape()
     {
-        Assert.Null(SourceAnalysis.Analyze("class D { int M( { }"));
+        Assert.Null(await SourceAnalysis.AnalyzeAsync("class D { int M( { }"));
     }
 
     [Theory]
@@ -122,25 +122,25 @@ public class SourceFingerprintTests
     [InlineData("class D { [DebuggerHidden] int M() { return 1; } }", "class D { [DebuggerHidden] int M() { return 2; } }")]
     [InlineData("using Blind = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute;\n[Blind] class D { int M() { return 1; } }", "using Blind = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute;\n[Blind] class D { int M() { return 2; } }")]
     [InlineData("class D { int M() {\n#line 7 \"mapped.cs\"\n return 1; } }", "class D { int M() {\n#line 7 \"mapped.cs\"\n return 2; } }")]
-    public void CoverageExcludedOrLineMappedCodeTreatsBodiesAsDeclarations(string before, string after)
+    public async Task CoverageExcludedOrLineMappedCodeTreatsBodiesAsDeclarations(string before, string after)
     {
-        Assert.NotEqual(Shape(before).Signature, Shape(after).Signature);
+        Assert.NotEqual((await Shape(before)).Signature, (await Shape(after)).Signature);
     }
 
     [Fact]
-    public void RecordsExcludedAndPartialTypesByNamespaceAndArity()
+    public async Task RecordsExcludedAndPartialTypesByNamespaceAndArity()
     {
-        var shape = Shape("namespace A.B;\n[System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage] public partial class C<T> { public class Nested { [DebuggerHidden] void M() { } } }\npublic partial struct S { }");
+        var shape = await Shape("namespace A.B;\n[System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage] public partial class C<T> { public class Nested { [DebuggerHidden] void M() { } } }\npublic partial struct S { }");
         Assert.Equal(["A.B:C`1", "A.B:C`1+Nested`0"], shape.ExcludedTypes.Order(StringComparer.Ordinal));
         Assert.Equal(["A.B:C`1", "A.B:S`0"], shape.PartialTypes.Order(StringComparer.Ordinal));
     }
 
     [Fact]
-    public void AnAssemblyLevelOrDisabledExclusionExcludesEverything()
+    public async Task AnAssemblyLevelOrDisabledExclusionExcludesEverything()
     {
-        Assert.Contains("*", Shape("[assembly: System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]\nclass D { }").ExcludedTypes);
-        Assert.Contains("*", Shape("class D { }\n#if NEVER\n[ExcludeFromCodeCoverage] class E { }\n#endif\n").ExcludedTypes);
-        Assert.DoesNotContain("*", Shape("class D { }\n#if NEVER\nclass E { }\n#endif\n").ExcludedTypes);
+        Assert.Contains("*", (await Shape("[assembly: System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]\nclass D { }")).ExcludedTypes);
+        Assert.Contains("*", (await Shape("class D { }\n#if NEVER\n[ExcludeFromCodeCoverage] class E { }\n#endif\n")).ExcludedTypes);
+        Assert.DoesNotContain("*", (await Shape("class D { }\n#if NEVER\nclass E { }\n#endif\n")).ExcludedTypes);
     }
 
     [Fact]
@@ -190,9 +190,9 @@ public class SourceFingerprintTests
     }
 
     [Fact]
-    public void TheServerSelfTestPasses()
+    public async Task TheServerSelfTestPasses()
     {
-        SourceAnalysis.Warm();
+        await SourceAnalysis.WarmAsync();
     }
 
     private sealed class ShapeComparer : IEqualityComparer<SourceShape?>

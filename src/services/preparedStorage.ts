@@ -34,7 +34,7 @@ interface Owner {
     readonly token: string;
     readonly pid: number;
     /** Distinguishes a live owner from an unrelated process that reused its PID. */
-    readonly process?: ProcessStamp;
+    readonly process?: ProcessStamp | undefined;
     readonly state: 'active' | 'parked';
     readonly parkedAt?: number;
     readonly snapshot?: unknown;
@@ -63,12 +63,12 @@ async function readOwner(storage: string, identity: string): Promise<Owner | 'un
         const stat = await fs.lstat(file);
         if (!stat.isFile() || stat.isSymbolicLink()) {return undefined;}
         if (stat.size > maximumMetadataBytes) {return 'unreadable';}
-        const value = JSON.parse(await fs.readFile(file, 'utf8')) as Owner;
+        const value = JSON.parse(await fs.readFile(file, 'utf8')) as { readonly [Key in keyof Owner]?: unknown } | null;
         if (!value || value.version !== 1 || value.identity !== identity || typeof value.token !== 'string' || !identityPattern.test(value.token)
             || !count(value.pid) || (value.state !== 'active' && value.state !== 'parked')
             || (value.state === 'active' ? value.pid === 0 : value.pid !== 0)
             || (value.process !== undefined && !isProcessStamp(value.process))) {return undefined;}
-        return value;
+        return value as Owner;
     } catch (error) {
         if (error instanceof SyntaxError) {return 'unreadable';}
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') {return undefined;}
@@ -110,8 +110,8 @@ async function inventory(storage: string, log: Budget['log'], signal?: AbortSign
     const result: Parked[] = [];
     for (const name of await fs.readdir(storage)) {
         signal?.throwIfAborted();
-        const temporary = name.split('.');
-        if (temporary.length === 3 && temporary[2] === 'tmp' && identityPattern.test(temporary[0]) && identityPattern.test(temporary[1])) {
+        const temporary = name.split('.'), [target, writer, kind] = temporary;
+        if (temporary.length === 3 && kind === 'tmp' && target && writer && identityPattern.test(target) && identityPattern.test(writer)) {
             // All metadata writers hold this lock, so these are interrupted writes.
             await fs.rm(path.join(storage, name), { force: true }).catch(() => undefined); continue;
         }
@@ -128,7 +128,7 @@ async function inventory(storage: string, log: Budget['log'], signal?: AbortSign
             if (!await isProcessAlive(owner.pid, owner.process)) {await tryDiscard(storage, identity, log);}
             continue;
         }
-        const stat = await fs.lstat(path.join(storage, identity)).catch(error => {
+        const stat = await fs.lstat(path.join(storage, identity)).catch((error: unknown) => {
             if ((error as NodeJS.ErrnoException).code === 'ENOENT') {return undefined;} throw error;
         });
         if (!parked(owner) || !stat?.isDirectory() || stat.isSymbolicLink() || !owner.retention.entries) {
@@ -164,7 +164,7 @@ async function trim(storage: string, owners: Parked[], budget: Budget): Promise<
         const excessEntries = total(owner => owner.retention.entries) - budget.maxEntries;
         const excessBytes = total(owner => owner.retention.bytes) - budget.maxBytes;
         if (excessEntries <= 0 && excessBytes <= 0) {break;}
-        const owner = owners[index];
+        const owner = owners[index]!; // index < owners.length
         // The oldest container gives up its oldest entries first and goes whole only when none fit.
         const shrunk = await shrinkOwner(storage, owner, { entries: Math.max(0, owner.retention.entries - Math.max(0, excessEntries)),
             bytes: Math.max(0, owner.retention.bytes - Math.max(0, excessBytes)) }, budget);

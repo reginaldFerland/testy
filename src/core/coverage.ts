@@ -1,17 +1,51 @@
 import { setImmediate as yieldTurn } from 'node:timers/promises';
-import { CoveredLine, Trace } from './model';
+import { CoveredLine, Declaration, Trace } from './model';
 import { contentHash, sourceVersion } from './paths';
 import { finish, finishAsync, sortedUnion } from './work';
 
 export interface CoverageSummary {
     readonly file: string;
     readonly lines: readonly CoveredLine[];
+    /** Method spans of the displayed source version, when the reports carried them. */
+    readonly declarations?: readonly Declaration[];
     readonly stale: boolean;
     readonly covered: number;
     readonly total: number;
     readonly groupIds: readonly string[];
 }
-export interface CoverageSource { readonly id: string; readonly file: string; readonly hash: string; readonly lines: readonly number[]; }
+export interface CoverageSource {
+    readonly id: string; readonly file: string; readonly hash: string; readonly lines: readonly number[];
+    readonly declarations?: readonly Declaration[];
+}
+
+const declarationKey = (declaration: Declaration): string => `${declaration.start}:${declaration.end}:${declaration.name}`;
+
+/** Method spans are geometry like lines: a sorted union across reports that
+ * returns `previous` itself when `next` adds nothing. */
+export function mergeDeclarations(previous: readonly Declaration[] | undefined, next: readonly Declaration[] | undefined): readonly Declaration[] | undefined {
+    if (!next?.length || previous === next) {return previous;}
+    const known = new Set(previous?.map(declarationKey));
+    if (previous && next.every(declaration => known.has(declarationKey(declaration)))) {return previous;}
+    const unique = new Map([...previous ?? [], ...next].map(declaration => [declarationKey(declaration), declaration]));
+    return [...unique.values()].sort((a, b) => a.start - b.start || a.end - b.end || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+/** Each method with instrumented lines, hit as often as its first instrumented line ran
+ * (or its busiest line, when only later lines report hits). */
+export function declarationHits(lines: readonly CoveredLine[], declarations: readonly Declaration[]): { readonly declaration: Declaration; readonly hits: number }[] {
+    const result: { declaration: Declaration; hits: number }[] = [];
+    for (const declaration of declarations) {
+        let low = 0, high = lines.length;
+        // Indices stay below lines.length throughout: middle < high, and the scan checks its bound.
+        while (low < high) {const middle = (low + high) >>> 1; if (lines[middle]!.line < declaration.start) {low = middle + 1;} else {high = middle;}}
+        const first = lines[low];
+        if (!first || first.line > declaration.end) {continue;}
+        let hits = first.hits;
+        for (let index = low; !hits && index < lines.length && lines[index]!.line <= declaration.end; index++) {hits = Math.max(hits, lines[index]!.hits);}
+        result.push({ declaration, hits });
+    }
+    return result;
+}
 export interface StoredTrace extends Trace { readonly sourceIds: readonly string[]; }
 export interface CoverageDelta {
     readonly sources: readonly CoverageSource[];
@@ -24,7 +58,7 @@ interface SourceRecord {
     readonly groups: Set<string>;
     readonly hits: Map<string, readonly CoveredLine[]>;
     staleCount: number;
-    aggregate?: { readonly lines: readonly CoveredLine[]; readonly covered: number };
+    aggregate?: { readonly lines: readonly CoveredLine[]; readonly covered: number } | undefined;
     aggregateVersion: number;
 }
 const moduleKey = (project: string): string => `\0module:${project}`;
@@ -66,7 +100,7 @@ export class CoverageStore {
         for (const id of groupIds) {
             const trace = this.records.get(id);
             if (!trace || (!trace.reliable && (!stale || trace.stale))) {continue;}
-            this.records.set(id, { ...trace, reliable: false, stale: stale || trace.stale });
+            this.records.set(id, { ...trace, reliable: false, stale: stale || trace.stale === true });
             this.staleOrigins.delete(id);
             changed = true;
             this.changedTraces.add(id);
@@ -146,12 +180,15 @@ export class CoverageStore {
                 }
                 const previous = sources.get(id) ?? this.sources.get(id)?.source;
                 const lines = yield* sortedUnion(previous?.lines ?? [], geometry);
-                sources.set(id, previous && previous.lines.length === lines.length ? previous : { id, file: file.file, hash: file.hash, lines });
+                const declarations = mergeDeclarations(previous?.declarations, file.declarations);
+                sources.set(id, previous && previous.lines.length === lines.length && previous.declarations === declarations ? previous
+                    : { id, file: file.file, hash: file.hash, lines, ...declarations ? { declarations } : {} });
                 sourceIds.push(id);
                 // Compare while packing can still yield. Installation checks the
                 // current array identity again; a concurrent replacement cannot
                 // authorize reuse of an aggregate for different hit data.
-                if (hits.length) {coverage.push({ ...file, lines: sameHits && previousHits!.length === hits.length ? previousHits! : hits });}
+                // Spans live on the shared source, not in each test file's hits.
+                if (hits.length) {coverage.push({ file: file.file, hash: file.hash, lines: sameHits && previousHits!.length === hits.length ? previousHits! : hits });}
             }
             packed.push({
                 ...trace, dependencies, moduleProjects, coverage, sourceIds,
@@ -381,8 +418,9 @@ export class CoverageStore {
     private registerSource(source: CoverageSource, canonical = false, merged = false): void {
         const previous = this.sources.get(source.id);
         const lines = merged ? source.lines : previous ? finish(sortedUnion(previous.source.lines, source.lines)) : canonical ? source.lines : finish(sortedUnion([], source.lines));
-        if (previous && lines.length === previous.source.lines.length) {return;}
-        this.sources.set(source.id, { source: { ...source, lines }, groups: previous?.groups ?? new Set(), hits: previous?.hits ?? new Map<string, readonly CoveredLine[]>(),
+        const declarations = mergeDeclarations(previous?.source.declarations, source.declarations);
+        if (previous && lines.length === previous.source.lines.length && declarations === previous.source.declarations) {return;}
+        this.sources.set(source.id, { source: { ...source, lines, ...declarations ? { declarations } : {} }, groups: previous?.groups ?? new Set(), hits: previous?.hits ?? new Map<string, readonly CoveredLine[]>(),
             staleCount: previous?.staleCount ?? 0, aggregateVersion: (previous?.aggregateVersion ?? 0) + 1 });
         const versions = this.byFile.get(source.file) ?? new Set<string>(); versions.add(source.id); this.byFile.set(source.file, versions);
         this.changedSources.add(source.id); this.removedSources.delete(source.id); this.dirty(source.file); this.version++;
@@ -496,7 +534,7 @@ export class CoverageStore {
         let low = 0, high = previous.length;
         while (low < high) {
             const middle = low + Math.floor((high - low) / 2);
-            if (previous[middle] < id) {low = middle + 1;} else {high = middle;}
+            if (previous[middle]! < id) {low = middle + 1;} else {high = middle;}
         }
         const exists = previous[low] === id;
         if (exists === add) {return;}
@@ -540,10 +578,10 @@ export class CoverageStore {
 
     private *calculation(file: string): Generator<void, CoverageSummary | undefined> {
         const revision = this.version;
-        const versions = [...this.byFile.get(file) ?? []].map(id => this.sources.get(id)!).filter(Boolean);
-        if (!versions.length) {return undefined;}
+        const versions = [...this.byFile.get(file) ?? []].flatMap(id => this.sources.get(id) ?? []);
         const current = versions.find(version => version.source.hash === this.hashes.get(file));
-        const displayed = current ?? versions[versions.length - 1];
+        const displayed = current ?? versions.at(-1);
+        if (!displayed) {return undefined;}
         let groupIds = this.owners.get(file);
         const groups = groupIds ? undefined : new Set<string>();
         let stale = !current;
@@ -571,8 +609,9 @@ export class CoverageStore {
         let sameLines = previous?.lines === aggregate.lines;
         if (!sameLines && previous?.lines.length === aggregate.lines.length) {
             sameLines = true;
+            // Both arrays have the same length, checked above.
             for (let index = 0; index < aggregate.lines.length; index++) {
-                const line = aggregate.lines[index], old = previous.lines[index];
+                const line = aggregate.lines[index]!, old = previous.lines[index]!;
                 if (line.line !== old.line || line.hits !== old.hits) {sameLines = false; break;}
                 if (++count % 4096 === 0) {yield;}
             }
@@ -581,8 +620,9 @@ export class CoverageStore {
         if (sameLines && displayed.aggregate === aggregate && lines !== aggregate.lines) {
             displayed.aggregate = { ...aggregate, lines };
         }
-        if (previous && sameLines && previous.stale === stale && previous.covered === aggregate.covered
+        const declarations = displayed.source.declarations;
+        if (previous && sameLines && previous.stale === stale && previous.covered === aggregate.covered && previous.declarations === declarations
             && (previous.groupIds === groupIds || (previous.groupIds.length === groupIds.length && groupIds.every((id, index) => id === previous.groupIds[index])))) {return previous;}
-        return { file, lines, stale, covered: aggregate.covered, total: lines.length, groupIds };
+        return { file, lines, ...declarations ? { declarations } : {}, stale, covered: aggregate.covered, total: lines.length, groupIds };
     }
 }

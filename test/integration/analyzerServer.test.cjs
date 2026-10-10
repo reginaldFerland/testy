@@ -11,18 +11,19 @@ const {normalizePath}=require('../../out/core/paths');
 
 const analyzer=path.resolve('dist/analyzer/Testy.Analysis.dll');
 
+/** @param {import('node:test').TestContext} t */
 async function fixture(t){
  const directory=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy analyzer server ')));
  const servers=new AnalyzerServers();
  t.after(async()=>{await servers.dispose();await fs.rm(directory,{recursive:true,force:true});});
- const oneShot=async request=>{
+ const oneShot=async(/** @type {string} */request)=>{
   const input=path.join(directory,'one-shot-request.json'),output=path.join(directory,'one-shot-response.json');
   await fs.writeFile(input,request);
   const result=await runProcess('dotnet',[analyzer,input,output],{cwd:directory});
   assert.equal(result.code,0,result.stderr);
   return fs.readFile(output,'utf8');
  };
- const serve=(request,options={})=>servers.request('dotnet',analyzer,request,{cwd:directory,...options});
+ const serve=(/** @type {string} */request,options={})=>servers.request('dotnet',analyzer,request,{cwd:directory,...options});
  return{directory,servers,oneShot,serve};
 }
 
@@ -110,17 +111,17 @@ test('a cancel message interrupts the running request by id and the server keeps
  }));
  const child=spawn('dotnet',[analyzer,'--server'],{stdio:['pipe','pipe','ignore']});
  t.after(()=>{child.kill();});
- const lines=[],waiters=[];
+ const lines=/** @type {string[]} */([]),waiters=/** @type {((line:string|undefined)=>void)[]} */([]);
  let buffer='';
  child.stdout.setEncoding('utf8');
  child.stdout.on('data',text=>{
   buffer+=text;
   for(let end=buffer.indexOf('\n');end>=0;end=buffer.indexOf('\n')){lines.push(buffer.slice(0,end));buffer=buffer.slice(end+1);}
-  while(waiters.length&&lines.length)waiters.shift()(lines.shift());
+  while(waiters.length&&lines.length)waiters.shift()?.(lines.shift());
  });
  const next=()=>lines.length?Promise.resolve(lines.shift()):new Promise(resolve=>waiters.push(resolve));
  assert.match(await next(),/^\{"ready":1,/);
- const send=(id,request)=>child.stdin.write(`{"id":${id},"cwd":${JSON.stringify(directory)},"request":${JSON.stringify(request)}}\n`);
+ const send=(/** @type {number} */id,/** @type {unknown} */request)=>child.stdin.write(`{"id":${id},"cwd":${JSON.stringify(directory)},"request":${JSON.stringify(request)}}\n`);
  send(1,{files,excludedAliases:[],concurrency:1});
  let started=Date.now();
  const finished=await next();

@@ -18,6 +18,7 @@ export function parseStackTrace(stack: string | undefined): readonly StackFrame[
         const match = frame.exec(text);
         if (!match) {continue;}
         const [, label, file, line] = match;
+        if (!label) {continue;}
         frames.push(file && line ? { label, file, line: Number(line) } : { label });
     }
     return frames;

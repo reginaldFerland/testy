@@ -12,7 +12,7 @@ const {normalizePath}=require('../../out/core/paths');
   const template=path.join(root,'template');await fs.mkdir(template);const hashes=new Map();
   await Promise.all(Array.from({length:1000},async(_,i)=>{const file=normalizePath(path.join(template,`File${i}.cs`));await fs.writeFile(file,'code');hashes.set(file,'v1');}));
   const lines=Array.from({length:100},(_,i)=>`<line number="${i+1}" hits="${i===0?1:0}"/>`).join('');
-  const escaped=file=>file.replace(/&/g,'&amp;').replace(/"/g,'&quot;');
+  const escaped=(/** @type {string} */file)=>file.replace(/&/g,'&amp;').replace(/"/g,'&quot;');
   const xml='<coverage><packages><package><classes>'+[...hashes.keys()].map(file=>`<class filename="${escaped(file)}"><lines>${lines}</lines></class>`).join('')+'</classes></package></packages></coverage>';
   const report=path.join(root,'coverage.xml');await fs.writeFile(report,xml);
   let start=performance.now();parseCobertura(xml,root,new Set(hashes.keys()));const synchronousMs=performance.now()-start;
@@ -28,14 +28,14 @@ const {normalizePath}=require('../../out/core/paths');
   for(let i=0;i<5;i++){start=performance.now();await output.restore();restoreMs.push(performance.now()-start);}
   console.log(JSON.stringify({kind:'coverage-and-output',files:1000,linesPerFile:100,reportBytes:Buffer.byteLength(xml),synchronousMs,workerReads:reads,unchangedRestoreMs:restoreMs}));
 
-  const runnerFile=path.resolve('out/services/runner.js'), runnerRequire=createRequire(runnerFile), runnerExports={};
+  const runnerFile=path.resolve('out/services/runner.js'), runnerRequire=createRequire(runnerFile), runnerExports=/** @type {Record<string,any>} */({});
   const nodes=Array.from({length:50000},(_,i)=>({uid:`node${i}`,'display-name':`Row ${i}`,'location.type':`Class${Math.floor(i/500)}`,'location.method':`Test${i}`,'location.method-arity':0}));
   const mtp=runnerRequire('./mtp');
-  vm.runInNewContext(syncfs.readFileSync(runnerFile,'utf8'),{exports:runnerExports,require:name=>name==='./mtp'?{...mtp,requestTests:async(_options,_operation,selected)=>(selected??nodes).map(node=>({...node,'execution-state':'passed'}))}:runnerRequire(name)});
+  vm.runInNewContext(syncfs.readFileSync(runnerFile,'utf8'),{exports:runnerExports,require:(/** @type {string} */name)=>name==='./mtp'?{...mtp,requestTests:async(/** @type {unknown} */_options,/** @type {unknown} */_operation,/** @type {typeof nodes|undefined} */selected)=>(selected??nodes).map(node=>({...node,'execution-state':'passed'}))}:runnerRequire(name)});
   const session=new runnerExports.RunnerSession({cwd:root,dotnet:'dotnet',storage:root,testArguments:[]});
   const assembly=path.join(root,'Tests.dll'),preparedRoot=path.join(root,'prepared');await fs.mkdir(preparedRoot);
   const nativeById=new Map(nodes.map(node=>[node.uid,node])),byKey=new Map();
-  for(const node of nodes)byKey.set(JSON.stringify(['display-name','location.type','location.method','location.method-arity'].map(key=>node[key]??null)),[node]);
+  for(const node of nodes)byKey.set(JSON.stringify(['display-name','location.type','location.method','location.method-arity'].map(key=>node[/** @type {keyof typeof node} */(key)]??null)),[node]);
   session.prepared.set(`${path.join(root,'Tests.csproj')}\0net10.0`,{root:preparedRoot,output:{directory:preparedRoot,restore:async()=>{}},session:'benchmark',coverage:false,nodes,nativeById,byKey,runs:0});
   const durations=[];start=performance.now();
   for(let i=0;i<100;i++){
@@ -46,7 +46,7 @@ const {normalizePath}=require('../../out/core/paths');
   console.log(JSON.stringify({kind:'runner-selection',projectCases:50000,testFiles:100,elapsedMs,medianFileMs:durations[50],maximumFileMs:durations.at(-1),scope:'actual run method with cached preparation and mocked MTP/output I/O'}));
 
   let publications=0;
-  const vscode={Uri:{file:fsPath=>({fsPath})},FileCoverage:class {},window:{visibleTextEditors:[]}};
+  const vscode={Uri:{file:(/** @type {string} */fsPath)=>({fsPath})},FileCoverage:class {},window:{visibleTextEditors:[]}};
   const coverageView=require('../unit/support/ui.cjs').loadUi({vscode}).CoverageView;
   const summaries=Array.from({length:5000},(_,i)=>({file:`/File${i}.cs`,stale:false,covered:1,total:1,lines:[{line:1,hits:1}]}));
   const context={host:{disposed:false,activeRun:{addCoverage(){publications++;}},updateStatus(){}},engine:{coverage:{summarize:()=>summaries},hashes:new Map()},productionSources:new Set(summaries.map(s=>s.file)),owners:new Map(),items:new Map(),publishedCoverage:new Map(),details:new WeakMap(),queue(){}};

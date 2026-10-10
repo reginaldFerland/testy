@@ -45,6 +45,11 @@ export interface StatusModel {
     readonly continuousOverride: boolean;
 }
 
+/** Status text without `$(icon)` references. */
+export function plainText(text: string): string { return text.replace(/\$\([^)]*\)\s*/g, '').trim(); }
+
+function sentence(text: string): string { return /[.!?…]$/.test(text) ? text : `${text}.`; }
+
 export class StatusBar {
     private readonly item = vscode.window.createStatusBarItem('testy.status', vscode.StatusBarAlignment.Left, 10);
 
@@ -69,17 +74,31 @@ export class StatusBar {
             : model.scheduling === 'waiting' ? `$(watch) ${l10n.t('Testy: waiting for changes to settle')}`
             : `$(beaker) ${failed ? l10n.t('{0} failed', failed) : passed ? l10n.t('{0} passed', passed) : lastSummary && !model.hasTests ? l10n.t('Testy: no C# tests found') : 'Testy'}${batches}${model.coverageSuffix}`;
         this.item.backgroundColor = lastError || failed || failedBatches ? new vscode.ThemeColor('statusBarItem.warningBackground') : undefined;
-        this.item.tooltip = [lastError || l10n.t('{0} passed · {1} failed', passed, failed),
+        const details = [lastError || l10n.t('{0} passed · {1} failed', passed, failed),
             lastSummary ? l10n.t('Last run: {0} test files in {1}s', lastSummary.files, (lastSummary.duration / 1000).toFixed(1)) : '',
             failedBatches ? l10n.t('{0} test batches could not run; see Output.', failedBatches) : '',
             lastSummary && !lastSummary.coverageAvailable ? l10n.t('Coverage unavailable or disabled; selection uses project fallback.') : '',
             model.continuousOverride ? l10n.t('A continuous run keeps automatic testing on.') : '',
-            l10n.t('Click for Testy actions.')].filter(Boolean).join('\n');
+            l10n.t('Click for Testy actions.')].filter(Boolean);
+        this.item.tooltip = details.join('\n');
+        // Screen readers announce the state without codicon names, then the details.
+        this.item.accessibilityInformation = { label: [plainText(this.item.text), ...details].map(sentence).join(' '), role: 'button' };
         setContext('testy.paused', model.paused);
         setContext('testy.running', model.running);
     }
 
     dispose(): void { this.item.dispose(); }
+}
+
+/** Shown instead of Testy in Restricted Mode: nothing runs until the workspace is trusted. */
+export function restrictedStatus(): vscode.Disposable {
+    const item = vscode.window.createStatusBarItem('testy.restricted', vscode.StatusBarAlignment.Left, 10);
+    const text = l10n.t('Testy: Restricted Mode');
+    item.name = 'Testy'; item.text = `$(shield) ${text}`; item.command = 'workbench.trust.manage';
+    item.tooltip = l10n.t('Testy builds and runs workspace code, so it waits until you trust this workspace. Click to manage Workspace Trust.');
+    item.accessibilityInformation = { label: `${text}. ${item.tooltip}`, role: 'button' };
+    item.show();
+    return item;
 }
 
 /** The commands offered by the status bar menu. */
@@ -94,7 +113,7 @@ export interface MenuActions {
     showOutput(): unknown;
 }
 
-export async function showMenu(state: { readonly paused: boolean; readonly running: boolean; readonly lastError: string; readonly placeHolder?: string }, actions: MenuActions): Promise<void> {
+export async function showMenu(state: { readonly paused: boolean; readonly running: boolean; readonly lastError: string; readonly placeHolder: string | undefined }, actions: MenuActions): Promise<void> {
     type Action = vscode.QuickPickItem & { readonly run: () => unknown };
     const items: Action[] = [
         ...state.lastError ? [{ label: `$(warning) ${l10n.t('Show Error Details')}`, detail: state.lastError, run: () => actions.showOutput() }] : [],
@@ -108,6 +127,6 @@ export async function showMenu(state: { readonly paused: boolean; readonly runni
         { label: `$(trash) ${l10n.t('Reset Caches and Baseline')}`, run: () => actions.resetCaches() },
         { label: `$(output) ${l10n.t('Show Output')}`, run: () => actions.showOutput() }
     ];
-    const choice = await vscode.window.showQuickPick(items, { title: 'Testy', placeHolder: state.placeHolder });
+    const choice = await vscode.window.showQuickPick(items, { title: 'Testy', ...state.placeHolder ? { placeHolder: state.placeHolder } : {} });
     await choice?.run();
 }

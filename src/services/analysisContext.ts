@@ -1,6 +1,6 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { contentHash } from '../core/paths';
+import { compareCodeUnits, contentHash } from '../core/paths';
 import { ProcessOptions } from './process';
 import { preparationToolIdentity } from './preparedOutputCache';
 import { ambiguousWindowsPath, isNativeExecutable, resolveNodeExecutable } from './executable';
@@ -60,8 +60,8 @@ export async function sourceAnalysisContext(dotnet: string, analyzer: string, op
         const base = actualAnalyzer.slice(0, -path.extname(actualAnalyzer).length);
         // Development probing can resolve dependencies from arbitrary external
         // directories. The shipped helper has one ordinary shared framework.
-        if (await fs.stat(`${base}.runtimeconfig.dev.json`).then(() => true, (error: NodeJS.ErrnoException) => {
-            if (['ENOENT', 'ENOTDIR'].includes(error.code ?? '')) {return false;} throw error;
+        if (await fs.stat(`${base}.runtimeconfig.dev.json`).then(() => true, (error: unknown) => {
+            if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) {return false;} throw error;
         })) {return undefined;}
         const runtime = JSON.parse(await fs.readFile(`${base}.runtimeconfig.json`, 'utf8')) as { runtimeOptions?: {
             framework?: { name?: string }; frameworks?: unknown; includedFrameworks?: unknown; additionalProbingPaths?: unknown;
@@ -88,6 +88,6 @@ export async function sourceAnalysisContext(dotnet: string, analyzer: string, op
         const assets = await preparationToolIdentity(actualAnalyzer, env, signal, options.cwd);
         signal?.throwIfAborted();
         return contentHash(JSON.stringify([2, host, contentHash(bytes), assets, inventories, roslyn, await fs.realpath(options.cwd),
-            Object.entries(env).sort(([left], [right]) => left.localeCompare(right))]));
+            Object.entries(env).sort(([left], [right]) => compareCodeUnits(left, right))]));
     } catch {signal?.throwIfAborted(); return undefined;}
 }

@@ -63,7 +63,7 @@ test('unmapped runtime rows appear under a project container and disappear when 
  const proto=loadUi({vscode:{Uri:{file:fsPath=>({fsPath})},Range:class{},TestMessage:class{}}}).TestTree.prototype,collection=()=>({values:[],replace(values){this.values=[...values];},add(value){this.values.push(value);}});
  const context={items:new Map(),testIds:new Map(),treeFiles:new Map(),treeProjects:new Map(),treeRoots:[],outcomes:new Map(),passed:0,failed:0,
   engine:{knownTests:group=>group.tests},host:{disposed:false,activeRun:undefined,roots:[],updateStatus(){}},setOutcome:proto.setOutcome,item:proto.item,
-  controller:{items:collection(),createTestItem(id,label,uri){return{id,label,uri,children:collection()};}}};
+  controller:{items:collection(),createTestItem(id,label,uri){return{id,label,uri,tags:[],children:collection()};}}};
  const group={id:'known',project:'/Tests.csproj',framework:'net10.0',file:'/Tests.cs',tests:[]};
  await proto.update.call(context,[group]);
  const unknown={...group,id:'runtime',file:undefined,runtimeOnly:true};

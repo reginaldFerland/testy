@@ -52,10 +52,11 @@ export class BaselineProgress {
         void Promise.resolve(vscode.window.withProgress({
             location: vscode.ProgressLocation.Window, title: l10n.t('Testy: establishing baseline'), cancellable: true
         }, (progress, token) => new Promise<void>(resolve => {
-            session.progress = progress; session.finish = resolve;
+            session.progress = progress;
             if (session.ended) {resolve(); return;}
-            token.onCancellationRequested(() => { if (!session.ended) {this.cancel();} });
-            if (session.message) {progress.report({ message: session.message, increment: session.percent || undefined });}
+            const registration = token.onCancellationRequested(() => { if (!session.ended) {this.cancel();} });
+            session.finish = () => { registration.dispose(); resolve(); };
+            if (session.message) {progress.report({ message: session.message, ...session.percent ? { increment: session.percent } : {} });}
         }))).catch(() => undefined);
         return session;
     }

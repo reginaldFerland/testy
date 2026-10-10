@@ -156,7 +156,7 @@ export interface PreparedArtifact {
     readonly session: string;
     readonly coverage: boolean;
     /** Discovery-only template that may be instrumented by its exclusive owner. */
-    readonly coveragePending?: boolean;
+    readonly coveragePending?: boolean | undefined;
     readonly instrumented: readonly string[];
     readonly reusable: boolean;
 }
@@ -168,7 +168,7 @@ export interface PreparedArtifactLease {
 }
 interface Entry {
     readonly key: string;
-    readonly slot?: string;
+    readonly slot?: string | undefined;
     artifact: PreparedArtifact;
     template: Manifest;
     bytes: number;
@@ -187,12 +187,12 @@ export interface PreparedOutputLimits {
 interface StoredEntry {
     readonly directory: string;
     readonly key: string;
-    readonly slot?: string;
+    readonly slot?: string | undefined;
     readonly template: Manifest;
     readonly used: number;
     readonly session: string;
     readonly coverage: boolean;
-    readonly coveragePending?: boolean;
+    readonly coveragePending?: boolean | undefined;
     readonly instrumented: readonly string[];
 }
 const sha256 = /^[0-9a-f]{64}$/i;
@@ -250,7 +250,7 @@ export class PreparedOutputCache {
     private readonly claimedSlots = new Set<string>();
     private readonly hashes: HashMemo = new Map();
     private readonly pending = new Set<Promise<unknown>>();
-    private owner?: Promise<RunOutputLease | PreparedStorageLease>;
+    private owner: Promise<RunOutputLease | PreparedStorageLease> | undefined;
     private closed = false;
     private disposal?: Promise<void>;
     private clock = 0;
@@ -292,7 +292,7 @@ export class PreparedOutputCache {
     private async acquireArtifact(source: string, context: string, create: (root: string) => Promise<PreparedArtifact>, signal?: AbortSignal, slot?: string): Promise<PreparedArtifactLease | undefined> {
         let sourceManifest: Manifest | undefined, root: string;
         try {
-            this.owner ??= this.claimOwner(signal).catch(error => {this.owner = undefined; throw error;});
+            this.owner ??= this.claimOwner(signal).catch((error: unknown) => {this.owner = undefined; throw error;});
             root = (await this.owner).directory;
         } catch (error) {signal?.throwIfAborted(); this.log(`Prepared output storage unavailable; preparing without the cache. ${String(error)}\n`); return undefined;}
         try {sourceManifest = await outputManifest(source, signal, true, this.hashes);}

@@ -9,7 +9,7 @@
 		"resolveJsonModule": true,
 		"checkJs": false,
 		"noEmit": true,
-		"strict": false,
+		"strict": true,
 		"types": ["node"]
 	},
 	"include": ["test/**/*.cjs"]

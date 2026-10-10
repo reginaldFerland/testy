@@ -16,7 +16,7 @@ const l10n = vscode.l10n;
 const testTags = new Map<string, vscode.TestTag>();
 
 function setTags(item: vscode.TestItem, ids: readonly string[]): void {
-    if (item.tags?.length === ids.length && item.tags.every((tag, index) => tag.id === ids[index])) {return;}
+    if (item.tags.length === ids.length && item.tags.every((tag, index) => tag.id === ids[index])) {return;}
     item.tags = ids.map(id => {
         let tag = testTags.get(id);
         if (!tag) {tag = new vscode.TestTag(id); testTags.set(id, tag);}
@@ -53,6 +53,8 @@ export function failureMessage(result: TestResult, item: vscode.TestItem, roots:
     const body = frames.length ? text : [text, result.stack].filter(Boolean).join('\n\n');
     const message = result.expected !== undefined && result.actual !== undefined
         ? vscode.TestMessage.diff(body, result.expected, result.actual) : new vscode.TestMessage(body);
+    // The `testing/message/context` menu matches `testMessage == testy.failure`.
+    message.contextValue = 'testy.failure';
     if (frames.length) {
         message.stackTrace = frames.map(frame => new vscode.TestMessageStackFrame(frame.label,
             frame.file ? vscode.Uri.file(frame.file) : undefined, frame.line ? new vscode.Position(frame.line - 1, 0) : undefined));
@@ -134,7 +136,8 @@ export class TestTree {
 
     /** Put back the descriptions that `explain` replaced for the run. */
     restoreDescriptions(): void {
-        for (const [item, description] of this.described) {if (item.description !== description) {item.description = description;}}
+        // Assigning undefined clears a description; the API typings omit undefined under exactOptionalPropertyTypes.
+        for (const [item, description] of this.described) {if (item.description !== description) {Object.assign(item, { description });}}
         this.described.clear();
     }
 
@@ -155,8 +158,8 @@ export class TestTree {
             const tests = this.engine.knownTests(group), previous = this.treeFiles.get(group.id);
             projectCounts.set(group.project, (projectCounts.get(group.project) ?? 0) + tests.length);
             const projectId = `project:${group.project}`, projectName = path.basename(group.project, '.csproj');
-            const tags = [`project:${projectName}`, `framework:${group.framework}`];
-            setTags(this.item(projectId, projectName, group.project), [tags[0]]);
+            const projectTag = `project:${projectName}`, tags = [projectTag, `framework:${group.framework}`];
+            setTags(this.item(projectId, projectName, group.project), [projectTag]);
             live.add(group.id);
             owners.set(group.id, `file:${group.id}`); owners.set(projectCoverageId(group), projectId);
             const files = projects.get(projectId) ?? [];
@@ -164,8 +167,9 @@ export class TestTree {
             setTags(file, tags);
             files.push(file); projects.set(projectId, files);
             let same = !previous?.dirty && previous?.tests.length === tests.length;
+            // same implies both lists have tests.length entries.
             if (same && previous!.tests !== tests) {for (let index = 0; index < tests.length; index++) {
-                const a = previous!.tests[index], b = tests[index];
+                const a = previous!.tests[index]!, b = tests[index]!;
                 if (a.id !== b.id || a.name !== b.name || a.file !== b.file || a.line !== b.line || a.endLine !== b.endLine || (a.traits !== b.traits && traitsSignature(a.traits) !== traitsSignature(b.traits))) {same = false; break;}
                 if (++work % 512 === 0) {await yieldTurn(); if (this.host.disposed) {return;}}
             }}
@@ -228,7 +232,7 @@ export class TestTree {
         if (result.outcome === 'passed') {run?.passed(item, result.duration);}
         else if (result.outcome === 'skipped') {run?.skipped(item);}
         else {
-            const message = failureMessage(result, item, this.host.roots ?? []);
+            const message = failureMessage(result, item, this.host.roots);
             if (result.outcome === 'failed') {run?.failed(item, message, result.duration);}
             else {run?.errored(item, message, result.duration);}
         }

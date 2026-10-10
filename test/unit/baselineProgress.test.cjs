@@ -78,7 +78,7 @@ test('the controller shows baseline progress for automatic runs only, and ends i
   workspace:{onDidSaveTextDocument:disposable,onDidDeleteFiles:disposable,onDidRenameFiles:disposable,onDidChangeConfiguration:disposable,onDidChangeWorkspaceFolders:disposable,onDidChangeTextDocument:disposable,
    getConfiguration:()=>({get:(_key,fallback)=>fallback})}};
  const state=()=>{const values=new Map();return{get:key=>values.get(key),update:async(key,value)=>{values.set(key,value);}};};
- const {Testy}=loadUi({vscode,stubs:{configuration:{configuration:()=>({enabled:true,trigger:'save',showCoverage:false,debounce:100,pattern:'**/*.cs',excludes:[]})}}});
+ const {Testy}=loadUi({vscode,stubs:{configuration:{configuration:()=>({enabled:true,trigger:'save',showCoverage:false,debounce:100,pattern:'**/*.cs',excludes:[],folderConflicts:[],additionalConfigurations:[]})}}});
  const ui=new Testy({extensionUri:{},storageUri:{fsPath:os.tmpdir()},globalStorageUri:{fsPath:os.tmpdir()},extensionPath:process.cwd(),workspaceState:state(),globalState:state()},['/workspace']);
  const events=ui.engine.options.events;
  ui.engine.groups=[{id:'a'},{id:'b'}];
@@ -92,4 +92,15 @@ test('the controller shows baseline progress for automatic runs only, and ends i
  assert.equal(ui.baselineProgress.active,true);
  await ui.dispose();
  assert.equal(ui.baselineProgress.active,false);
+});
+
+test('the cancellation listener is disposed when the baseline ends',async()=>{
+ let disposed=0;
+ const vscode={ProgressLocation:{Window:10},window:{withProgress:(options,callback)=>callback({report(){}},{onCancellationRequested:()=>({dispose(){disposed++;}})})}};
+ const {BaselineProgress}=loadUi({vscode}).module('ui/baselineProgress');
+ const baseline=new BaselineProgress(()=>undefined);
+ baseline.update({completed:1,total:2});
+ assert.equal(disposed,0);
+ baseline.end();await tick();
+ assert.equal(disposed,1);
 });

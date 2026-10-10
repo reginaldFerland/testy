@@ -24,8 +24,8 @@ internal static class StartupHook
             var seen = new HashSet<string>(StringComparer.Ordinal);
             var gate = new object();
             var failed = false;
-            var writer = new StreamWriter(new FileStream(Path.Combine(directory, $"{Guid.NewGuid()}.log"),
-                FileMode.CreateNew, FileAccess.Write, FileShare.Read)) { AutoFlush = true };
+            var log = new FileStream(Path.Combine(directory, $"{Guid.NewGuid()}.log"), FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+            var writer = new StreamWriter(log) { AutoFlush = true };
             var entry = Assembly.GetEntryAssembly()?.Location ?? "";
             writer.WriteLine("ready\t" + Encode(entry));
             void Loaded(Assembly assembly)

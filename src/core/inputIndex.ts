@@ -30,7 +30,7 @@ export class InputIndex {
         if (this.list === files && this.directories === directories && this.version === version) {return this;}
         this.version = version; this.list = files; this.directories = directories;
         this.known = new Set(files);
-        this.sources = sourceDirectories(files, directories ?? []);
+        this.sources = sourceDirectories(files, directories);
         this.sourceSet = new Set(this.sources);
         this.sorted = undefined;
         return this;
@@ -57,9 +57,9 @@ export class InputIndex {
         const sorted = this.sorted ??= [...this.known].sort();
         const prefix = folder.endsWith('/') || folder.endsWith(path.sep) ? folder : `${folder}/`;
         let low = 0, high = sorted.length;
-        while (low < high) {const middle = (low + high) >>> 1; if (sorted[middle] < prefix) {low = middle + 1;} else {high = middle;}}
+        while (low < high) {const middle = (low + high) >>> 1; if (sorted[middle]! < prefix) {low = middle + 1;} else {high = middle;}}
         const result: string[] = [];
-        for (; low < sorted.length && sorted[low].startsWith(prefix); low++) {result.push(sorted[low]);}
+        for (let entry = sorted[low]; entry?.startsWith(prefix); entry = sorted[++low]) {result.push(entry);}
         return result;
     }
 }

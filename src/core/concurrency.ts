@@ -27,13 +27,15 @@ export async function mapConcurrent<T, R>(
     const abort = (): void => controller.abort(signal?.reason);
     signal?.addEventListener('abort', abort, { once: true });
     const results = new Array<R>(items.length);
-    let next = 0, failed = false, failure: unknown;
+    // Workers set failed; `as boolean` keeps reads after the awaits from narrowing to false.
+    let next = 0, failed = false as boolean, failure: unknown;
     try {
         await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async (_, worker) => {
             while (!controller.signal.aborted) {
                 const index = next++;
                 if (index >= items.length) {return;}
-                try {results[index] = await work(items[index], index, controller.signal, worker);}
+                // The bound check above guarantees the element exists.
+                try {results[index] = await work(items[index] as T, index, controller.signal, worker);}
                 catch (error) {
                     if (!failed) {failed = true; failure = error; controller.abort(error);
                         // A notification failure must not bypass draining admitted work.
@@ -67,8 +69,8 @@ export async function mapConcurrentByKey<T, R>(
     signal?.throwIfAborted();
     type Target = { indices: number[]; next: number; active: number; exclusive: boolean };
     const targets = new Map<string, Target>();
-    for (let index = 0; index < items.length; index++) {
-        const id = key(items[index]);
+    for (const [index, item] of items.entries()) {
+        const id = key(item);
         let target = targets.get(id);
         if (!target) {target = { indices: [], next: 0, active: 0, exclusive: false }; targets.set(id, target);}
         target.indices.push(index);
@@ -80,18 +82,20 @@ export async function mapConcurrentByKey<T, R>(
     signal?.addEventListener('abort', abort, { once: true });
     controller.signal.addEventListener('abort', wake, { once: true });
     const results = new Array<R>(items.length);
-    let admitted = 0, failed = false, failure: unknown;
+    // Workers set failed; `as boolean` keeps reads after the awaits from narrowing to false.
+    let admitted = 0, failed = false as boolean, failure: unknown;
     const take = (): { target: Target; index: number } | undefined => {
         let chosen: Target | undefined, exclusive = false;
         for (const target of targets.values()) {
             if (target.next === target.indices.length || target.exclusive || (chosen && target.active >= chosen.active)) {continue;}
-            const index = target.indices[target.next], parallel = parallelEligible(items[index], index);
+            // target.next < target.indices.length, and every index came from items.
+            const index = target.indices[target.next]!, parallel = parallelEligible(items[index] as T, index);
             if (target.active && !parallel) {continue;}
             chosen = target; exclusive = !parallel;
             if (!target.active) {break;}
         }
         if (!chosen) {return undefined;}
-        const index = chosen.indices[chosen.next++];
+        const index = chosen.indices[chosen.next++]!;
         chosen.active++; chosen.exclusive = exclusive; admitted++;
         return { target: chosen, index };
     };
@@ -106,7 +110,7 @@ export async function mapConcurrentByKey<T, R>(
                         await new Promise<void>(resolve => waiting.add(resolve));
                         continue;
                     }
-                    results[selected.index] = await work(items[selected.index], selected.index, controller.signal, worker);
+                    results[selected.index] = await work(items[selected.index] as T, selected.index, controller.signal, worker);
                 } catch (error) {
                     if (!failed) {
                         failed = true; failure = error; controller.abort(error);
@@ -145,7 +149,19 @@ export class Semaphore {
     constructor(private readonly limit: number) {}
     async run<T>(signal: AbortSignal | undefined, work: () => Promise<T>): Promise<T> {
         signal?.throwIfAborted();
-        if (this.active >= this.limit) {await new Promise<void>(resolve => this.waiting.push(resolve));}
+        if (this.active >= this.limit) {
+            // An aborted waiter leaves the queue; a granted permit is never abandoned.
+            await new Promise<void>((resolve, reject) => {
+                const grant = (): void => {signal?.removeEventListener('abort', abort); resolve();};
+                const abort = (): void => {
+                    const index = this.waiting.indexOf(grant);
+                    if (index >= 0) {this.waiting.splice(index, 1);}
+                    reject(signal!.reason);
+                };
+                this.waiting.push(grant);
+                signal?.addEventListener('abort', abort, { once: true });
+            });
+        }
         else {this.active++;}
         try {signal?.throwIfAborted(); return await work();}
         finally {this.release();}
@@ -181,7 +197,7 @@ export function walkTree<T>(roots: readonly T[], visit: (job: T) => Promise<read
             while (active < width && queued.length) {
                 const job = queued.pop()!; active++;
                 void budget.run(signal, () => visit(job)).then(children => {if (!failed) {queued.push(...children);}})
-                    .catch(error => {if (!failed) {failed = true; failure = error;}})
+                    .catch((error: unknown) => {if (!failed) {failed = true; failure = error;}})
                     .finally(() => {active--; pump();});
             }
             if (!active && !queued.length) {if (failed) {reject(failure);} else {resolve();}}

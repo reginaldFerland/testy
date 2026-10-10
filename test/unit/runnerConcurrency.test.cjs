@@ -60,13 +60,13 @@ async function fixture(t,config={}){
    await config.instrument?.(args,state,control.signal);
    await fs.appendFile(args[1],args[3]);return{code:0,stdout:'',stderr:''};
   }},
-  './preparedOutputCache':{...cacheTools,preparationToolIdentity:async command=>command},
+  './preparedOutputCache':{...cacheTools,preparationToolIdentity:async(command,...rest)=>config.toolIdentity?config.toolIdentity(command,...rest):command},
   './preparationIdentity':{windowsPreparationTools:async options=>({dotnet:options.dotnet,collector:options.coverageTool,analyzer:options.analyzer,instrumentationLaunch:'node'})},
   './output':{...output,removeOutput:async directory=>{
    for(const assembly of state.activeAssemblies)assert.equal(assembly.startsWith(directory+path.sep),false,'cleanup must await the owning run');
    return output.removeOutput(directory);
   }},
-  './runOutputs':{...ownership,claimRunOutputs:async(...args)=>{state.claims++;await delay(5);return ownership.claimRunOutputs(...args);}},
+  './runOutputs':{...ownership,claimRunOutputs:async(...args)=>{state.claims++;await delay(5);if(config.failClaim?.(state.claims))throw new Error('controlled claim failure');return ownership.claimRunOutputs(...args);}},
   './coverageReader':{CoverageReader:class{async read(report,_cwd,hashes){return(state.reports.get(report)??[]).map(normalizePath).map(file=>({file,hash:hashes.get(file),lines:[{line:1,hits:1}]}));}async dispose(){}}},
   './runtimeObservation':{RuntimeObservation:class{static async start(_directory,_assembly,_modules,_instrumented,env){return{env,dependencies:async()=>({files:[],projects:[]})};}}}
  };
@@ -301,4 +301,26 @@ test('disposal releases every cached owner even when one cleanup fails, and conc
  let completed=false;const rejected=assert.rejects(disposal,error=>error.name==='AggregateError'&&error.errors.some(error=>/controlled lease cleanup failure/.test(error.message))).then(()=>{completed=true;});
  await entered.promise;await delay(5);assert.equal(completed,false);finish.resolve();await rejected;
  assert.deepEqual(released.sort(),['first','second']);assert.deepEqual(await fs.readdir(path.join(f.root,'runs')),[]);
+});
+
+test('a lane whose output lease failed is discarded, so a later batch creates a fresh lane',async t=>{
+ const f=await fixture(t,{cache:true,holdPrimary:true,failClaim:claims=>claims===1}),groups=await f.session.discover(f.project);
+ assert.equal(f.state.claims,0,'the cached primary needs no run lease');
+ const primary=f.session.run([groups[0]],f.hashes,0);await f.state.primaryStarted.promise;
+ await assert.rejects(f.session.run([groups[1]],f.hashes,1),/controlled claim failure/);
+ assert.equal(f.session.lanes.size,0);
+ const result=await f.session.run([groups[1]],f.hashes,1);
+ // Completed while the primary is held, so it ran in a separate lane output.
+ assert.equal(f.state.peak,2);assert.notEqual(f.state.runs.at(-1).assembly,f.state.runs[0].assembly);
+ assert.deepEqual(Array.from(result.results,item=>item.id),Array.from(groups[1].tests,item=>item.id));
+ f.state.release.resolve();await primary;
+});
+
+test('a failed preparation tool identity is not cached for later targets',async t=>{
+ let calls=0;
+ const f=await fixture(t,{cache:true,toolIdentity:async command=>{if(++calls===1)throw new Error('controlled identity failure');return command;}});
+ const other={...f.project,file:path.join(path.dirname(f.project.file),'Other.csproj')};
+ await f.session.discover(f.project);const first=calls;
+ await f.session.discover(other);
+ assert.ok(calls>first,'the second target identifies its tools again');
 });

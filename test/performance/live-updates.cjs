@@ -15,7 +15,7 @@ async function measure(callback) {
   const groups=Array.from({length:100},(_,i)=>({id:`g${i}`,project:'/w/Tests.csproj',framework:'net10.0',file:`/w/Test${i}.cs`,tests:Array.from({length:count/100},(_,j)=>({id:`t${j}`,name:`Case ${j}`,file:`/w/Test${i}.cs`,line:1}))}));
   let replacements=0;
   const context={items:new Map(),testIds:new Map(),treeFiles:new Map(),treeProjects:new Map(),treeRoots:[],engine:{knownTests:g=>TestEngine.prototype.knownTests.call({runtime:new Map()},g)},host:{disposed:false,activeRun:undefined,roots:[],updateStatus(){}},setOutcome(){},
-   controller:{items:{replace(){replacements++;}},createTestItem(id,label,uri){return{id,label,uri,children:{replace(){replacements++;}}};}},item:testTree.prototype.item};
+   controller:{items:{replace(){replacements++;}},createTestItem(id,label,uri){return{id,label,uri,tags:[],children:{replace(){replacements++;}}};}},item:testTree.prototype.item};
   const initial=await measure(()=>testTree.prototype.update.call(context,groups));
   const before=replacements,unchanged=[];
   for(let i=0;i<3;i++)unchanged.push(await measure(()=>testTree.prototype.update.call(context,groups)));

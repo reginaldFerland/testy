@@ -65,3 +65,24 @@ test('the export command writes the chosen format to the chosen location',async(
   assert.equal(messages.length,1,'stale-only coverage is not exported');
  } finally {fs.rmSync(directory,{recursive:true,force:true});}
 });
+
+test('with several workspace folders the export asks which folder, and exports only its files relative to it',async()=>{
+ const directory=fs.mkdtempSync(path.join(os.tmpdir(),'testy-export-')),target=path.join(directory,'out.lcov');
+ try {
+  const other=path.resolve('/other/space');let defaultUri,folderPicks,choose=items=>items[1];
+  const vscode={workspace:{workspaceFolders:[]},Uri:{file:fsPath=>({fsPath})},
+   window:{showQuickPick:async items=>items[0].format?items[0]:(folderPicks=items,choose(items)),showSaveDialog:async options=>{defaultUri=options.defaultUri;return{fsPath:target};},
+    showWarningMessage:async()=>undefined,showInformationMessage:async()=>undefined}};
+  const {exportCoverageFile}=loadUi({vscode}).module('ui/exportCoverage');
+  const files=[...summaries,{...summary('x',[[1,1]]),file:path.join(other,'lib','Other.cs')}];
+  assert.equal(await exportCoverageFile(()=>files,[root,other],()=>undefined),target);
+  assert.deepEqual([...folderPicks.map(pick=>pick.description).slice(0,2)],[root,other]);
+  assert.equal(defaultUri.fsPath,path.join(other,'coverage','testy.lcov'));
+  assert.equal(fs.readFileSync(target,'utf8'),'TN:\nSF:lib/Other.cs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n');
+  choose=items=>items.at(-1);
+  await exportCoverageFile(()=>files,[root,other],()=>undefined);
+  const all=fs.readFileSync(target,'utf8');assert.match(all,/SF:src\/Calculator\.cs/);assert.match(all,/SF:lib\/Other\.cs/,'all folders keep every file');
+  choose=()=>undefined;
+  assert.equal(await exportCoverageFile(()=>files,[root,other],()=>undefined),undefined,'dismissing the folder choice cancels');
+ } finally {fs.rmSync(directory,{recursive:true,force:true});}
+});

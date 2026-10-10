@@ -3,7 +3,7 @@ import { Worker } from 'node:worker_threads';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { CoveredLine, FileCoverage } from '../core/model';
 import { Cancelled } from './process';
-import type { CoverageRequest, CoverageResponse } from './coverageWorker';
+import type { CoverageFiles, CoverageRequest, CoverageResponse } from './coverageWorker';
 
 interface Pending {
     readonly worker: Worker;
@@ -18,11 +18,21 @@ export class CoverageReader {
     private disposed = false;
     private readonly pending = new Map<number, Pending>();
     private sequence = 0;
+    private filesVersion = 0;
+    /** The file list the current worker holds. */
+    private sent?: { readonly worker: Worker; readonly hashes: ReadonlyMap<string, string>; readonly size: number; readonly version: number };
 
+    /** `hashes` is an immutable snapshot (the engine replaces its map on change), so its
+     * file list is sent to a worker once and again only for a different snapshot. */
     async read(report: string, cwd: string, hashes: ReadonlyMap<string, string>, signal?: AbortSignal): Promise<readonly FileCoverage[]> {
         signal?.throwIfAborted();
         if (this.disposed) {throw new Cancelled();}
         const worker = this.worker ?? this.start(), id = ++this.sequence;
+        if (this.sent?.worker !== worker || this.sent.hashes !== hashes || this.sent.size !== hashes.size) {
+            this.sent = { worker, hashes, size: hashes.size, version: ++this.filesVersion };
+            worker.postMessage({ version: this.sent.version, files: [...hashes.keys()] } satisfies CoverageFiles);
+        }
+        const filesVersion = this.sent.version;
         let abort = (): void => {};
         let response: CoverageResponse;
         try {
@@ -35,7 +45,7 @@ export class CoverageReader {
                 };
                 this.pending.set(id, entry);
                 signal?.addEventListener('abort', abort, { once: true });
-                worker.postMessage({ id, report, cwd, allowedFiles: [...hashes.keys()] } satisfies CoverageRequest);
+                worker.postMessage({ id, report, cwd, filesVersion } satisfies CoverageRequest);
             });
         } finally {
             // Conversion below observes the signal itself and must not stop a shared worker.
@@ -46,11 +56,12 @@ export class CoverageReader {
         let converted = 0;
         for (const file of response.files ?? []) {
             const lines: CoveredLine[] = [];
-            for (let index = 0; index < file.values.length; index += 2) {
+            // Values are (line, hits) pairs; the bound covers both reads.
+            for (let index = 0; index + 1 < file.values.length; index += 2) {
                 if (++converted % 4096 === 0) {await yieldTurn(); signal?.throwIfAborted();}
-                lines.push({ line: file.values[index], hits: file.values[index + 1] });
+                lines.push({ line: file.values[index]!, hits: file.values[index + 1]! });
             }
-            files.push({ file: file.file, hash: hashes.get(file.file)!, lines });
+            files.push({ file: file.file, hash: hashes.get(file.file)!, lines, ...file.declarations ? { declarations: file.declarations } : {} });
         }
         signal?.throwIfAborted();
         return files;

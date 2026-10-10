@@ -49,7 +49,7 @@ function validQuery(value: unknown): value is EvaluationQuery {
         || typeof value.recursive !== 'boolean' || !(value.pattern === null || text(value.pattern))) {return false;}
     if (['file', 'directory', 'exists', 'mtime'].includes(value.kind as string)) {
         return value.pattern === null && !value.recursive && array(value.values, text, 1) && value.values.length === 1
-            && (value.kind === 'mtime' ? /^\d{1,20}$/.test(value.values[0]) : ['true', 'false'].includes(value.values[0]));
+            && value.values.every(item => value.kind === 'mtime' ? /^\d{1,20}$/.test(item) : ['true', 'false'].includes(item));
     }
     if (!['files', 'directories', 'entries', 'imports'].includes(value.kind as string) || !array(value.values, absolute)) {return false;}
     return value.pattern === null || value.pattern === '*' || (value.kind === 'imports'
@@ -78,8 +78,10 @@ function boundEntry(file: string, entry: EvaluationEntry): boolean {
     if (!record(evidence) || Object.keys(evidence).length > maximumNodes
         || !Object.entries(evidence).every(([file, input]) => absolute(file) && absolute(input))
         || !entry.graph.some(project => project.file === file)) {return false;}
-    const covered = (project: Project): boolean => Object.hasOwn(evidence, project.file)
-        && entry.inputs.some(input => Object.hasOwn(input.hashes!, evidence[project.file])) && (project.contexts ?? []).every(covered);
+    const covered = (project: Project): boolean => {
+        const evaluated = Object.hasOwn(evidence, project.file) ? evidence[project.file] : undefined;
+        return evaluated !== undefined && entry.inputs.some(input => Object.hasOwn(input.hashes!, evaluated)) && (project.contexts ?? []).every(covered);
+    };
     return entry.graph.every(covered);
 }
 
@@ -98,7 +100,7 @@ export async function readEvaluationSnapshot(storage: string, options: Evaluatio
     signal?.throwIfAborted();
     const stat = await fs.lstat(file);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > maxBytes) {return undefined;}
-    const handle = await fs.open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const handle = await fs.open(file, constants.O_RDONLY | ((constants as { readonly O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0));
     let contents: string;
     try {
         const current = await handle.stat();
@@ -128,7 +130,8 @@ export async function readEvaluationSnapshot(storage: string, options: Evaluatio
         signal?.throwIfAborted();
         if (!record(value) || !fields(value, ['file', 'graph', 'inputs', 'context', 'stamp', 'projectInputs']) || !absolute(value.file) || !text(value.context)
             || !fingerprint(value.stamp) || !indices(value.graph, projects.length) || !indices(value.inputs, inputs.length) || entries.has(value.file)) {return undefined;}
-        const entry: EvaluationEntry = { graph: value.graph.map(index => projects[index]), inputs: value.inputs.map(index => inputs[index]), context: value.context, stamp: value.stamp,
+        // indices() bounded every index, so nothing is dropped here.
+        const entry: EvaluationEntry = { graph: value.graph.flatMap(index => projects[index] ?? []), inputs: value.inputs.flatMap(index => inputs[index] ?? []), context: value.context, stamp: value.stamp,
             projectInputs: value.projectInputs as Readonly<Record<string, string>> };
         if (!boundEntry(value.file, entry)) {return undefined;} entries.set(value.file, entry);
         await yieldTurn();

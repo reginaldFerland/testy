@@ -18,7 +18,7 @@ Testy runs your tests through **.NET 10+ and Microsoft.Testing.Platform (MTP)**,
 - VS Code 1.99 or later.
 - [.NET SDK 10](https://dotnet.microsoft.com/download) or later. If your workspace has a `global.json`, it must select a supported SDK.
 - C# test projects that target .NET 10 or later and use [Microsoft.Testing.Platform](https://learn.microsoft.com/en-us/dotnet/core/testing/microsoft-testing-platform-intro). MSTest, xUnit v3 (MTP v2), and NUnit with the MTP adapter are tested. VSTest projects and test targets older than .NET 10 are skipped and listed in Output.
-- A trusted workspace. Testy builds and runs workspace code, so it does not start in Restricted Mode.
+- A trusted workspace. Testy builds and runs workspace code, so in Restricted Mode it runs nothing: the status bar shows **Testy: Restricted Mode**, settings that choose what runs (`testy.dotnetPath`, `testy.coverageToolPath`, `testy.testArguments`, `testy.solution`, `testy.debugConfiguration`, `testy.buildConfiguration`, `testy.additionalConfigurations`) are ignored from workspace settings, and Testy starts as soon as you trust the workspace.
 - NuGet access on first use, to install Microsoft's `dotnet-coverage` collector (unless you set `testy.coverageToolPath`).
 - Portable debug symbols (the .NET default) for source mapping and coverage.
 - The [C# extension](https://marketplace.visualstudio.com/items?itemName=ms-dotnettools.csharp), only for debugging tests.
@@ -26,7 +26,7 @@ Testy runs your tests through **.NET 10+ and Microsoft.Testing.Platform (MTP)**,
 ## Getting started
 
 1. Open a folder or workspace that contains MTP test projects, and trust it.
-2. Testy builds, discovers, and runs every test file once to establish a baseline. The status bar shows a baseline progress indicator with a percentage (no popup); cancel it with **Testy: Cancel Current Run** or the stop button in Test Explorer. The **Get started with Testy** walkthrough covers the same steps.
+2. The first time a workspace opens, Testy asks before it builds anything. **Run Now** builds, discovers, and runs every test file once to establish a baseline; **Not Now** waits for a save or a manual run and asks again next time; **Don't Ask Again** always waits for a save or a manual run in this workspace. Workspaces that already have a baseline continue automatically. The status bar shows a baseline progress indicator with a percentage (no popup); cancel it with **Testy: Cancel Current Run** or the stop button in Test Explorer. The **Get started with Testy** walkthrough covers the same steps.
 3. Save a source file. Testy cancels its previous automatic run, waits briefly for edits to settle, then builds and runs the affected test files.
 
 Saves never cancel a run you started manually. Changes are accumulated across cancelled runs, and an interrupted baseline resumes where it stopped.
@@ -42,10 +42,15 @@ Click the Testy status bar item to open its action menu. Every action is also av
 | **Testy: Refresh and Run All C# Tests** | Rebuild, rediscover, and run everything to replace the baseline. |
 | **Testy: Cancel Current Run** | Cancel the active run. |
 | **Testy: Clear Coverage** | Discard retained coverage. |
-| **Testy: Export Coverage…** | Write the current merged coverage as LCOV or Cobertura XML (default `coverage/testy.lcov` or `coverage/testy.cobertura.xml` in the first workspace folder), with paths relative to the workspace. Stale coverage is not exported. |
+| **Testy: Export Coverage…** | Write the current merged coverage as LCOV or Cobertura XML (default `coverage/testy.lcov` or `coverage/testy.cobertura.xml`), with paths relative to the workspace. In a multi-root workspace, choose one folder (only its files, relative to it) or all folders. Stale coverage is not exported. |
 | **Testy: Reset Caches and Baseline** | Delete learned coverage, saved project evaluations, and prepared test outputs, then establish a fresh baseline. |
 | **Testy: Show Output** | Open the Testy log, including build output and why each selection was made. |
 | **Testy: Show Actions** | Open the status bar menu. |
+| **Run Affected Tests for This File** | In the editor and Explorer context menus of a `.cs` file: run the tests affected by that file, as if it had been saved. |
+
+Test Explorer items also have **Why Was This Selected?**, which explains whether and why the item ran in the latest run, and project items have **Exclude Project from Testy**, which adds the project to `testy.projects.exclude` (per folder in a multi-root workspace). A failure message's context menu has **Show Output**.
+
+Startup and environment problems, such as a missing `dotnet`, an unsupported SDK, an analyzer crash or an unreadable `testy.solution`, are also shown once per session as a notification with **Show Output** and **Open Settings**. Build and test failures only update the status bar.
 
 The refresh button in Test Explorer rediscovers tests without running them. Test items are tagged by project and framework (`project:<name>`, `framework:<tfm>`) for filtering. Traits reported by the test framework (xUnit traits, NUnit `Category`, MSTest `TestCategory`) become `trait:<key>=<value>` tags, plus `category:<value>` for category traits, so you can filter Test Explorer with, for example, `@testy:trait:Category=Integration`. Spaces in tag values appear as `_`.
 
@@ -53,13 +58,17 @@ The refresh button in Test Explorer rediscovers tests without running them. Test
 
 Use the **Debug** profile in Test Explorer. Testy starts the test host, waits for it to report its process ID, and attaches the `coreclr` debugger. Debug runs use one process per project, run without coverage, and are not limited by `testy.timeoutSeconds`. The C# extension must be installed; Testy offers to install it if it is missing.
 
+Set `testy.debugConfiguration` to add properties to the attach configuration, for example `{ "justMyCode": false, "symbolOptions": { "searchMicrosoftSymbolServer": true } }`. Testy always sets `request` and `processId`.
+
 ## Build configurations
 
-List extra configurations in `testy.additionalConfigurations` (for example `["Release"]`) to get **Run (Release)** and **Run with coverage (Release)** profiles next to the defaults. A manual run through one of them builds, discovers and runs with that configuration for that run only. Automatic runs always use `testy.buildConfiguration`, and the profiles are not the default. Coverage learned under another configuration is shown, but it is not trusted to narrow later selections: the affected files are conservatively rerun and relearned by the next automatic run.
+List extra configurations in `testy.additionalConfigurations` (for example `["Release"]`) to get **Run (Release)**, **Run with coverage (Release)** and **Debug (Release)** profiles next to the defaults. A manual run through one of them builds, discovers and runs with that configuration for that run only. Automatic runs always use `testy.buildConfiguration`, and the profiles are not the default. Coverage learned under another configuration is shown, but it is not trusted to narrow later selections: the affected files are conservatively rerun and relearned by the next automatic run.
 
 ## Continuous run
 
-The Run profile supports Test Explorer's continuous run. While automatic testing is paused, a continuous run keeps the selected tests running after changes.
+The Run and Run with coverage profiles support Test Explorer's continuous run. While automatic testing is paused, a continuous run keeps the selected tests running after changes. A continuous run started from **Run with coverage** collects and shows coverage in its automatic runs even when `testy.runWithCoverage` is off.
+
+Automatic runs are named by what started them in Test Explorer's results, for example `Testy · on save: Calculator.cs`.
 
 ## Coverage
 
@@ -87,16 +96,16 @@ See [How Testy works](docs/how-it-works.md) for the full details: caching, evalu
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `testy.autoRun` | `true` | Establish a baseline on open and run automatically. Pausing is stored per workspace and overrides this default. |
+| `testy.autoRun` | `true` | Run automatically after changes. The first baseline of a workspace still asks first. Pausing is stored per workspace and overrides this default. |
 | `testy.runMode` | `affected` | `affected` or `all`. |
 | `testy.trigger` | `save` | `save` for editor saves, or `fileSystem` to include external disk changes and branch switches. |
 | `testy.debounceTime` | `500` | Delay after the latest change, in milliseconds. |
 | `testy.runWithCoverage` | `true` | Collect coverage. Disabling it uses project fallback. |
 | `testy.showCoverage` | `false` | Also show coverage and stale markers in editor gutters. |
-| `testy.solution` | (empty) | Optional `.sln`, `.slnx`, or `.slnf` whose projects limit the entry points. `${workspaceFolder}` is supported. |
-| `testy.projects.include` | `[]` | Globs for entry-point projects to include, for example `tests/**/*.csproj`. |
-| `testy.projects.exclude` | `[]` | Globs for entry-point projects to exclude. Exclusions win over inclusions. |
-| `testy.exclude` | `[]` | Additional file patterns to ignore. |
+| `testy.solution` | (empty) | Optional `.sln`, `.slnx`, or `.slnf` whose projects limit the entry points. Relative paths resolve against the folder that sets it. `${workspaceFolder}` is supported. *Per folder.* |
+| `testy.projects.include` | `[]` | Globs for entry-point projects to include, for example `tests/**/*.csproj`. *Per folder.* |
+| `testy.projects.exclude` | `[]` | Globs for entry-point projects to exclude. Exclusions win over inclusions. *Per folder.* |
+| `testy.exclude` | `[]` | Additional file patterns to ignore. *Per folder.* |
 | `testy.fileWatcherPattern` | Source and configuration files | Which files can trigger runs. |
 | `testy.buildConfiguration` | `Debug` | MSBuild configuration for automatic runs and the default profiles. |
 | `testy.additionalConfigurations` | `[]` | Extra MSBuild configurations such as `Release`. Each adds `Run (Release)` and `Run with coverage (Release)` profiles that build and run manual selections with that configuration. |
@@ -105,9 +114,10 @@ See [How Testy works](docs/how-it-works.md) for the full details: caching, evalu
 | `testy.dotnetPath` | `dotnet` | Path to the .NET CLI. *Machine-overridable.* |
 | `testy.testArguments` | `[]` | Additional MTP arguments, such as framework settings. |
 | `testy.timeoutSeconds` | `600` | Limit for each build, discovery, or test-file run. Debug runs are not limited. |
-| `testy.coverageToolPath` | Automatic | Existing `dotnet-coverage` executable. *Machine-overridable.* |
+| `testy.coverageToolPath` | Automatic | Absolute path to an existing `dotnet-coverage` executable. *Machine-overridable.* |
+| `testy.debugConfiguration` | `{}` | Extra properties for the `coreclr` attach configuration of Debug profiles. |
 
-One engine serves every folder of a multi-root workspace, so settings other than the two executable paths are window-scoped: set them in user or workspace settings, not per folder. With `0`, test-file workers use available CPUs minus one, and project workers use up to four while reserving one CPU.
+One engine serves every folder of a multi-root workspace. Settings marked *per folder* can be set in a folder's settings: they then apply to that folder's projects and resolve relative paths and globs against it (folder `exclude` patterns add to the workspace ones; a folder `solution` or `projects.include` replaces the inherited value for that folder). `testy.buildConfiguration` and `testy.testArguments` can be set per folder but apply to the whole run: when folders disagree, Testy warns and uses the workspace value. Other settings are window-scoped. With `0`, test-file workers use available CPUs minus one, and project workers use up to four while reserving one CPU.
 
 ## Remote, WSL, and dev containers
 

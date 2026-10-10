@@ -72,6 +72,19 @@ test('ambiguous Windows path and cwd-search forms decline instead of selecting a
  assert.equal(await changed.resolve('C:\\bin\\tool.exe'),'C:\\bin\\tool.exe','explicit paths do not depend on cwd search policy');
 });
 
+test('owned Windows command resolution is memoized by command and search path, never caching a failure',async()=>{
+ const f=windows({'C:\\bin\\tool.exe':{},'C:\\other\\tool.exe':{}});
+ const stats=()=>f.calls.filter(([kind])=>kind==='stat').length;
+ assert.equal(await f.resolveOwnedCommand('tool',{PATH:'C:\\bin'},'C:\\work'),'C:\\bin\\tool.exe');
+ const first=stats();
+ assert.deepEqual(await Promise.all([1,2,3].map(()=>f.resolveOwnedCommand('tool',{PATH:'C:\\bin'},'C:\\elsewhere'))),Array(3).fill('C:\\bin\\tool.exe'));
+ assert.equal(stats(),first,'repeated launches reuse the resolution');
+ assert.equal(await f.resolveOwnedCommand('tool',{PATH:'C:\\other'},'C:\\work'),'C:\\other\\tool.exe','another PATH resolves again');
+ await assert.rejects(f.resolveOwnedCommand('missing',{PATH:'C:\\bin'},'C:\\work'),/Cannot find missing/);
+ f.files.set(f.key('C:\\bin\\missing.exe'),{});
+ assert.equal(await f.resolveOwnedCommand('missing',{PATH:'C:\\bin'},'C:\\work'),'C:\\bin\\missing.exe');
+});
+
 test('a selected Windows candidate is never replaced by a later one after identity failure',async()=>{
  const denied=Object.assign(new Error('selected file denied'),{code:'EACCES'});
  const f=windows({'C:\\work\\tool.exe':{},'C:\\bin\\tool.exe':{}},undefined,{realpath:()=>{throw denied;}});

@@ -9,19 +9,20 @@ import { OwnedProcess, ProcessOptions, ProcessResult, startProcess } from './pro
 import { resolveOwnedCommand } from './executable';
 
 export type { TestNode } from '../core/testUpdates';
-interface TestUpdates { readonly runId: string; readonly changes: readonly { readonly node: TestNode }[] | null; }
-interface InitializeResult { readonly capabilities: { readonly testing: { readonly supportsDiscovery: boolean } }; }
+// Protocol messages from the test host; optional parts may be absent.
+interface TestUpdates { readonly runId: string; readonly changes?: readonly { readonly node: TestNode }[] | null; }
+interface InitializeResult { readonly capabilities?: { readonly testing?: { readonly supportsDiscovery?: boolean } }; }
 
 export interface MtpOptions extends ProcessOptions {
     readonly dotnet: string;
     readonly assembly: string;
     readonly args?: readonly string[];
     /** A coverage collector can wrap the same owned MTP process. */
-    readonly wrapper?: { readonly command: string; readonly args: readonly string[] };
+    readonly wrapper?: { readonly command: string; readonly args: readonly string[] } | undefined;
     readonly onNode?: (node: TestNode) => void;
     readonly expectedTests?: readonly TestNode[];
     /** Run under a debugger: the host waits until this attaches to the reported process. */
-    readonly debug?: (processId: number) => Promise<void>;
+    readonly debug?: ((processId: number) => Promise<void>) | undefined;
 }
 
 /** After a complete result stream, how long the host may take to exit. A coverage
@@ -30,7 +31,9 @@ export const mtpTiming = { exitGraceMs: 10_000, wrappedExitGraceMs: 120_000,
     /** How long the host may take to connect; a collector's cold start is slower. Never beyond the process timeout. */
     connectMs: 30_000, wrappedConnectMs: 120_000,
     /** How long a host waiting for a debugger may take to report its process ID. */
-    attachMs: 60_000 };
+    attachMs: 60_000,
+    /** After the connection closes, how long to wait for the host's exit before failing pending requests. */
+    closeGraceMs: 5_000 };
 
 /** MTP's exit code when no test matched the request, e.g. because the selected IDs no longer exist. */
 const zeroTestsRan = 8;
@@ -143,8 +146,15 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
         // Closing a transport does not itself reject vscode-jsonrpc's pending
         // requests. Disposal is essential when a cancelled/crashed runner exits.
         // Give process exit/timeout its diagnostic before RPC disposal rejects
-        // outstanding requests with an otherwise unhelpful transport error.
-        rpc.onClose(() => {closeTimer = setTimeout(() => rpc?.dispose(), 100);});
+        // outstanding requests with an otherwise unhelpful transport error: wait
+        // until the exit is observed (it can lag the socket under load), bounded
+        // for a host that closes the connection but keeps running.
+        const host = process;
+        rpc.onClose(() => {
+            const dispose = (delay: number): void => {clearTimeout(closeTimer); closeTimer = setTimeout(() => rpc?.dispose(), delay);};
+            dispose(mtpTiming.closeGraceMs);
+            void host.done.then(() => dispose(0), () => dispose(0));
+        });
         const exited = process.done.then(result => {
             throw new Error(`The test application exited during ${operation} (exit ${result.code}).\n${result.stderr || result.stdout}`);
         });
@@ -153,7 +163,8 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
         const nodes = new Map<string, TestNode>();
         const pendingOutput = new Map<string, { stdout: string[]; stderr: string[] }>();
         const runId = randomUUID();
-        let completed = false;
+        // Set by the update notification; `as boolean` keeps the read after the requests from narrowing to false.
+        let completed = false as boolean;
         rpc.onNotification('testing/testUpdates/tests', (update: TestUpdates) => {
             if (update.runId !== runId) {return;}
             if (update.changes === null) { completed = true; return; }
@@ -233,7 +244,7 @@ export function assertComplete(nodes: readonly TestNode[], expected: readonly Te
     const expectedIds = new Set(expected.map(node => node.uid));
     const byId = new Map(leaves.map(node => [node.uid, node]));
     const method = (node: TestNode): string | undefined => typeof node['location.type'] === 'string' && typeof node['location.method'] === 'string'
-        ? JSON.stringify([node['location.type'], String(node['location.method']).split('(')[0]]) : undefined;
+        ? JSON.stringify([node['location.type'], node['location.method'].split('(')[0]]) : undefined;
     const expectedMethods = new Map<string | undefined, number>();
     for (const node of expected) {const key = method(node); expectedMethods.set(key, (expectedMethods.get(key) ?? 0) + 1);}
     const runtimeMethods = new Set(leaves.filter(node => !expectedIds.has(node.uid) && isTerminal(node)).map(method).filter(Boolean));

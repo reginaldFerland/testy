@@ -156,13 +156,15 @@ test('explicit standalone owned collectors retain cache eligibility and invalida
  assert.equal(f.state.instruments.length,2);assert.notEqual(changed.session,first.session);
 });
 
-test('POSIX preparation contexts retain the exact version-three key while Windows uses a new proof version',async t=>{
- const f=await runnerFixture(t,{platform:'linux'}),session=f.create({analyzer:'analyzer.dll'}),group={project:f.project.file,framework:f.project.framework,assembly:f.project.assembly};
- const context=await session.preparationContext(group),env=stableEnvironment({...f.fakeProcess.env});
+test('preparation contexts order the environment by code units under a bumped version on every platform',async t=>{
+ const f=await runnerFixture(t,{platform:'linux'}),session=f.create({analyzer:'analyzer.dll',env:{a_lower:'1',B_UPPER:'2'}}),group={project:f.project.file,framework:f.project.framework,assembly:f.project.assembly};
+ const context=await session.preparationContext(group),env=stableEnvironment({...f.fakeProcess.env,a_lower:'1',B_UPPER:'2'});
+ const entries=Object.entries(env).sort(([left],[right])=>left<right?-1:left>right?1:0);
+ // Uppercase sorts before lowercase by code unit, regardless of the host locale.
+ assert.ok(entries.findIndex(([key])=>key==='B_UPPER')<entries.findIndex(([key])=>key==='a_lower'));
  const tools=contentHash(JSON.stringify({tools:['legacy:dotnet','legacy:collector','legacy:analyzer.dll'],
-  env:Object.entries(env).sort(([left],[right])=>left.localeCompare(right)),arguments:[],assemblies:[f.project.assembly],
-  runtime:process.version,platform:'linux',architecture:process.arch}));
- assert.equal(context,JSON.stringify({version:3,tools,project:group.project,framework:group.framework,assembly:group.assembly}));
+  env:entries,arguments:[],assemblies:[f.project.assembly],runtime:process.version,platform:'linux',architecture:process.arch}));
+ assert.equal(context,JSON.stringify({version:4,tools,project:group.project,framework:group.framework,assembly:group.assembly}));
  const windows=await runnerFixture(t),current=JSON.parse(await windows.create().preparationContext({project:windows.project.file,framework:windows.project.framework,assembly:windows.project.assembly}));
- assert.equal(current.version,4);assert.deepEqual(f.state.legacy,['dotnet','collector','analyzer.dll']);
+ assert.equal(current.version,5);assert.deepEqual(f.state.legacy,['dotnet','collector','analyzer.dll']);
 });

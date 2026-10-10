@@ -8,8 +8,9 @@ const folderOf=uri=>folders.find(folder=>uri.fsPath.startsWith(`${folder.uri.fsP
 const item=(fsPath,parent)=>({uri:fsPath&&{fsPath},parent});
 
 test('debugging attaches in the workspace folder that contains the run\'s tests',async()=>{
- const started=[];
- const {Testy}=loadUi({vscode:{workspace:{workspaceFolders:folders,getWorkspaceFolder:folderOf},
+ const started=[],custom=new Map();
+ const {Testy}=loadUi({vscode:{workspace:{workspaceFolders:folders,getWorkspaceFolder:folderOf,
+   getConfiguration:(section,scope)=>({get:(key,fallback)=>custom.get(scope?.fsPath)??fallback})},
   debug:{startDebugging:async(folder,configuration,options)=>{started.push({folder,configuration,options});return true;}}}});
  const proto=Testy.prototype,activeRun={};
  const attach=async include=>{
@@ -24,6 +25,12 @@ test('debugging attaches in the workspace folder that contains the run\'s tests'
  assert.equal((await attach([item('/elsewhere/Linked.cs')])).folder,folders[0],'tests outside every folder fall back to the first folder');
  assert.equal((await attach(undefined)).folder,folders[0],'a run of everything falls back to the first folder');
  assert.equal((await attach([])).folder,folders[0]);
+ assert.deepEqual({...second.configuration},{type:'coreclr',name:'Testy: Debug tests',request:'attach',processId:'4242'});
+ custom.set('/two',{justMyCode:false,type:'monovsdbg',request:'launch',processId:1,name:'Mine'});
+ assert.deepEqual({...(await attach([item('/two/Tests/A.cs')])).configuration},{type:'monovsdbg',name:'Mine',justMyCode:false,request:'attach',processId:'4242'},
+  'testy.debugConfiguration of the folder is merged; request and process stay Testy\'s');
+ custom.set('/two',['not','an','object']);
+ assert.equal((await attach([item('/two/Tests/A.cs')])).configuration.type,'coreclr');
 });
 
 test('disposing resets the context keys that enable the extension\'s menus',async()=>{
@@ -36,7 +43,7 @@ test('disposing resets the context keys that enable the extension\'s menus',asyn
   workspace:{onDidSaveTextDocument:disposable,onDidDeleteFiles:disposable,onDidRenameFiles:disposable,onDidChangeConfiguration:disposable,onDidChangeWorkspaceFolders:disposable,onDidChangeTextDocument:disposable,
    getConfiguration:()=>({get:(_key,fallback)=>fallback})}};
  const state=()=>{const values=new Map();return{get:key=>values.get(key),update:async(key,value)=>{values.set(key,value);}};};
- const {Testy}=loadUi({vscode,stubs:{configuration:{configuration:()=>({enabled:true,trigger:'save',showCoverage:false,debounce:100,pattern:'**/*.cs',excludes:[]})}}});
+ const {Testy}=loadUi({vscode,stubs:{configuration:{configuration:()=>({enabled:true,trigger:'save',showCoverage:false,debounce:100,pattern:'**/*.cs',excludes:[],folderConflicts:[],additionalConfigurations:[]})}}});
  const ui=new Testy({extensionUri:{},storageUri:{fsPath:os.tmpdir()},globalStorageUri:{fsPath:os.tmpdir()},extensionPath:process.cwd(),workspaceState:state(),globalState:state()},['/workspace']);
  assert.equal(keys.get('testy.active'),true);
  ui.updateStatus();

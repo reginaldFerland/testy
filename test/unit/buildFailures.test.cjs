@@ -13,7 +13,7 @@ class MarkdownString{
 async function fixture() {
  const collection=()=>({values:[],replace(values){this.values=[...values];},add(value){this.values.push(value);}});
  const ui=loadUi({vscode:{MarkdownString,TestRunRequest:class{},Uri:{file:fsPath=>({fsPath})},Range:class{}}});
- const controller={items:collection(),createTestItem:(id,label,uri)=>({id,label,uri,children:collection()}),invalidateTestResults(){}};
+ const controller={items:collection(),createTestItem:(id,label,uri)=>({id,label,uri,tags:[],children:collection()}),invalidateTestResults(){}};
  const tree=new ui.TestTree(controller,{knownTests:group=>group.tests},{disposed:false,activeRun:undefined,roots:[],updateStatus(){}});
  const group=project=>({id:`${project}:a`,project:`/w/${project}/${project}.csproj`,framework:'net10.0',file:`/w/${project}/A.cs`,tests:[{id:'t',name:'t',file:`/w/${project}/A.cs`,line:1}]});
  await tree.update([group('One'),group('Two')]);
@@ -59,7 +59,7 @@ async function execute(t,{fail,aborted=false}) {
  const proto=f.ui.Testy.prototype;
  const run={token:{onCancellationRequested:()=>({dispose(){}})},end(){},appendOutput(){}};
  const abort=new AbortController();
- const context={controller:{createTestRun:()=>run},runProfile:{},coverageProfile:{},debugProfile:{},config:{coverage:false},coverage:{beginRun(){}},
+ const context={controller:{createTestRun:()=>run},runProfile:{},coverageProfile:{},debugProfile:{},config:{coverage:false},continuousCoverage:new Set(),runName:()=>'Testy',coverage:{beginRun(){}},
   tree:{showBuildFailures:(diagnostics,fallback)=>calls.push(['show',[...diagnostics].map(d=>d.code),fallback]),clearBuildFailures:()=>calls.push(['clear'])},
   lines:{flush:()=>[]},output:{info(){},warn(){}},lastError:'',buildDiagnostics:new Map(),updateStatus(){},log(){},
   publishDiagnostics:()=>calls.push(['diagnostics']),reportError(error){context.lastError=error.message;}};

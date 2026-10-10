@@ -27,6 +27,11 @@ test('MTP reports timeouts and early process exits instead of RPC disposal error
  await assert.rejects(requestTests({...options,timeoutMs:5000,env:{TESTY_EXIT_DURING:'41'}},'run'),/exit 41.*\ncontrolled process failure/);
 });
 
+test('MTP waits for an exit observed after the connection closes before failing pending requests',async()=>{
+ const options={dotnet:process.execPath,assembly:path.resolve('test/fixtures/mtp-peer.cjs'),cwd:process.cwd(),timeoutMs:5000};
+ await assert.rejects(requestTests({...options,env:{TESTY_EXIT_LATE:'42'}},'run'),/exit 42.*\nlate process failure/);
+});
+
 function prototypes(vscode={}) {
  const ui=loadUi({vscode});
  return{Testy:ui.Testy.prototype,tree:ui.TestTree.prototype,coverage:ui.CoverageView.prototype,status:ui.module('ui/statusBar').StatusBar.prototype};
@@ -78,7 +83,7 @@ test('watchers cover external sources, reuse unchanged roots and dispose removed
 test('save invalidation preserves historical test outcomes until final selection',async()=>{
  const proto=uiPrototype();let invalidated=0,cleared=0;
  const context={disposed:false,roots:['/workspace'],generatedFiles:new Set(),config:{excludes:[],pattern:'**/*.cs'},
-  engine:{knownFiles:['/workspace/Code.cs'],markChanged:async()=>{}},scheduler:{request(){}},
+  engine:{knownFiles:['/workspace/Code.cs'],directories:[],sources:{observeGenerated(){},isGenerated:()=>false},markChanged:async()=>{}},scheduler:{request(){}},
   controller:{invalidateTestResults(){invalidated++;}},setOutcome(){cleared++;}};
  await proto.changed.call(context,{scheme:'file',fsPath:'/workspace/Code.cs'},'class Code {}');
  assert.equal(invalidated,0);assert.equal(cleared,0);
@@ -105,7 +110,7 @@ test('save-mode directory events expand known paths and trigger structural disco
  const root=normalizePath(path.resolve(require('node:os').tmpdir(),'testy-ui-workspace'));
  const directory=path.join(root,'Tests','Feature'),source=normalizePath(path.join(directory,'FeatureTests.cs'));
  const context={disposed:false,roots:[root],config:{excludes:[],pattern:'**/*.{cs,csproj}',mode:'affected'},
-  engine:{knownFiles:[source],select:()=>({groups:[]}),markChanged:async files=>marked.push([...files])},
+  engine:{knownFiles:[source],directories:[],select:()=>({groups:[]}),markChanged:async files=>marked.push([...files])},
   scheduler:{request:(files,full)=>requested.push({files:[...files],full})},controller:{invalidateTestResults:()=>{}},items:new Map()};
  await proto.changed.call(context,{scheme:'file',fsPath:directory},undefined,true);
  assert.equal(requested.length,1);assert.equal(requested[0].full,true);
@@ -269,7 +274,7 @@ test('startup schedules its baseline after optional cache failure, but never aft
  t.after(()=>io.rm(storage,{recursive:true,force:true}));
  const warnings=[],engine=new TestEngine({roots:[],storage,events:{output:text=>warnings.push(text)}});
  engine.cache.restore=async()=>{throw new Error('unavailable cache worker');};
- const lifetime=new AbortController(),context={engine,lifetime,config:{enabled:true},watch(){},scheduler:{setPaused(){},request:(...args)=>requested.push(args)}};
+ const lifetime=new AbortController(),context={engine,lifetime,config:{enabled:true},context:{workspaceState:{get:()=>'always'}},watch(){},noticeDevKit(){},scheduler:{setPaused(){},request:(...args)=>requested.push(args)}};
  await proto.start.call(context);assert.equal(requested.length,1);assert.equal(requested[0][1],true);assert.match(warnings[0],/fresh baseline/);
  lifetime.abort();await assert.rejects(proto.start.call(context),{name:'AbortError'});assert.equal(requested.length,1);
 });

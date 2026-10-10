@@ -38,7 +38,11 @@ export function* jsonChunks(value: unknown): Generator<string> {
                 yield JSON.stringify(key); yield ':'; yield* pieces(field);
             }
             yield '}';
-        } else {yield JSON.stringify(value) ?? 'null';}
+        } else {
+            // Undefined, functions and symbols have no JSON text; the lib typing omits that.
+            const text = JSON.stringify(value) as string | undefined;
+            yield text ?? 'null';
+        }
     }
     let chunk = '';
     for (const piece of pieces(value)) {

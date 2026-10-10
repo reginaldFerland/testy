@@ -19,22 +19,22 @@ static class SourceAnalysis
     // that cannot be loaded, or that behaves differently from what this analysis was
     // written for, fails the start of the server and not the first real request.
     [MethodImpl(MethodImplOptions.NoInlining)]
-    public static void Warm()
+    public static async Task WarmAsync()
     {
         const string sample = "global using Hidden = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute;\n"
             + "using Blind = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute;\n"
             + "namespace N;\n#if NEVER\nclass Disabled {}\n#endif\n"
             + "[Blind] public partial class C<T> { public int P => 1; public int this[int i] { get { return i; } } public int M(int x) { return x; }\n"
             + "#line 5 \"mapped.cs\"\n public void L() { }\n#line default\n}\n";
-        var shape = Analyze(sample);
+        var shape = await AnalyzeAsync(sample);
         if (shape is null || !shape.ExcludedTypes.SequenceEqual(["N:C`1"]) || !shape.PartialTypes.SequenceEqual(["N:C`1"]) || !GlobalAliases(sample).SequenceEqual(["Hidden"]))
         {
             throw new InvalidOperationException("The installed Roslyn did not analyze the self-test source as expected.");
         }
         // The contract that selection relies on: executable edits keep the declaration signature, declaration edits change it.
-        var original = Analyze("class D { int M(int x) { return x; } int P => 1; int this[int i] { get { return i; } } }");
-        var edited = Analyze("class D { int M(int x) { return x + 1; } int P => 2; int this[int i] { get { return i + 1; } } }");
-        var redeclared = Analyze("class D { int M(long x) { return x; } int P => 1; int this[int i] { get { return i; } } }");
+        var original = await AnalyzeAsync("class D { int M(int x) { return x; } int P => 1; int this[int i] { get { return i; } } }");
+        var edited = await AnalyzeAsync("class D { int M(int x) { return x + 1; } int P => 2; int this[int i] { get { return i + 1; } } }");
+        var redeclared = await AnalyzeAsync("class D { int M(long x) { return x; } int P => 1; int this[int i] { get { return i; } } }");
         if (original is null || edited is null || redeclared is null || original.Signature == original.Body
             || original.Signature != edited.Signature || original.Body == edited.Body || original.Signature == redeclared.Signature)
         {
@@ -42,7 +42,7 @@ static class SourceAnalysis
         }
     }
 
-    internal static SourceShape? Analyze(string text) => AnalyzeBytes(Encoding.UTF8.GetBytes(text), [], CancellationToken.None).Result.Shape;
+    internal static async Task<SourceShape?> AnalyzeAsync(string text) => (await AnalyzeBytes(Encoding.UTF8.GetBytes(text), [], CancellationToken.None)).Shape;
 
     // The Roslyn this process runs on, for diagnostics.
     [MethodImpl(MethodImplOptions.NoInlining)]

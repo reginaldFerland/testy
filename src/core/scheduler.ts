@@ -1,4 +1,5 @@
 import { Cancelled } from '../services/process';
+import { isAbortError } from './errors';
 
 export interface ChangeBatch { readonly files: readonly string[]; readonly full: boolean; readonly generation?: number; }
 export type SchedulerState = 'idle' | 'waiting' | 'running' | 'paused';
@@ -140,8 +141,8 @@ export class Scheduler {
             if (controller.signal.aborted) {return;}
             for (const [file, revision] of snapshot) {if (this.pending.get(file) === revision) {this.pending.delete(file);}}
             if (this.fullRevision === full) {this.fullRevision = undefined;}
-        }).catch(error => {
-            if (!controller.signal.aborted && (error as Error)?.name !== 'AbortError') {this.options.error?.(error);}
+        }).catch((error: unknown) => {
+            if (!controller.signal.aborted && !isAbortError(error)) {this.options.error?.(error);}
         }).finally(() => {
             this.active = undefined; this.publish(); this.pump();
         });

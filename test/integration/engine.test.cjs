@@ -37,6 +37,7 @@ test('MTP baseline, affected-file rerun, failure details, retained coverage and 
  const greeting=normalizePath(path.join(root,'ImpactDemo/Greeting.cs'));
  const greetingBefore=engine.coverage.summarize(engine.hashes).find(file=>file.file===greeting);
  assert.ok(greetingBefore.covered>0);assert.equal(greetingBefore.stale,false);
+ assert.deepEqual(greetingBefore.declarations?.map(({name,start})=>[name,start]),[['For(string)',6]],'Cobertura method spans reach the coverage summary');
  const old=await fs.readFile(arithmetic,'utf8');
  await fs.writeFile(arithmetic,old.replace('a + b','a + b + 1'));
  await engine.markChanged();

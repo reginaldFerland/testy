@@ -17,6 +17,7 @@ const installedRoslyn=()=>execFileSync('dotnet',['--list-sdks'],{encoding:'utf8'
  return match&&Number(match[1])>=10?[{version:line.split(' ')[0],directory:path.join(match[2],line.split(' ')[0],'Roslyn','bincore')}]:[];
 });
 
+/** @param {import('node:test').TestContext} t */
 async function workspace(t){
  const directory=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy roslyn loader ')));
  const servers=new AnalyzerServers();

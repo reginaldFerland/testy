@@ -28,7 +28,7 @@ Changes are accumulated across cancelled runs. Completed, version-checked test f
 
 ## Coverage and results
 
-Fresh coverage is published to Test Explorer's native coverage view, where it can be filtered by test file or project. With `testy.showCoverage` enabled, gutter markers also appear:
+Fresh coverage is published to Test Explorer's native coverage view, where it can be filtered by test file or project. Method (function) coverage comes from the method spans in the collector's Cobertura report: lambdas and local functions count toward their enclosing member, and async or iterator methods are reported under their own names. Statement ranges follow the open editor's text when the file is open. With `testy.showCoverage` enabled, gutter markers also appear:
 
 - A **filled green circle** marks a covered line.
 - A **red ring** marks an uncovered line.
@@ -46,7 +46,7 @@ A manual test selection preserves failures from unselected runtime rows. Their o
 
 Overlapping manual selections run each discovered test once after fallback expansion. A complete refresh removes runtime rows that no longer exist, including when the project runs file by file or resumes from a completed checkpoint. Partial or cancelled refreshes retain unresolved rows until the remaining project files finish.
 
-Test failures include their messages and stack traces in Test Explorer. The status item shows progress, passing/failing totals, and fresh production-code line coverage. **Testy: Show Output** includes build output and explains each selection.
+Test failures include their messages and stack traces in Test Explorer. Each test's output is attached when its result arrives. MTP's server protocol delivers standard output and error only with a test's final result (verified with MSTest 4.3.3 and xUnit v3 3.2.0), so output cannot be streamed while a test is still running. The status item shows progress, passing/failing totals, and fresh production-code line coverage. **Testy: Show Output** includes build output and explains each selection.
 
 ## Concurrency, generated files and watched inputs
 
@@ -68,6 +68,8 @@ External input watchers are installed before builds and discovery, allowing a co
 - .NET SDK 10 or later; test projects must target .NET 10 or later and enable MTP. Referenced production libraries may target compatible earlier frameworks.
 - An MTP test framework that supports the standard discovery and execution server protocol. Integration tests cover MSTest 4.3.3, xUnit v3 3.2.0 with MTP v2, and NUnit 4.4.0 with adapter 6.3.0.
 - Portable debug symbols for source mapping and coverage. A missing source location causes conservative selection.
+
+The Test Explorer tree is filled eagerly rather than when a node is expanded. Affected selection must know every test project's tests and their source files before it can map a change to them, and discovery needs a build and an MTP discovery request per project. Discovering only on expansion would save no work and would leave tests in collapsed projects unselectable.
 
 Test discovery is scoped to projects inside the opened workspace folders. Referenced projects outside those folders are built as dependencies, but their tests are not discovered. A build failure stops the current batch, including independent projects.
 

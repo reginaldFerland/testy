@@ -1,6 +1,6 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { contentHash, normalizePath } from '../core/paths';
+import { contentHash, preparePathNormalizer } from '../core/paths';
 import { Project } from '../core/model';
 import { ProcessOptions, requireSuccess, runProcess } from './process';
 import { analyzerServers, AnalyzerRequestFailed, AnalyzerServerUnavailable } from './analyzerServer';
@@ -33,9 +33,10 @@ async function analyze(dotnet: string, analyzer: string, storage: string, prefix
 export async function sourceLocations(dotnet: string, analyzer: string, assembly: string, storage: string, options: ProcessOptions): Promise<ReadonlyMap<string, { file: string; line: number }>> {
     const output = await analyze(dotnet, analyzer, storage, 'symbols-', JSON.stringify({ assembly }), 'Reading portable symbols', options);
     const values = JSON.parse(output) as Record<string, { file?: string; line?: number } | null>;
-    return new Map(Object.entries(values).filter((entry): entry is [string, { file: string; line: number }] =>
-        typeof entry[1]?.file === 'string' && Number.isSafeInteger(entry[1]?.line) && entry[1].line! > 0)
-        .map(([key, value]) => [key, { file: normalizePath(value.file), line: value.line }]));
+    const entries = Object.entries(values).filter((entry): entry is [string, { file: string; line: number }] =>
+        typeof entry[1]?.file === 'string' && Number.isSafeInteger(entry[1].line) && entry[1].line! > 0);
+    const normalize = await preparePathNormalizer(entries.map(([, value]) => value.file), options.signal);
+    return new Map(entries.map(([key, value]) => [key, { file: normalize(value.file), line: value.line }]));
 }
 
 export interface SourceShape {
@@ -97,11 +98,12 @@ export async function sourceAnalysisBatch(dotnet: string, analyzer: string, file
         || Object.keys(value.sourceHashes).length !== expected.size)) {throw new Error('Invalid source analysis provenance.');}
     const analyses = new Map<string, SourceShape | null>();
     const sourceHashes = new Map<string, string>();
+    const normalize = await preparePathNormalizer(expected, options.signal);
     for (const file of expected) {
         if (!Object.hasOwn(value.analyses, file)) {throw new Error('Incomplete combined source analysis response.');}
         const shape = value.analyses[file];
         if (shape !== null && !sourceShape(shape)) {throw new Error('Invalid combined source analysis record.');}
-        const normalized = normalizePath(file);
+        const normalized = normalize(file);
         if (provenance) {
             const hash = value.sourceHashes![file];
             if (!Object.hasOwn(value.sourceHashes!, file) || (hash !== null && (typeof hash !== 'string' || !/^[A-F0-9]{64}$/.test(hash)))
@@ -141,10 +143,10 @@ export async function sourceAnalyses(dotnet: string, analyzer: string, files: re
     const output = await analyze(dotnet, analyzer, storage, 'analysis-', JSON.stringify({ files, excludedAliases, concurrency: workers(concurrency) }), 'Analyzing C# declarations', options);
     const parsed: unknown = JSON.parse(output);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {throw new Error('Invalid source analysis response.');}
-    const result = new Map<string, SourceShape | null>();
+    const result = new Map<string, SourceShape | null>(), normalize = await preparePathNormalizer(files, options.signal);
     for (const file of files) {
         const value = (parsed as Record<string, Partial<SourceShape> | null>)[file];
-        result.set(normalizePath(file), sourceShape(value) ? value : null);
+        result.set(normalize(file), sourceShape(value) ? value : null);
     }
     return result;
 }

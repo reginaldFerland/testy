@@ -15,7 +15,7 @@ export interface Project {
     readonly outputDirectories?: readonly string[];
     /** Evaluated imports, resources and other build inputs across reference contexts. */
     readonly inputs?: readonly string[];
-    readonly entryPoint?: boolean;
+    readonly entryPoint?: boolean | undefined;
     readonly properties?: Readonly<Record<string, string>>;
     /** SDK graph node identity and exact edges, before merging file ownership. */
     readonly contextId?: string;
@@ -30,7 +30,7 @@ export interface DiscoveredTest {
     readonly id: string;
     readonly name: string;
     readonly fullyQualifiedName: string;
-    readonly file?: string;
+    readonly file?: string | undefined;
     readonly line: number;
     /** Last line of the test's declaration, when the provider reports it. */
     readonly endLine?: number;
@@ -45,10 +45,10 @@ export interface TestFile {
     readonly project: string;
     readonly framework: string;
     readonly assembly: string;
-    readonly file?: string;
+    readonly file?: string | undefined;
     readonly tests: readonly DiscoveredTest[];
     /** Explicit manual exclusions must also constrain runtime identity fallback. */
-    readonly excludedTestIds?: readonly string[];
+    readonly excludedTestIds?: readonly string[] | undefined;
     /** Rows whose file cannot be identified; manual fallback covers the project. */
     readonly runtimeOnly?: boolean;
 }
@@ -58,17 +58,26 @@ export interface CoveredLine {
     readonly hits: number;
 }
 
+/** A method's source span from the coverage report, in 1-based inclusive lines. */
+export interface Declaration {
+    readonly name: string;
+    readonly start: number;
+    readonly end: number;
+}
+
 export interface FileCoverage {
     readonly file: string;
     readonly hash: string;
     readonly lines: readonly CoveredLine[];
+    /** Method spans; geometry like the lines, so equal for every test of one source version. */
+    readonly declarations?: readonly Declaration[];
 }
 
 export interface Trace {
     readonly groupId: string;
     readonly dependencies: readonly string[];
     /** Whole-module dependencies observed outside the instrumented private copy. */
-    readonly moduleProjects?: readonly string[];
+    readonly moduleProjects?: readonly string[] | undefined;
     readonly coverage: readonly FileCoverage[];
     /** Only complete, successful runs can narrow subsequent selections. */
     readonly reliable: boolean;
@@ -86,8 +95,8 @@ export interface TestResult {
     readonly fullyQualifiedName: string;
     readonly outcome: 'passed' | 'failed' | 'skipped' | 'errored';
     readonly duration: number;
-    readonly message?: string;
-    readonly stack?: string;
+    readonly message?: string | undefined;
+    readonly stack?: string | undefined;
     /** Assertion values for a diff, when the framework reports them. */
     readonly expected?: string;
     readonly actual?: string;

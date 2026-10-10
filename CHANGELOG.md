@@ -6,7 +6,7 @@
 
 - **Debug profile:** debug tests from Test Explorer (requires the C# extension). Each selected project runs in one process without coverage, and the run timeout does not apply.
 - **Continuous run:** Test Explorer's continuous run is supported. While automatic testing is paused, a continuous run keeps its selected tests running after changes.
-- **Native coverage view:** coverage appears in Test Explorer's coverage view with per-line statement ranges, can be filtered per test file and project, and retained coverage is published even without a run.
+- **Native coverage view:** coverage appears in Test Explorer's coverage view with per-line statement ranges (taken from the open editor's text when there is one) and per-method (function) coverage, can be filtered per test file and project, and retained coverage is published even without a run.
 - **Status bar menu:** pause or resume, run affected tests now, refresh, cancel the current run, clear coverage, reset caches and baseline, and show output.
 - **New commands:** **Run Affected Tests Now**, **Cancel Current Run**, **Clear Coverage**, **Reset Caches and Baseline**, and separate **Pause**/**Resume** buttons in Test Explorer.
 - **Project filtering:** `testy.solution` limits Testy to the projects of a `.sln`, `.slnx` or `.slnf`; `testy.projects.include` and `testy.projects.exclude` filter projects by glob.
@@ -21,15 +21,28 @@
 - **Trait tags:** test traits and categories become Test Explorer tags (`trait:Key=Value`, `category:Value`).
 - Establishing a baseline shows progress with a percentage in the status bar.
 - Build errors are shown on the affected project items in Test Explorer, with a link to the output.
+- **Context menus:** **Why Was This Selected?** on Test Explorer items, **Exclude Project from Testy** on project items, **Show Output** on failure messages, and **Run Affected Tests for This File** in the editor and Explorer.
+- **Debug configuration:** `testy.debugConfiguration` adds properties to the `coreclr` attach configuration, and each `testy.additionalConfigurations` entry also gets a Debug profile.
+- **Continuous coverage:** the Run with coverage profile supports continuous runs, which collect and show coverage in their automatic runs.
+- **Multi-root settings:** `testy.solution`, `testy.exclude` and `testy.projects.*` can be set per folder and apply to that folder's projects, with relative paths resolved against it. Differing folder values of `testy.buildConfiguration` or `testy.testArguments` are reported.
+- Testy activates for workspaces that only contain `.slnf` solution filters.
 
 ### Changed
 
 - Pausing automatic testing is remembered per workspace and no longer edits `.vscode/settings.json`; `testy.autoRun` is now only the default.
 - Test Explorer's refresh button rediscovers tests without running them. **Refresh and Run All C# Tests** still rebuilds and runs everything.
-- Gutter coverage markers are optional (`testy.showCoverage` now defaults to `false`).
+- Gutter coverage markers are optional (`testy.showCoverage` now defaults to `false`), and have light and dark theme variants.
 - Output uses a log channel with levels (**Developer: Set Log Level…**).
+- The first open of a workspace asks before building and running the baseline (**Run Now**, **Not Now**, **Don't Ask Again**); until then, a save or a manual run starts it. Workspaces with a retained baseline start as before.
+- In Restricted Mode Testy now activates without running anything, shows **Testy: Restricted Mode** in the status bar, and starts when the workspace is trusted. Settings that choose what runs are ignored from untrusted workspace settings.
+- Startup and environment errors (missing `dotnet`, unsupported SDK, analyzer crash, unreadable `testy.solution`) are shown once per session as a notification with **Show Output** and **Open Settings**; build and test failures stay in the status bar.
+- Automatic runs are named by their trigger in Test Explorer's results, for example `Testy · on save: Calculator.cs`. Discovery-only refreshes are no longer kept in the results history.
+- Export Coverage asks which folder to export in a multi-root workspace.
+- The status bar item has a screen-reader label.
+- `testy.coverageToolPath` must be an absolute path; a relative path is rejected instead of being resolved differently for the check and the launch.
+- Path normalization during analysis, discovery and project filtering no longer blocks the editor with synchronous file-system calls, the coverage parser receives the tracked file list once instead of with every report, Windows command lookups are memoized, and cache saves no longer fsync the epoch file.
 - The extension is bundled into a single module, and activation no longer waits for the coverage cache to be restored, so startup is faster and the package smaller.
-- `testy.dotnetPath` and `testy.coverageToolPath` are machine-overridable. Other settings are window-scoped because one engine serves every folder of a workspace.
+- `testy.dotnetPath` and `testy.coverageToolPath` are machine-overridable. `testy.solution`, `testy.exclude`, `testy.projects.*`, `testy.buildConfiguration`, `testy.testArguments` and `testy.debugConfiguration` are resource-scoped; the rest are window-scoped because one engine serves every folder of a workspace.
 - Prepared test outputs are kept after cancelled runs instead of being rebuilt, and file copies use the operating system's fast copy path.
 - Preparation tool fingerprints are cached between runs instead of rehashing the collector and SDK each time.
 - Retained preparation templates are rebuilt once after upgrading, because their environment identity changed.
@@ -69,9 +82,17 @@
 - On Windows, `dotnet`, the coverage collector and commands run by the process owner are resolved from PATH, never from the workspace.
 - Project discovery finds `.csproj` files regardless of extension case and follows symlinked directories, with cycle protection.
 - A briefly locked source file no longer fails the whole refresh.
+- Overlapping source refreshes no longer let an older read overwrite newer file hashes, which could commit a stale trace as fresh.
+- SDK checks are cancelled and awaited when Testy is disposed or its caches are reset, instead of outliving the window for up to the run timeout.
+- A failed runner lane or preparation-tool lookup is no longer reused for the rest of the run, and cancelled work waiting for a worker slot stops immediately.
+- A test host that exits right after closing its connection reports its exit code and output instead of a connection-disposed error.
+- The analyzer helper ignores duplicate request IDs without losing the original request's cancellation, frees malformed requests, caps unterminated output, and stops project-graph evaluation when MSBuild cancels it.
 - Relative file names in Cobertura reports are resolved against the report's `<sources>`.
 - Debugging in multi-root workspaces attaches in the folder that contains the tests.
 - Project analysis output is deterministic and explains why evaluation reuse is unavailable.
+- An error while workspace folders change is reported instead of escaping the event handler.
+- Ending the baseline progress disposes its cancellation listener.
+- The Pause/Resume and Run buttons in Test Explorer's title bar use numeric ordering.
 
 ### Internal
 

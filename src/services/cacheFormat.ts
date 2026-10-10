@@ -8,7 +8,11 @@ const positive = (value: unknown): value is number => typeof value === 'number' 
 export function validSource(value: unknown): value is CoverageSource {
     const source = record(value);
     return !!source && typeof source.id === 'string' && typeof source.file === 'string' && typeof source.hash === 'string'
-        && source.id === contentHash(`${source.file}\0${source.hash}`) && Array.isArray(source.lines) && source.lines.every(positive);
+        && source.id === contentHash(`${source.file}\0${source.hash}`) && Array.isArray(source.lines) && source.lines.every(positive)
+        && (source.declarations === undefined || Array.isArray(source.declarations) && source.declarations.every(value => {
+            const declaration = record(value);
+            return !!declaration && typeof declaration.name === 'string' && positive(declaration.start) && positive(declaration.end) && declaration.start <= declaration.end;
+        }));
 }
 
 export function validTrace(value: unknown): value is StoredTrace {

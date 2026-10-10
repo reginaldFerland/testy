@@ -12,18 +12,18 @@ test('excluded production dependencies still serialize conflicting reference con
  const library=normalizePath(path.join(hidden,'Core.csproj')),source=normalizePath(path.join(hidden,'Core.cs'));
  await fs.writeFile(library,`<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><DefineConstants Condition="'$(Flavor)' == 'First'">$(DefineConstants);FIRST</DefineConstants></PropertyGroup></Project>`);
  await fs.writeFile(source,'public static class Core { public static int Value =>\n#if FIRST\n11;\n#else\n22;\n#endif\n}');
- const targets=[];
+ const targets=/** @type {string[]} */([]);
  for(const [name,value] of [['First',11],['Second',22]]){
   const directory=path.join(root,`${name}.Tests`);await fs.mkdir(directory);
   const file=normalizePath(path.join(directory,`${name}.Tests.csproj`));targets.push(file);
   await fs.writeFile(file,`<Project Sdk="MSTest.Sdk/4.3.3"><PropertyGroup><TargetFramework>net10.0</TargetFramework><TestingExtensionsProfile>None</TestingExtensionsProfile></PropertyGroup><ItemGroup><ProjectReference Include="../Excluded/Core/Core.csproj" AdditionalProperties="Flavor=${name}"/></ItemGroup></Project>`);
   await fs.writeFile(path.join(directory,'FlavorTests.cs'),`using Microsoft.VisualStudio.TestTools.UnitTesting; [TestClass] public class FlavorTests { [TestMethod] public void UsesOwnReferenceContext() => Assert.AreEqual(${value},Core.Value); }`);
  }
- const output=[],results=[];
+ const output=/** @type {string[]} */([]),results=/** @type {{project:string,outcome:string}[]} */([]);
  const engine=new TestEngine({roots:[root],storage:path.join(temp,'state'),tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),
   configuration:()=>({dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:false,excludes:['**/Excluded/**'],testArguments:[],timeout:60000,maxParallelProjects:2,maxParallelTestFiles:2}),
   events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result:(group,result)=>results.push({project:group.project,...result}),started(){},coverage(){},invalidated(){}}});
- const build=projects.buildProjects,batches=[];let active=0,peak=0;
+ const build=projects.buildProjects,batches=/** @type {string[][]} */([]);let active=0,peak=0;
  projects.buildProjects=async(...args)=>{
   const roots=args[1];batches.push(roots.map(project=>project.file));
   assert.equal(roots.length,1,'the excluded Core contexts share outputs and must build in separate waves');

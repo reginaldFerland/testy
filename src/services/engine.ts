@@ -6,13 +6,14 @@ import { isTestTarget, Project, TestFile, TestResult } from '../core/model';
 import { environmentIdentity } from '../core/environment';
 import { ChangeBatch } from '../core/scheduler';
 import { ProjectIndex, selectTests, Selection, uniformCauses } from '../core/selection';
-import { contentHash, defaultExcludes, isConfigurationFile, isExcluded, normalizePath, sourceVersion, testTargetKey } from '../core/paths';
+import { compareCodeUnits, contentHash, defaultExcludes, isConfigurationFile, isExcluded, normalizePath, normalizePathsAsync, sourceVersion, testTargetKey } from '../core/paths';
 import { buildOrder, buildRoots, buildWaves, buildSnapshotTargets, buildProjects, mergeProjects, evaluateProjects, restoreProjects, filterEntryPoints, findProjects, refreshProjectSnapshotBatches, sdkContextGroups, sdkConfigurationFiles } from './projects';
 import { Cancelled, ProcessOptions, requireSuccess, runProcess } from './process';
 import { FileRun, projectCoverageId, RunnerOptions, RunnerSession } from './runner';
 import { disposeAnalyzerServers, resolveShapes, sourceAnalysisBatch, SourceShape } from './analysis';
 import { sourceAnalysisContext } from './analysisContext';
 import { SourceTracker } from './sources';
+import { RuntimeInventory } from './runtimeInventory';
 import { CoverageCache } from './cache';
 import { discoveredTest } from './mtp';
 import { installCoverageTool } from './coverageTool';
@@ -21,6 +22,7 @@ import { copyOutput } from './output';
 import { PreparedOutputCache } from './preparedOutputCache';
 import { evaluationToolContext, ProjectEvaluationCache } from './projectEvaluationCache';
 import { mapConcurrent, mapConcurrentByKey, resolveConcurrency, resolveTestFileConcurrency, Semaphore, SerialQueue } from '../core/concurrency';
+import { isAbortError } from '../core/errors';
 
 export interface EngineConfiguration {
     readonly dotnet: string;
@@ -30,11 +32,13 @@ export interface EngineConfiguration {
     readonly excludes: readonly string[];
     readonly testArguments: readonly string[];
     readonly timeout: number;
-    readonly coverageTool?: string;
+    readonly coverageTool?: string | undefined;
     readonly maxParallelProjects?: number;
     readonly maxParallelTestFiles?: number;
     /** Optional .sln, .slnx or .slnf limiting the workspace's entry-point projects. */
-    readonly solution?: string;
+    readonly solution?: string | undefined;
+    /** Solutions that limit only the entry points inside their workspace folder (folder-level `testy.solution`). */
+    readonly solutions?: readonly { readonly file: string; readonly root: string }[] | undefined;
     /** Entry-point project globs; exclusions win over inclusions. */
     readonly projects?: { readonly include: readonly string[]; readonly exclude: readonly string[] };
 }
@@ -89,7 +93,7 @@ export interface ManualSelection {
     readonly groups: ReadonlySet<string>;
     readonly all?: boolean;
     readonly projects?: ReadonlySet<string>;
-    readonly exclude?: Omit<ManualSelection, 'exclude' | 'coverage'>;
+    readonly exclude?: Omit<ManualSelection, 'exclude' | 'coverage'> | undefined;
     readonly tests?: ReadonlyMap<string, ReadonlySet<string>>;
     readonly coverage?: boolean;
     /** Run without collection, one host at a time, each waiting for a debugger. */
@@ -141,13 +145,13 @@ interface RunContext {
     readonly config: EngineConfiguration;
     readonly projectLimit: number;
     readonly testLimit: number;
-    readonly manual?: ManualSelection;
+    readonly manual?: ManualSelection | undefined;
     readonly manualOperation: boolean;
     /** Automatic runs limited to the items of a continuous run. */
-    readonly scope?: RunScope;
+    readonly scope?: RunScope | undefined;
     readonly full: boolean;
     readonly newBaseline: boolean;
-    readonly baseline?: Baseline;
+    readonly baseline?: Baseline | undefined;
     readonly rootSnapshot: readonly string[];
     readonly processOptions: ProcessOptions;
     readonly changes: readonly string[];
@@ -172,7 +176,7 @@ interface BuildResult {
     readonly sdkByFile: ReadonlyMap<string, string>;
 }
 interface PreparedTests {
-    readonly coverageTool?: string;
+    readonly coverageTool?: string | undefined;
     sessions: RunnerSession;
     runtimeTreeChanged: boolean;
     liveIds: Set<string>;
@@ -220,11 +224,12 @@ export class TestEngine {
     private excludedAliases: readonly string[] = [];
     private readonly sdkContexts = new Set<string>();
     private readonly sdkChecks = new Map<string, Promise<void>>();
+    /** Every SDK check still running, including ones a reset or configuration change detached. */
+    private readonly sdkRunning = new Set<Promise<void>>();
+    private sdkAbort = new AbortController();
+    private sdkGeneration = 0;
     private readonly restored = new Set<string>();
-    private readonly runtime = new Map<string, Map<string, ReturnType<typeof discoveredTest>>>();
-    private readonly runtimeGroups = new Map<string, TestFile>();
-    private readonly knownCache = new Map<string, { discovered: TestFile['tests']; tests: TestFile['tests'] }>();
-    private readonly discoveredIds = new Map<string, ReadonlySet<string>>();
+    private readonly runtime = new RuntimeInventory();
     private readonly cache: CoverageCache;
     private readonly identity = randomUUID();
     private readonly preparedOutputs: PreparedOutputCache;
@@ -253,19 +258,12 @@ export class TestEngine {
     get inputVersion(): number { return this.inputTopology; }
     get knownFiles(): readonly string[] { return this.inputs; }
     get directories(): readonly string[] { return this.inputDirectories; }
-    get displayGroups(): readonly TestFile[] { return this.runtimeGroups.size ? [...this.groups, ...this.runtimeGroups.values()] : this.groups; }
+    get displayGroups(): readonly TestFile[] { return this.runtime.containers.size ? [...this.groups, ...this.runtime.containers.values()] : this.groups; }
     get baselineProgress(): { completed: number; total: number } | undefined {
         return this.baseline ? { completed: this.baseline.completed.size, total: this.groups.length } : undefined;
     }
 
-    knownTests(group: TestFile): readonly ReturnType<typeof discoveredTest>[] {
-        const runtime = this.runtime.get(group.id);
-        if (!runtime?.size) {return group.tests;}
-        const cached = this.knownCache.get(group.id);
-        if (cached?.discovered === group.tests) {return cached.tests;}
-        const tests = [...new Map([...group.tests, ...runtime.values()].map(test => [test.id, test])).values()];
-        this.knownCache.set(group.id, { discovered: group.tests, tests }); return tests;
-    }
+    knownTests(group: TestFile): readonly ReturnType<typeof discoveredTest>[] { return this.runtime.tests(group); }
 
     setRoots(roots: readonly string[]): void {
         this.roots = roots.map(normalizePath); this.topology++; this.structureDirty = true;
@@ -293,7 +291,7 @@ export class TestEngine {
         try {await this.cache.restore(this.coverage, signal);}
         catch (error) {
             signal?.throwIfAborted();
-            if ((error as Error)?.name === 'AbortError') {throw error;}
+            if (isAbortError(error)) {throw error;}
             this.options.events.output(`Coverage cache unavailable; starting a fresh baseline. ${String(error)}\n`);
         }
     }
@@ -321,7 +319,8 @@ export class TestEngine {
         this.initialized = false; this.baseline = undefined; this.structureDirty = true;
         this.shapes = new Map(); this.analyses = new Map(); this.analyzedHashes = new Map();
         this.analysisContext = undefined; this.aliasStamp = undefined;
-        this.sdkContexts.clear(); this.restored.clear(); this.toolIdentities.clear();
+        await this.stopSdkChecks();
+        this.restored.clear(); this.toolIdentities.clear();
         await this.publishCoverage(signal); await this.save(signal);
         this.options.events.output('Testy caches were reset; the next run establishes a new baseline.\n');
     }
@@ -331,8 +330,10 @@ export class TestEngine {
         if (!this.disposal) {
             this.disposed = true;
             for (const controller of this.operations.keys()) {controller.abort();}
+            this.sdkAbort.abort();
             this.disposal = (async () => {
                 await Promise.allSettled(this.operations.values());
+                await this.stopSdkChecks();
                 await disposeAnalyzerServers();
                 await this.projectEvaluations.dispose();
                 await this.preparedOutputs.dispose();
@@ -399,7 +400,7 @@ export class TestEngine {
         // A configuration override applies to this run only: evaluation, preparation and
         // build identities include the configuration, so nothing cached for another one is reused.
         const override = manual?.configuration?.trim() || undefined;
-        const config: EngineConfiguration = manual?.debug ? { ...configured, coverage: false, timeout: 7 * 24 * 60 * 60 * 1000, maxParallelTestFiles: 1 }
+        const config: EngineConfiguration = manual?.debug ? { ...configured, coverage: false, timeout: 7 * 24 * 60 * 60 * 1000, maxParallelTestFiles: 1, ...override ? { configuration: override } : {} }
             : { ...configured, coverage: (manual?.discoverOnly ? false : manual?.coverage) ?? configured.coverage, ...override ? { configuration: override } : {} };
         if (override && override !== configured.configuration) {events.output(`Testy build configuration for this run: ${override} (testy.buildConfiguration is ${configured.configuration}).\n`);}
         const projectLimit = resolveConcurrency(config.maxParallelProjects), testLimit = resolveTestFileConcurrency(config.maxParallelTestFiles);
@@ -422,7 +423,7 @@ export class TestEngine {
         const processOptions: ProcessOptions = { cwd: rootSnapshot[0] ?? this.options.storage, signal, output: events.output,
             timeoutMs: config.timeout, dotnetHost: config.dotnet, cleanupDescendants: false };
         const sourceChanges = await this.sources.refresh(this.sources.files, signal);
-        for (const file of [...batch.files.map(normalizePath), ...sourceChanges]) {this.pendingChanges.add(file);}
+        for (const file of [...await normalizePathsAsync(batch.files, signal), ...sourceChanges]) {this.pendingChanges.add(file);}
         const changes = [...this.pendingChanges];
         const structural = !!manual || this.structureDirty || newBaseline || changes.some(file => isConfigurationFile(file) || !this.index.hasSource(file) || !this.hashes.has(file));
         return { controller, signal, began, topology, configured, config, projectLimit, testLimit, manual, manualOperation, full, newBaseline, baseline,
@@ -433,11 +434,11 @@ export class TestEngine {
     private async refreshStructure(run: RunContext): Promise<void> {
         const { config, signal, manual, newBaseline, rootSnapshot, processOptions, projectLimit, changes, baseline } = run;
         const events = this.options.events;
-        if (newBaseline || changes.some(isConfigurationFile)) {this.sdkContexts.clear(); this.restored.clear();}
+        if (newBaseline || changes.some(isConfigurationFile)) {this.forgetSdkContexts(); this.restored.clear();}
         const selected = manual && !manual.all ? [...new Set([...manual.projects ?? [], ...this.displayGroups.filter(group => manual.groups.has(group.id)).map(group => group.project)])] : undefined;
         const filter = await filterEntryPoints(await findProjects(rootSnapshot, [...defaultExcludes, ...config.excludes], signal, 16,
             (directory, error) => events.output(`Skipping unreadable directory ${directory}: ${error.message}\n`)),
-        { solution: config.solution, include: config.projects?.include, exclude: config.projects?.exclude }, rootSnapshot, signal);
+        { solution: config.solution, solutions: config.solutions, include: config.projects?.include, exclude: config.projects?.exclude }, rootSnapshot, signal);
         const entryPoints = filter.entryPoints;
         // SDK selection can fail before MSBuild can describe any inputs.
         // Keep its candidate paths observable so a corrected pin can recover.
@@ -505,7 +506,7 @@ export class TestEngine {
         await this.sources.refresh(this.sources.files, signal);
         const eligible = new Set(this.projects.filter(isTestTarget).map(project => testTargetKey(project.file, project.framework)));
         const retained = this.groups.filter(group => eligible.has(testTargetKey(group.project, group.framework)));
-        if (retained.length !== this.groups.length || [...this.runtimeGroups.values()].some(group => !eligible.has(testTargetKey(group.project, group.framework)))) {
+        if (retained.length !== this.groups.length || [...this.runtime.containers.values()].some(group => !eligible.has(testTargetKey(group.project, group.framework)))) {
             // A library/reference can remain in the build graph without
             // remaining a test target. Retire it even if the next build fails.
             await this.reconcileGroups(retained, baseline);
@@ -589,7 +590,7 @@ export class TestEngine {
         const context = await sourceAnalysisContext(config.dotnet, this.options.analyzer, processOptions);
         const contextChanged = !context || context !== this.analysisContext;
         const shapeFiles = allFiles.filter(file => contextChanged || !this.analyses.get(file) || analysisHashes.get(file) !== this.analyzedHashes.get(file));
-        const candidates = [...this.sources.aliasSources].sort(([a], [b]) => a.localeCompare(b));
+        const candidates = [...this.sources.aliasSources].sort(([a], [b]) => compareCodeUnits(a, b));
         const stamp = contentHash(JSON.stringify(candidates)), aliasesChanged = contextChanged || stamp !== this.aliasStamp;
         let nextAnalyses: ReadonlyMap<string, SourceShape | null>;
         const nextHashes = new Map(contextChanged ? [] : this.analyzedHashes);
@@ -685,29 +686,13 @@ export class TestEngine {
                 target: project.contextId, sdk: built.sdkByFile.get(project.file),
                 contexts: buildOrder(this.buildGraph, new Set([project.file])).map(context => ({
                     id: context.contextId, file: context.file, framework: context.framework, assembly: context.assembly,
-                    properties: Object.entries(context.properties ?? {}).sort(([a], [b]) => a.localeCompare(b))
+                    properties: Object.entries(context.properties ?? {}).sort(([a], [b]) => compareCodeUnits(a, b))
                 }))
             }))])),
             buildInputs: new Map(this.projects.filter(project => project.isTestProject).map(project => [project.file,
                 [...new Set(buildOrder(this.projects, new Set([project.file])).flatMap(input => [...input.inputs ?? []]))]])),
             onResult: (group, result, test) => {
-                if (group.runtimeOnly) {
-                    if (!this.runtimeGroups.has(group.id)) {prepared.runtimeTreeChanged = true;}
-                    this.runtimeGroups.set(group.id, group);
-                } else {
-                    for (const [id, unknown] of this.runtimeGroups) {
-                        if (testTargetKey(group.project, group.framework) !== testTargetKey(unknown.project, unknown.framework)) {continue;}
-                        const runtime = this.runtime.get(id);
-                        if (runtime?.delete(result.id)) {
-                            this.knownCache.delete(id); prepared.runtimeTreeChanged = true;
-                            if (!runtime.size) {this.runtimeGroups.delete(id); this.runtime.delete(id);}
-                        }
-                    }
-                }
-                if (result.node && !this.discoveredIds.get(group.id)?.has(result.id)) {
-                    const nodes = this.runtime.get(group.id) ?? new Map<string, ReturnType<typeof discoveredTest>>(); nodes.set(result.id, test ?? discoveredTest(result.node as { uid: string })); this.runtime.set(group.id, nodes);
-                    this.knownCache.delete(group.id);
-                }
+                if (this.runtime.observe(group, result, test)) {prepared.runtimeTreeChanged = true;}
                 for (const observer of this.resultObservers) {observer(group, result);}
                 events.result(group, result);
             }, onStarted: events.started, onPrepared: events.prepared,
@@ -715,8 +700,9 @@ export class TestEngine {
             debug: manual?.debug ? events.debug : undefined
         };
         const sessions = prepared.sessions = state.sessions = new RunnerSession(runnerOptions);
-        const next = this.groups.filter(group => !testBuilds.some(project => project.file === group.project && project.framework === group.framework)
-            && this.projects.some(project => project.file === group.project && project.framework === group.framework && isTestTarget(project)));
+        const rebuilt = new Set(testBuilds.map(project => testTargetKey(project.file, project.framework)));
+        const targets = new Set(this.projects.filter(isTestTarget).map(project => testTargetKey(project.file, project.framework)));
+        const next = this.groups.filter(group => !rebuilt.has(testTargetKey(group.project, group.framework)) && targets.has(testTargetKey(group.project, group.framework)));
         let discoveredProjects = 0, activeDiscoveries = 0;
         const discoveryProgress = (): void => events.phase({ kind: 'preparingTests', completed: discoveredProjects, total: testBuilds.length, active: activeDiscoveries });
         let inventories: readonly (readonly TestFile[])[];
@@ -791,7 +777,8 @@ export class TestEngine {
         const { signal, config, configured, manual, manualOperation, baseline, changes, testLimit, topology, controller } = run;
         const { before, revision, obsoleteBuild } = built, { coverageTool, sessions, liveIds } = prepared, { selection } = selected;
         const events = this.options.events;
-        const batches: TestFile[][] = [];
+        // Each batch is one test target (project and framework), with at least one file.
+        const batches: [TestFile, ...TestFile[]][] = [];
         const originalGroups = new Map(this.groups.map(group => [group.id, group]));
         const projectGroups = new Map<string, TestFile[]>();
         for (const group of this.groups) {const key = testTargetKey(group.project, group.framework); const groups = projectGroups.get(key) ?? []; groups.push(group); projectGroups.set(key, groups);}
@@ -815,9 +802,10 @@ export class TestEngine {
         let available = !!coverageTool, failedBatches = 0;
         const commits = new SerialQueue();
         let completed = 0, active = 0;
-        const allowSecondary = !manual || (!manual.exclude && !manual.tests && ![...manual.groups].some(id => this.runtimeGroups.has(id)));
+        const allowSecondary = !manual || (!manual.exclude && !manual.tests && ![...manual.groups].some(id => this.runtime.containers.has(id)));
         const progress = (): void => events.phase({ kind: 'testing', completed, total: batches.length, active, ...baseline ? { learned: baseline.completed.size, learnedTotal: this.groups.length } : {} });
-        const commit = async (groups: readonly TestFile[], run: FileRun): Promise<void> => {
+        /** target: the batch's first requested file; the executed groups share its project and framework. */
+        const commit = async (target: TestFile, groups: readonly TestFile[], run: FileRun): Promise<void> => {
             signal.throwIfAborted();
             for (const group of groups) {executedFiles.add(group.id);}
             results.push(...run.results); available &&= run.coverageAvailable;
@@ -836,22 +824,11 @@ export class TestEngine {
             });
             if (complete) {
                 const reported = new Set(run.results.map(result => result.id));
-                let removed = false;
-                for (const group of groups) {
-                    runtimeResults.set(group.id, reported);
-                    const runtime = this.runtime.get(group.id);
-                    for (const id of runtime?.keys() ?? []) {if (!reported.has(id)) {runtime!.delete(id); this.knownCache.delete(group.id); removed = true;}}
-                }
-                const key = testTargetKey(groups[0].project, groups[0].framework), project = projectGroups.get(key);
-                if (project?.every(group => runtimeResults.has(group.id))) {
-                    const projectReported = new Set(project.flatMap(group => [...runtimeResults.get(group.id)!]));
-                    for (const [id, group] of this.runtimeGroups) {if (testTargetKey(group.project, group.framework) === key) {
-                        const runtime = this.runtime.get(id);
-                        for (const uid of runtime?.keys() ?? []) {if (!projectReported.has(uid)) {runtime!.delete(uid); this.knownCache.delete(id); removed = true;}}
-                        if (!runtime?.size) {this.runtimeGroups.delete(id); this.runtime.delete(id); this.knownCache.delete(id);}
-                    }}
-                }
-                prepared.runtimeTreeChanged ||= removed;
+                for (const group of groups) {runtimeResults.set(group.id, reported);}
+                // Containers are retired only once every file of the target has completed.
+                const project = projectGroups.get(testTargetKey(target.project, target.framework));
+                const targetReported = project?.every(group => runtimeResults.has(group.id)) ? new Set(project.flatMap(group => [...runtimeResults.get(group.id)!])) : undefined;
+                prepared.runtimeTreeChanged ||= this.runtime.retireUnreported(groups, reported, targetReported);
             } else {
                 // A partial manual run may reveal another deferred row, but
                 // cannot retire rows from an earlier complete checkpoint.
@@ -866,15 +843,15 @@ export class TestEngine {
                 else {
                     // The old aggregate cannot be split into file ownership.
                     // Retain it as history while publishing the new file trace.
-                    this.coverage.markHistorical(new Set([projectCoverageId(groups[0])]));
+                    this.coverage.markHistorical(new Set([projectCoverageId(target)]));
                 }
                 // Another configuration can compile different code (#if DEBUG, optimizations), so
                 // what it covered cannot narrow later selections: keep the trace, but not its trust.
                 await this.coverage.replaceAsync([config.configuration !== configured.configuration ? { ...run.trace, reliable: false } : run.trace], liveIds, signal);
                 if (revision !== this.sources.revision) {this.coverage.markStale(new Set([run.trace.groupId]));}
-                const aggregate = projectCoverageId(groups[0]);
+                const aggregate = projectCoverageId(target);
                 if (groups.length === 1 && this.coverage.traces.has(aggregate)
-                    && projectGroups.get(testTargetKey(groups[0].project, groups[0].framework))!.every(group => {
+                    && projectGroups.get(testTargetKey(target.project, target.framework))!.every(group => {
                         const trace = this.coverage.traces.get(group.id); return trace && !trace.stale;
                     })) {
                     liveIds.delete(aggregate); this.coverage.replace([], liveIds);
@@ -911,11 +888,11 @@ export class TestEngine {
                 let outcome: FileRun;
                 try {outcome = await sessions.run(requestedGroups, before, allowSecondary ? worker + 1 : 0);}
                 catch (error) {
-                    if (signal.aborted || error instanceof Cancelled || (error as Error)?.name === 'AbortError') {throw error;}
+                    if (signal.aborted || error instanceof Cancelled || isAbortError(error)) {throw error;}
                     await commits.run(() => fail(requestedGroups, error, reported));
                     completed++; return;
                 } finally {unsubscribe();}
-                await commits.run(() => commit(outcome.executedGroups, outcome));
+                await commits.run(() => commit(requestedGroups[0], outcome.executedGroups, outcome));
                 completed++;
             } finally {active--; progress();}
         }, () => controller.abort(), groups => allowSecondary && sessions.canRunParallel(groups));
@@ -954,18 +931,10 @@ export class TestEngine {
             const previous = oldGroups.get(group.id);
             return previous && previous.tests.map(test => test.id).sort().join('\0') !== group.tests.map(test => test.id).sort().join('\0');
         }).map(group => group.id));
-        for (const id of identitiesChanged) {baseline?.completed.delete(id); baseline?.runtimeResults.delete(id); this.runtime.delete(id); this.knownCache.delete(id);}
+        for (const id of identitiesChanged) {baseline?.completed.delete(id); baseline?.runtimeResults.delete(id);}
         this.coverage.invalidate(identitiesChanged); this.groups = next;
-        this.discoveredIds.clear();
-        for (const group of next) {this.discoveredIds.set(group.id, new Set(group.tests.map(test => test.id)));}
+        this.runtime.reconcile(next, identitiesChanged);
         const groupIds = new Set(next.map(group => group.id));
-        const targets = new Set(next.map(group => testTargetKey(group.project, group.framework)));
-        const changedTargets = new Set(next.filter(group => identitiesChanged.has(group.id)).map(group => testTargetKey(group.project, group.framework)));
-        for (const [id, group] of this.runtimeGroups) {
-            const key = testTargetKey(group.project, group.framework);
-            if (!targets.has(key) || changedTargets.has(key)) {this.runtimeGroups.delete(id);}
-        }
-        for (const id of this.runtime.keys()) {if (!groupIds.has(id) && !this.runtimeGroups.has(id)) {this.runtime.delete(id); this.knownCache.delete(id);}}
         for (const id of baseline?.completed ?? []) {if (!groupIds.has(id)) {baseline?.completed.delete(id);}}
         for (const id of baseline?.runtimeResults.keys() ?? []) {if (!groupIds.has(id)) {baseline?.runtimeResults.delete(id);}}
         const liveIds = new Set([...next.map(group => group.id), ...next.map(projectCoverageId)]);
@@ -973,26 +942,43 @@ export class TestEngine {
         return liveIds;
     }
 
-    /** One version check per SDK context, shared by concurrent callers. The check
-     * is not bound to any caller's cancellation; each caller stops waiting on its own. */
+    /** One version check per SDK context, shared by concurrent callers. The check is
+     * bound to the engine, not to any caller's cancellation (each caller stops waiting on
+     * its own); reset and disposal stop it. */
     private async ensureSdk(dotnet: string, options: ProcessOptions, sdkContext = options.cwd): Promise<void> {
         const key = `${dotnet}\0${sdkContext}`; if (this.sdkContexts.has(key)) {return;}
         let check = this.sdkChecks.get(key);
         if (!check) {
-            check = (async () => {
-                const version = requireSuccess(await runProcess(dotnet, ['--version'], { ...options, signal: undefined, output: undefined }), `Finding the .NET SDK for ${options.cwd}`).stdout.trim();
+            const signal = this.sdkAbort.signal, generation = this.sdkGeneration;
+            const pending = check = (async () => {
+                const version = requireSuccess(await runProcess(dotnet, ['--version'], { ...options, signal, output: undefined }), `Finding the .NET SDK for ${options.cwd}`).stdout.trim();
                 if (!/^\d+\./.test(version) || Number(version.split('.')[0]) < 10) {throw new Error(`Testy requires .NET SDK 10 or later; ${options.cwd} selects ${version}. Check its global.json.`);}
-                this.sdkContexts.add(key);
+                // A check detached by a reset or configuration change established nothing.
+                if (generation === this.sdkGeneration) {this.sdkContexts.add(key);}
             })();
-            const pending = check;
-            this.sdkChecks.set(key, pending);
-            void pending.then(() => this.sdkChecks.delete(key), () => this.sdkChecks.delete(key));
+            this.sdkChecks.set(key, pending); this.sdkRunning.add(pending);
+            const settle = (): void => {if (this.sdkChecks.get(key) === pending) {this.sdkChecks.delete(key);} this.sdkRunning.delete(pending);};
+            void pending.then(settle, settle);
         }
         await untilAborted(check, options.signal);
     }
 
+    /** Forget established SDK contexts; checks still running cannot establish theirs. */
+    private forgetSdkContexts(): void { this.sdkContexts.clear(); this.sdkChecks.clear(); this.sdkGeneration++; }
+
+    /** Stop every SDK check, wait for its process, and forget what the checks established. */
+    private async stopSdkChecks(): Promise<void> {
+        this.sdkAbort.abort(); this.forgetSdkContexts();
+        await Promise.allSettled([...this.sdkRunning]);
+        this.sdkAbort = new AbortController();
+    }
+
     private async ensureCoverageTool(config: EngineConfiguration, options: ProcessOptions): Promise<string> {
-        if (config.coverageTool) {await fs.access(config.coverageTool); return config.coverageTool;}
+        if (config.coverageTool) {
+            // Launches run in each project's directory, so a relative path would name a different file per project.
+            if (!path.isAbsolute(config.coverageTool)) {throw new Error(`testy.coverageToolPath must be an absolute path: ${config.coverageTool}`);}
+            await fs.access(config.coverageTool); return config.coverageTool;
+        }
         this.options.events.phase({ kind: 'settingUpCoverage' });
         return installCoverageTool(config.dotnet, this.options.tools, options);
     }

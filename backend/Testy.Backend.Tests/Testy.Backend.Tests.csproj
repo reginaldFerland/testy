@@ -1,20 +1,23 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <!-- Run by `npm run test:dotnet` only; the build:* scripts and the VSIX never touch it. -->
+  <!-- Run by `npm run test:dotnet` only; the build:* scripts and the VSIX never touch it.
+       xunit.v3 on Microsoft.Testing.Platform: the project is its own test runner executable. -->
   <PropertyGroup>
+    <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="xunit" Version="2.9.3" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.0.1" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <PackageReference Include="xunit.v3" />
     <!-- The helpers reference these without their runtime assets (the SDK supplies them); the tests need real copies. -->
-    <PackageReference Include="Microsoft.Build" Version="18.0.2" />
-    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.0.0" />
+    <PackageReference Include="Microsoft.Build" />
+    <PackageReference Include="Microsoft.Build.Utilities.Core" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Testy.Analysis\Testy.Analysis.csproj" />
     <ProjectReference Include="..\Testy.ProcessHost\Testy.ProcessHost.csproj" />
+    <!-- Copied beside the tests, which load it as a startup hook into a child process. -->
+    <ProjectReference Include="..\Testy.RuntimeObserver\Testy.RuntimeObserver.csproj" />
   </ItemGroup>
 </Project>

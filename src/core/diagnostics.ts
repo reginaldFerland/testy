@@ -21,6 +21,7 @@ export function parseBuildDiagnostic(line: string): BuildDiagnostic | undefined 
     const match = pattern.exec(line);
     if (!match) {return undefined;}
     const [, file, start, column, endLine, endColumn, severity, code, message, project] = match;
+    if (!file || !code || message === undefined) {return undefined;}
     return {
         file: file.trim(), line: Number(start), column: Number(column ?? 1),
         ...(endLine ? { endLine: Number(endLine), endColumn: Number(endColumn) } : {}),

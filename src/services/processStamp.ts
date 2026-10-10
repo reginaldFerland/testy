@@ -53,12 +53,16 @@ function processStart(pid: number): Promise<string | undefined> {
 
 let current: Promise<ProcessStamp> | undefined;
 export function currentProcessStamp(): Promise<ProcessStamp> {
-    return current ??= (async () => ({ pid: process.pid, boot: bootTime(), start: await processStart(process.pid) }))();
+    return current ??= (async () => {
+        const start = await processStart(process.pid);
+        return { pid: process.pid, boot: bootTime(), ...start === undefined ? {} : { start } };
+    })();
 }
 
 export function isProcessStamp(value: unknown): value is ProcessStamp {
-    const stamp = value as ProcessStamp;
-    return !!stamp && typeof stamp === 'object' && Number.isSafeInteger(stamp.pid) && stamp.pid > 0
+    if (typeof value !== 'object' || value === null) {return false;}
+    const stamp = value as { readonly [Key in keyof ProcessStamp]?: unknown };
+    return typeof stamp.pid === 'number' && Number.isSafeInteger(stamp.pid) && stamp.pid > 0
         && Number.isSafeInteger(stamp.boot) && (stamp.start === undefined || typeof stamp.start === 'string');
 }
 

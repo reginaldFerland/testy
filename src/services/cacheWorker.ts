@@ -25,14 +25,15 @@ type Outcome = { readonly value: unknown } | { readonly corrupt: true } | { read
 async function read(directory: string, limits: CacheLimits): Promise<CacheSnapshot> {
     const warnings: string[] = [];
     let complete = true;
-    const inventories = await Promise.all(['sources', 'traces'].map(async kind => {
+    type Inventory = { readonly kind: string; readonly names: readonly string[]; readonly warning: string | undefined };
+    const list = async (kind: string): Promise<Inventory> => {
         try {return { kind, names: (await fs.readdir(path.join(directory, kind))).filter(name => /^[a-f0-9]{64}\.json$/.test(name)), warning: undefined };}
         catch (error) {
             return { kind, names: [], warning: (error as NodeJS.ErrnoException).code !== 'ENOENT' ? `Unable to read the coverage cache: ${String(error)}` : undefined };
         }
-    }));
+    };
+    const [sourceInventory, traceInventory] = await Promise.all([list('sources'), list('traces')]);
     // Keep the newest traces within the limits. Order is otherwise inventory order.
-    const traceInventory = inventories[1];
     const aged = await mapConcurrent(traceInventory.names, 16, undefined, async name => {
         try {const stat = await fs.stat(path.join(directory, 'traces', name)); return { name, bytes: stat.size, mtimeMs: stat.mtimeMs };}
         catch {return { name, bytes: 0, mtimeMs: 0 };}
@@ -44,11 +45,11 @@ async function read(directory: string, limits: CacheLimits): Promise<CacheSnapsh
         if (full) {evicted.push(`traces/${item.name}`);} else {kept.add(item.name); used += item.bytes;}
     }
     const stats = new Map(aged.map(item => [item.name, { bytes: item.bytes, mtimeMs: item.mtimeMs }]));
-    const names = [inventories[0].names, traceInventory.names.filter(name => kept.has(name))];
+    const traceTable: Inventory = { ...traceInventory, names: traceInventory.names.filter(name => kept.has(name)) }, tables = [sourceInventory, traceTable];
     // One small pool spans both tables. Preserve inventory order, including
     // warnings, without creating a pending read for every record. No size cutoff:
     // every entry this version writes must be readable.
-    const records = await mapConcurrent(inventories.flatMap(({ kind }, index) => names[index].map(name => ({ kind, name }))), 4, undefined, async ({ kind, name }): Promise<Outcome> => {
+    const records = await mapConcurrent(tables.flatMap(({ kind, names }) => names.map(name => ({ kind, name }))), 4, undefined, async ({ kind, name }): Promise<Outcome> => {
         let contents: string;
         try {contents = await fs.readFile(path.join(directory, kind, name), 'utf8');}
         catch {return { warning: `Ignoring an unreadable coverage cache entry: ${name}` };}
@@ -56,18 +57,21 @@ async function read(directory: string, limits: CacheLimits): Promise<CacheSnapsh
         catch {return { corrupt: true };}
     });
     const corrupt: string[] = [];
-    let offset = 0, unreadableSources = false;
-    const [sourceValues, traceValues] = inventories.map((inventory, table) => {
-        if (inventory.warning) {warnings.push(inventory.warning); complete = false; if (table === 0) {unreadableSources = true;}}
+    // collect() sets unreadableSources; `as boolean` keeps the later read from narrowing to false.
+    let offset = 0, unreadableSources = false as boolean;
+    const collect = (table: Inventory, sources: boolean): { readonly name: string; readonly value: unknown }[] => {
+        if (table.warning) {warnings.push(table.warning); complete = false; if (sources) {unreadableSources = true;}}
         const values: { readonly name: string; readonly value: unknown }[] = [];
-        for (const name of names[table]) {
-            const record = records[offset++];
-            if ('warning' in record) {warnings.push(record.warning); complete = false; if (table === 0) {unreadableSources = true;}}
-            else if ('corrupt' in record) {warnings.push(`Discarding a corrupt coverage cache entry: ${name}`); corrupt.push(`${inventory.kind}/${name}`);}
+        for (const name of table.names) {
+            // records holds exactly one outcome per table name, in table order.
+            const record = records[offset++]!;
+            if ('warning' in record) {warnings.push(record.warning); complete = false; if (sources) {unreadableSources = true;}}
+            else if ('corrupt' in record) {warnings.push(`Discarding a corrupt coverage cache entry: ${name}`); corrupt.push(`${table.kind}/${name}`);}
             else {values.push({ name, value: record.value });}
         }
         return values;
-    });
+    };
+    const sourceValues = collect(sourceInventory, true), traceValues = collect(traceTable, false);
     // A record in the wrong file would be duplicated by the next save of its identity.
     const sourceIssues: string[] = [], malformed: string[] = [], dangling: string[] = [];
     const sources = sourceValues.filter(({ name, value }) => validSource(value) && name === `${value.id}.json` || (sourceIssues.push(name), false));
@@ -102,4 +106,4 @@ async function read(directory: string, limits: CacheLimits): Promise<CacheSnapsh
 const input = workerData as string | { directory: string; limits: CacheLimits };
 void (typeof input === 'string' ? read(input, defaultCacheLimits) : read(input.directory, input.limits)).then(snapshot => parentPort!.postMessage(snapshot,
     [...snapshot.sources.map(source => source.lines.buffer), ...snapshot.traces.flatMap(trace => [trace.sourceIds.buffer, ...trace.coverage.map(file => file.values.buffer)])] as ArrayBuffer[]))
-    .catch(error => {throw error;});
+    .catch((error: unknown) => {throw error;});

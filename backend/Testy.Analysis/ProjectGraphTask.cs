@@ -13,13 +13,19 @@ namespace Testy.Analysis;
 
 // Loaded by the selected SDK's MSBuild process, so SDK resolution and assembly
 // binding use that SDK rather than a bundled copy of MSBuild.
-public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
+[System.Diagnostics.CodeAnalysis.SuppressMessage("Design", "CA1001", Justification = "MSBuild may call Cancel at any time; a source without timers or a wait handle holds nothing to release.")]
+public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task, ICancelableTask
 {
+    // MSBuild calls Cancel on Ctrl+C or when the build is aborted (the extension kills the process tree on cancellation).
+    private readonly CancellationTokenSource cancellation = new();
+
     [Required] public string RequestFile { get; set; } = "";
     [Required] public string OutputFile { get; set; } = "";
 
     // MSBuild values keep the backslashes of the project's authoring platform.
     private static string FullPath(string value, string directory) => Path.GetFullPath(value.Replace('\\', Path.DirectorySeparatorChar), directory);
+
+    public void Cancel() => cancellation.Cancel();
 
     public override bool Execute()
     {
@@ -45,8 +51,11 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
                 // Resolver state is fingerprinted once via sharedInputs, and parsed
                 // import XML is still shared through the ProjectCollection.
                 var fileSystem = new EvaluationInputs(sharedInputs);
-                var project = Project.FromFile(projectFile, new ProjectOptions { GlobalProperties = properties, ProjectCollection = projects,
-                    EvaluationContext = EvaluationContext.Create(EvaluationContext.SharingPolicy.Shared, fileSystem) });
+                var project = Project.FromFile(projectFile, new ProjectOptions
+                {
+                    GlobalProperties = properties, ProjectCollection = projects,
+                    EvaluationContext = EvaluationContext.Create(EvaluationContext.SharingPolicy.Shared, fileSystem)
+                });
                 var instance = project.CreateProjectInstance();
                 try { evaluationInputs[instance] = fileSystem.Complete(project); }
                 catch (Exception error) { evaluationInputs[instance] = new(false, [], new Dictionary<string, string>(), [], [], "", $"{error.GetType().Name}: {error.Message}"); }
@@ -57,7 +66,7 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
                 // lifetime; parsed import XML stays cached for other projects.
                 projects.UnloadProject(project);
                 return instance;
-            }, concurrency, CancellationToken.None);
+            }, concurrency, cancellation.Token);
             static IEnumerable<ProjectGraphNode> Targets(ProjectGraphNode node) => string.IsNullOrEmpty(node.ProjectInstance.GetPropertyValue("TargetFramework"))
                 ? node.ProjectReferences.Where(child => child.ProjectInstance.FullPath == node.ProjectInstance.FullPath).SelectMany(Targets)
                 : [node];
@@ -142,6 +151,13 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task
                 .ToDictionary(node => identities[node], node => evaluationInputs[node.ProjectInstance]);
             File.WriteAllText(OutputFile, JsonSerializer.Serialize(new { projects, roots, evaluations }));
             return true;
+        }
+        // Not only OperationCanceledException: ProjectGraph can stop loading part-way and then fail
+        // looking up the nodes it skipped. Once cancelled, any failure is the cancellation.
+        catch (Exception) when (cancellation.IsCancellationRequested)
+        {
+            Log.LogError("The project graph evaluation was cancelled.");
+            return false;
         }
         catch (Exception error)
         {

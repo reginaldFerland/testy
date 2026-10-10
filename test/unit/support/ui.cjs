@@ -2,11 +2,11 @@ const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),{cre
 
 const out=path.resolve('out');
 // Modules that import `vscode` are evaluated against the stub; everything else loads normally.
-const stubbed=new Set(['extension','controller','ui/coverage','ui/statusBar','ui/testTree','ui/exportCoverage','ui/selectionCause','ui/baselineProgress']);
+const stubbed=new Set(['extension','controller','configuration','ui/coverage','ui/statusBar','ui/testTree','ui/exportCoverage','ui/selectionCause','ui/baselineProgress']);
 
 /**
  * Loads the compiled extension-host modules from out/ into one sandbox with a stub `vscode`.
- * `stubs` replaces modules by name (`configuration`, `node:path`); `globals` extends the sandbox.
+ * `stubs` replaces modules by name (`configuration`, `node:path`; `configuration: undefined` loads the real one); `globals` extends the sandbox.
  */
 function loadUi({vscode={},stubs={},globals={}}={}) {
  stubs={configuration:{},...stubs};
@@ -14,7 +14,7 @@ function loadUi({vscode={},stubs={},globals={}}={}) {
  const sandbox=vm.createContext({Buffer,setTimeout,clearTimeout,AbortController,...globals}),cache=new Map();
  const load=file=>{
   const key=path.relative(out,file).replace(/\\/g,'/').replace(/\.js$/,'');
-  if(key in stubs)return stubs[key];
+  if(stubs[key]!==undefined)return stubs[key];
   if(!stubbed.has(key))return createRequire(file)(file);
   if(cache.has(file))return cache.get(file).exports;
   const module={exports:{}};cache.set(file,module);

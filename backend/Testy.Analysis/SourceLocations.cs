@@ -27,17 +27,17 @@ static class SourceLocations
             var method = metadata.GetMethodDefinition(handle);
             var debug = pdb.GetMethodDebugInformation(handle.ToDebugInformationHandle());
             var points = debug.GetSequencePoints().Where(point => !point.IsHidden).ToArray();
-            if (points.Length == 0) {continue;}
+            if (points.Length == 0) { continue; }
             var point = points[0];
             var document = point.Document.IsNil ? debug.Document : point.Document;
-            if (document.IsNil) {continue;}
+            if (document.IsNil) { continue; }
             var kickoff = debug.GetStateMachineKickoffMethod();
-            if (!kickoff.IsNil) {method = metadata.GetMethodDefinition(kickoff);}
+            if (!kickoff.IsNil) { method = metadata.GetMethodDefinition(kickoff); }
             var type = TypeName(metadata, method.GetDeclaringType());
             var key = type + "." + metadata.GetString(method.Name);
             var location = new Location(pdb.GetString(pdb.GetDocument(document).Name), point.StartLine);
-            if (result.TryGetValue(key, out var previous) && previous?.File != location.File) {result[key] = null;}
-            else if (!result.ContainsKey(key)) {result[key] = location;}
+            if (result.TryGetValue(key, out var previous) && previous?.File != location.File) { result[key] = null; }
+            else if (!result.ContainsKey(key)) { result[key] = location; }
         }
         return result;
     }
@@ -49,7 +49,7 @@ static class SourceLocations
         var type = metadata.GetTypeDefinition(handle);
         var declaring = type.GetDeclaringType();
         var name = metadata.GetString(type.Name);
-        if (!declaring.IsNil) {return TypeName(metadata, declaring) + "+" + name;}
+        if (!declaring.IsNil) { return TypeName(metadata, declaring) + "+" + name; }
         var ns = metadata.GetString(type.Namespace);
         return string.IsNullOrEmpty(ns) ? name : ns + "." + name;
     }

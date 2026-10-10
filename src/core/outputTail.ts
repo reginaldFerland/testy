@@ -8,8 +8,9 @@ export class OutputTail {
     append(text: string): void {
         if (!text || this.limit <= 0) {return;}
         this.chunks.push(text); this.length += text.length;
+        // While length exceeds the limit, chunks[first] is a retained chunk.
         while (this.length > this.limit) {
-            const chunk = this.chunks[this.first], excess = this.length - this.limit;
+            const chunk = this.chunks[this.first]!, excess = this.length - this.limit;
             if (chunk.length <= excess) {this.length -= chunk.length; this.chunks[this.first++] = '';}
             else {this.chunks[this.first] = chunk.slice(excess); this.length -= excess;}
         }

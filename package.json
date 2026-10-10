@@ -36,7 +36,8 @@
   "activationEvents": [
     "workspaceContains:**/*.csproj",
     "workspaceContains:**/*.sln",
-    "workspaceContains:**/*.slnx"
+    "workspaceContains:**/*.slnx",
+    "workspaceContains:**/*.slnf"
   ],
   "extensionKind": [
     "workspace"
@@ -109,6 +110,24 @@
         "command": "testy.showMenu",
         "title": "%command.showMenu%",
         "category": "Testy"
+      },
+      {
+        "command": "testy.explainSelection",
+        "title": "%command.explainSelection%",
+        "category": "Testy",
+        "icon": "$(question)"
+      },
+      {
+        "command": "testy.excludeProject",
+        "title": "%command.excludeProject%",
+        "category": "Testy",
+        "icon": "$(exclude)"
+      },
+      {
+        "command": "testy.runFile",
+        "title": "%command.runFile%",
+        "category": "Testy",
+        "icon": "$(play)"
       }
     ],
     "menus": {
@@ -116,17 +135,17 @@
         {
           "command": "testy.runAffected",
           "when": "view == workbench.view.testing && testy.active",
-          "group": "navigation@testy1"
+          "group": "navigation@1"
         },
         {
           "command": "testy.pause",
           "when": "view == workbench.view.testing && testy.active && !testy.paused",
-          "group": "navigation@testy2"
+          "group": "navigation@2"
         },
         {
           "command": "testy.resume",
           "when": "view == workbench.view.testing && testy.active && testy.paused",
-          "group": "navigation@testy2"
+          "group": "navigation@2"
         },
         {
           "command": "testy.refreshTests",
@@ -193,6 +212,51 @@
         {
           "command": "testy.showMenu",
           "when": "testy.active"
+        },
+        {
+          "command": "testy.explainSelection",
+          "when": "false"
+        },
+        {
+          "command": "testy.excludeProject",
+          "when": "false"
+        },
+        {
+          "command": "testy.runFile",
+          "when": "testy.active && resourceScheme == file && resourceExtname == .cs"
+        }
+      ],
+      "testing/item/context": [
+        {
+          "command": "testy.explainSelection",
+          "when": "controllerId == testy && testy.active",
+          "group": "testy@1"
+        },
+        {
+          "command": "testy.excludeProject",
+          "when": "controllerId == testy && testy.active && testId =~ /^project:/",
+          "group": "testy@2"
+        }
+      ],
+      "testing/message/context": [
+        {
+          "command": "testy.showOutput",
+          "when": "testMessage == testy.failure && testy.active",
+          "group": "testy@1"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "testy.runFile",
+          "when": "testy.active && resourceScheme == file && resourceExtname == .cs",
+          "group": "testy@1"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "testy.runFile",
+          "when": "testy.active && resourceScheme == file && resourceExtname == .cs",
+          "group": "testy@1"
         }
       ]
     },
@@ -263,7 +327,7 @@
           "type": "string",
           "default": "",
           "markdownDescription": "%config.solution%",
-          "scope": "window",
+          "scope": "resource",
           "order": 6
         },
         "testy.projects.include": {
@@ -273,7 +337,7 @@
             "type": "string"
           },
           "markdownDescription": "%config.projects.include%",
-          "scope": "window",
+          "scope": "resource",
           "order": 7
         },
         "testy.projects.exclude": {
@@ -283,7 +347,7 @@
             "type": "string"
           },
           "markdownDescription": "%config.projects.exclude%",
-          "scope": "window",
+          "scope": "resource",
           "order": 8
         },
         "testy.fileWatcherPattern": {
@@ -300,14 +364,14 @@
             "type": "string"
           },
           "markdownDescription": "%config.exclude%",
-          "scope": "window",
+          "scope": "resource",
           "order": 10
         },
         "testy.buildConfiguration": {
           "type": "string",
           "default": "Debug",
           "markdownDescription": "%config.buildConfiguration%",
-          "scope": "window",
+          "scope": "resource",
           "order": 11
         },
         "testy.maxParallelProjects": {
@@ -340,7 +404,7 @@
             "type": "string"
           },
           "markdownDescription": "%config.testArguments%",
-          "scope": "window",
+          "scope": "resource",
           "order": 15
         },
         "testy.timeoutSeconds": {
@@ -368,6 +432,13 @@
           "markdownDescription": "%config.additionalConfigurations%",
           "scope": "window",
           "order": 18
+        },
+        "testy.debugConfiguration": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "%config.debugConfiguration%",
+          "scope": "resource",
+          "order": 19
         }
       }
     },
@@ -444,11 +515,11 @@
     "build:analyzer": "node -e \"require('fs').rmSync('dist/analyzer', { recursive: true, force: true })\" && dotnet build backend/Testy.Analysis/Testy.Analysis.csproj --configuration Release --output dist/analyzer --nologo",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint && npm run typecheck:tests",
-    "lint": "eslint src test *.mjs",
+    "lint": "eslint src test *.mjs .vscode-test.mjs",
     "typecheck:tests": "tsc -p tsconfig.tests.json",
     "test": "node --test test/unit/*.test.cjs",
     "test:integration": "npm run compile && node --test test/integration/*.test.cjs",
-    "test:dotnet": "dotnet test backend/Testy.Backend.Tests --nologo",
+    "test:dotnet": "cd backend && dotnet test --project Testy.Backend.Tests",
     "test:extension": "vscode-test",
     "package": "vsce package",
     "benchmark": "npm run compile && node test/performance/benchmark.cjs",
@@ -456,29 +527,43 @@
     "l10n:export": "npx @vscode/l10n-dev export --outDir ./l10n ./src"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/mocha": "^10.0.10",
-    "@types/node": "20.x",
-    "@types/vscode": "^1.99.0",
+    "@types/node": "^20.19.43",
+    "@types/vscode": "~1.99.1",
     "@vscode/l10n-dev": "^0.0.35",
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^3.1.0",
-    "@vscode/vsce": "^3.9.2",
+    "@vscode/vsce": "^4.0.0",
     "esbuild": "^0.28.2",
-    "eslint": "^9.25.1",
+    "eslint": "^9.39.5",
     "fast-xml-parser": "^5.11.1",
     "minimatch": "^10.2.6",
-    "typescript": "^5.8.3",
+    "typescript": "~5.9.3",
     "typescript-eslint": "^8.71.1",
     "vscode-jsonrpc": "^9.0.2"
   },
   "capabilities": {
     "untrustedWorkspaces": {
-      "supported": false,
-      "description": "%capabilities.untrusted%"
+      "supported": "limited",
+      "description": "%capabilities.untrusted%",
+      "restrictedConfigurations": [
+        "testy.dotnetPath",
+        "testy.coverageToolPath",
+        "testy.testArguments",
+        "testy.solution",
+        "testy.debugConfiguration",
+        "testy.buildConfiguration",
+        "testy.additionalConfigurations"
+      ]
     },
     "virtualWorkspaces": {
       "supported": false,
       "description": "%capabilities.virtual%"
     }
+  },
+  "overrides": {
+    "serialize-javascript": "^7.0.5",
+    "diff": "^8.0.3"
   }
 }

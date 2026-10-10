@@ -45,6 +45,7 @@ class AnalyzerServer {
     private signalFailure: (error: Error) => void = () => undefined;
     private nextId = 1;
     private partial: string[] = [];
+    private partialLength = 0;
     private idle?: NodeJS.Timeout;
     private started = false;
     private gone = false;
@@ -52,7 +53,7 @@ class AnalyzerServer {
     closed = false;
 
     constructor(command: string, args: readonly string[], env: NodeJS.ProcessEnv, private readonly idleMs: number, startupMs: number,
-        private readonly cancelMs: number, private readonly onClosed: () => void) {
+        private readonly cancelMs: number, private readonly maxLine: number, private readonly onClosed: () => void) {
         this.ready = new Promise<void>((resolve, reject) => {this.signalReady = resolve; this.signalFailure = reject;});
         void this.ready.catch(() => undefined);
         // A neutral working directory never locks the workspace (Windows) and requests carry their own.
@@ -84,14 +85,27 @@ class AnalyzerServer {
     get hasStarted(): boolean { return this.started; }
     get busy(): boolean { return this.pending.size > 0; }
 
+    /** Lines are bounded: a peer that never ends one would otherwise grow the buffer without limit. */
     private receive(text: string): void {
-        this.partial.push(text);
-        if (!text.includes('\n')) {return;}
-        const lines = this.partial.join('').split('\n');
-        this.partial = [lines.pop()!];
+        if (this.overflowed) {return;}
+        this.partial.push(text); this.partialLength += text.length;
+        if (!text.includes('\n')) {
+            if (this.partialLength > this.maxLine) {this.overflow();}
+            return;
+        }
+        const lines = this.partial.join('').split('\n'), rest = lines.pop()!;
+        this.partial = [rest]; this.partialLength = rest.length;
         for (const line of lines) {
+            if (line.length > this.maxLine) {this.overflow(); return;}
             if (line.length) {this.line(line);}
         }
+        if (rest.length > this.maxLine) {this.overflow();}
+    }
+
+    private overflowed = false;
+    private overflow(): void {
+        this.overflowed = true; this.partial = []; this.partialLength = 0;
+        this.terminate(new AnalyzerServerUnavailable(`The analyzer server sent a line longer than ${this.maxLine} characters.`), false);
     }
 
     private line(line: string): void {
@@ -216,6 +230,8 @@ export interface AnalyzerServerOptions {
     readonly cancelMs?: number;
     /** Servers kept at once; idle least recently used ones are stopped beyond this. */
     readonly limit?: number;
+    /** Longest protocol line, in characters; a longer one stops the server. */
+    readonly maxLineLength?: number;
 }
 
 /** Servers keyed by everything that can change an analysis: the host, the helper
@@ -224,9 +240,12 @@ export class AnalyzerServers {
     private readonly servers = new Map<string, AnalyzerServer>();
     private readonly failedUntil = new Map<string, number>();
     private readonly idleMs: number; private readonly startupMs: number; private readonly retryMs: number; private readonly cancelMs: number; private readonly limit: number;
+    private readonly maxLine: number;
     constructor(options: AnalyzerServerOptions = {}) {
         this.idleMs = options.idleMs ?? 120_000; this.startupMs = options.startupMs ?? 30_000;
         this.retryMs = options.retryMs ?? 30_000; this.cancelMs = options.cancelMs ?? 3000; this.limit = options.limit ?? 4;
+        // Far above real responses, and well below V8's maximum string length.
+        this.maxLine = options.maxLineLength ?? 256 * 1024 * 1024;
     }
 
     get size(): number { return this.servers.size; }
@@ -263,7 +282,7 @@ export class AnalyzerServers {
     }
 
     private start(key: string, command: string, args: readonly string[], env: NodeJS.ProcessEnv): AnalyzerServer {
-        const server: AnalyzerServer = new AnalyzerServer(command, args, env, this.idleMs, this.startupMs, this.cancelMs, () => {
+        const server: AnalyzerServer = new AnalyzerServer(command, args, env, this.idleMs, this.startupMs, this.cancelMs, this.maxLine, () => {
             if (this.servers.get(key) === server) {this.servers.delete(key);}
         });
         this.servers.set(key, server);

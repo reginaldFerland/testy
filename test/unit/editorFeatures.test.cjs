@@ -143,4 +143,5 @@ test('failure messages use assertion diffs, stack frames and the failing workspa
  assert.equal(message.location.uri.fsPath,test);assert.equal(message.location.range.line,11);
  const plain=exports.failureMessage({message:'Boom',stack:'unparseable stack'},item,[workspace]);
  assert.equal(plain.message,'Boom\n\nunparseable stack');assert.equal(plain.expectedOutput,undefined);assert.equal(plain.location.range,item.range);
+ assert.deepEqual([message.contextValue,plain.contextValue],['testy.failure','testy.failure'],'failure messages can carry testing/message/context menu items');
 });

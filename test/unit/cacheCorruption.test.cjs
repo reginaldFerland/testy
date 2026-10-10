@@ -90,3 +90,19 @@ test('records are flushed to disk before they are published',async t=>{
  assert.ok(events.includes('open directory'));
  assert.ok(events.lastIndexOf('open directory')>events.indexOf('rename traces'),'the directory is synced after the final rename');
 });
+
+test('the writer epoch is replaced atomically without syncing, while records still sync before publication',async t=>{
+ const f=await fixture(t),a=source(0),b=source(1),events=[];
+ const open=fs.open;
+ fs.open=async function(file,...args){const handle=await open.call(this,file,...args);
+  if(String(file).endsWith('.tmp')){const sync=handle.sync;handle.sync=function(...a){events.push(`sync ${path.basename(path.dirname(String(file)))}`);return sync.apply(this,a);};}
+  else if(args[0]==='r'){events.push(`directory ${path.basename(String(file))}`);}
+  return handle;};
+ try{await f.cache.save(delta([a,b],[trace('one',[a]),trace('two',[b])]),t.signal);}finally{fs.open=open;}
+ assert.ok(!events.includes('sync coverage-v2'),'the epoch is not synced');
+ assert.ok(!events.includes('directory coverage-v2'),'the cache root holds only the epoch and is not synced');
+ assert.equal(events.filter(event=>event==='sync sources').length,2);assert.equal(events.filter(event=>event==='sync traces').length,2);
+ assert.equal(JSON.parse(await fs.readFile(path.join(f.directory,'epoch.json'),'utf8')),f.cache.epoch);
+ const restored=new CoverageStore();await new CoverageCache(f.root,()=>undefined).restore(restored,t.signal);
+ assert.deepEqual([...restored.traces.keys()].sort(),['one','two']);
+});

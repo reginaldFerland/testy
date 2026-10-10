@@ -1,7 +1,7 @@
 import * as fs from 'node:fs/promises';
 import { contentHash, isGeneratedSource, sourceText } from '../core/paths';
 
-interface SourceState { readonly stamp: string; readonly hash?: string; readonly analysisHash?: string; readonly generated: boolean; readonly aliasSource?: string; }
+interface SourceState { readonly stamp: string; readonly hash: string | undefined; readonly analysisHash: string | undefined; readonly generated: boolean; readonly aliasSource: string | undefined; }
 
 /** Cheap candidate check for `global using` directives; Roslyn interprets escapes and disabled branches later.
  * Comments are blanked, so prose and commented-out directives do not retain full sources. */
@@ -18,7 +18,9 @@ export class SourceTracker {
     private tracked = new Set<string>();
     private readonly classifications = new Map<string, { generated: boolean; version: number }>();
     private classificationVersion = 0;
-    private derived?: { readonly analysisHashes: ReadonlyMap<string, string>; readonly aliasSources: ReadonlyMap<string, string> };
+    private derived: { readonly analysisHashes: ReadonlyMap<string, string>; readonly aliasSources: ReadonlyMap<string, string> } | undefined;
+    /** Refreshes apply in start order; see refresh(). */
+    private refreshing: Promise<unknown> = Promise.resolve();
     revision = 0;
 
     get hashes(): ReadonlyMap<string, string> { return this.current; }
@@ -57,7 +59,23 @@ export class SourceTracker {
         this.revision++;
     }
 
-    async refresh(files: readonly string[], signal?: AbortSignal): Promise<readonly string[]> {
+    /** Refreshes are serialized: overlapping ones (event handling, run phases, commits) would
+     * otherwise apply in completion order, so a slow older read could replace newer hashes.
+     * A caller that is cancelled while queued stops waiting at once. */
+    refresh(files: readonly string[], signal?: AbortSignal): Promise<readonly string[]> {
+        if (signal?.aborted) {return Promise.reject(signal.reason as Error);}
+        const result = this.refreshing.then(() => this.refreshNow(files, signal));
+        this.refreshing = result.catch(() => undefined);
+        if (!signal) {return result;}
+        return new Promise((resolve, reject) => {
+            const abort = (): void => reject(signal.reason);
+            signal.addEventListener('abort', abort, { once: true });
+            result.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+        });
+    }
+
+    private async refreshNow(files: readonly string[], signal?: AbortSignal): Promise<readonly string[]> {
+        signal?.throwIfAborted();
         const queue = [...new Set([...files, ...this.dirty])].filter(file => this.known.has(file));
         const updates = new Map<string, SourceState | undefined>();
         const transient = new Set<string>();
@@ -101,6 +119,8 @@ export class SourceTracker {
             changed.push(file);
         }
         for (const [file, state] of updates) {
+            // setFiles may have retired it while this refresh read it.
+            if (!this.known.has(file)) {continue;}
             if (this.current.get(file) !== state?.hash) {
                 changed.push(file); hashes ??= new Map(this.current);
                 if (state?.hash) {hashes.set(file, state.hash);} else {hashes.delete(file);}
@@ -109,7 +129,7 @@ export class SourceTracker {
                 this.states.set(file, state);
                 if ((this.classifications.get(file)?.version ?? 0) <= classificationVersion) {this.observeGenerated(file, state.generated);}
             }
-            else if (this.states.get(file)?.generated) {this.states.set(file, { stamp: '', generated: true });}
+            else if (this.states.get(file)?.generated) {this.states.set(file, { stamp: '', hash: undefined, analysisHash: undefined, generated: true, aliasSource: undefined });}
             else {this.states.delete(file);}
         }
         if (revision === this.revision) {for (const file of queue) {if (!transient.has(file)) {this.dirty.delete(file);}}}

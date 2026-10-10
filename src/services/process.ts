@@ -21,9 +21,9 @@ export interface ProcessResult {
 
 export interface ProcessOptions {
     readonly cwd: string;
-    readonly signal?: AbortSignal;
-    readonly env?: NodeJS.ProcessEnv;
-    readonly output?: (text: string) => void;
+    readonly signal?: AbortSignal | undefined;
+    readonly env?: NodeJS.ProcessEnv | undefined;
+    readonly output?: ((text: string) => void) | undefined;
     readonly timeoutMs?: number;
     readonly dotnetHost?: string;
     /** Build commands may leave shared compiler servers; test processes may not. */
@@ -33,7 +33,7 @@ export interface ProcessOptions {
 export interface OwnedProcess {
     readonly child: ChildProcess;
     readonly done: Promise<ProcessResult>;
-    readonly interruption?: Error;
+    readonly interruption?: Error | undefined;
     stop(): void;
 }
 

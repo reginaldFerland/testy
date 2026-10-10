@@ -64,7 +64,7 @@ test('declaration analysis distinguishes executable edits from compile-time depe
   directive:original.replace('return x + 1;','\n#pragma warning disable\nreturn x + 1;'),
   invalid:'public class {'
  };
- const files={};
+ const files=/** @type {Record<string,string>} */({});
  for(const [name,source] of Object.entries(variants)) {
   const file=normalizePath(path.join(directory,`${name}.cs`));files[name]=file;
   await fs.writeFile(file,source);
@@ -93,7 +93,7 @@ test('partial exclusions cross namespace styles, generic/nested types and partia
  assert.notEqual(after.get(implementation),before.get(implementation));
  assert.equal(after.get(ordinary),before.get(ordinary),'ordinary partial classes must retain narrow selection');
  const isolated=resolveShapes(new Map([...initial,...changed]),[{sourceFiles:[excluded]},{sourceFiles:[implementation,ordinary]}]);
- assert.equal(isolated.get(implementation),initial.get(implementation).signature,'same-named types in unrelated projects do not share exclusions');
+ assert.equal(isolated.get(implementation),initial.get(implementation)?.signature,'same-named types in unrelated projects do not share exclusions');
  await fs.writeFile(excluded,'namespace N { public partial class Outer<T> { public partial class Inner { [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage] public partial int Value(); } } }');
  const member=await sourceAnalyses('dotnet',analyzer,[excluded],directory,options);
  assert.equal(resolveShapes(new Map([...initial,...member])).get(implementation),before.get(implementation),'a partial member attribute must cover its implementation');

@@ -27,8 +27,9 @@ export interface EvaluationInputs {
 export const evaluationInputs = new WeakMap<readonly Project[], readonly EvaluationInputs[]>();
 export interface EvaluationEntry {
     readonly graph: readonly Project[]; readonly inputs: readonly EvaluationInputs[]; readonly context: string; readonly stamp: string;
-    /** Canonical graph files mapped to the original captured input spellings. */
-    readonly projectInputs?: Readonly<Record<string, string>>;
+    /** Canonical graph files mapped to the original captured input spellings; absent
+     * without storage, or when a spelling could not be captured (such entries are not saved). */
+    readonly projectInputs?: Readonly<Record<string, string>> | undefined;
 }
 const missing = (error: unknown): boolean => ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '');
 const lexical = (value: string): string => process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value);
@@ -58,14 +59,16 @@ export async function evaluationToolContext(dotnet: string, analyzer: string, di
             if (!executable) {throw new Error('The configured .NET host could not be resolved.');}
             return fingerprint(executable);
         });
-        const unique = [...new Set(hosts)];
-        if (unique.length !== 1) {return undefined;}
-        const executable = unique[0].split('\0')[0], root = path.dirname(executable), bytes = await fs.readFile(executable, { signal });
+        const unique = [...new Set(hosts)], [host] = unique;
+        if (unique.length !== 1 || !host) {return undefined;}
+        const [executable] = host.split('\0');
+        if (!executable) {return undefined;}
+        const root = path.dirname(executable), bytes = await fs.readFile(executable, { signal });
         if (!['dotnet', 'dotnet.exe'].includes(path.basename(executable).toLowerCase()) || !isNativeExecutable(bytes)
             || !(await fs.stat(path.join(root, 'sdk'))).isDirectory() || !(await fs.stat(path.join(root, 'host', 'fxr'))).isDirectory()) {return undefined;}
         const analyzerIdentity = await fingerprint(analyzer);
         signal?.throwIfAborted();
-        return { key: digest(JSON.stringify([unique[0], analyzerIdentity])), root };
+        return { key: digest(JSON.stringify([host, analyzerIdentity])), root };
     } catch {signal?.throwIfAborted(); return undefined;}
 }
 
@@ -143,7 +146,7 @@ class Validation {
     private realPath(file: string): Promise<string> {
         const previous = this.realPaths.get(file);
         if (previous) {return previous;}
-        const pending = fs.realpath(file).catch(error => {if (missing(error)) {return 'missing';} throw error;});
+        const pending = fs.realpath(file).catch((error: unknown) => {if (missing(error)) {return 'missing';} throw error;});
         this.realPaths.set(file, pending); return pending;
     }
     query(query: EvaluationQuery, excluded: readonly string[]): Promise<string> {
@@ -229,7 +232,7 @@ class Validation {
 export class ProjectEvaluationCache {
     private readonly entries = new Map<string, EvaluationEntry>();
     private readonly replacements = new Map<string, number>();
-    private live?: ReadonlySet<string>;
+    private live: ReadonlySet<string> | undefined;
     private loaded = false;
     private revision = 0;
     private dirty = false;
@@ -253,6 +256,8 @@ export class ProjectEvaluationCache {
         try {
             const snapshot = await readEvaluationSnapshot(this.storage, this.limits, signal);
             signal?.throwIfAborted();
+            // A concurrent load can finish during the read.
+            // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
             if (!snapshot || this.loaded || revision !== this.revision) {return;}
             // A concurrent admission/retirement wins over an older disk read.
             for (const [file, entry] of snapshot.entries) {

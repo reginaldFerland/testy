@@ -16,7 +16,8 @@ const decodeXml = (value: string): string => value.replace(/&(lt|gt|quot|apos|am
 export function parseSln(content: string, directory: string): SolutionProjects {
     const projects: string[] = [];
     for (const match of content.matchAll(/^\s*Project\("[^"]*"\)\s*=\s*"[^"]*"\s*,\s*"([^"]+)"/gm)) {
-        if (isProject(match[1])) {projects.push(resolve(directory, match[1]));}
+        const [, file] = match;
+        if (file && isProject(file)) {projects.push(resolve(directory, file));}
     }
     return { projects };
 }
@@ -25,7 +26,7 @@ export function parseSln(content: string, directory: string): SolutionProjects {
 export function parseSlnx(content: string, directory: string): SolutionProjects {
     const projects: string[] = [];
     for (const match of content.replace(/<!--[\s\S]*?-->/g, '').matchAll(/<Project\b[^>]*?\bPath\s*=\s*(["'])(.*?)\1/g)) {
-        const file = decodeXml(match[2]);
+        const file = decodeXml(match[2] ?? '');
         if (isProject(file)) {projects.push(resolve(directory, file));}
     }
     return { projects };

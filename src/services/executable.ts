@@ -108,12 +108,31 @@ export async function resolveNodeExecutable(command: string, env: NodeJS.Process
     return undefined;
 }
 
+/** Successful owned-command resolutions, keyed by command and search path. Each test host
+ * resolves several commands, so a short expiry still removes most repeated PATH scans
+ * while a reinstalled or moved tool is found again within seconds. */
+const ownedCommands = new Map<string, { readonly resolved: Promise<string>; readonly expires: number }>();
+const ownedCommandLimit = 32, ownedCommandTtlMs = 30_000;
+
 /** Resolve a bare command for a launch that must never search the workspace: the
  * Windows owner's CreateProcess would try the current directory before PATH.
  * Explicit paths pass through; bare names resolve on PATH alone. */
-export async function resolveOwnedCommand(command: string, env: NodeJS.ProcessEnv | undefined, cwd: string): Promise<string> {
-    if (process.platform !== 'win32' || /[/\\]/.test(command) || path.isAbsolute(command)) {return command;}
-    const search = processEnvironmentValue({ ...process.env, ...env }, 'PATH') ?? '';
+export function resolveOwnedCommand(command: string, env: NodeJS.ProcessEnv | undefined, cwd: string): Promise<string> {
+    if (process.platform !== 'win32' || /[/\\]/.test(command) || path.isAbsolute(command)) {return Promise.resolve(command);}
+    const effective = { ...process.env, ...env };
+    const search = processEnvironmentValue(effective, 'PATH') ?? '';
+    const key = JSON.stringify([command, search, processEnvironmentValue(effective, 'PATHEXT') ?? null]), now = Date.now();
+    const cached = ownedCommands.get(key);
+    if (cached && cached.expires > now) {return cached.resolved;}
+    const resolved = searchOwnedCommand(command, search, cwd);
+    ownedCommands.delete(key); ownedCommands.set(key, { resolved, expires: now + ownedCommandTtlMs });
+    if (ownedCommands.size > ownedCommandLimit) {ownedCommands.delete(ownedCommands.keys().next().value!);}
+    // A failure is reported to its callers only; the next launch searches again.
+    void resolved.catch(() => {if (ownedCommands.get(key)?.resolved === resolved) {ownedCommands.delete(key);}});
+    return resolved;
+}
+
+async function searchOwnedCommand(command: string, search: string, cwd: string): Promise<string> {
     const dot = command.indexOf('.', 1);
     const names = dot >= 0 && dot < command.length - 1 ? [command] : [`${command}.com`, `${command}.exe`];
     for (const directory of search.split(path.delimiter)) {

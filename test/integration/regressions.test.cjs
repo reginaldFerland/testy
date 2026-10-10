@@ -789,7 +789,7 @@ test('retiring a test target also removes unmapped runtime rows and remembered i
  const runtime=f.engine.displayGroups.find(group=>group.runtimeOnly);assert.ok(runtime);assert.ok(f.engine.knownTests(runtime).length);
  const project=f.file('ImpactDemo.Tests/ImpactDemo.Tests.csproj');
  await fs.writeFile(project,'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup></Project>');
- assert.equal((await f.run([project])).tests,0);assert.equal(f.engine.displayGroups.length,0);assert.equal(f.engine.runtime.size,0);assert.equal(f.engine.knownCache.size,0);assert.equal(f.engine.coverage.traces.size,0);
+ assert.equal((await f.run([project])).tests,0);assert.equal(f.engine.displayGroups.length,0);assert.equal(f.engine.runtime.rows.size,0);assert.equal(f.engine.runtime.known.size,0);assert.equal(f.engine.coverage.traces.size,0);
 });
 
 test('removing a workspace test folder stops execution while its referenced project still builds',{timeout:90000},async t=>{

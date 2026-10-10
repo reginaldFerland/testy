@@ -30,54 +30,54 @@ internal sealed partial class EvaluationInputs : MSBuildFileSystemBase
         {
             try
             {
-            // Capture before any graph project is evaluated. The same original
-            // resolver bytes/inventory are validated again by every cache hit.
-            var dotnetRoot = Path.GetDirectoryName(Path.GetDirectoryName(Sdk))!;
-            var resolverDirectory = Path.Combine(Sdk, "SdkResolvers");
-            var captured = new HashSet<string>(); var queries = new List<Query>(); string? unsupported = null;
-            foreach (var folder in new[] { Path.Combine(dotnetRoot, "sdk-manifests"), Path.Combine(dotnetRoot, "metadata", "workloads"), resolverDirectory })
-            {
-                var exists = Directory.Exists(folder); queries.Add(new("directory", folder, null, false, [exists ? "true" : "false"]));
-                if (!exists) { continue; }
-                var inventory = Directory.GetFiles(folder, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal).ToArray();
-                queries.Add(new("files", folder, "*", true, inventory)); captured.UnionWith(inventory);
-            }
-            var sdkFiles = Directory.GetFiles(Sdk).Order(StringComparer.Ordinal).ToArray();
-            queries.Add(new("files", Sdk, "*", false, sdkFiles));
-            queries.Add(new("directories", Path.GetDirectoryName(Sdk)!, "*", false, Directory.GetDirectories(Path.GetDirectoryName(Sdk)!).Order(StringComparer.Ordinal).ToArray()));
-            if (Directory.Exists(resolverDirectory) && Directory.GetDirectories(resolverDirectory).FirstOrDefault(folder => Path.GetFileName(folder)
-                is not ("Microsoft.Build.NuGetSdkResolver" or "Microsoft.NET.Sdk.WorkloadMSBuildSdkResolver")) is { } unknown) { unsupported ??= $"Unrecognized SDK resolver: {unknown}"; }
-            var pending = new Stack<string>();
-            foreach (var descriptor in captured.Where(file => Within(file, resolverDirectory) && Path.GetExtension(file).Equals(".xml", StringComparison.OrdinalIgnoreCase)).ToArray())
-            {
-                var resolverPath = XDocument.Load(descriptor).Root?.Element("Path")?.Value;
-                if (string.IsNullOrWhiteSpace(resolverPath)) { unsupported ??= $"SDK resolver manifest has no Path: {descriptor}"; continue; }
-                var assembly = Path.GetFullPath(resolverPath.Replace('\\', Path.DirectorySeparatorChar), Path.GetDirectoryName(descriptor)!);
-                if (!Within(assembly, Sdk)) { unsupported ??= $"SDK resolver outside the SDK: {assembly}"; continue; }
-                pending.Push(assembly);
-            }
-            var assemblies = new HashSet<string>();
-            while (pending.TryPop(out var assembly))
-            {
-                if (!assemblies.Add(assembly)) { continue; }
-                captured.Add(assembly);
-                using var stream = System.IO.File.OpenRead(assembly); using var image = new PEReader(stream);
-                if (!image.HasMetadata) { unsupported ??= $"SDK resolver has no metadata: {assembly}"; continue; }
-                var metadata = image.GetMetadataReader();
-                foreach (var reference in metadata.AssemblyReferences)
+                // Capture before any graph project is evaluated. The same original
+                // resolver bytes/inventory are validated again by every cache hit.
+                var dotnetRoot = Path.GetDirectoryName(Path.GetDirectoryName(Sdk))!;
+                var resolverDirectory = Path.Combine(Sdk, "SdkResolvers");
+                var captured = new HashSet<string>(); var queries = new List<Query>(); string? unsupported = null;
+                foreach (var folder in new[] { Path.Combine(dotnetRoot, "sdk-manifests"), Path.Combine(dotnetRoot, "metadata", "workloads"), resolverDirectory })
                 {
-                    var name = metadata.GetString(metadata.GetAssemblyReference(reference).Name) + ".dll";
-                    var adjacent = Path.Combine(Path.GetDirectoryName(assembly)!, name); var sdkFile = Path.Combine(Sdk, name);
-                    if (System.IO.File.Exists(adjacent)) { pending.Push(adjacent); }
-                    else if (System.IO.File.Exists(sdkFile)) { pending.Push(sdkFile); }
+                    var exists = Directory.Exists(folder); queries.Add(new("directory", folder, null, false, [exists ? "true" : "false"]));
+                    if (!exists) { continue; }
+                    var inventory = Directory.GetFiles(folder, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal).ToArray();
+                    queries.Add(new("files", folder, "*", true, inventory)); captured.UnionWith(inventory);
                 }
-                var deps = Path.ChangeExtension(assembly, ".deps.json");
-                if (System.IO.File.Exists(deps)) { captured.Add(deps); }
-            }
-            captured.Add(Path.Combine(Sdk, "Microsoft.Build.dll")); captured.Add(Path.Combine(Sdk, "MSBuild.dll"));
-            captured.Add(Path.Combine(dotnetRoot, OperatingSystem.IsWindows() ? "dotnet.exe" : "dotnet"));
-            foreach (var file in captured) { _ = Hash(file); }
-            ResolverFiles = captured.ToArray(); ResolverQueries = queries.ToArray(); Unsupported = unsupported; ReusableResolvers = unsupported is null;
+                var sdkFiles = Directory.GetFiles(Sdk).Order(StringComparer.Ordinal).ToArray();
+                queries.Add(new("files", Sdk, "*", false, sdkFiles));
+                queries.Add(new("directories", Path.GetDirectoryName(Sdk)!, "*", false, Directory.GetDirectories(Path.GetDirectoryName(Sdk)!).Order(StringComparer.Ordinal).ToArray()));
+                if (Directory.Exists(resolverDirectory) && Directory.GetDirectories(resolverDirectory).FirstOrDefault(folder => Path.GetFileName(folder)
+                    is not ("Microsoft.Build.NuGetSdkResolver" or "Microsoft.NET.Sdk.WorkloadMSBuildSdkResolver")) is { } unknown) { unsupported ??= $"Unrecognized SDK resolver: {unknown}"; }
+                var pending = new Stack<string>();
+                foreach (var descriptor in captured.Where(file => Within(file, resolverDirectory) && Path.GetExtension(file).Equals(".xml", StringComparison.OrdinalIgnoreCase)).ToArray())
+                {
+                    var resolverPath = XDocument.Load(descriptor).Root?.Element("Path")?.Value;
+                    if (string.IsNullOrWhiteSpace(resolverPath)) { unsupported ??= $"SDK resolver manifest has no Path: {descriptor}"; continue; }
+                    var assembly = Path.GetFullPath(resolverPath.Replace('\\', Path.DirectorySeparatorChar), Path.GetDirectoryName(descriptor)!);
+                    if (!Within(assembly, Sdk)) { unsupported ??= $"SDK resolver outside the SDK: {assembly}"; continue; }
+                    pending.Push(assembly);
+                }
+                var assemblies = new HashSet<string>();
+                while (pending.TryPop(out var assembly))
+                {
+                    if (!assemblies.Add(assembly)) { continue; }
+                    captured.Add(assembly);
+                    using var stream = System.IO.File.OpenRead(assembly); using var image = new PEReader(stream);
+                    if (!image.HasMetadata) { unsupported ??= $"SDK resolver has no metadata: {assembly}"; continue; }
+                    var metadata = image.GetMetadataReader();
+                    foreach (var reference in metadata.AssemblyReferences)
+                    {
+                        var name = metadata.GetString(metadata.GetAssemblyReference(reference).Name) + ".dll";
+                        var adjacent = Path.Combine(Path.GetDirectoryName(assembly)!, name); var sdkFile = Path.Combine(Sdk, name);
+                        if (System.IO.File.Exists(adjacent)) { pending.Push(adjacent); }
+                        else if (System.IO.File.Exists(sdkFile)) { pending.Push(sdkFile); }
+                    }
+                    var deps = Path.ChangeExtension(assembly, ".deps.json");
+                    if (System.IO.File.Exists(deps)) { captured.Add(deps); }
+                }
+                captured.Add(Path.Combine(Sdk, "Microsoft.Build.dll")); captured.Add(Path.Combine(Sdk, "MSBuild.dll"));
+                captured.Add(Path.Combine(dotnetRoot, OperatingSystem.IsWindows() ? "dotnet.exe" : "dotnet"));
+                foreach (var file in captured) { _ = Hash(file); }
+                ResolverFiles = captured.ToArray(); ResolverQueries = queries.ToArray(); Unsupported = unsupported; ReusableResolvers = unsupported is null;
             }
             catch (Exception exception)
             {

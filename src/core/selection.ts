@@ -30,7 +30,7 @@ export function uniformCauses(groups: readonly TestFile[], kind: SelectionCause[
     return new Map(groups.map(group => [group.id, cause]));
 }
 
-interface CauseEntry { kind: SelectionCause['kind']; reason?: FallbackReason; files: string[]; count: number }
+interface CauseEntry { kind: SelectionCause['kind']; reason: FallbackReason | undefined; files: string[]; count: number }
 
 /** Collects the changes behind each selected group, keeping only the first few files. */
 class CauseLog {
@@ -91,8 +91,8 @@ export class ProjectIndex {
             for (const owner of owners ?? this.projectIds) {affected.add(owner);}
         }
         const queue = [...affected];
-        for (let index = 0; index < queue.length; index++) {
-            for (const dependent of this.dependents.get(queue[index]) ?? []) {
+        for (const project of queue) {
+            for (const dependent of this.dependents.get(project) ?? []) {
                 if (!affected.has(dependent)) {affected.add(dependent); queue.push(dependent);}
             }
         }

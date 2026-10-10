@@ -12,7 +12,7 @@ const {CoverageStore}=require('../../out/core/coverage'),{normalizePath}=require
   const aggregation=store.summarizeAsync(hashes);await new Promise(resolve=>setImmediate(resolve));
   const context={host:{disposed:false,config:{showCoverage:true},lifetime:new AbortController()},engine:{coverage:store,hashes},decorations:{covered:{},uncovered:{},stale:{}}};
   let decorated=0,last=performance.now(),gap=0;
-  const editor={document:{uri:{fsPath:file},lineCount:1000,isDirty:true},setDecorations(_kind,entries){decorated+=entries.length;}};
+  const editor={document:{uri:{fsPath:file},lineCount:1000,isDirty:true},setDecorations(/** @type {unknown} */_kind,/** @type {unknown[]} */entries){decorated+=entries.length;}};
   const timer=setInterval(()=>{const now=performance.now();gap=Math.max(gap,now-last);last=now;},1);
   const start=performance.now();const pending=coverageView.prototype.decorate.call(context,[editor]);const synchronousMs=performance.now()-start;
   try{await pending;await aggregation;}finally{clearInterval(timer);}

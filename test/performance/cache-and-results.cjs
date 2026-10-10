@@ -19,12 +19,12 @@ const {CoverageStore}=require(path.join(repo,'out/core/coverage')),{CoverageCach
   }
   const enginePath=path.join(repo,'out/services/engine.js'),realRequire=createRequire(enginePath);
   for(const count of [5000,10000,20000]){
-   let groups,callbackMs;
-   const exports={};
+   /** @type {any[]} */let groups=[];let callbackMs=0;
+   const exports=/** @type {Record<string,any>} */({});
    class Session{
-    constructor(options){this.options=options;}
+    constructor(/** @type {any} */options){this.options=options;}
     async discover(){return groups;}
-    async run(selected){
+    async run(/** @type {any[]} */selected){
      const results=[];const start=performance.now();
      for(const group of selected)for(const test of group.tests){const result={id:test.id,name:test.name,outcome:'passed',node:test.node};this.options.onResult(group,result);results.push(result);}
      callbackMs=performance.now()-start;
@@ -32,14 +32,14 @@ const {CoverageStore}=require(path.join(repo,'out/core/coverage')),{CoverageCach
     }
     async dispose(){}
    }
-   vm.runInNewContext(sync.readFileSync(enginePath,'utf8'),{exports,require:name=>name==='./projects'?{...realRequire(name),evaluateProject:async()=>[project]}:name==='./runner'?{...realRequire(name),RunnerSession:Session}:name==='./process'?{...realRequire(name),runProcess:async()=>({code:0,stdout:'10.0.400',stderr:''})}:realRequire(name)});
+   vm.runInNewContext(sync.readFileSync(enginePath,'utf8'),{exports,require:(/** @type {string} */name)=>name==='./projects'?{...realRequire(name),evaluateProject:async()=>[project]}:name==='./runner'?{...realRequire(name),RunnerSession:Session}:name==='./process'?{...realRequire(name),runProcess:async()=>({code:0,stdout:'10.0.400',stderr:''})}:realRequire(name)});
    const project={file:path.join(temp,'Tests.csproj'),assembly:path.join(temp,'Tests.dll'),framework:'net10.0',sourceFiles:[],references:[],isTestProject:true};
    groups=[{id:'g',project:project.file,framework:project.framework,assembly:project.assembly,file:path.join(temp,'Tests.cs'),tests:Array.from({length:count},(_,i)=>({id:`case-${i}`,name:`Case ${i}`,node:{uid:`case-${i}`}}))}];
    Object.defineProperty(groups[0].tests,'some',{value:()=>{throw new Error('Live classification scanned discovered tests');}});
    const engine=new exports.TestEngine({roots:[temp],storage:temp,tools:temp,analyzer:'',configuration:()=>({dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:false,excludes:[],testArguments:[],timeout:60000}),events:{output(){},phase(){},discovered(){},selected(){},result(){},started(){},coverage(){},invalidated(){}}});
    engine.initialized=true;engine.structureDirty=false;engine.projects=[project];engine.groups=groups;engine.cache.save=async()=>{};
    await engine.run({files:[],full:false},new AbortController().signal,{groups:new Set(['g']),coverage:false});
-   if(engine.runtime.size)throw new Error('Known results were classified as new runtime IDs');
+   if(engine.runtime.rows.size)throw new Error('Known results were classified as new runtime IDs');
    console.log(JSON.stringify({kind:'engine-result-callback',casesInOneFile:count,callbackMs,scope:'actual engine onResult callback with process and runner I/O mocked; no UI'}));
   }
  }finally{await fs.rm(temp,{recursive:true,force:true});}

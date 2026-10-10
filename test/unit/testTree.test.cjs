@@ -9,11 +9,11 @@ function uiPrototype(vscode={},pathApi=path) {return loadUi({vscode,stubs:{'node
 
 test('tree refresh reuses unchanged children, updates locations and removes runtime results',async()=>{
  let replacements=0,created=0;
- function collection(){return{values:[],replace(values){replacements++;this.values=[...values];},add(value){this.values.push(value);}};}
- const proto=uiPrototype({Uri:{file:fsPath=>({fsPath})},Range:class{constructor(line){this.line=line;}}});
+ function collection(){return{values:/** @type {unknown[]} */([]),replace(/** @type {unknown[]} */values){replacements++;this.values=[...values];},add(/** @type {unknown} */value){this.values.push(value);}};}
+ const proto=uiPrototype({Uri:{file:(/** @type {string} */fsPath)=>({fsPath})},Range:class{constructor(/** @type {number} */line){this.line=line;}}});
  const context={items:new Map(),testIds:new Map(),treeFiles:new Map(),treeProjects:new Map(),treeRoots:[],outcomes:new Map(),passed:0,failed:0,
-  engine:{knownTests:g=>g.tests},host:{disposed:false,activeRun:undefined,roots:[],updateStatus(){}},setOutcome:proto.setOutcome,item:proto.item,
-  controller:{items:collection(),createTestItem(id,label,uri){created++;return{id,label,uri,children:collection()};}}};
+  engine:{knownTests:(/** @type {{tests:unknown[]}} */g)=>g.tests},host:{disposed:false,activeRun:undefined,roots:[],updateStatus(){}},setOutcome:proto.setOutcome,item:proto.item,
+  controller:{items:collection(),createTestItem(/** @type {string} */id,/** @type {string} */label,/** @type {unknown} */uri){created++;return{id,label,uri,tags:[],children:collection()};}}};
  const group={id:'g',project:'/Tests.csproj',framework:'net10.0',file:'/Tests.cs',tests:Array.from({length:2000},(_,i)=>({id:`t${i}`,name:`case ${i}`,file:'/Tests.cs',line:i+1}))};
  let completed=false;const first=proto.update.call(context,[group]).then(()=>completed=true);await turn();assert.equal(completed,false,'large groups yield before publication completes');await first;
  const before=replacements,child=context.items.get('g:t0');await proto.update.call(context,[group]);await proto.update.call(context,[{...group,tests:group.tests.map(t=>({...t}))}]);
@@ -28,8 +28,8 @@ test('tree refresh reuses unchanged children, updates locations and removes runt
 
 test('tree items reuse Windows URI paths with native separators',()=>{
  let created=0;
- const proto=uiPrototype({Uri:{file:file=>({fsPath:path.win32.normalize(file)})}},path.win32);
- const context={items:new Map(),controller:{createTestItem(id,label,uri){created++;return{id,label,uri};}}};
+ const proto=uiPrototype({Uri:{file:(/** @type {string} */file)=>({fsPath:path.win32.normalize(file)})}},path.win32);
+ const context={items:new Map(),controller:{createTestItem(/** @type {string} */id,/** @type {string} */label,/** @type {unknown} */uri){created++;return{id,label,uri,tags:[]};}}};
  const original=proto.item.call(context,'case','case','c:/workspace/Tests.cs');
  assert.equal(original.uri.fsPath,'c:\\workspace\\Tests.cs');
  assert.equal(proto.item.call(context,'case','renamed','c:/workspace/Tests.cs'),original);assert.equal(original.label,'renamed');assert.equal(created,1);

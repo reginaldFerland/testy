@@ -35,14 +35,17 @@ export async function readCache(directory: string, signal?: AbortSignal, limits:
             const sourceIds: string[] = [];
             for (const index of trace.sourceIds) {
                 if (++converted % 4096 === 0) {await yieldTurn(); signal?.throwIfAborted();}
-                sourceIds.push(sources[index].id);
+                const source = sources[index];
+                if (!source) {throw new Error('The coverage cache reader returned a trace with an unknown source.');}
+                sourceIds.push(source.id);
             }
             const coverage = [];
             for (const file of trace.coverage) {
                 const lines: CoveredLine[] = [];
-                for (let index = 0; index < file.values.length; index += 2) {
+                // Values are (line, hits) pairs; the bound covers both reads.
+                for (let index = 0; index + 1 < file.values.length; index += 2) {
                     if (++converted % 4096 === 0) {await yieldTurn(); signal?.throwIfAborted();}
-                    lines.push({ line: file.values[index], hits: file.values[index + 1] });
+                    lines.push({ line: file.values[index]!, hits: file.values[index + 1]! });
                 }
                 coverage.push({ file: file.file, hash: file.hash, lines });
             }

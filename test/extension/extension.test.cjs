@@ -6,6 +6,11 @@ const path = require('node:path');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 
+/**
+ * @template T
+ * @param {() => T} predicate
+ * @param {string} description
+ */
 async function until(predicate, description, timeout=90000) {
  const start=Date.now();
  while(Date.now()-start<timeout) {
@@ -15,6 +20,20 @@ async function until(predicate, description, timeout=90000) {
  throw new Error(`Timed out: ${description}`);
 }
 
+/** The extension's API; snapshot() reports its state for these tests. */
+async function activate() {
+ const extension=vscode.extensions.getExtension('reginaldFerland.testy');
+ assert.ok(extension);
+ return extension.activate();
+}
+
+/** The test workspace's folder. */
+function workspaceRoot() {
+ const folder=vscode.workspace.workspaceFolders?.[0];
+ assert.ok(folder,'The extension tests need a workspace folder.');
+ return folder.uri;
+}
+
 suite('Testy in VS Code',()=>{
  test('automatically baselines, reacts to saves, retains coverage and pauses',async()=>{
   const extension=vscode.extensions.getExtension('reginaldFerland.testy');
@@ -22,20 +41,24 @@ suite('Testy in VS Code',()=>{
   const api=await extension.activate();
   assert.ok(api?.snapshot);
   const snapshot=()=>api.snapshot();
+  // A new workspace asks before its first baseline; a manual run also starts it.
+  await until(()=>snapshot().awaitingBaseline || snapshot().error,'baseline question');
+  assert.equal(snapshot().summary,undefined,'nothing runs before the user agrees');
+  await vscode.commands.executeCommand('testy.runAffected');
   await until(()=>snapshot().summary || snapshot().error,'initial baseline');
   assert.equal(snapshot().error,'',snapshot().error);
   assert.equal(snapshot().summary.tests,3);
   assert.equal(snapshot().groups.length,2);
   assert.equal(snapshot().summary.coverageAvailable,true);
   assert.match(snapshot().status,/3 passed/);
-  const greeting=snapshot().coverage.find(file=>file.file.endsWith('/Greeting.cs'));
+  const greeting=snapshot().coverage.find(/** @param {{file:string}} file */file=>file.file.endsWith('/Greeting.cs'));
   assert.ok(greeting?.covered>0);assert.equal(greeting.stale,false);
-  const root=vscode.workspace.workspaceFolders[0].uri;
+  const root=workspaceRoot();
   const file=vscode.Uri.joinPath(root,'ImpactDemo','Arithmetic.cs');
   const document=await vscode.workspace.openTextDocument(file);
   await vscode.window.showTextDocument(document);
   const original=document.getText();
-  const replace=async text=>{
+  const replace=async(/** @type {string} */text)=>{
    const edit=new vscode.WorkspaceEdit();
    edit.replace(document.uri,new vscode.Range(document.positionAt(0),document.positionAt(document.getText().length)),text);
    assert.equal(await vscode.workspace.applyEdit(edit),true);
@@ -50,7 +73,7 @@ suite('Testy in VS Code',()=>{
    await until(()=>snapshot().summary?.failed===2 || snapshot().error,'affected failing run');
    assert.equal(snapshot().error,'',snapshot().error);
    assert.equal(snapshot().summary.files,1);assert.equal(snapshot().summary.tests,2);
-   assert.deepEqual(snapshot().coverage.find(file=>file.file.endsWith('/Greeting.cs')),greeting);
+   assert.deepEqual(snapshot().coverage.find(/** @param {{file:string}} file */file=>file.file.endsWith('/Greeting.cs')),greeting);
    assert.match(snapshot().status,/2 failed/);
    await vscode.commands.executeCommand('testy.toggleAutoRun');
    await until(()=>snapshot().paused,'pause');
@@ -101,8 +124,8 @@ suite('Testy in VS Code',()=>{
  });
 
  test('filesystem mode observes edits, renames and deletion of externally linked source',async()=>{
-  const api=await vscode.extensions.getExtension('reginaldFerland.testy').activate(), snapshot=()=>api.snapshot();
-  const root=vscode.workspace.workspaceFolders[0].uri.fsPath, settings=vscode.workspace.getConfiguration('testy');
+  const api=await activate(), snapshot=()=>api.snapshot();
+  const root=workspaceRoot().fsPath, settings=vscode.workspace.getConfiguration('testy');
   await until(()=>!snapshot().running && !/waiting/.test(snapshot().status),'previous run to settle');
   let previous=snapshot().summary;
   await settings.update('runMode','affected',vscode.ConfigurationTarget.Workspace);
@@ -113,7 +136,7 @@ suite('Testy in VS Code',()=>{
   const source=path.join(root,'ImpactDemo','Arithmetic.cs'),project=path.join(root,'ImpactDemo','ImpactDemo.csproj');
   const original=await fs.readFile(source,'utf8'),originalProject=await fs.readFile(project,'utf8');
   let linked=path.join(external,'Arithmetic.cs');
-  const include=file=>originalProject.replace('</Project>',`<ItemGroup><Compile Include="${file.replace(/&/g,'&amp;').replace(/"/g,'&quot;')}" Link="Arithmetic.cs" /></ItemGroup></Project>`);
+  const include=(/** @type {string} */file)=>originalProject.replace('</Project>',`<ItemGroup><Compile Include="${file.replace(/&/g,'&amp;').replace(/"/g,'&quot;')}" Link="Arithmetic.cs" /></ItemGroup></Project>`);
   try{
    previous=snapshot().summary;
    await fs.rename(source,linked);await fs.writeFile(project,include(linked));
@@ -140,16 +163,16 @@ suite('Testy in VS Code',()=>{
   }
  });
  test('saves track handwritten generator markers and shared compiler configuration',async()=>{
-  const api=await vscode.extensions.getExtension('reginaldFerland.testy').activate(),snapshot=()=>api.snapshot();
-  const root=vscode.workspace.workspaceFolders[0].uri.fsPath,settings=vscode.workspace.getConfiguration('testy');
+  const api=await activate(),snapshot=()=>api.snapshot();
+  const root=workspaceRoot().fsPath,settings=vscode.workspace.getConfiguration('testy');
   await settings.update('autoRun',false,vscode.ConfigurationTarget.Workspace);
   await until(()=>snapshot().paused&&!snapshot().running,'pause for save fixtures');
   await settings.update('trigger','save',vscode.ConfigurationTarget.Workspace);
   const source=path.join(root,'ImpactDemo/Greeting.cs'),config=path.join(root,'.editorconfig');
   const original=await fs.readFile(source,'utf8'),previousConfig=await fs.readFile(config,'utf8').catch(()=>undefined);
   const marked=original+'\ninternal static class GeneratorMarkers { public const string Header = "<auto-generated/>"; public static void Unused() { int unused; } }';
-  const contents=severity=>`root = true\n[*.cs]\ndotnet_diagnostic.CS0168.severity = ${severity}\n`;
-  const save=async(document,text)=>{
+  const contents=(/** @type {string} */severity)=>`root = true\n[*.cs]\ndotnet_diagnostic.CS0168.severity = ${severity}\n`;
+  const save=async(/** @type {vscode.TextDocument} */document,/** @type {string} */text)=>{
    const edit=new vscode.WorkspaceEdit();edit.replace(document.uri,new vscode.Range(document.positionAt(0),document.positionAt(document.getText().length)),text);
    assert.equal(await vscode.workspace.applyEdit(edit),true);assert.equal(await document.save(),true);
   };
@@ -179,8 +202,8 @@ suite('Testy in VS Code',()=>{
   }
  });
  test('new external inputs recover from failed builds and UTF-16 generated saves stay excluded',async()=>{
-  const api=await vscode.extensions.getExtension('reginaldFerland.testy').activate(),snapshot=()=>api.snapshot();
-  const root=vscode.workspace.workspaceFolders[0].uri.fsPath,settings=vscode.workspace.getConfiguration('testy');
+  const api=await activate(),snapshot=()=>api.snapshot();
+  const root=workspaceRoot().fsPath,settings=vscode.workspace.getConfiguration('testy');
   await settings.update('autoRun',false,vscode.ConfigurationTarget.Workspace);await until(()=>snapshot().paused&&!snapshot().running,'pause for failed-build fixture');
   const external=await fs.mkdtemp(path.join(os.tmpdir(),'testy failed linked '));
   const source=path.join(root,'ImpactDemo','Arithmetic.cs'),project=path.join(root,'ImpactDemo','ImpactDemo.csproj'),linked=path.join(external,'Arithmetic.cs');
@@ -200,7 +223,7 @@ suite('Testy in VS Code',()=>{
    await settings.update('trigger','save',vscode.ConfigurationTarget.Workspace);await new Promise(resolve=>setTimeout(resolve,400));
    await until(()=>!snapshot().running&&!/waiting/.test(snapshot().status),'save settings to settle');previous=snapshot().summary;
    const document=await vscode.workspace.openTextDocument(generated);assert.match(document.getText(),/<auto-generated/);
-   const save=async text=>{
+   const save=async(/** @type {string} */text)=>{
     const edit=new vscode.WorkspaceEdit();edit.replace(document.uri,new vscode.Range(document.positionAt(0),document.positionAt(document.getText().length)),text);
     assert.equal(await vscode.workspace.applyEdit(edit),true);assert.equal(await document.save(),true);
    };

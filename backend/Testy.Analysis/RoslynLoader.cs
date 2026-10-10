@@ -55,16 +55,7 @@ static class RoslynLoader
                 {
                     if (Inspect(Path.Combine(sdk, "Roslyn", "bincore"), minimum, problems) is { } candidate) { candidates.Add(candidate with { Sdk = Path.GetFileName(sdk) }); }
                 }
-                // The SDK line this helper was built against first, stable before preview,
-                // then the newest Roslyn, then the newest SDK.
-                var best = candidates
-                    .OrderByDescending(candidate => candidate.Roslyn.Major == minimum.Major)
-                    .ThenByDescending(candidate => !candidate.Sdk.Contains('-'))
-                    .ThenByDescending(candidate => candidate.Roslyn)
-                    .ThenByDescending(candidate => SdkVersion(candidate.Sdk))
-                    .ThenByDescending(candidate => candidate.Sdk, StringComparer.Ordinal)
-                    .FirstOrDefault();
-                if (best is not null) { return chosen = best.Directory; }
+                if (Best(candidates, minimum) is { } best) { return chosen = best.Directory; }
             }
             throw Unavailable(minimum, problems);
         }
@@ -90,9 +81,19 @@ static class RoslynLoader
         }
     }
 
-    sealed record Candidate(string Directory, Version Roslyn, string Sdk = "");
+    internal sealed record Candidate(string Directory, Version Roslyn, string Sdk = "");
 
-    static Candidate? Inspect(string directory, Version minimum, List<string> problems)
+    // The SDK line this helper was built against first, stable before preview,
+    // then the newest Roslyn, then the newest SDK.
+    internal static Candidate? Best(IEnumerable<Candidate> candidates, Version minimum) => candidates
+        .OrderByDescending(candidate => candidate.Roslyn.Major == minimum.Major)
+        .ThenByDescending(candidate => !candidate.Sdk.Contains('-'))
+        .ThenByDescending(candidate => candidate.Roslyn)
+        .ThenByDescending(candidate => SdkVersion(candidate.Sdk))
+        .ThenByDescending(candidate => candidate.Sdk, StringComparer.Ordinal)
+        .FirstOrDefault();
+
+    internal static Candidate? Inspect(string directory, Version minimum, List<string> problems)
     {
         try
         {

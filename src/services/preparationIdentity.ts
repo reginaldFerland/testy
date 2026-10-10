@@ -6,7 +6,7 @@ import { preparationToolIdentity } from './preparedOutputCache';
 
 interface PreparationTools extends Pick<ProcessOptions, 'signal' | 'dotnetHost' | 'cleanupDescendants'> {
     readonly dotnet: string;
-    readonly coverageTool?: string;
+    readonly coverageTool?: string | undefined;
     readonly analyzer?: string;
 }
 
