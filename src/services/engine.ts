@@ -4,7 +4,8 @@ import { CoverageStore } from '../core/coverage';
 import { EngineConfiguration, Project, TestFile, TestResult } from '../core/model';
 import { ChangeBatch } from '../core/scheduler';
 import { ProjectIndex, selectTests, Selection } from '../core/selection';
-import { isConfigurationFile, normalizePath, normalizePathsAsync } from '../core/paths';
+import { defaultExcludes, isExcluded, normalizePath, normalizePathsAsync } from '../core/paths';
+import { consumesChanges, FailingTests, isStructuralChange, needsSourceSweep, TestOutcome, TestOutcomes } from '../core/runPolicy';
 import { ProcessOptions, Shutdown } from './process';
 import { projectCoverageId, RunnerSession } from './runner';
 import { disposeAnalyzerServers, SourceShape } from './analysis';
@@ -15,9 +16,10 @@ import { discoveredTest } from './mtp';
 import { claimRunOutputs, reclaimRunOutputs } from './runOutputs';
 import { PreparedOutputCache } from './preparedOutputCache';
 import { ProjectEvaluationCache } from './projectEvaluationCache';
-import { resolveConcurrency, resolveTestFileConcurrency } from '../core/concurrency';
+import { resolveConcurrency, resolveTestFileConcurrency, SerialQueue, untilAborted } from '../core/concurrency';
 import { EnvironmentError, isAbortError } from '../core/errors';
 import type { EngineHost } from './engine/host';
+import { Baseline } from './engine/baseline';
 import { SdkChecks } from './engine/sdk';
 import { planBuild } from './engine/plan';
 import { refreshStructure } from './engine/structure';
@@ -25,13 +27,14 @@ import { build } from './engine/build';
 import { prepareTests } from './engine/prepare';
 import { selectRun } from './engine/select';
 import { executeSelection } from './engine/execute';
-import { Baseline, EngineEvents, EngineOptions, ManualSelection, phaseTimingNames, RunContext, RunPhase, RunScope, RunSummary } from './engine/types';
+import { AnalysisState, EngineEvents, EngineOptions, ManualSelection, phaseTimingNames, RunContext, RunPhase, RunScope, RunSummary, SelectedRun, StructureState } from './engine/types';
 export { selectManual } from './engine/selectManual';
 export type { EngineEvents, EngineOptions, ManualSelection, RunPhase, RunScope, RunSummary };
 
 export type { EngineConfiguration };
 
-/** Members that are not private are shared with the run stages in ./engine through EngineHost. */
+/** Members that are not private are shared with the run stages in ./engine through EngineHost, a read-only view:
+ * stages return their results or pass them to the `apply` methods below. */
 export class TestEngine implements EngineHost {
     readonly coverage = new CoverageStore();
     readonly sources = new SourceTracker();
@@ -53,6 +56,8 @@ export class TestEngine implements EngineHost {
     readonly sdk = new SdkChecks();
     readonly restored = new Set<string>();
     readonly runtime = new RuntimeInventory();
+    /** The latest outcome of every test, saved with the coverage cache. */
+    readonly lastOutcomes = new TestOutcomes();
     private readonly cache: CoverageCache;
     readonly identity = randomUUID();
     readonly preparedOutputs: PreparedOutputCache;
@@ -69,6 +74,13 @@ export class TestEngine implements EngineHost {
     readonly toolIdentities = new Map<string, Promise<string>>();
     unsupportedReport = '';
     readonly resultObservers = new Set<(group: TestFile, result: TestResult) => void>();
+    /** Every save runs in order, so an older delta can never overwrite a newer one. */
+    private readonly saves = new SerialQueue();
+    private saveTimer: NodeJS.Timeout | undefined;
+    /** How long a scheduled save waits for further contributions to share its locked write. */
+    private saveDelay = 150;
+    /** Bounds background saves only at disposal, when another window may hold the cache lock. */
+    private readonly saveController = new AbortController();
 
     constructor(readonly options: EngineOptions) {
         this.roots = options.roots.map(normalizePath);
@@ -78,6 +90,10 @@ export class TestEngine implements EngineHost {
     }
 
     get hashes(): ReadonlyMap<string, string> { return this.sources.hashes; }
+    /** Files whose latest results include a failure; impact runs schedule them first. */
+    get failing(): FailingTests { return this.lastOutcomes.failing; }
+    /** The latest outcome of every test by the `group:test` id the tree uses, including outcomes restored from the cache. */
+    get outcomes(): ReadonlyMap<string, TestOutcome> { return this.lastOutcomes.byTest; }
     get inputVersion(): number { return this.inputTopology; }
     get knownFiles(): readonly string[] { return this.inputs; }
     get directories(): readonly string[] { return this.inputDirectories; }
@@ -111,7 +127,7 @@ export class TestEngine implements EngineHost {
         if (this.disposed) {throw new Error('The test engine has been disposed.');}
         await reclaimRunOutputs(path.join(this.options.storage, 'runs'), signal, this.options.events.output);
         await reclaimRunOutputs(path.join(this.options.storage, 'prepared'), signal, this.options.events.output);
-        try {await this.cache.restore(this.coverage, signal);}
+        try {this.lastOutcomes.restore(await this.cache.restore(this.coverage, signal)); this.options.events.restored?.();}
         catch (error) {
             signal?.throwIfAborted();
             if (isAbortError(error)) {throw error;}
@@ -131,7 +147,7 @@ export class TestEngine implements EngineHost {
         finally {this.operations.delete(controller); signal.removeEventListener('abort', abort);}
     }
 
-    /** Forget learned coverage, saved evaluations, analyses and idle prepared outputs.
+    /** Forget learned coverage, test outcomes, saved evaluations, analyses and idle prepared outputs.
      * The next run establishes a fresh baseline. Call only while no run is active. */
     async reset(signal?: AbortSignal): Promise<void> {
         if (this.disposed) {throw new Error('The test engine has been disposed.');}
@@ -143,7 +159,7 @@ export class TestEngine implements EngineHost {
         this.shapes = new Map(); this.analyses = new Map(); this.analyzedHashes = new Map();
         this.analysisContext = undefined; this.aliasStamp = undefined;
         await this.sdk.stop();
-        this.restored.clear(); this.toolIdentities.clear();
+        this.restored.clear(); this.toolIdentities.clear(); this.lastOutcomes.clear();
         await this.publishCoverage(signal); await this.save(signal);
         this.options.events.output('Testy caches were reset; the next run establishes a new baseline.\n');
     }
@@ -156,6 +172,9 @@ export class TestEngine implements EngineHost {
             this.sdk.abort();
             this.disposal = (async () => {
                 await Promise.allSettled(this.operations.values());
+                // Runs start flushing their own saves; wait for them unless another window holds the cache lock too long.
+                const stop = setTimeout(() => this.saveController.abort(), 5000);
+                try {await this.flushSaves();} finally {clearTimeout(stop);}
                 await this.sdk.stop();
                 await disposeAnalyzerServers();
                 await this.projectEvaluations.dispose();
@@ -175,7 +194,7 @@ export class TestEngine implements EngineHost {
             }
             const beforeBuild = this.hashes;
             await this.publishCoverage(run.signal);
-            const plan = planBuild(this, run);
+            const plan = await planBuild(this, run);
             const outputLease = await claimRunOutputs(path.join(this.options.storage, 'runs'), this.identity, run.signal, this.options.events.output);
             try {
                 run.phase('building');
@@ -183,18 +202,11 @@ export class TestEngine implements EngineHost {
                 run.phase('preparingTests');
                 const prepared = await prepareTests(this, run, plan, built, outputLease, state);
                 const selected = await selectRun(this, run, built, prepared);
+                await this.adoptSelection(run, selected);
                 run.phase('testing');
                 const tested = await executeSelection(this, run, built, prepared, selected);
                 run.signal.throwIfAborted();
-                // A scoped run did not execute every affected file: keep its
-                // changes pending, and their shapes unconsumed, for a full run.
-                if (!manual && !(run.scope && !run.baseline)) {
-                    this.shapes = selected.currentShapes;
-                    if (!run.baseline || this.groups.every(group => run.baseline!.completed.has(group.id))) {
-                        this.initialized = true; this.baseline = undefined;
-                        for (const file of run.changes) {this.pendingChanges.delete(file);}
-                    }
-                }
+                this.finishRun(run, selected);
                 await this.publishCoverage(run.signal); await this.save(run.signal);
                 const results = tested.results;
                 return { files: tested.executedFiles.size, tests: results.length, passed: results.filter(result => result.outcome === 'passed').length,
@@ -210,7 +222,38 @@ export class TestEngine implements EngineHost {
                 try {await state.sessions?.dispose();} finally {await outputLease.dispose();}
             }
         } catch (error) {controller.abort(error); throw error;}
-        finally {run.finishPhase();}
+        finally {
+            run.finishPhase();
+            // A cancelled run still persists what it committed, including a delta its own aborted save left pending,
+            // without waiting for another window's lock; disposal waits for this flush, bounded.
+            void this.flushSaves();
+        }
+    }
+
+    /** Consume the changes and declaration shapes a completed run executed, and close a finished baseline. */
+    private finishRun(run: RunContext, selected: SelectedRun): void {
+        if (!consumesChanges({ manual: !!run.manual, scoped: !!run.scope, baseline: !!run.baseline })) {return;}
+        this.shapes = selected.currentShapes;
+        if (!run.baseline || this.groups.every(group => run.baseline!.completed.has(group.id))) {
+            this.initialized = true; this.baseline = undefined;
+            for (const file of run.changes) {this.pendingChanges.delete(file);}
+        }
+    }
+
+    /** Learn affected baseline files again, then announce the selection. */
+    private async adoptSelection(run: RunContext, selected: SelectedRun): Promise<void> {
+        if (selected.checkpoint) {run.baseline?.invalidate(selected.checkpoint.invalidated); run.baseline?.rebase(selected.checkpoint.shapes, selected.checkpoint.inputs);}
+        this.options.events.selected(selected.selection); await this.publishCoverage(run.signal);
+    }
+
+    applyStructure(next: StructureState, unsupportedReport: string): void {
+        this.projectSnapshots = next.projectSnapshots; this.buildGraph = next.buildGraph; this.projects = next.projects;
+        this.index = next.index; this.structureDirty = next.structureDirty; this.unsupportedReport = unsupportedReport;
+    }
+
+    applyAnalysis(next: AnalysisState): void {
+        this.analyses = next.analyses; this.analyzedHashes = next.analyzedHashes; this.analysisContext = next.analysisContext;
+        this.aliasStamp = next.aliasStamp; this.excludedAliases = next.excludedAliases;
     }
 
     /** Resolve configuration, the baseline generation and accumulated changes. */
@@ -240,15 +283,20 @@ export class TestEngine implements EngineHost {
         const full = batch.full || !this.initialized || !!this.baseline;
         const generation = batch.generation ?? (batch.full ? randomUUID() : this.baseline?.generation ?? randomUUID());
         const newBaseline = full && this.baseline?.generation !== generation;
-        if (newBaseline) {this.baseline = { generation, completed: new Set(), runtimeResults: new Map(), shapes: this.shapes, inputs: new Map() };}
+        if (newBaseline) {this.baseline = new Baseline(generation, this.shapes);}
         const baseline = full ? this.baseline : undefined;
         const rootSnapshot = this.roots;
         const processOptions: ProcessOptions = { cwd: rootSnapshot[0] ?? this.options.storage, signal, output: events.output,
             timeoutMs: config.timeout, dotnetHost: config.dotnet, cleanupDescendants: false };
-        const sourceChanges = await this.sources.refresh(this.sources.files, signal);
-        for (const file of [...await normalizePathsAsync(batch.files, signal), ...sourceChanges]) {this.pendingChanges.add(file);}
+        // Excluded files (build output, editor state such as .vscode) never trigger runs, whoever reports them.
+        const excludes = [...defaultExcludes, ...config.excludes];
+        const requested = (await normalizePathsAsync(batch.files, signal)).filter(file => !isExcluded(file, excludes, rootSnapshot));
+        // Watched changes are already marked dirty, and refresh always rereads dirty files.
+        const sweep = needsSourceSweep({ full, structureDirty: this.structureDirty, manual: !!manual, trigger: configured.trigger });
+        const sourceChanges = await this.sources.refresh(sweep ? this.sources.files : requested, signal);
+        for (const file of [...requested, ...sourceChanges]) {this.pendingChanges.add(file);}
         const changes = [...this.pendingChanges];
-        const structural = !!manual || this.structureDirty || newBaseline || changes.some(file => isConfigurationFile(file) || !this.index.hasSource(file) || !this.hashes.has(file));
+        const structural = !!manual || this.structureDirty || newBaseline || changes.some(file => isStructuralChange(file, this.index, this.hashes));
         return { controller, signal, began, topology, configured, config, projectLimit, testLimit, manual, manualOperation, full, newBaseline, baseline,
             rootSnapshot, processOptions, changes, previousIndex: this.index, structural, phase, finishPhase };
     }
@@ -268,13 +316,15 @@ export class TestEngine implements EngineHost {
             const previous = oldGroups.get(group.id);
             return previous && previous.tests.map(test => test.id).sort().join('\0') !== group.tests.map(test => test.id).sort().join('\0');
         }).map(group => group.id));
-        for (const id of identitiesChanged) {baseline?.completed.delete(id); baseline?.runtimeResults.delete(id);}
+        baseline?.invalidate(identitiesChanged);
         this.coverage.invalidate(identitiesChanged); this.groups = next;
         this.runtime.reconcile(next, identitiesChanged);
+        // Rediscovered files keep the outcomes of tests they still have, their runtime rows included.
+        for (const group of next) {if (identitiesChanged.has(group.id)) {this.lastOutcomes.settle(group.id, new Set(this.knownTests(group).map(test => test.id)));}}
         const groupIds = new Set(next.map(group => group.id));
-        for (const id of baseline?.completed ?? []) {if (!groupIds.has(id)) {baseline?.completed.delete(id);}}
-        for (const id of baseline?.runtimeResults.keys() ?? []) {if (!groupIds.has(id)) {baseline?.runtimeResults.delete(id);}}
+        baseline?.invalidate([...baseline.completed, ...baseline.runtimeResults.keys()].filter(id => !groupIds.has(id)));
         const liveIds = new Set([...next.map(group => group.id), ...next.map(projectCoverageId)]);
+        this.lastOutcomes.retain(new Set(this.displayGroups.map(group => group.id)));
         this.coverage.replace([], liveIds); await this.options.events.discovered(this.displayGroups);
         return liveIds;
     }
@@ -288,9 +338,30 @@ export class TestEngine implements EngineHost {
         this.options.events.coverage();
     }
 
-    async save(signal?: AbortSignal): Promise<void> {
-        const delta = await this.coverage.takeDeltaAsync(signal);
+    /** A cancelled caller stops waiting; whatever its save did not write stays pending for the next one. */
+    save(signal?: AbortSignal): Promise<void> {
+        if (this.saveTimer) {clearTimeout(this.saveTimer); this.saveTimer = undefined;}
+        const saving = this.saves.run(() => this.persist(signal ? AbortSignal.any([signal, this.saveController.signal]) : this.saveController.signal));
+        if (!signal) {return saving;}
+        void saving.catch(() => undefined);
+        return untilAborted(saving, signal);
+    }
+
+    /** Write everything not yet saved now, under the engine-lifetime signal: a scheduled save, and any delta a save
+     * aborted with its run (cancellation, shutdown, another window's lock) left pending. Resolves once every save requested
+     * so far has settled. An empty delta takes no lock. */
+    private flushSaves(): Promise<void> {
+        return this.save().catch(() => undefined);
+    }
+
+    scheduleSave(): void {
+        this.saveTimer ??= setTimeout(() => {this.saveTimer = undefined; void this.saves.run(() => this.persist(this.saveController.signal)).catch(() => undefined);}, this.saveDelay);
+    }
+
+    /** One locked write of everything changed since the previous save; a failed write is retried by the next. */
+    private async persist(signal?: AbortSignal): Promise<void> {
+        const delta = { ...await this.coverage.takeDeltaAsync(signal), outcomes: this.lastOutcomes.take() };
         try {await this.cache.save(delta, signal);}
-        catch (error) {this.coverage.retryDelta(delta);signal?.throwIfAborted(); this.options.events.output(`Coverage could not be saved; current test results remain available. ${String(error)}\n`);}
+        catch (error) {this.coverage.retryDelta(delta); this.lastOutcomes.retry(delta.outcomes); signal?.throwIfAborted(); this.options.events.output(`Coverage could not be saved; current test results remain available. ${String(error)}\n`);}
     }
 }

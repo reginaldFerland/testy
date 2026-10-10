@@ -4,15 +4,17 @@ const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:
 const {SourceTracker}=require('../../out/services/sources');
 const {contentHash,normalizePath}=require('../../out/core/paths');
 
-async function temporary(t){const root=normalizePath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-sources-')));t.after(()=>fs.rm(root,{recursive:true,force:true}));return root;}
+async function temporary(/** @type {import('node:test').TestContext} */ t){const root=normalizePath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-sources-')));t.after(()=>fs.rm(root,{recursive:true,force:true}));return root;}
 const turn=()=>new Promise(resolve=>setImmediate(resolve));
 
-test('an older slow refresh cannot replace the hashes read by a newer overlapping one',async t=>{
+test('an older slow refresh cannot replace the hashes read by a newer overlapping one',async(/** @type {import('node:test').TestContext} */ t)=>{
  const root=await temporary(t),sources=new SourceTracker(),file=path.join(root,'A.cs');
  await fs.writeFile(file,'class A {}');sources.setFiles([file]);
- const readFile=fs.readFile;let release,blocked=true;const gate=new Promise(resolve=>{release=resolve;});
- fs.readFile=async function(...args){const bytes=await readFile.apply(this,args);if(blocked){blocked=false;await gate;}return bytes;};
- t.after(()=>{fs.readFile=readFile;release();});
+ /** @type {any} */ const readFile=fs.readFile; // intercepted below, so typed loosely
+ const mutableFs=/** @type {any} */ (fs); // fs.readFile is replaced to gate reads
+ /** @type {any} */ let release,blocked=true;const gate=new Promise(resolve=>{release=resolve;});
+ mutableFs.readFile=async function(/** @type {any[]} */ ...args){const bytes=await readFile.apply(this,args);if(blocked){blocked=false;await gate;}return bytes;};
+ t.after(()=>{mutableFs.readFile=readFile;release();});
  const older=sources.refresh([file]);
  while(blocked)await turn();
  // Edited after the older refresh read it, without a file event.
@@ -23,12 +25,14 @@ test('an older slow refresh cannot replace the hashes read by a newer overlappin
  assert.equal(sources.hashes.get(file),contentHash(await readFile(file)));
 });
 
-test('a refresh cancelled while queued behind another stops waiting at once',async t=>{
+test('a refresh cancelled while queued behind another stops waiting at once',async(/** @type {import('node:test').TestContext} */ t)=>{
  const root=await temporary(t),sources=new SourceTracker(),file=path.join(root,'A.cs');
  await fs.writeFile(file,'class A {}');sources.setFiles([file]);
- const readFile=fs.readFile;let release;const gate=new Promise(resolve=>{release=resolve;});
- fs.readFile=async function(...args){const bytes=await readFile.apply(this,args);await gate;return bytes;};
- t.after(()=>{fs.readFile=readFile;release();});
+ /** @type {any} */ const readFile=fs.readFile; // intercepted below, so typed loosely
+ const mutableFs=/** @type {any} */ (fs); // fs.readFile is replaced to gate reads
+ /** @type {any} */ let release;const gate=new Promise(resolve=>{release=resolve;});
+ mutableFs.readFile=async function(/** @type {any[]} */ ...args){const bytes=await readFile.apply(this,args);await gate;return bytes;};
+ t.after(()=>{mutableFs.readFile=readFile;release();});
  const first=sources.refresh([file]),abort=new AbortController(),queued=sources.refresh([file],abort.signal);
  abort.abort();
  await assert.rejects(queued,{name:'AbortError'});
@@ -36,12 +40,14 @@ test('a refresh cancelled while queued behind another stops waiting at once',asy
  assert.ok(sources.hashes.has(file));
 });
 
-test('a file retired while a refresh read it is not restored',async t=>{
+test('a file retired while a refresh read it is not restored',async(/** @type {import('node:test').TestContext} */ t)=>{
  const root=await temporary(t),sources=new SourceTracker(),file=path.join(root,'A.cs');
  await fs.writeFile(file,'class A {}');sources.setFiles([file]);
- const readFile=fs.readFile;let release,blocked=true;const gate=new Promise(resolve=>{release=resolve;});
- fs.readFile=async function(...args){const bytes=await readFile.apply(this,args);if(blocked){blocked=false;await gate;}return bytes;};
- t.after(()=>{fs.readFile=readFile;release();});
+ /** @type {any} */ const readFile=fs.readFile; // intercepted below, so typed loosely
+ const mutableFs=/** @type {any} */ (fs); // fs.readFile is replaced to gate reads
+ /** @type {any} */ let release,blocked=true;const gate=new Promise(resolve=>{release=resolve;});
+ mutableFs.readFile=async function(/** @type {any[]} */ ...args){const bytes=await readFile.apply(this,args);if(blocked){blocked=false;await gate;}return bytes;};
+ t.after(()=>{mutableFs.readFile=readFile;release();});
  const refreshing=sources.refresh([file]);
  while(blocked)await turn();
  sources.setFiles([]);release();await refreshing;

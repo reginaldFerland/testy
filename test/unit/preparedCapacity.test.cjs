@@ -5,18 +5,24 @@ const {PreparedOutputCache}=require('../../out/services/preparedOutputCache');
 const {claimPreparedStorage}=require('../../out/services/preparedStorage');
 const {PreparedOutput,copyOutput}=require('../../out/services/output');
 
+/**
+ * @param {import('node:test').TestContext} t
+ * @param {{maxBytes?: number, maxEntries?: number}} [limits]
+ */
 async function fixture(t,limits={}){
  const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-capacity-')),source=path.join(root,'build'),storage=path.join(root,'state');
  await fs.mkdir(source);await fs.writeFile(path.join(source,'Tests.dll'),'binary');await fs.writeFile(path.join(source,'asset'),'original');
- const caches=[],active=new Set(),created=[];
+ /** @type {import('../../out/services/preparedOutputCache').PreparedOutputCache[]} */ const caches=[];
+ /** @type {Set<import('../../out/services/preparedOutputCache').PreparedArtifactLease>} */ const active=new Set();
+ /** @type {import('../../out/services/preparedOutputCache').PreparedArtifact[]} */ const created=[];
  const cache=()=>{const value=new PreparedOutputCache(storage,randomUUID(),{...limits,persist:true});caches.push(value);return value;};
- const create=async directory=>{
+ const create=async (/** @type {string} */ directory)=>{
   const template=path.join(directory,'template');await copyOutput(source,template);
   const output=new PreparedOutput(template,path.join(directory,'assembly'));await output.initialize();
   const artifact={root:directory,output,session:randomUUID(),coverage:true,instrumented:[],reusable:true};created.push(artifact);return artifact;
  };
- const acquire=async(cache,slot)=>{const lease=await cache.acquire(source,'same-context',create,undefined,`target/${slot}`);assert.ok(lease);active.add(lease);return lease;};
- const release=async lease=>{await lease.release();active.delete(lease);};
+ const acquire=async(/** @type {import('../../out/services/preparedOutputCache').PreparedOutputCache} */ cache,/** @type {number} */ slot)=>{const lease=await cache.acquire(source,'same-context',create,undefined,`target/${slot}`);assert.ok(lease);active.add(lease);return lease;};
+ const release=async (/** @type {import('../../out/services/preparedOutputCache').PreparedArtifactLease} */ lease)=>{await lease.release();active.delete(lease);};
  t.after(async()=>{await Promise.allSettled([...active].map(lease=>lease.release(false)));for(const cache of caches)await cache.dispose();await fs.rm(root,{recursive:true,force:true});});
  return{root,source,storage,cache,created,acquire,release};
 }
@@ -62,13 +68,13 @@ test('expanding the entry allowance preserves byte eviction and validates capaci
 
 test('storage entry expansion keeps ownership transitions and its original byte bound',async t=>{
  const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-storage-capacity-')),storage=path.join(root,'prepared');
- const owners=[];t.after(async()=>{for(const owner of owners)await owner.dispose();await fs.rm(root,{recursive:true,force:true});});
+ /** @type {import('../../out/services/preparedStorage').PreparedStorageLease[]} */ const owners=[];t.after(async()=>{for(const owner of owners)await owner.dispose();await fs.rm(root,{recursive:true,force:true});});
  const first=await claimPreparedStorage(storage,undefined,{maxEntries:1,maxBytes:64});owners.push(first);
  for(const value of [-1,NaN,1.5])assert.throws(()=>first.reserveEntries(value),/Invalid/);
  first.reserveEntries(31);first.reserveEntries(1);
  await first.park({marker:'retained'},{entries:31,bytes:31});
  const next=await claimPreparedStorage(storage,undefined,{maxEntries:31,maxBytes:64});owners.push(next);
- assert.equal(next.directory,first.directory);assert.equal(next.snapshot.marker,'retained');
+ assert.equal(next.directory,first.directory);assert.equal(/** @type {{marker: string}} */ (next.snapshot).marker,'retained');
  await first.dispose();assert.ok(await fs.stat(next.directory),'old owner cannot delete its successor');
  next.reserveEntries(64);await next.park({marker:'oversized'},{entries:32,bytes:65});
  assert.deepEqual(await fs.readdir(storage),[],'more entry capacity never raises the byte allowance');

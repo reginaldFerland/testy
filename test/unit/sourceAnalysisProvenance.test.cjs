@@ -5,22 +5,28 @@ const {createHash}=require('node:crypto');
 const analysis=require('../../out/services/analysis'),processes=require('../../out/services/process');
 const {sourceAnalysisContext}=require('../../out/services/analysisContext');
 const {normalizePath}=require('../../out/core/paths');
-const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
+const hash=(/** @type {import('node:crypto').BinaryLike} */ bytes)=>createHash('sha256').update(bytes).digest('hex');
 const shape={signature:'A'.repeat(64),body:'B'.repeat(64),partialTypes:['N:C`0'],excludedTypes:[]};
 
+/**
+ * @typedef {(request: any, bytes: Buffer, options?: any) => any} Respond A scripted helper response (request JSON is deliberately untyped).
+ * @param {import('node:test').TestContext} t
+ */
 async function fixture(t){
  const directory=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy analysis provenance ')));
  const files=['Aliases.cs','Body.cs'].map(name=>path.join(directory,name));
- const run=processes.runProcess,calls=[];let respond;
- processes.runProcess=async(command,args,options)=>{
-  const bytes=await fs.readFile(args[1]),request=JSON.parse(bytes);calls.push({request,options,bytes});
+ const run=processes.runProcess;
+ /** @type {{request: any, options: any, bytes: Buffer}[]} */ const calls=[];
+ /** @type {Respond} */ let respond=()=>undefined; // replaced by f.respond before any call
+ processes.runProcess=async(/** @type {string} */ command,/** @type {readonly string[]} */ args,/** @type {any} */ options)=>{
+  const bytes=await fs.readFile(args[1]),request=JSON.parse(/** @type {any} */ (bytes));calls.push({request,options,bytes});
   await fs.writeFile(args[2],JSON.stringify(await respond(request,bytes,options)));return{code:0,stdout:'',stderr:''};
  };
  t.after(async()=>{processes.runProcess=run;await fs.rm(directory,{recursive:true,force:true});});
- const valid=(request,bytes)=>({version:1,requestHash:hash(bytes).toUpperCase(),aliases:request.excludedAliases,
-  analyses:Object.fromEntries(request.files.map(file=>[file,shape])),sourceHashes:Object.fromEntries(request.files.map(file=>[file,'C'.repeat(64)]))});
- return{directory,files,keys:files.map(normalizePath),calls,valid,respond:value=>{respond=value;},
-  batch:(files_,aliases=[],update,options={})=>analysis.sourceAnalysisBatch('dotnet','analyzer.dll',files_,directory,{cwd:directory,...options},aliases,3,update,true)};
+ const valid=(/** @type {any} */ request,/** @type {Buffer} */ bytes)=>({version:1,requestHash:hash(bytes).toUpperCase(),aliases:request.excludedAliases,
+  analyses:Object.fromEntries(request.files.map((/** @type {string} */ file)=>[file,shape])),sourceHashes:Object.fromEntries(request.files.map((/** @type {string} */ file)=>[file,'C'.repeat(64)]))});
+ return{directory,files,keys:files.map(normalizePath),calls,valid,respond:(/** @type {Respond} */ value)=>{respond=value;},
+  batch:(/** @type {string[]} */ files_,/** @type {string[]} */ aliases=[],/** @type {import('../../out/services/analysis').SourceAliasUpdate | undefined} */ update=undefined,/** @type {{signal?: AbortSignal}} */ options={})=>analysis.sourceAnalysisBatch('dotnet','analyzer.dll',files_,directory,{cwd:directory,...options},aliases,3,update,true)};
 }
 
 test('analysis provenance binds Unicode aliases to exact serialized request bytes without changing SourceShape',async t=>{
@@ -29,14 +35,14 @@ test('analysis provenance binds Unicode aliases to exact serialized request byte
  const result=await f.batch([f.files[0]],[],{sources:['global using 秘密 = System.Diagnostics.DebuggerHiddenAttribute; // <>& 😀'],allFiles:f.files});
  assert.equal(f.calls.length,1);assert.equal(f.calls[0].request.provenance,true);assert.equal(f.calls[0].request.concurrency,3);
  assert.deepEqual(result.aliases,['秘密']);assert.deepEqual([...result.analyses.values()],[shape,shape]);
- assert.deepEqual([...result.analyses.keys()],f.keys);assert.deepEqual([...result.sourceHashes.keys()],f.keys);
- assert.deepEqual([...result.sourceHashes.values()],['c'.repeat(64),'c'.repeat(64)]);
+ assert.deepEqual([...result.analyses.keys()],f.keys);assert.deepEqual([.../** @type {ReadonlyMap<string, string>} */ (result.sourceHashes).keys()],f.keys);
+ assert.deepEqual([.../** @type {ReadonlyMap<string, string>} */ (result.sourceHashes).values()],['c'.repeat(64),'c'.repeat(64)]);
  assert.deepEqual(await fs.readdir(f.directory),[]);
 });
 
 test('provenance requires complete matching hashes and rejects otherwise valid legacy or wrong-request responses',async t=>{
  const f=await fixture(t);
- const changes=[value=>({...value,version:2}),value=>({...value,requestHash:'D'.repeat(64)}),
+ /** @type {((value: any) => any)[]} */ const changes=[value=>({...value,version:2}),value=>({...value,requestHash:'D'.repeat(64)}),
   value=>({...value,sourceHashes:undefined}),value=>({...value,sourceHashes:[]}),
   value=>({...value,sourceHashes:{[f.files[0]]:'C'.repeat(64)}}),
   value=>({...value,sourceHashes:{...value.sourceHashes,[f.files[1]]:null}}),
@@ -45,16 +51,16 @@ test('provenance requires complete matching hashes and rejects otherwise valid l
  for(const change of changes){f.respond((request,bytes)=>change(f.valid(request,bytes)));await assert.rejects(f.batch(f.files));}
  f.respond((request,bytes)=>{const value=f.valid(request,bytes);return{...value,analyses:{...value.analyses,[f.files[1]]:null},sourceHashes:{...value.sourceHashes,[f.files[1]]:null}};});
  const result=await f.batch(f.files);assert.deepEqual(result.analyses.get(f.keys[0]),shape);assert.equal(result.analyses.get(f.keys[1]),null);
- assert.equal(result.sourceHashes.has(f.keys[1]),false);assert.deepEqual(await fs.readdir(f.directory),[]);
+ assert.equal(/** @type {ReadonlyMap<string, string>} */ (result.sourceHashes).has(f.keys[1]),false);assert.deepEqual(await fs.readdir(f.directory),[]);
 });
 
 test('empty provenance work avoids a helper and removal of the last alias still analyzes every affected file',async t=>{
  const f=await fixture(t);f.respond(f.valid);
- assert.equal((await f.batch([])).sourceHashes.size,0);
- assert.equal((await f.batch([],[],{sources:[],allFiles:f.files})).sourceHashes.size,0);assert.equal(f.calls.length,0);
+ assert.equal(/** @type {ReadonlyMap<string, string>} */ ((await f.batch([])).sourceHashes).size,0);
+ assert.equal(/** @type {ReadonlyMap<string, string>} */ ((await f.batch([],[],{sources:[],allFiles:f.files})).sourceHashes).size,0);assert.equal(f.calls.length,0);
  const result=await f.batch([],['Blind'],{sources:[],allFiles:f.files});
  assert.equal(f.calls.length,1);assert.deepEqual(f.calls[0].request.files,f.files);assert.deepEqual(f.calls[0].request.excludedAliases,[]);
- assert.equal(result.sourceHashes.size,2);assert.deepEqual(result.aliases,[]);
+ assert.equal(/** @type {ReadonlyMap<string, string>} */ (result.sourceHashes).size,2);assert.deepEqual(result.aliases,[]);
 });
 
 test('provenance cancellation and malformed responses clean temporary requests without publishing results',async t=>{
@@ -66,6 +72,7 @@ test('provenance cancellation and malformed responses clean temporary requests w
  assert.deepEqual(await fs.readdir(f.directory),[]);
 });
 
+/** @param {import('node:test').TestContext} t */
 async function toolFixture(t){
  const directory=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy analysis identity ')));
  t.after(()=>fs.rm(directory,{recursive:true,force:true}));
@@ -76,14 +83,14 @@ async function toolFixture(t){
  await fs.writeFile(analyzer.replace('.dll','.deps.json'),JSON.stringify({targets:{net10:{Roslyn:{runtime:{'lib/Microsoft.CodeAnalysis.CSharp.dll':{}}}}}}));
  const asset=path.join(path.dirname(analyzer),'Microsoft.CodeAnalysis.CSharp.dll');await fs.writeFile(asset,'Roslyn version A');
  // Roslyn is not shipped with the helper; it is read from an SDK beside the host.
- const sdk=async version=>{const roslyn=path.join(directory,'sdk',version,'Roslyn','bincore');await fs.mkdir(roslyn,{recursive:true});
+ const sdk=async (/** @type {string} */ version)=>{const roslyn=path.join(directory,'sdk',version,'Roslyn','bincore');await fs.mkdir(roslyn,{recursive:true});
   for(const name of ['Microsoft.CodeAnalysis.dll','Microsoft.CodeAnalysis.CSharp.dll'])await fs.writeFile(path.join(roslyn,name),`${name} from ${version}`);return roslyn;};
  const roslyn=await sdk('10.0.100');
  // The host fixture models ordinary installed hosting independently of CI CLR overrides.
  const runtimeOverride=/^(?:CORECLR_|COR_|COMPlus_|DOTNET_(?:STARTUP_HOOKS|ADDITIONAL_DEPS|SHARED_STORE|ROOT(?:_|$)|MULTILEVEL_LOOKUP|ROLL_FORWARD|RUNTIME_ID))/i;
  const nativeInjection=/^(?:LD_(?:PRELOAD|LIBRARY_PATH|AUDIT|ORIGIN_PATH)|DYLD_(?:INSERT_LIBRARIES|(?:FALLBACK_|VERSIONED_)?(?:LIBRARY|FRAMEWORK)_PATH|ROOT_PATH|IMAGE_SUFFIX|SHARED_CACHE_DIR))$/i;
  const env=Object.fromEntries(Object.keys(process.env).filter(key=>runtimeOverride.test(key)||nativeInjection.test(key)).map(key=>[key,undefined]));
- const context=(extra={})=>sourceAnalysisContext(host,analyzer,{cwd:directory,env:{...env,...extra}});
+ const context=(/** @type {NodeJS.ProcessEnv} */ extra={})=>sourceAnalysisContext(host,analyzer,{cwd:directory,env:{...env,...extra}});
  return{directory,host,analyzer,asset,roslyn,sdk,context,env};
 }
 

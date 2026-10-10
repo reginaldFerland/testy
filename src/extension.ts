@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { registerInactiveCommands } from './commands';
 import { Testy } from './controller';
 import { normalizePath } from './core/paths';
 import { restrictedStatus } from './ui/statusBar';
@@ -8,9 +9,12 @@ let activeExtension: Testy | undefined;
 const shutdownTimeout = 3000;
 
 export function activate(context: vscode.ExtensionContext): { snapshot: () => unknown } | undefined {
-    if (!vscode.workspace.workspaceFolders?.length) {return;}
+    if (!vscode.workspace.workspaceFolders?.length) {context.subscriptions.push(registerInactiveCommands('noFolder')); return;}
+    let inactive: vscode.Disposable | undefined;
     const start = (): void => {
         if (activeExtension) {return;}
+        // The full registration replaces the explanatory commands.
+        inactive?.dispose(); inactive = undefined;
         const roots = (vscode.workspace.workspaceFolders ?? []).map(folder => normalizePath(folder.uri.fsPath));
         const extension = new Testy(context, roots);
         activeExtension = extension;
@@ -22,7 +26,8 @@ export function activate(context: vscode.ExtensionContext): { snapshot: () => un
     else {
         // Restricted Mode: nothing is built, restored or executed until the user trusts the workspace.
         const notice = restrictedStatus();
-        context.subscriptions.push(notice, vscode.workspace.onDidGrantWorkspaceTrust(() => {
+        inactive = registerInactiveCommands('restricted');
+        context.subscriptions.push(notice, { dispose: () => {inactive?.dispose();} }, vscode.workspace.onDidGrantWorkspaceTrust(() => {
             notice.dispose();
             try {start();} catch (error) {void vscode.window.showErrorMessage(vscode.l10n.t('Testy: {0}', error instanceof Error ? error.message : String(error)));}
         }));

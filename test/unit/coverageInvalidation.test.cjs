@@ -3,6 +3,8 @@ const assert=require('node:assert/strict');
 const {setImmediate:turn}=require('node:timers/promises');
 const {CoverageStore}=require('../../out/core/coverage');
 
+/** @typedef {import('../../out/core/coverage').StoredTrace} StoredTrace */
+
 function trace(groupId='a') {return {groupId,dependencies:['/code.cs'],inputs:{'/code.cs':'v1'},reliable:true,timestamp:1,coverage:[{file:'/code.cs',hash:'v1',lines:[{line:1,hits:1}]}]};}
 
 test('transient coverage invalidation writes only changed contributions and preserves failed writes',async()=>{
@@ -17,9 +19,9 @@ test('transient coverage invalidation writes only changed contributions and pres
  store.retryDelta(pending);store.markStale(new Set(['b']));
  assert.deepEqual(store.takeDelta().traces.map(t=>t.groupId),['b'],'retry state must survive a toggle while a write is in flight');
  store.markStale(new Set(['a']),false);store.takeDelta();store.markStale(ids);store.invalidate(ids);store.markStale(ids,false);
- assert.equal(store.traces.get('a').reliable,false);assert.equal(store.takeDelta().traces.length,2,'reliability changes cannot be undone by freshness restoration');
+ assert.equal(/** @type {StoredTrace} */ (store.traces.get('a')).reliable,false);assert.equal(store.takeDelta().traces.length,2,'reliability changes cannot be undone by freshness restoration');
  store.markHistorical(new Set(['a']));store.markStale(new Set(['a']),false);
- assert.equal(store.traces.get('a').historical,true);assert.equal(store.traces.get('a').stale,true);
+ assert.equal(/** @type {StoredTrace} */ (store.traces.get('a')).historical,true);assert.equal(/** @type {StoredTrace} */ (store.traces.get('a')).stale,true);
 });
 
 test('large live coverage deltas yield, retain cancellation state and restart after concurrent invalidation',async()=>{
@@ -27,10 +29,10 @@ test('large live coverage deltas yield, retain cancellation state and restart af
  store.restorePacked(sourceIds.map((id,i)=>({id,file:`/s${i}.cs`,hash:'v1',lines:[1]})),[...ids].map(groupId=>({...trace(groupId),coverage:[],sourceIds})));
  store.markStale(ids,false);store.takeDelta();store.markStale(ids);
  const abort=new AbortController(),pending=store.takeDeltaAsync(abort.signal);await turn();abort.abort();
- await assert.rejects(pending,{name:'AbortError'});assert.equal(store.changedTraces.size,2);
+ await assert.rejects(pending,{name:'AbortError'});assert.equal(/** @type {any} */ (store).changedTraces.size,2);
  const next=store.takeDeltaAsync();await turn();store.markStale(new Set(['b']),false);
  const delta=await next;assert.deepEqual(delta.traces.map(t=>t.groupId),['a']);assert.equal(delta.sources.length,9000);
- assert.equal(store.changedTraces.size,0);
+ assert.equal(/** @type {any} */ (store).changedTraces.size,0);
  const aggregate=store.summarizeAsync(new Map(sourceIds.map((_,i)=>[`/s${i}.cs`,'v1'])));
  await turn();store.markStale(new Set(['b']));const summaries=await aggregate;
  assert.equal(summaries.length,9000);assert.ok(summaries.every(s=>s.stale));

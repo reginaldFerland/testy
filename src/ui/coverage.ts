@@ -3,7 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { Configuration } from '../configuration';
 import { CoverageSummary, declarationHits } from '../core/coverage';
-import { normalizePath } from '../core/paths';
+import { normalizePathAsync } from '../core/paths';
 import { TestEngine } from '../services/engine';
 
 const l10n = vscode.l10n;
@@ -86,7 +86,11 @@ export class CoverageView {
     /** Statements span each line's code from its first non-blank character; declarations span their methods.
      * An open editor's text wins over the disk copy, so ranges fit what is shown; lines past its end are dropped. */
     private async detail(summary: CoverageSummary, lines: CoverageSummary['lines'], token?: vscode.CancellationToken): Promise<vscode.FileCoverageDetail[]> {
-        const open = vscode.workspace.textDocuments.find(document => document.uri.scheme === 'file' && normalizePath(document.uri.fsPath) === summary.file);
+        // Only documents of the same name can be the file, so few paths are resolved.
+        const name = path.basename(summary.file).toLowerCase();
+        const documents = vscode.workspace.textDocuments.filter(document => document.uri.scheme === 'file' && path.basename(document.uri.fsPath).toLowerCase() === name);
+        const files = await Promise.all(documents.map(document => normalizePathAsync(document.uri.fsPath)));
+        const open = documents.find((_, index) => files[index] === summary.file);
         let text: string[] | undefined = open?.getText().split(/\r?\n/);
         if (!text) {try {text = (await fs.readFile(summary.file, 'utf8')).split(/\r?\n/);} catch { /* Deleted file: fall back to line starts. */ }}
         if (token?.isCancellationRequested) {return [];}
@@ -190,6 +194,8 @@ export class CoverageView {
         const disposed = (): boolean => host.disposed, visible = (): boolean => host.config.showCoverage && !this.hidden;
         let hashes: ReadonlyMap<string, string>;
         let summaries: readonly CoverageSummary[];
+        // Editor paths are resolved without blocking the extension host; nothing needs them while coverage is hidden.
+        const files = visible() ? await Promise.all(editors.map(editor => normalizePathAsync(editor.document.uri.fsPath))) : [];
         do {
             hashes = this.engine.hashes;
             summaries = visible() ? await this.engine.coverage.summarizeAsync(hashes, host.lifetime.signal) : [];
@@ -199,9 +205,9 @@ export class CoverageView {
             this.decorationIndex = { summaries, files: new Map(summaries.map(summary => [summary.file, summary])) };
         }
         const byFile = this.decorationIndex.files, rendered = this.decoratedEditors ??= new WeakMap();
-        for (const editor of editors) {
-            const document = editor.document, show = visible();
-            const summary = show ? byFile.get(normalizePath(document.uri.fsPath)) : undefined;
+        for (const [index, editor] of editors.entries()) {
+            const document = editor.document, show = visible(), file = files[index];
+            const summary = show && file !== undefined ? byFile.get(file) : undefined;
             const state: EditorCoverageState = { document, version: document.version, lineCount: document.lineCount, dirty: document.isDirty,
                 show, lines: summary?.lines, stale: summary?.stale };
             const previous = rendered.get(editor);

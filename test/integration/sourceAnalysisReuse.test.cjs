@@ -8,13 +8,18 @@ const {analyzerServers}=require('../../out/services/analyzerServer');
 const {sourceAnalysisContext}=require('../../out/services/analysisContext');
 const {TestEngine}=require('../../out/services/engine');
 const {normalizePath}=require('../../out/core/paths');
+/** @typedef {import('../../out/services/engine').TestEngine} Engine */
+/** @typedef {import('../../out/services/analysis').SourceShape} SourceShape */
+/** @typedef {{-readonly [K in keyof import('../../out/core/model').EngineConfiguration]: import('../../out/core/model').EngineConfiguration[K]}} MutableConfiguration */
+
+/** @param {import('node:crypto').BinaryLike} bytes */
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 
 test('Roslyn provenance hashes the exact UTF-8, BOM, UTF-16 and UTF-32 bytes while preserving legacy syntax results',{timeout:60000},async t=>{
  const directory=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy raw analysis bytes ')));
  t.after(()=>fs.rm(directory,{recursive:true,force:true}));
  const source='namespace Café; public partial class 秘密 { public string Value() => "<&😀>"; }';
- const utf16=Buffer.from(source,'utf16le'),utf32=Buffer.alloc([...source].length*4);[...source].forEach((char,index)=>utf32.writeUInt32LE(char.codePointAt(0),index*4));
+ const utf16=Buffer.from(source,'utf16le'),utf32=Buffer.alloc([...source].length*4);[...source].forEach((char,index)=>utf32.writeUInt32LE(/** @type {number} */ (char.codePointAt(0)),index*4));
  const contents=[Buffer.from(source),Buffer.concat([Buffer.from([0xef,0xbb,0xbf]),Buffer.from(source)]),
   Buffer.concat([Buffer.from([0xff,0xfe]),utf16]),Buffer.concat([Buffer.from([0xfe,0xff]),Buffer.from(utf16).swap16()]),
   Buffer.concat([Buffer.from([0xff,0xfe,0,0]),utf32])];
@@ -28,13 +33,14 @@ test('Roslyn provenance hashes the exact UTF-8, BOM, UTF-16 and UTF-32 bytes whi
  const legacy=await analysis.sourceAnalyses('dotnet',analyzer,[...files,invalid,missing],directory,options,aliases,3);
  const result=await analysis.sourceAnalysisBatch('dotnet',analyzer,[],directory,options,[],3,
   {sources:[alias],allFiles:[...files,invalid,missing]},true);
+ const sourceHashes=/** @type {ReadonlyMap<string, string>} */ (result.sourceHashes);
  assert.deepEqual(result.aliases,aliases);assert.deepEqual(result.analyses,legacy);
  for(let index=0;index<files.length;index++){
-  assert.equal(result.sourceHashes.get(keys[index]),hash(contents[index]));
+  assert.equal(sourceHashes.get(keys[index]),hash(contents[index]));
   assert.deepEqual(result.analyses.get(keys[index]),legacy.get(keys[0]),'decoding preserves declaration semantics across encodings');
  }
- assert.equal(result.analyses.get(invalidKey),null);assert.equal(result.sourceHashes.get(invalidKey),hash('class Invalid {'));
- assert.equal(result.analyses.get(missingKey),null);assert.equal(result.sourceHashes.has(missingKey),false);
+ assert.equal(result.analyses.get(invalidKey),null);assert.equal(sourceHashes.get(invalidKey),hash('class Invalid {'));
+ assert.equal(result.analyses.get(missingKey),null);assert.equal(sourceHashes.has(missingKey),false);
  // Legacy callers could also encode the request itself with a BOM. Bind the
  // response to those raw bytes while retaining the old request decoder.
  const request=JSON.stringify({files:[files[0]],excludedAliases:aliases,concurrency:1,provenance:true}),requestFile=path.join(directory,'encoded-request.json');
@@ -47,10 +53,11 @@ test('Roslyn provenance hashes the exact UTF-8, BOM, UTF-16 and UTF-32 bytes whi
  }
 });
 
+/** @param {import('node:test').TestContext} t */
 async function ordinaryNativeHost(t){
  // Positive reuse cases exercise ordinary installed hosting. CI may spell PATH
  // as Path on Windows or set CLR overrides, whose decline behavior has its own tests.
- const pathKey=process.platform==='win32'?Object.keys(process.env).find(key=>key.toUpperCase()==='PATH'):'PATH';
+ const pathKey=/** @type {string} */ (process.platform==='win32'?Object.keys(process.env).find(key=>key.toUpperCase()==='PATH'):'PATH');
  const executable=process.platform==='win32'?'dotnet.exe':'dotnet';
  let host;
  for(const directory of (process.env[pathKey]??'').split(path.delimiter)){
@@ -58,7 +65,7 @@ async function ordinaryNativeHost(t){
   try{
    await fs.access(candidate,process.platform==='win32'?constants.F_OK:constants.X_OK);
    if((await fs.stat(candidate)).isFile()){host=await fs.realpath(candidate);break;}
-  }catch(error){if(!['ENOENT','ENOTDIR','EACCES'].includes(error.code))throw error;}
+  }catch(error){if(!['ENOENT','ENOTDIR','EACCES'].includes(/** @type {string} */ (/** @type {NodeJS.ErrnoException} */ (error).code)))throw error;}
  }
  assert.ok(host,'positive reuse fixture requires a native dotnet executable on PATH');
  const runtimeOverride=/^(?:CORECLR_|COR_|COMPlus_|DOTNET_(?:STARTUP_HOOKS|ADDITIONAL_DEPS|SHARED_STORE|ROOT(?:_|$)|MULTILEVEL_LOOKUP|ROLL_FORWARD|RUNTIME_ID))/i;
@@ -69,14 +76,23 @@ async function ordinaryNativeHost(t){
  return host;
 }
 
+/**
+ * @param {import('node:test').TestContext} t
+ * @param {{copyAnalyzer?: boolean}} [options]
+ */
 async function fixture(t,{copyAnalyzer=false}={}){
  const dotnet=await ordinaryNativeHost(t);
  const temp=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy source reuse '))),root=path.join(temp,'workspace'),storage=path.join(temp,'state');
  await fs.cp(path.resolve('test/fixtures/ImpactDemo'),root,{recursive:true,filter:file=>!/(^|[/\\])(bin|obj|TestResults)([/\\]|$)/.test(file)});
  const analyzer=copyAnalyzer?path.join(temp,'analyzer','Testy.Analysis.dll'):path.resolve('dist/analyzer/Testy.Analysis.dll');
  if(copyAnalyzer)await fs.cp(path.dirname(path.resolve('dist/analyzer/Testy.Analysis.dll')),path.dirname(analyzer),{recursive:true});
+ /** @type {MutableConfiguration} */
  const config={dotnet,configuration:'Debug',mode:'affected',coverage:false,excludes:[],testArguments:[],timeout:60000,maxParallelProjects:2,maxParallelTestFiles:2};
- const control=new AbortController(),signal=AbortSignal.any([control.signal,t.signal]),output=[],results=[],requests=[],cleanups=[];
+ const control=new AbortController(),signal=AbortSignal.any([control.signal,t.signal]);
+ /** @type {string[]} */ const output=[];
+ /** @type {unknown[][]} */ const results=[];
+ /** @type {{files: string[]}[]} */ const requests=[];
+ /** @type {(() => unknown)[]} */ const cleanups=[];
  const engine=new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer,configuration:()=>config,
   events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result:(group,result)=>results.push([group.id,result.id,result.outcome]),started(){},coverage(){},invalidated(){}}});
  const run=processes.runProcess,batch=analysis.sourceAnalysisBatch;
@@ -91,12 +107,14 @@ async function fixture(t,{copyAnalyzer=false}={}){
  servers.request=async(dotnet_,helper,request,...rest)=>{const value=JSON.parse(request);if(value.files)requests.push(value);return serve.call(servers,dotnet_,helper,request,...rest);};
  t.after(async()=>{control.abort();analysis.sourceAnalysisBatch=batch;processes.runProcess=run;servers.request=serve;for(const cleanup of cleanups)await cleanup();await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
  assert.ok(await sourceAnalysisContext(dotnet,analyzer,{cwd:root,signal}),'real reuse fixture requires ordinary installed dotnet and bundled analyzer assets');
- return{temp,root,storage,analyzer,engine,config,signal,output,results,requests,batch,cleanup:fn=>cleanups.push(fn),
-  file:relative=>normalizePath(path.join(root,relative)),
+ return{temp,root,storage,analyzer,engine,config,signal,output,results,requests,batch,cleanup:(/** @type {() => unknown} */ fn)=>cleanups.push(fn),
+  file:(/** @type {string} */ relative)=>normalizePath(path.join(root,relative)),
   baseline:async(signal_=signal)=>{const value=await engine.run({files:[],full:true},signal_);assert.equal(value.passed,3,output.join(''));assert.equal(value.failed,0);return value;}};
 }
 
+/** @param {Engine} engine */
 function rawSnapshot(engine){return new Map([...engine.analyses].map(([file,shape])=>[file,shape]));}
+/** @param {Engine} engine */
 function assertNoReusableShapes(engine){for(const [file,shape]of engine.analyses){assert.equal(shape,null,file);assert.equal(engine.analyzedHashes.has(file),false,file);}}
 
 test('Windows default dotnet with a mixed-case Path reuses real syntax while rediscovering and running tests',
@@ -107,7 +125,8 @@ test('Windows default dotnet with a mixed-case Path reuses real syntax while red
  for(const key of keys)delete process.env[key];
  process.env.Path=[path.dirname(f.config.dotnet),...prior.values()].join(path.delimiter);
  assert.deepEqual(Object.keys(process.env).filter(key=>key.toUpperCase()==='PATH'),['Path'],'fixture exercises the ordinary mixed-case environment spelling');
- const mtp=require('../../out/services/mtp'),request=mtp.requestTests,calls=[];
+ const mtp=require('../../out/services/mtp'),request=mtp.requestTests;
+ /** @type {string[]} */ const calls=[];
  mtp.requestTests=(options,operation,...args)=>{calls.push(operation);return request(options,operation,...args);};
  f.cleanup(()=>{mtp.requestTests=request;});
  f.config.dotnet='dotnet';
@@ -132,12 +151,12 @@ test('full refresh reuses raw syntax and recomputes partial exclusions after sou
  await fs.writeFile(attribute,'[System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage] public partial class SharedShape {}');
  await f.baseline();assert.ok(f.requests.some(request=>request.files.includes(attribute)));
  assert.equal(f.engine.analyses.get(core),first.get(core));assert.equal(f.engine.analyses.get(tests),first.get(tests));
- assert.equal(f.engine.shapes.get(core),first.get(core).body,'new generated exclusion metadata affects the retained implementation');
- assert.equal(f.engine.shapes.get(tests),first.get(tests).signature,'the same type key in another project is isolated');
+ assert.equal(f.engine.shapes.get(core),/** @type {SourceShape} */ (first.get(core)).body,'new generated exclusion metadata affects the retained implementation');
+ assert.equal(f.engine.shapes.get(tests),/** @type {SourceShape} */ (first.get(tests)).signature,'the same type key in another project is isolated');
  assert.equal(f.engine.hashes.has(attribute),false);assert.equal(f.engine.analyzedHashes.has(attribute),true);
  await fs.unlink(attribute);f.requests.length=0;await f.baseline();
  assert.equal(f.engine.analyses.has(attribute),false);assert.equal(f.engine.analyzedHashes.has(attribute),false);
- assert.equal(f.engine.shapes.get(core),first.get(core).signature,'deleted exclusion metadata restores ordinary declaration selection');
+ assert.equal(f.engine.shapes.get(core),/** @type {SourceShape} */ (first.get(core)).signature,'deleted exclusion metadata restores ordinary declaration selection');
  assert.equal(f.requests.length,0,'deleting a non-alias input only changes project-scoped resolution');
 });
 
@@ -157,7 +176,7 @@ test('source edits between tracking and parsing cannot seed a reusable signature
  let parsed;
  analysis.sourceAnalysisBatch=async(...args)=>{
   await fs.writeFile(file,changed);
-  try{const result=await f.batch(...args);parsed=result.sourceHashes.get(file);return result;}
+  try{const result=await f.batch(...args);parsed=/** @type {ReadonlyMap<string, string>} */ (result.sourceHashes).get(file);return result;}
   finally{await fs.writeFile(file,original);}
  };
  await assert.rejects(f.engine.run({files:[],full:true},f.signal),{name:'AbortError'});
@@ -180,7 +199,7 @@ test('null syntax, failed alias responses and cancellation retry without retaini
  const stamp=f.engine.aliasStamp;await fs.writeFile(alias,'global using Blind = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute;');
  analysis.sourceAnalysisBatch=async()=>{throw new Error('controlled alias response failure');};
  await f.baseline();assert.equal(f.engine.aliasStamp,stamp);assertNoReusableShapes(f.engine);
- analysis.sourceAnalysisBatch=f.batch;await f.baseline();assert.equal(f.engine.shapes.get(body),f.engine.analyses.get(body).body);
+ analysis.sourceAnalysisBatch=f.batch;await f.baseline();assert.equal(f.engine.shapes.get(body),/** @type {SourceShape} */ (f.engine.analyses.get(body)).body);
  const previous=rawSnapshot(f.engine),hashes=new Map(f.engine.analyzedHashes),aliasStamp=f.engine.aliasStamp;
  await fs.appendFile(body,'\n// cancelled edit');const abort=new AbortController();
  analysis.sourceAnalysisBatch=async(...args)=>{const result=await f.batch(...args);abort.abort();return result;};

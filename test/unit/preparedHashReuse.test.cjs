@@ -2,24 +2,33 @@ const test=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os'),{randomUUID}=require('node:crypto');
 const {PreparedOutputCache,outputManifest}=require('../../out/services/preparedOutputCache');
 const outputTools=require('../../out/services/output');
+const {HashMemo,hashMemoTiming}=require('../../out/services/hashMemo');
 
 /** Old timestamps let metadata vouch for a file; fresh ones may hide a same-tick write and are always rehashed. */
+/**
+ * @param {import('node:test').TestContext} t
+ * @param {{fresh?:boolean}} [options]
+ */
 async function fixture(t,{fresh=false}={}){
  const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-hash-reuse-'))),source=path.join(root,'build');
  await fs.mkdir(source);await fs.writeFile(path.join(source,'Tests.dll'),'binary');await fs.writeFile(path.join(source,'asset'),'original');
- const hourAgo=new Date(Date.now()-3_600_000),age=async directory=>{if(!fresh)for(const name of await fs.readdir(directory))await fs.utimes(path.join(directory,name),hourAgo,hourAgo);};
+ const hourAgo=new Date(Date.now()-3_600_000),age=async (/** @type {string} */ directory)=>{if(!fresh)for(const name of await fs.readdir(directory))await fs.utimes(path.join(directory,name),hourAgo,hourAgo);};
  await age(source);
+ // utimes leaves each change time fresh; aged files count as settled here, fresh ones keep the real window.
+ if(!fresh){const racyMs=hashMemoTiming.racyMs;hashMemoTiming.racyMs=-3_600_000;t.after(()=>{hashMemoTiming.racyMs=racyMs;});}
  const hashes=new Map(),fileHash=outputTools.fileHash;
- outputTools.fileHash=async(file,signal)=>{hashes.set(file,(hashes.get(file)??0)+1);return fileHash(file,signal);};
+ outputTools.fileHash=async(/** @type {string} */ file,/** @type {AbortSignal|undefined} */ signal)=>{hashes.set(file,(hashes.get(file)??0)+1);return fileHash(file,signal);};
  const cache=new PreparedOutputCache(path.join(root,'storage'),randomUUID());
  t.after(async()=>{outputTools.fileHash=fileHash;await cache.dispose();await fs.rm(root,{recursive:true,force:true});});
+ /** @param {string} directory @returns {Promise<import('../../out/services/preparedOutputCache').PreparedArtifact>} */
  const create=async directory=>{
   const template=path.join(directory,'template'),output=new outputTools.PreparedOutput(template,path.join(directory,'assembly'));
   await outputTools.copyOutput(source,template);await age(template);await output.initialize();
   return{root:directory,output,session:randomUUID(),coverage:true,instrumented:[],reusable:true};
  };
- const acquire=(slot='target/0')=>cache.acquire(source,'context',create,undefined,slot);
- return{root,source,hashes,cache,create,acquire,count:file=>hashes.get(file)??0};
+ // acquire only yields undefined once the cache is closed, which these tests never do
+ const acquire=(slot='target/0')=>/** @type {Promise<import('../../out/services/preparedOutputCache').PreparedArtifactLease>} */ (cache.acquire(source,'context',create,undefined,slot));
+ return{root,source,hashes,cache,create,acquire,count:(/** @type {string} */ file)=>hashes.get(file)??0};
 }
 
 test('a preparation reads each unchanged build file once, including when the retained template is verified',async t=>{
@@ -53,7 +62,7 @@ test('recently written files are always rehashed because a same-tick write could
 });
 
 test('manifests with and without a session memo agree',async t=>{
- const f=await fixture(t),memo=new Map(),plain=await outputManifest(f.source);
+ const f=await fixture(t),memo=new HashMemo(100),plain=await outputManifest(f.source);
  assert.deepEqual(await outputManifest(f.source,undefined,true,memo),plain);
  assert.deepEqual(await outputManifest(f.source,undefined,true,memo),plain,'a warm memo gives the same answer');
  assert.ok(memo.size>0);

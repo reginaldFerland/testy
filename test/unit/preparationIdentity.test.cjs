@@ -3,22 +3,29 @@ const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:
 const {createRequire}=require('node:module'),{randomUUID}=require('node:crypto');
 const {normalizePath,contentHash}=require('../../out/core/paths');
 const {stableEnvironment}=require('../../out/core/environment');
+const {loadRunner}=require('./support/runner.cjs');
 
-function deferred(){let resolve;const promise=new Promise(done=>{resolve=done;});return{promise,resolve};}
+/** @returns {{promise: Promise<void>, resolve: () => void}} */
+function deferred(){let resolve=()=>{}; // replaced synchronously by the promise executor
+ /** @type {Promise<void>} */ const promise=new Promise(done=>{resolve=done;});return{promise,resolve};}
+/** @param {{resolve?: (command: string) => Promise<void>, hash?: (file: string) => Promise<void>}} [config] */
 async function identityFixture(config={}){
- const file=path.resolve('out/services/preparationIdentity.js'),realRequire=createRequire(file),exports={};
+ const file=path.resolve('out/services/preparationIdentity.js'),realRequire=createRequire(file);
+ /** @type {any} */ const exports={}; // the module under test, evaluated in a vm
  const resolved=new Map([['dotnet','C:\\tools\\dotnet.exe'],['collector','C:\\tools\\collector.exe'],['other-host','C:\\other\\dotnet.exe']]);
- const versions=new Map(),calls=[],hashes=[];
+ const versions=new Map();
+ /** @type {any[]} */ const calls=[];
+ /** @type {any[]} */ const hashes=[];
  // Helper paths resolve against the module's own directory, so evaluate them with the same Windows root.
- const assets={};vm.runInNewContext(await fs.readFile(path.resolve('out/services/assets.js'),'utf8'),{exports:assets,__dirname:'C:\\repo\\out\\services',require:name=>name==='node:path'?path.win32:realRequire(name)});
- vm.runInNewContext(await fs.readFile(file,'utf8'),{exports,__dirname:'C:\\repo\\out\\services',require:name=>name==='node:path'?path.win32:name==='./assets'?assets:
-  name==='./executable'?{ambiguousWindowsPath:realRequire('./executable').ambiguousWindowsPath,resolveNodeExecutable:async(command,env,cwd,signal)=>{
+ const assets={};vm.runInNewContext(await fs.readFile(path.resolve('out/services/assets.js'),'utf8'),{exports:assets,__dirname:'C:\\repo\\out\\services',require:(/** @type {string} */ name)=>name==='node:path'?path.win32:realRequire(name)});
+ vm.runInNewContext(await fs.readFile(file,'utf8'),{exports,__dirname:'C:\\repo\\out\\services',require:(/** @type {string} */ name)=>name==='node:path'?path.win32:name==='./assets'?assets:
+  name==='./executable'?{ambiguousWindowsPath:realRequire('./executable').ambiguousWindowsPath,resolveNodeExecutable:async(/** @type {string} */ command,/** @type {unknown} */ env,/** @type {string} */ cwd,/** @type {AbortSignal | undefined} */ signal)=>{
    signal?.throwIfAborted();calls.push({command,env,cwd});await config.resolve?.(command);
    return resolved.get(command)??(path.win32.isAbsolute(command)?command:undefined);
-  },resolveOwnedCommand:async command=>{
+  },resolveOwnedCommand:async (/** @type {string} */ command)=>{
    const found=resolved.get(command)??(path.win32.isAbsolute(command)?command:undefined);
    if(!found)throw new Error(`Cannot find ${command} on PATH`);return found;
-  }}:name==='./preparedOutputCache'?{preparationToolIdentity:async(file,env,signal,cwd,identities)=>{
+  }}:name==='./preparedOutputCache'?{preparationToolIdentity:async(/** @type {string} */ file,/** @type {unknown} */ env,/** @type {AbortSignal | undefined} */ signal,/** @type {string} */ cwd,/** @type {unknown} */ identities)=>{
    signal?.throwIfAborted();assert.equal(path.win32.isAbsolute(file),true,'only explicitly resolved file paths reach asset hashing');
    hashes.push({file,env,cwd,identities});await config.hash?.(file);signal?.throwIfAborted();
    return `${file}:${versions.get(file)??'v1'}`;
@@ -26,16 +33,16 @@ async function identityFixture(config={}){
  const env={Path:'C:\\tools'},identities=new Map();
  const options={dotnet:'dotnet',coverageTool:'collector',analyzer:'analyzer\\Testy.Analysis.dll',cleanupDescendants:false};
  return{...exports,resolved,versions,calls,hashes,env,identities,options,
-  read:overrides=>exports.windowsPreparationTools({...options,...overrides},env,'C:\\work',identities)};
+  read:(/** @type {Record<string, any> | undefined} */ overrides=undefined)=>exports.windowsPreparationTools({...options,...overrides},env,'C:\\work',identities)};
 }
 
 test('Windows preparation assigns executable and asset roles without resolving analyzer DLLs as commands',async()=>{
  const f=await identityFixture(),tools=await f.read();
  assert.equal(tools.instrumentationLaunch,'node');assert.equal(tools.dotnetNode,'C:\\tools\\dotnet.exe:v1');
  assert.equal(tools.collector,'C:\\tools\\collector.exe:v1');assert.equal(tools.analyzerAsset,'C:\\work\\analyzer\\Testy.Analysis.dll:v1');
- assert.deepEqual(f.calls.map(call=>call.command),['dotnet','collector']);
- assert.ok(f.calls.every(call=>call.env===f.env&&call.cwd==='C:\\work'));
- assert.ok(f.hashes.every(call=>call.identities===f.identities));
+ assert.deepEqual(f.calls.map((/** @type {any} */ call)=>call.command),['dotnet','collector']);
+ assert.ok(f.calls.every((/** @type {any} */ call)=>call.env===f.env&&call.cwd==='C:\\work'));
+ assert.ok(f.hashes.every((/** @type {any} */ call)=>call.identities===f.identities));
  assert.equal(tools.ownerNode,undefined);assert.equal(tools.ownerAsset,undefined);
 });
 
@@ -59,13 +66,13 @@ test('standalone Windows owned instrumentation requires an explicit existing col
  assert.equal(first.ownerAsset,'C:\\repo\\dist\\processhost\\Testy.ProcessHost.dll:v1');
  f.versions.set('C:\\repo\\dist\\processhost\\Testy.ProcessHost.dll','v2');assert.notEqual((await f.read(options)).ownerAsset,first.ownerAsset);
  f.versions.set('C:\\other\\dotnet.exe','v2');assert.notEqual((await f.read(options)).ownerNode,first.ownerNode);
- assert.ok(!f.calls.some(call=>call.command==='C:\\tools\\collector.exe'),'explicit owned command is checked as an exact asset, without Node fallback suffix search');
+ assert.ok(!f.calls.some((/** @type {any} */ call)=>call.command==='C:\\tools\\collector.exe'),'explicit owned command is checked as an exact asset, without Node fallback suffix search');
 });
 
 test('without coverage there is no owned-instrumentation gate or owner bundle read',async()=>{
  const f=await identityFixture(),tools=await f.read({coverageTool:undefined,cleanupDescendants:undefined});
  assert.equal(tools.instrumentationLaunch,'none');assert.equal(tools.collector,undefined);assert.equal(tools.ownerAsset,undefined);
- assert.deepEqual(f.calls.map(call=>call.command),['dotnet']);
+ assert.deepEqual(f.calls.map((/** @type {any} */ call)=>call.command),['dotnet']);
 });
 
 test('failed Windows role resolution drains independently admitted asset reads before fallback', {timeout:5000},async t=>{
@@ -85,43 +92,50 @@ test('cancellation drains Windows identity readers and rejects rather than retur
  finish.resolve();await rejected;
 });
 
+/**
+ * @param {import('node:test').TestContext} t
+ * @param {{platform?: string, collector?: string, owned?: boolean}} [config]
+ */
 async function runnerFixture(t,config={}){
  const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-preparation-roles-'))),source=path.join(root,'build'),workspace=path.join(root,'workspace');
  await fs.mkdir(source);await fs.mkdir(workspace);await fs.writeFile(path.join(source,'Tests.dll'),'pristine');await fs.writeFile(path.join(source,'asset'),'pristine');
  const sourceFile=normalizePath(path.join(workspace,'Tests.cs'));
  const project={file:normalizePath(path.join(workspace,'Tests.csproj')),framework:'net10.0',assembly:path.join(source,'Tests.dll'),sourceFiles:[sourceFile]};
- const file=path.resolve('out/services/runner.js'),realRequire=createRequire(file),exports={},identity=await identityFixture();
+ const file=path.resolve('out/services/runner.js'),realRequire=createRequire(file),identity=await identityFixture();
+ /** @type {any} */ const exports={}; // the runner module under test, evaluated in a vm
  const mtp=realRequire('./mtp'),cacheTools=realRequire('./preparedOutputCache'),processTools=realRequire('./process');
  const platform=config.platform??'win32',fakeProcess=Object.create(process);Object.defineProperty(fakeProcess,'platform',{value:platform});Object.defineProperty(fakeProcess,'env',{value:{Path:'C:\\tools'}});
+ /** @type {{instruments: {command: string, session: string, cleanupDescendants: unknown}[], discoveries: {assembly: string, uid: string}[], runs: {dotnet: string, wrapper: any, ids: string[]}[], messages: string[], legacy: (string | undefined)[]}} */
  const state={instruments:[],discoveries:[],runs:[],messages:[],legacy:[]};
  const modules={
   './preparationIdentity':platform==='win32'?identity:{windowsPreparationTools:()=>{throw new Error('POSIX must retain its existing identity path');}},
-  './preparedOutputCache':{...cacheTools,preparationToolIdentity:async command=>{state.legacy.push(command);return command===undefined?undefined:`legacy:${command}`;}},
-  './process':{...processTools,runProcess:async(command,args,options)=>{
+  './preparedOutputCache':{...cacheTools,preparationToolIdentity:async (/** @type {string | undefined} */ command)=>{state.legacy.push(command);return command===undefined?undefined:`legacy:${command}`;}},
+  './process':{...processTools,runProcess:async(/** @type {string} */ command,/** @type {string[]} */ args,/** @type {any} */ options)=>{
    assert.equal(args[0],'instrument');state.instruments.push({command,session:args[3],cleanupDescendants:options.cleanupDescendants});
    await fs.appendFile(args[1],`:instrumented:${args[3]}`);return{code:0,stdout:'',stderr:''};
   }},
-  './mtp':{...mtp,requestTests:async(options,operation,selected)=>{
+  './mtp':{...mtp,requestTests:async(/** @type {any} */ options,/** @type {string} */ operation,/** @type {any[] | undefined} */ selected)=>{
    const asset=path.join(path.dirname(options.assembly),'asset');
    assert.equal(await fs.readFile(asset,'utf8'),'pristine','cached working output is repaired before every native operation');
    if(operation==='discover'){
     const uid=`fresh-${state.discoveries.length}`;state.discoveries.push({assembly:options.assembly,uid});await fs.writeFile(asset,'discovery mutation');
     return[{uid,'display-name':'Current test','location.file':sourceFile,'location.type':'Tests','location.method':'Run'}];
    }
-   const nodes=selected??options.expectedTests;assert.deepEqual(Array.from(nodes,node=>node.uid),[state.discoveries.at(-1).uid]);
-   state.runs.push({dotnet:options.dotnet,wrapper:options.wrapper,ids:nodes.map(node=>node.uid)});
-   return nodes.map(node=>({...node,'execution-state':'passed'}));
+   const nodes=selected??options.expectedTests;assert.deepEqual(Array.from(nodes,(/** @type {any} */ node)=>node.uid),[/** @type {{uid: string}} */ (state.discoveries.at(-1)).uid]);
+   state.runs.push({dotnet:options.dotnet,wrapper:options.wrapper,ids:nodes.map((/** @type {any} */ node)=>node.uid)});
+   return nodes.map((/** @type {any} */ node)=>({...node,'execution-state':'passed'}));
   }},
-  './coverageReader':{CoverageReader:class{async read(_report,_cwd,hashes){return[{file:sourceFile,hash:hashes.get(sourceFile),lines:[{line:1,hits:1}]}];}async dispose(){}}},
+  './coverageReader':{CoverageReader:class{async read(/** @type {unknown} */ _report,/** @type {unknown} */ _cwd,/** @type {Map<string, string>} */ hashes){return[{file:sourceFile,hash:hashes.get(sourceFile),lines:[{line:1,hits:1}]}];}async dispose(){}}},
   './runtimeObservation':{RuntimeObservation:class{static async start(){return{dependencies:async()=>({files:[],projects:[]})};}}}
  };
- vm.runInNewContext(await fs.readFile(file,'utf8'),{exports,process:fakeProcess,require:name=>modules[name]??realRequire(name)});
- const cache=new cacheTools.PreparedOutputCache(path.join(root,'cache'),randomUUID()),sessions=[];
+ Object.assign(exports,loadRunner(modules,{process:fakeProcess}));
+ const cache=new cacheTools.PreparedOutputCache(path.join(root,'cache'),randomUUID());
+ /** @type {{dispose(): Promise<void>}[]} */ const sessions=[];
  const base={dotnet:'dotnet',coverageTool:config.collector??'collector',managedCoverageTool:true,storage:path.join(root,'runs'),testArguments:[],preparedOutputCache:cache,
-  cleanupDescendants:config.owned?undefined:false,output:message=>state.messages.push(message),assemblies:[project.assembly]};
- const create=(overrides={})=>{const session=new exports.RunnerSession({...base,...overrides});sessions.push(session);return session;};
+  cleanupDescendants:config.owned?undefined:false,output:(/** @type {string} */ message)=>state.messages.push(message),assemblies:[project.assembly]};
+ const create=(/** @type {Record<string, any>} */ overrides={})=>{const session=new exports.RunnerSession({...base,...overrides});sessions.push(session);return session;};
  t.after(async()=>{for(const session of sessions)await session.dispose();await cache.dispose();await fs.rm(root,{recursive:true,force:true});});
- const run=async overrides=>{const session=create(overrides),groups=await session.discover(project),result=await session.run(groups,new Map([[sourceFile,'v1']]));
+ const run=async (/** @type {Record<string, any> | undefined} */ overrides=undefined)=>{const session=create(overrides),groups=await session.discover(project),result=await session.run(groups,new Map([[sourceFile,'v1']]));
   const artifact=[...session.prepared.values()][0];await session.dispose();return{groups,result,session:artifact.session,root:artifact.root};};
  return{root,sourceFile,project,identity,state,base,create,run,fakeProcess};
 }
@@ -133,7 +147,7 @@ test('ordinary Windows direct preparation stays cached while fresh native IDs, c
  assert.equal(second.result.results[0].id,second.groups[0].tests[0].id);assert.equal(second.result.trace.reliable,true);
  assert.deepEqual(second.result.trace.coverage,first.result.trace.coverage);assert.equal(second.result.trace.coverage[0].hash,'v1');
  assert.ok(f.state.runs.every(run=>run.dotnet==='dotnet'&&run.wrapper.command==='collector'),'identity lookup never rewrites owned MTP/collector launch arguments');
- assert.ok(f.state.instruments.every(call=>call.cleanupDescendants===false));
+ assert.ok(f.state.instruments.every((/** @type {any} */ call)=>call.cleanupDescendants===false));
 });
 
 test('Windows caller invalidates a template when the selected Node instrumenter changes',async t=>{
@@ -146,7 +160,7 @@ test('standalone owned bare collectors still execute but cannot publish reusable
  const f=await runnerFixture(t,{owned:true}),first=await f.run(),second=await f.run();
  assert.equal(f.state.instruments.length,2);assert.notEqual(first.session,second.session);assert.equal(f.state.runs.length,2);
  assert.ok(f.state.messages.some(message=>message.includes('without an explicit path')));
- assert.ok(f.state.instruments.every(call=>call.command==='collector'&&call.cleanupDescendants===undefined));
+ assert.ok(f.state.instruments.every((/** @type {any} */ call)=>call.command==='collector'&&call.cleanupDescendants===undefined));
 });
 
 test('explicit standalone owned collectors retain cache eligibility and invalidate owner bundle changes',async t=>{
@@ -158,13 +172,13 @@ test('explicit standalone owned collectors retain cache eligibility and invalida
 
 test('preparation contexts order the environment by code units under a bumped version on every platform',async t=>{
  const f=await runnerFixture(t,{platform:'linux'}),session=f.create({analyzer:'analyzer.dll',env:{a_lower:'1',B_UPPER:'2'}}),group={project:f.project.file,framework:f.project.framework,assembly:f.project.assembly};
- const context=await session.preparationContext(group),env=stableEnvironment({...f.fakeProcess.env,a_lower:'1',B_UPPER:'2'});
+ const context=await session.preparer.preparationContext(group),env=stableEnvironment({...f.fakeProcess.env,a_lower:'1',B_UPPER:'2'});
  const entries=Object.entries(env).sort(([left],[right])=>left<right?-1:left>right?1:0);
  // Uppercase sorts before lowercase by code unit, regardless of the host locale.
  assert.ok(entries.findIndex(([key])=>key==='B_UPPER')<entries.findIndex(([key])=>key==='a_lower'));
  const tools=contentHash(JSON.stringify({tools:['legacy:dotnet','legacy:collector','legacy:analyzer.dll'],
   env:entries,arguments:[],assemblies:[f.project.assembly],runtime:process.version,platform:'linux',architecture:process.arch}));
  assert.equal(context,JSON.stringify({version:4,tools,project:group.project,framework:group.framework,assembly:group.assembly}));
- const windows=await runnerFixture(t),current=JSON.parse(await windows.create().preparationContext({project:windows.project.file,framework:windows.project.framework,assembly:windows.project.assembly}));
+ const windows=await runnerFixture(t),current=JSON.parse(await windows.create().preparer.preparationContext({project:windows.project.file,framework:windows.project.framework,assembly:windows.project.assembly}));
  assert.equal(current.version,5);assert.deepEqual(f.state.legacy,['dotnet','collector','analyzer.dll']);
 });

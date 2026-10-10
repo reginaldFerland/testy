@@ -4,26 +4,28 @@ const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:
 const {TestEngine}=require('../../out/services/engine');
 const analysis=require('../../out/services/analysis'),mtp=require('../../out/services/mtp');
 
-function deferred(){let resolve;const promise=new Promise(done=>{resolve=done;});return{promise,resolve};}
+function deferred(){/** @type {() => void} */ let resolve=()=>{};const promise=new Promise(done=>{resolve=()=>done(undefined);});return{promise,resolve};}
 
+/** @param {import('node:test').TestContext} t @param {number} limit */
 async function fixture(t,limit){
  const temp=await fs.mkdtemp(path.join(os.tmpdir(),'testy-preparation-pipeline-')),workspace=path.join(temp,'workspace'),storage=path.join(temp,'state');
  await fs.cp(path.resolve('test/fixtures/ImpactDemo'),workspace,{recursive:true,filter:file=>!/(^|[/\\])(bin|obj|TestResults)([/\\]|$)/.test(file)});
  const control=new AbortController(),signal=AbortSignal.any([control.signal,t.signal]);
- const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:false,excludes:[],testArguments:[],timeout:60000,maxParallelProjects:limit,maxParallelTestFiles:limit};
- const output=[],cleanup=[];
+ /** @type {import('../../out/core/model').EngineConfiguration} */ const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:false,excludes:[],testArguments:[],timeout:60000,maxParallelProjects:limit,maxParallelTestFiles:limit};
+ /** @type {string[]} */ const output=[];
+ /** @type {(() => void)[]} */ const cleanup=[];
  const engine=new TestEngine({roots:[workspace],storage,tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
   events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result(){},started(){},coverage(){},invalidated(){}}});
  t.after(async()=>{control.abort();for(const release of cleanup)release();await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
- return{engine,signal,storage,output,cleanup:release=>cleanup.push(release)};
+ return{engine,signal,storage,output,cleanup:(/** @type {() => void} */ release)=>cleanup.push(release)};
 }
 
 for(const limit of [1,2,4])test(`analysis and discovery share ${limit} preparation worker${limit===1?'':'s'}`,{timeout:120000},async t=>{
  const f=await fixture(t,limit),entered=deferred(),release=deferred();
  const analyze=analysis.sourceAnalysisBatch,request=mtp.requestTests;
  let active=0,peak=0,overlapped=false;
- const counted=async(slots,work)=>{active+=slots;peak=Math.max(peak,active);assert.ok(active<=limit,`${active} reserved workers exceeds ${limit}`);try{return await work();}finally{active-=slots;}};
- analysis.sourceAnalysisBatch=(...args)=>counted(args[6],async()=>{
+ const counted=async(/** @type {number} */ slots,/** @type {() => Promise<any>} */ work)=>{active+=slots;peak=Math.max(peak,active);assert.ok(active<=limit,`${active} reserved workers exceeds ${limit}`);try{return await work();}finally{active-=slots;}};
+ analysis.sourceAnalysisBatch=(...args)=>counted(/** @type {number} */ (args[6]),async()=>{
   entered.resolve();if(limit>1)await release.promise;return analyze(...args);
  });
  mtp.requestTests=async(options,operation,...args)=>{
@@ -43,11 +45,12 @@ for(const limit of [1,2,4])test(`analysis and discovery share ${limit} preparati
 test('discovery failure cancels and drains concurrent analysis before disposing the engine',{timeout:120000},async t=>{
  const f=await fixture(t,2),entered=deferred(),aborted=deferred(),finish=deferred();
  const analyze=analysis.sourceAnalysisBatch,request=mtp.requestTests;
- analysis.sourceAnalysisBatch=async(...args)=>{
+ // Deliberate partial mock: never resolves with a result, it only observes cancellation and then throws.
+ analysis.sourceAnalysisBatch=/** @type {any} */ (async(/** @type {any[]} */ ...args)=>{
   const signal=args[4].signal;entered.resolve();
-  await new Promise(resolve=>{if(signal.aborted)resolve();else signal.addEventListener('abort',resolve,{once:true});});
+  await /** @type {Promise<void>} */ (new Promise(resolve=>{if(signal.aborted)resolve(undefined);else signal.addEventListener('abort',()=>resolve(),{once:true});}));
   aborted.resolve();await finish.promise;signal.throwIfAborted();
- };
+ });
  mtp.requestTests=async(options,operation,...args)=>{
   if(operation!=='discover')return request(options,operation,...args);
   await entered.promise;throw new Error('controlled discovery failure');

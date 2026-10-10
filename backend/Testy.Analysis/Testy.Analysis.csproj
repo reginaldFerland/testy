@@ -4,6 +4,8 @@
     <TargetFramework>net10.0</TargetFramework>
     <!-- Ordinal comparisons only (hashes, paths, identifiers), so skip loading ICU. -->
     <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Everything is serialized through source-generated contexts (AnalysisJson), so nothing needs reflection-based System.Text.Json. -->
+    <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
     <!-- The server amortizes Tier-0 instrumentation over many requests. The one-shot
          fallback (a short-lived process) turns it off with DOTNET_TieredPGO=0. -->
     <TieredPGO>true</TieredPGO>

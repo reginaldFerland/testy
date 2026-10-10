@@ -4,10 +4,15 @@ const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:
 const {TestEngine}=require('../../out/services/engine');
 const {normalizePath}=require('../../out/core/paths');
 
+/** @typedef {import('../../out/core/model').TestFile} TestFile */
+/** @typedef {import('../../out/core/model').TestResult & {group: TestFile}} Reported */
+/** @typedef {{instruments: {assembly: string, session: string}[], discoveries: string[], runs: string[], active: number, peak: number, beforeRun?: (options: any) => Promise<void>}} Probe */
+
+/** @param {import('node:test').TestContext} t @param {{projects?: number, files?: number, dynamic?: boolean}} [options] */
 async function fixture(t,{projects=1,files=1,dynamic=false}={}) {
  const temp=await fs.mkdtemp(path.join(os.tmpdir(),'testy-prepared-cache-'));
  const root=path.join(temp,'workspace'),storage=path.join(temp,'state');
- const file=relative=>normalizePath(path.join(root,relative));
+ const file=(/** @type {string} */ relative)=>normalizePath(path.join(root,relative));
  const control=path.join(temp,'expected.txt'),assetControl=path.join(temp,'expected-asset.txt'),slow=path.join(temp,'slow');
  await fs.mkdir(file('Core'),{recursive:true});
  await fs.writeFile(file('Core/Core.csproj'),'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>');
@@ -34,16 +39,16 @@ async function fixture(t,{projects=1,files=1,dynamic=false}={}) {
 }`);
   }
  }
- const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:60000,
+ /** @type {import('../../out/core/model').EngineConfiguration} */ const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:60000,
   coverageTool:process.env.TESTY_COVERAGE_TOOL,maxParallelProjects:projects,maxParallelTestFiles:projects};
- const state={output:[],prepared:[],started(){},results:[]};
+ /** @type {{output: string[], prepared: string[], started: (group: TestFile, id: string) => void, results: Reported[]}} */ const state={output:[],prepared:[],started(){},results:[]};
  const engine=new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
   events:{output:text=>state.output.push(text),phase(){},discovered(){},selected(){},result:(group,result)=>state.results.push({group,...result}),
    started:(...args)=>state.started(...args),coverage(){},invalidated(){},prepared:project=>state.prepared.push(project)}});
  t.after(async()=>{await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
  const processTools=require('../../out/services/process'),mtp=require('../../out/services/mtp');
  const runProcess=processTools.runProcess,requestTests=mtp.requestTests;
- const probe={instruments:[],discoveries:[],runs:[],active:0,peak:0};
+ /** @type {Probe} */ const probe={instruments:[],discoveries:[],runs:[],active:0,peak:0};
  processTools.runProcess=async(command,args,...rest)=>{
   if(args[0]==='instrument')probe.instruments.push({assembly:args[1],session:args[args.indexOf('--session-id')+1]});
   return runProcess(command,args,...rest);
@@ -55,7 +60,7 @@ async function fixture(t,{projects=1,files=1,dynamic=false}={}) {
   try{await probe.beforeRun?.(options);return await requestTests(options,operation,...rest);}finally{probe.active--;}
  };
  t.after(()=>{processTools.runProcess=runProcess;mtp.requestTests=requestTests;});
- const run=(full=false,manual)=>engine.run({files:[],full},new AbortController().signal,manual);
+ const run=(full=false,/** @type {import('../../out/services/engine/types').ManualSelection | undefined} */ manual=undefined)=>engine.run({files:[],full},new AbortController().signal,manual);
  const manual=()=>({groups:new Set(engine.groups.map(group=>group.id))});
  return {temp,root,storage,file,control,assetControl,slow,config,state,engine,probe,run,manual};
 }
@@ -86,7 +91,7 @@ test('prepared outputs invalidate when a dependency DLL or copied asset changes'
  await fs.writeFile(f.control,'3');
  const dependency=await f.run(false,f.manual());assert.equal(dependency.passed,1,f.state.output.join(''));
  assert.ok(f.probe.instruments.length>initial,'changed production DLL bytes invalidate the retained target preparation');
- assert.ok(f.engine.coverage.traces.get(f.engine.groups[0].id).dependencies.includes(f.file('Core/Core.cs')));
+ assert.ok(/** @type {import('../../out/core/model').Trace} */ (f.engine.coverage.traces.get(/** @type {TestFile} */ (f.engine.groups[0]).id)).dependencies.includes(f.file('Core/Core.cs')));
  const afterDependency=f.probe.instruments.length;
  await fs.writeFile(f.file('Suite0/asset.txt'),'updated asset');await fs.writeFile(f.assetControl,'updated asset');
  const asset=await f.run(false,f.manual());assert.equal(asset.passed,1,f.state.output.join(''));
@@ -102,7 +107,7 @@ test('xUnit selected and excluded row identities survive prepared-output invalid
  await fs.writeFile(f.file('Suite0/Value0Tests.cs'),`using Xunit; public class Value0Tests { [Theory][InlineData("${prefix}1")][InlineData("${prefix}2")] public void Duplicate(string value) { Assert.True(Core.Value(1)>0); Assert.EndsWith("1",value); } }`);
  const baseline=await f.run(true);assert.equal(baseline.tests,2);assert.equal(baseline.passed,1);assert.equal(baseline.failed,1);
  const group=f.engine.groups[0],ids=group.tests.map(test=>test.id).sort();
- const passed=f.state.results.find(result=>result.outcome==='passed'),failed=f.state.results.find(result=>result.outcome==='failed');
+ const passed=/** @type {Reported} */ (f.state.results.find(result=>result.outcome==='passed')),failed=/** @type {Reported} */ (f.state.results.find(result=>result.outcome==='failed'));
  assert.equal(passed.name,failed.name,'row names deliberately collide so name-based recovery cannot hide changed native IDs');assert.notEqual(passed.id,failed.id);
  const instrumented=f.probe.instruments.length;
  await fs.writeFile(f.file('Core/Core.cs'),'public static class Core { public static int Value(int value) => value + 2; }');
@@ -127,7 +132,7 @@ test('cancelled cached execution drains, retries cleanly and parks only pristine
  f.state.started=()=>{};await fs.rm(f.slow);
  const retry=await f.run(false,f.manual());assert.equal(retry.passed,1,f.state.output.join(''));assert.equal(retry.coverageAvailable,true);
  assert.ok(f.probe.instruments.length>before,'a cancelled collector session is discarded before retry');
- assert.equal(f.engine.coverage.traces.get(f.engine.groups[0].id).reliable,true);
+ assert.equal(/** @type {import('../../out/core/model').Trace} */ (f.engine.coverage.traces.get(/** @type {TestFile} */ (f.engine.groups[0]).id)).reliable,true);
  await f.engine.dispose();
  const owners=(await fs.readdir(path.join(f.storage,'prepared-v2'))).filter(name=>name.endsWith('.owner.json'));
  assert.equal(owners.length,1);
@@ -139,8 +144,11 @@ test('cancelled cached execution drains, retries cleanly and parks only pristine
 
 test('balanced project scheduling uses prepared primaries before creating additional worker copies',{timeout:180000},async t=>{
  const f=await fixture(t,{projects:4,files:3});
- let admitted=0,release,firstWave,timer;
- const primariesAdmitted=new Promise(resolve=>release=resolve);
+ let admitted=0;
+ /** @type {() => void} */ let release=()=>{};
+ /** @type {{discoveries: string[], instruments: {assembly: string, session: string}[], runs: string[]} | undefined} */ let firstWave;
+ /** @type {NodeJS.Timeout | undefined} */ let timer;
+ const primariesAdmitted=new Promise(resolve=>{release=()=>resolve(undefined);});
  t.after(()=>clearTimeout(timer));
  f.probe.beforeRun=async()=>{
   const index=admitted++;if(index>=4)return;
@@ -161,6 +169,6 @@ test('balanced project scheduling uses prepared primaries before creating additi
  // legitimately create additional lanes when real process durations differ.
  assert.equal(f.engine.coverage.traces.size,12);
  for(const group of f.engine.groups) {
-  const trace=f.engine.coverage.traces.get(group.id);assert.equal(trace.reliable,true);assert.ok(trace.dependencies.includes(f.file('Core/Core.cs')));
+  const trace=/** @type {import('../../out/core/model').Trace} */ (f.engine.coverage.traces.get(group.id));assert.equal(trace.reliable,true);assert.ok(trace.dependencies.includes(f.file('Core/Core.cs')));
  }
 });

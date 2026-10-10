@@ -3,7 +3,8 @@ const assert=require('node:assert/strict');
 const {loadUi}=require('./support/ui.cjs');
 
 // A recognizable "translation" proves every displayed string passes through l10n.
-const translate=(message,...args)=>`«${message.replace(/\{(\d+)\}/g,(_,index)=>String(args[index]))}»`;
+/** @type {(message: string, ...args: unknown[]) => string} */
+const translate=(message,...args)=>`«${message.replace(/\{(\d+)\}/g,(/** @type {string} */ _,/** @type {number} */ index)=>String(args[index]))}»`;
 
 test('engine phases are formatted from typed payloads through l10n',()=>{
  const {describePhase}=loadUi({vscode:{l10n:{t:translate}}}).module('ui/statusBar');
@@ -19,7 +20,7 @@ test('engine phases are formatted from typed payloads through l10n',()=>{
 
 test('the status bar shows the localized phase while a run is active',()=>{
  const {StatusBar}=loadUi({vscode:{l10n:{t:translate},commands:{executeCommand:async()=>{}},ThemeColor:class{}}}).module('ui/statusBar');
- const bar={item:{}},model={paused:false,running:true,scheduling:'idle',phase:undefined,lastError:'',lastSummary:undefined,passed:0,failed:0,hasTests:true,coverageSuffix:'',continuousOverride:false};
+ /** @type {{item: {text?: string}}} */ const bar={item:{}},model={paused:false,running:true,scheduling:'idle',phase:undefined,lastError:'',lastSummary:undefined,passed:0,failed:0,hasTests:true,coverageSuffix:'',continuousOverride:false};
  StatusBar.prototype.update.call(bar,{...model,phase:{kind:'building'}});
  assert.equal(bar.item.text,'$(sync~spin) «Testy: «Building»»');
  StatusBar.prototype.update.call(bar,{...model,phase:{kind:'testing',completed:2,total:6,active:3}});

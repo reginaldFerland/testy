@@ -1,4 +1,5 @@
 // @ts-check
+require('./artifacts.cjs');
 const fs=require('node:fs/promises'),sync=require('node:fs'),path=require('node:path'),os=require('node:os'),vm=require('node:vm'),crypto=require('node:crypto'),{createRequire}=require('node:module');
 const repo=path.resolve(__dirname,'../..');
 const {CoverageStore}=require(path.join(repo,'out/core/coverage')),{CoverageCache}=require(path.join(repo,'out/services/cache'));

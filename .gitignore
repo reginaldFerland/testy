@@ -11,3 +11,5 @@ backend/publish/
 
 .test-tools/
 .DS_Store
+.benchmarks/
+coverage/

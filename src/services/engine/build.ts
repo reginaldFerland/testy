@@ -11,13 +11,13 @@ import type { BuildPlan, BuildResult, RunContext } from './types';
 /** Build in conflict-free waves, snapshotting test outputs that a later context could overwrite. */
 export async function build(host: EngineHost, run: RunContext, plan: BuildPlan, outputLease: RunOutputLease, beforeBuild: ReadonlyMap<string, string>): Promise<BuildResult> {
     const { signal, config, processOptions, projectLimit, manual, manualOperation } = run;
-    const { closure, builds, testBuilds, sharedOutputs } = plan;
+    const { closure, builds, testBuilds, sharedOutputs, normalize } = plan;
     const snapshots = new Map<string, string>();
     const builtInputs = [...new Set(closure.flatMap(project => [...project.analysisFiles ?? project.sourceFiles, ...project.inputs ?? []]))];
     const revision = host.sources.revision;
     const buildContexts = await sdkContextGroups([...new Set(builds.map(project => project.file))], signal);
     const sdkByFile = new Map(buildContexts.flatMap(context => context.files.map(file => [file, context.key] as const)));
-    for (const wave of buildWaves(closure, builds, sdkByFile)) {
+    for (const wave of buildWaves(closure, builds, sdkByFile, normalize)) {
         const contexts = await sdkContextGroups([...new Set(wave.map(project => project.file))], signal);
         const workers = Math.min(projectLimit, contexts.length);
         await mapConcurrent(contexts, projectLimit, signal, async (context, _index, workerSignal) => {

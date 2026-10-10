@@ -10,6 +10,12 @@ const {sourceAliases,disposeAnalyzerServers}=require('../../out/services/analysi
 const peer=path.resolve('test/fixtures/analyzer-server-peer.cjs'),node=process.execPath;
 const alive=(/** @type {number} */pid)=>{try{process.kill(pid,0);return true;}catch{return false;}};
 const until=async(/** @type {() => unknown} */condition,/** @type {string} */message)=>{for(let index=0;index<200;index++){if(await condition())return;await new Promise(resolve=>setTimeout(resolve,25));}assert.fail(message);};
+/** A file the peer writes when it receives a slow request. */
+const receipt=async(/** @type {import('node:test').TestContext} */t)=>{
+ const directory=await fs.mkdtemp(path.join(os.tmpdir(),'testy-server-receipt-'));t.after(()=>fs.rm(directory,{recursive:true,force:true}));
+ const file=path.join(directory,'started');
+ return {file,arrived:()=>until(()=>fs.access(file).then(()=>true,()=>false),'the server did not receive the request')};
+};
 const send=(/** @type {InstanceType<typeof AnalyzerServers>} */servers,/** @type {string} */mode,options={},extra={})=>servers.request(node,peer,JSON.stringify({mode,...extra}),{cwd:os.tmpdir(),...options}).then(JSON.parse);
 
 test('one server answers concurrent requests by id, resolves relative paths from the request cwd and shares its process',async t=>{
@@ -43,12 +49,12 @@ test('servers are keyed by working directory and environment, and replaced when 
 test('an aborted request rejects at once, is cancelled in the server, and later requests use the same process',async t=>{
  const servers=new AnalyzerServers();t.after(()=>servers.dispose());
  const {pid}=await send(servers,'echo');
- const abort=new AbortController(),slow=send(servers,'slow',{signal:abort.signal},{ms:30_000});
- await new Promise(resolve=>setTimeout(resolve,100));
- const started=Date.now();abort.abort();
+ const started=await receipt(t),abort=new AbortController(),slow=send(servers,'slow',{signal:abort.signal},{ms:30_000,started:started.file});
+ await started.arrived();
+ const aborted=Date.now();abort.abort();
  await assert.rejects(slow,{name:'AbortError'});
  // The slow request would take 30s; the bound only proves the abort did not wait for it.
- assert.ok(Date.now()-started<15_000);
+ assert.ok(Date.now()-aborted<15_000);
  // The stale acknowledgement must not complete or confuse the next request.
  const next=await send(servers,'echo');
  assert.equal(next.pid,pid);
@@ -61,8 +67,8 @@ test('an aborted request rejects at once, is cancelled in the server, and later 
 test('a server that ignores a cancel is replaced instead of poisoning the next request',async t=>{
  const servers=new AnalyzerServers({cancelMs:150});t.after(()=>servers.dispose());
  const {pid}=await send(servers,'echo');
- const abort=new AbortController(),stubborn=send(servers,'slow',{signal:abort.signal},{ms:30_000,stubborn:true});
- await new Promise(resolve=>setTimeout(resolve,100));abort.abort();
+ const started=await receipt(t),abort=new AbortController(),stubborn=send(servers,'slow',{signal:abort.signal},{ms:30_000,stubborn:true,started:started.file});
+ await started.arrived();abort.abort();
  await assert.rejects(stubborn,{name:'AbortError'});
  await until(()=>!alive(pid),'the unresponsive server was not stopped');
  const next=await send(servers,'echo');
@@ -146,15 +152,14 @@ test('an idle server shuts down by itself and the next request starts another',a
  await until(()=>servers.size===0&&!alive(pid),'the idle server was not stopped');
  const next=await send(servers,'echo');
  assert.notEqual(next.pid,pid);
- // Activity keeps it alive.
- for(let index=0;index<4;index++){await new Promise(resolve=>setTimeout(resolve,150));assert.equal((await send(servers,'echo')).pid,next.pid);}
+ // Activity keeps it alive past the idle limit; each gap is far shorter than the limit.
+ for(const started=Date.now();Date.now()-started<1500;){await new Promise(resolve=>setTimeout(resolve,100));assert.equal((await send(servers,'echo')).pid,next.pid);}
 });
 
 test('a request waiting on a server stopped on purpose is retried on a new one',async t=>{
  const servers=new AnalyzerServers();t.after(()=>servers.dispose());
- const pending=send(servers,'slow',{},{ms:1500});
- await until(()=>servers.size===1,'the server did not start');
- await new Promise(resolve=>setTimeout(resolve,100));
+ const started=await receipt(t),pending=send(servers,'slow',{},{ms:1500,started:started.file});
+ await started.arrived();
  await servers.dispose();
  assert.equal(await pending,'done');
  assert.equal(servers.size,1);

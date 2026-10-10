@@ -4,6 +4,7 @@ import { escape } from 'minimatch';
 import { EngineConfiguration } from './core/model';
 import { additionalConfigurations } from './core/buildConfigurations';
 import { defaultExcludes, normalizePath } from './core/paths';
+import type { BuildDiagnosticsMode } from './diagnosticsPublisher';
 
 export interface Configuration extends EngineConfiguration {
     readonly enabled: boolean;
@@ -11,13 +12,15 @@ export interface Configuration extends EngineConfiguration {
     readonly debounce: number;
     readonly pattern: string;
     readonly showCoverage: boolean;
+    /** Whether build errors are published to the Problems panel (`testy.problems.publishBuildDiagnostics`). */
+    readonly buildDiagnostics: BuildDiagnosticsMode;
     /** Extra build configurations offered as manual Run and Coverage profiles. */
     readonly additionalConfigurations: readonly string[];
     /** Resource-scoped settings whose folder-level values differ; one engine applies the workspace value. */
     readonly folderConflicts: readonly string[];
 }
 
-export const defaultWatcherPattern = '**/*.{cs,csproj,sln,slnx,slnf,props,targets,runsettings,json,config,resx,editorconfig,globalconfig,ruleset}';
+export const defaultWatcherPattern = '**/*.{cs,csproj,sln,slnx,slnf,props,targets,runsettings,json,config,resx,editorconfig,globalconfig,ruleset,razor,cshtml,xaml,axaml,proto}';
 
 interface Folder { readonly root: string; readonly name: string; readonly settings: vscode.WorkspaceConfiguration }
 
@@ -68,6 +71,7 @@ export function configuration(): Configuration {
         debounce: Math.max(0, settings.get('debounceTime', 500)),
         pattern: settings.get('fileWatcherPattern', defaultWatcherPattern),
         showCoverage: settings.get('showCoverage', false),
+        buildDiagnostics: settings.get<BuildDiagnosticsMode>('problems.publishBuildDiagnostics', 'auto'),
         additionalConfigurations: additionalConfigurations(settings.get<string[]>('additionalConfigurations', []), buildConfiguration),
         dotnet: settings.get('dotnetPath', 'dotnet'), configuration: buildConfiguration,
         mode: settings.get('runMode', 'affected'), coverage: settings.get('runWithCoverage', true),

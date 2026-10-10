@@ -7,7 +7,7 @@ const port=Number(process.argv[process.argv.indexOf('--client-port')+1]);
 if(process.env.TESTINGPLATFORM_WAIT_ATTACH_DEBUGGER==='1'){
  console.log(`Waiting for debugger to attach... Process Id: ${process.pid}, Name: testhost`);
  const fs=require('node:fs'),started=Date.now();
- while(!fs.existsSync(process.env.TESTY_ATTACHED_FILE)&&Date.now()-started<10000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20);
+ while(!fs.existsSync(/** @type {string} */ (process.env.TESTY_ATTACHED_FILE))&&Date.now()-started<10000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20);
 }
 const socket=net.connect(port,'127.0.0.1');
 const rpc=createMessageConnection(socket,socket);

@@ -59,23 +59,22 @@ static class SourceAnalysis
         var combined = request.TryGetProperty("allFiles", out var allFiles);
         if (!combined && request.TryGetProperty("aliasSources", out var aliasSources))
         {
-            var names = aliasSources.Deserialize<string[]>()!.SelectMany(GlobalAliases).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+            var names = await ResolveAliasesAsync(aliasSources.Deserialize(AnalysisJson.Default.StringArray)!, cancellationToken);
             return JsonSerializer.Serialize(names, AnalysisJson.Default.StringArray);
         }
         if (request.TryGetProperty("assembly", out var assembly))
         {
             return JsonSerializer.Serialize(SourceLocations.Read(Path.GetFullPath(assembly.GetString()!, cwd), cancellationToken), AnalysisJson.Default.DictionaryStringLocation);
         }
-        var files = request.GetProperty("files").Deserialize<string[]>()
+        var files = request.GetProperty("files").Deserialize(AnalysisJson.Default.StringArray)
             ?? throw new ArgumentException("Expected an array of source paths.");
-        var aliases = request.GetProperty("excludedAliases").Deserialize<string[]>() ?? [];
+        var aliases = request.GetProperty("excludedAliases").Deserialize(AnalysisJson.Default.StringArray) ?? [];
         if (combined)
         {
-            var resolved = request.GetProperty("aliasSources").Deserialize<string[]>()!
-                .SelectMany(GlobalAliases).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+            var resolved = await ResolveAliasesAsync(request.GetProperty("aliasSources").Deserialize(AnalysisJson.Default.StringArray)!, cancellationToken);
             if (!resolved.ToHashSet(StringComparer.Ordinal).SetEquals(aliases))
             {
-                files = allFiles.Deserialize<string[]>() ?? throw new ArgumentException("Expected all analysis source paths.");
+                files = allFiles.Deserialize(AnalysisJson.Default.StringArray) ?? throw new ArgumentException("Expected all analysis source paths.");
             }
             aliases = resolved;
         }
@@ -199,13 +198,26 @@ static class SourceAnalysis
 
     static IEnumerable<string> AliasNames(string name) => name.EndsWith("Attribute", StringComparison.Ordinal) ? [name, name[..^9]] : [name];
 
-    internal static IEnumerable<string> GlobalAliases(string content)
+    // Parsing is CPU-bound, so it takes the same shared slots as the per-file analysis.
+    static async Task<string[]> ResolveAliasesAsync(string[] sources, CancellationToken cancellationToken)
     {
-        var root = CSharpSyntaxTree.ParseText(content).GetRoot();
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var source in sources)
+        {
+            await Cpu.WaitAsync(cancellationToken);
+            try { names.UnionWith(GlobalAliases(source, cancellationToken)); }
+            finally { Cpu.Release(); }
+        }
+        return [.. names.Order(StringComparer.Ordinal)];
+    }
+
+    internal static IEnumerable<string> GlobalAliases(string content, CancellationToken cancellationToken = default)
+    {
+        var root = CSharpSyntaxTree.ParseText(content, cancellationToken: cancellationToken).GetRoot(cancellationToken);
         // Without each compilation's symbols, include aliases from either branch.
         var roots = new[] { root }.Concat(root.DescendantTrivia(descendIntoTrivia: true)
             .Where(trivia => trivia.IsKind(SyntaxKind.DisabledTextTrivia))
-            .Select(trivia => CSharpSyntaxTree.ParseText(trivia.ToFullString()).GetRoot()));
+            .Select(trivia => CSharpSyntaxTree.ParseText(trivia.ToFullString(), cancellationToken: cancellationToken).GetRoot(cancellationToken)));
         return roots.SelectMany(node => node.DescendantNodes().OfType<UsingDirectiveSyntax>())
             .Where(directive => directive.GlobalKeyword.IsKind(SyntaxKind.GlobalKeyword) && directive.Alias is not null && IsExcluded(Name(directive.Name)))
             .SelectMany(directive => AliasNames(directive.Alias!.Name.Identifier.ValueText));

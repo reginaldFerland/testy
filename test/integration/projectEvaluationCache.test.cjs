@@ -5,13 +5,15 @@ const {TestEngine}=require('../../out/services/engine');
 const {normalizePath}=require('../../out/core/paths');
 const projects=require('../../out/services/projects');
 
+/** @param {import('node:test').TestContext} t */
 async function fixture(t){
  const temp=await fs.mkdtemp(path.join(os.tmpdir(),'testy-evaluation-integration-')),root=path.join(temp,'workspace');await fs.mkdir(root);
  const project=normalizePath(path.join(root,'Tests.csproj')),source=normalizePath(path.join(root,'Tests.cs'));
  await fs.writeFile(project,'<Project Sdk="MSTest.Sdk/4.3.3"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>');
  await fs.writeFile(source,'using Microsoft.VisualStudio.TestTools.UnitTesting; [TestClass] public class SmokeTests { [TestMethod] public void Pass() => Assert.IsTrue(true); }');
+ /** @type {{-readonly [K in keyof import('../../out/core/model').EngineConfiguration]: import('../../out/core/model').EngineConfiguration[K]}} */
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:false,excludes:[],testArguments:[],timeout:60000,maxParallelProjects:2,maxParallelTestFiles:2};
- const output=[];let evaluations=0;const evaluate=projects.evaluateProjects;
+ const output=/** @type {string[]} */ ([]);let evaluations=0;const evaluate=projects.evaluateProjects;
  projects.evaluateProjects=async(...args)=>{evaluations++;return evaluate(...args);};
  const engine=new TestEngine({roots:[root],storage:path.join(temp,'state'),tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
   events:{output:text=>output.push(text),phase:()=>{},discovered:()=>{},selected:()=>{},result:()=>{},started:()=>{},coverage:()=>{},invalidated:()=>{}}});
@@ -92,11 +94,11 @@ test('an SDK wildcard import appearing after evaluation cannot validate an older
  const {runProcess,requireSuccess}=require('../../out/services/process'),options={cwd:probe,timeoutMs:60000};
  requireSuccess(await runProcess('dotnet',['build',taskProject,'-o',taskOutput,'--nologo'],options),'Building evaluation race probe');
  await projects.restoreProjects('dotnet',[f.project],'Debug',{cwd:f.root},2);
- const xml=value=>value.replaceAll('&','&amp;').replaceAll('"','&quot;'),query=path.join(probe,'query.proj');
+ const xml=(/** @type {string} */ value)=>value.replaceAll('&','&amp;').replaceAll('"','&quot;'),query=path.join(probe,'query.proj');
  await fs.writeFile(query,`<Project><UsingTask TaskName="Probe" AssemblyFile="${xml(path.join(taskOutput,'Probe.dll'))}"/><Target Name="Inspect"><Probe Analyzer="${xml(path.resolve('dist/analyzer/Testy.Analysis.dll'))}" Input="${xml(f.project)}" Output="${xml(result)}"/></Target></Project>`);
  requireSuccess(await runProcess('dotnet',['msbuild',query,'-target:Inspect','-nologo'],options),'Checking evaluation race');
  const {raced:snapshot,stable}=JSON.parse(await fs.readFile(result,'utf8'));
  assert.equal(stable,true,'the same ordinary MSTest graph is reusable when no concurrent import change occurs');
- assert.ok(snapshot.queries.some(query=>query.kind==='imports'&&query.values.some(file=>file.endsWith('.late.props'))),'probe deterministically adds the matching file after Project.FromFile');
+ assert.ok(snapshot.queries.some((/** @type {{kind:string,values:string[]}} */ query)=>query.kind==='imports'&&query.values.some(file=>file.endsWith('.late.props'))),'probe deterministically adds the matching file after Project.FromFile');
  assert.equal(snapshot.reusable,false,'current directory contents must not validate a graph that never imported the new file');
 });

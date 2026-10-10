@@ -7,31 +7,20 @@ import { fileHash, PreparedOutput, removeOutput } from './output';
 import { claimRunOutputs, RunOutputLease } from './runOutputs';
 import { claimPreparedStorage, PreparedStorageLease, PreparedStorageShrink, Retention } from './preparedStorage';
 import { uuidPattern as uuid } from '../core/paths';
+import { HashMemo } from './hashMemo';
 
 const readers = new Semaphore(8);
 interface Manifest { readonly hash: string; readonly bytes: number; }
 /** What a retained preparation costs against the byte budget: its template and its working copy. */
 const footprint = (template: Manifest): number => template.bytes * 2;
 
-/** A file hash and the metadata it was computed under. */
-interface HashRecord { readonly size: number; readonly mtimeMs: number; readonly ctimeMs: number; readonly ino: number; readonly hashedAt: number; readonly hash: string; }
 /** Hashes remembered within one session, by real path, so a preparation does not read unchanged files again. */
-export type HashMemo = Map<string, HashRecord>;
-/** A write in the same timestamp tick as the hashing could leave the metadata unchanged
- * (FAT keeps two-second resolution), so only files that were already older are trusted. */
-const racyMs = 2_000;
-const memoLimit = 50_000;
-
 async function memoizedHash(file: string, stat: Stats, memo: HashMemo | undefined, signal?: AbortSignal): Promise<string> {
-    const known = memo?.get(file);
-    if (known && known.size === stat.size && known.mtimeMs === stat.mtimeMs && known.ctimeMs === stat.ctimeMs && known.ino === stat.ino
-        && stat.mtimeMs + racyMs < known.hashedAt) {return known.hash;}
+    const known = memo?.get(file, stat);
+    if (known !== undefined) {return known;}
     const hashedAt = Date.now(), hash = await fileHash(file, signal);
-    if (memo) {
-        // The metadata read before hashing is kept: a later write changes it, so the entry cannot vouch for newer bytes.
-        memo.delete(file); memo.set(file, { size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, ino: stat.ino, hashedAt, hash });
-        if (memo.size > memoLimit) {memo.delete(memo.keys().next().value as string);}
-    }
+    // The metadata read before hashing is kept: a later write changes it, so the entry cannot vouch for newer bytes.
+    memo?.set(file, stat, hash, hashedAt);
     return hash;
 }
 
@@ -248,7 +237,7 @@ function targetOf(slot: string | undefined): string {
 export class PreparedOutputCache {
     private readonly entries = new Set<Entry>();
     private readonly claimedSlots = new Set<string>();
-    private readonly hashes: HashMemo = new Map();
+    private readonly hashes = new HashMemo(50_000);
     private readonly pending = new Set<Promise<unknown>>();
     private owner: Promise<RunOutputLease | PreparedStorageLease> | undefined;
     private closed = false;

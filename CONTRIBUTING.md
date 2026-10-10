@@ -18,17 +18,19 @@
 - `npm run test:integration`: integration tests against the real .NET SDK and MTP fixtures.
 - `npm run test:extension`: VS Code extension tests, run by `test/extension/run.mjs` on `@vscode/test-electron` (pass `scenarios`, `commands`, `xunit` or `nunit` to run one configuration). Use `TESTY_VSCODE_PATH` to reuse an installed VS Code and `TESTY_COVERAGE_TOOL` to reuse an installed collector.
 - `npm run test:dotnet`: xUnit tests for the .NET helpers in `backend/Testy.Backend.Tests` (command-line quoting, PATH resolution, evaluation allowlists, source fingerprints, JSON contracts). They run on any OS; the `build:*` scripts and the VSIX never include them.
-- `npm run typecheck:tests`: tests opt in to type checking with a leading `// @ts-check`. New test files should opt in; many older ones use deliberately partial mocks and do not yet.
+- `npm run typecheck:tests`: every `test/**/*.cjs` file is type-checked (`checkJs` in `tsconfig.tests.json`) against the declarations in `out/`, so run `npm run compile` first. No `// @ts-check` marker is needed. Type test code with JSDoc and `import('../../out/...')` types; use `/** @type {any} */` only for a deliberate partial mock, with a comment. All tests are also linted with the type-aware `@typescript-eslint/no-floating-promises`, `no-misused-promises` and `await-thenable` rules (`node:test` registration calls are exempt), so a forgotten `await` fails `npm run lint`.
+- `:only` variants (`test:unit:only`, `test:integration:only`, `test:extension:only`) skip the compile step that `test`, `test:integration` and `test:extension` run first. Use them after `npm run compile`; CI compiles once and uses them.
+- `npm run clean`: removes `out/`, `dist/`, `coverage/`, `.benchmarks/` and any `*.vsix` in the repository root (`node scripts/clean.mjs --all` also removes the `.vscode-test/` VS Code download). Run `npm run compile` afterwards.
 - `npm run l10n:export`: regenerate `l10n/bundle.l10n.json` after changing user-facing strings. Call `l10n.t(...)` literally so the extractor finds them. The extractor is fetched on demand at a pinned version rather than installed with the other dev dependencies.
 
-- `npm run coverage`: run the unit tests with Node's built-in coverage report (`--experimental-test-coverage`).
-- `npm run check:vsix`: compare the VSIX file list (`vsce ls`) with the snapshot in `scripts/vsix-files.txt`; run it after a build, and refresh the snapshot with `node scripts/check-vsix-files.mjs --update` when a packaging change is intended.
+- `npm run coverage`: run the unit tests with Node's built-in coverage report (`--experimental-test-coverage`, tests and `node_modules` excluded) and fail below the line-coverage floor set in the script. CI runs it on Ubuntu; raise the floor when coverage improves.
+- `npm run check:vsix`: compare the VSIX file list (`vsce ls`) with the snapshot in `scripts/vsix-files.txt`; run it after a build. `npm run check:vsix -- --vsix testy.vsix` compares the entries of a built package instead (CI and the release job use it on the exact file they upload or publish). Refresh the snapshot with `node scripts/check-vsix-files.mjs --update` when a packaging change is intended.
 
 ## Continuous integration
 
-GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request to `main`. On Windows, macOS and Ubuntu it runs `npm test` (on Node 24, the extension host's Node in the minimum supported VS Code, per `.nvmrc`), `npm run test:dotnet`, `npm run test:integration` and `npm run test:extension` (under `xvfb-run` on Linux). A packaging job builds the release bundle, checks the VSIX file list and uploads the VSIX as an artifact. CodeQL (`codeql.yml`) scans the TypeScript and C# code, and Dependabot proposes weekly grouped updates for npm, NuGet and Actions.
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request to `main`. On Windows, macOS and Ubuntu it compiles once, then lints, type-checks the tests and runs the unit tests (on Node 24, the extension host's Node in the minimum supported VS Code, per `.nvmrc`), `npm run test:dotnet`, the integration tests and the extension tests (under `xvfb-run` on Linux) through the `:only` scripts. Ubuntu also enforces the unit-test line-coverage floor and fails when `npm run l10n:export` changes `l10n/`. A separate job repeats the extension tests on the minimum VS Code in `engines.vscode` (`TESTY_VSCODE_VERSION=min`; a version number or `insiders` also works locally). A packaging job builds the VSIX once, checks its file list and uploads it as an artifact. Every action is pinned to a commit SHA with a version comment; Dependabot proposes updates. CodeQL (`codeql.yml`) scans the TypeScript and C# code, and Dependabot proposes weekly grouped updates for npm, NuGet and Actions.
 
-Pushing a `v*` tag runs `release.yml`: it repeats CI as a gate, requires the tag to match `package.json`, attaches the VSIX to a GitHub release, and publishes to the Visual Studio Marketplace (`VSCE_PAT`) and Open VSX (`OVSX_PAT`). A publish step is skipped when its secret is absent.
+Pushing a `v*` tag runs `release.yml`: it repeats CI as a gate, requires the tag to match `package.json`, packages the VSIX once, checks that file's contents with `check:vsix`, attaches it to a GitHub release, and publishes to the Visual Studio Marketplace (`VSCE_PAT`) and Open VSX (`OVSX_PAT`). A publish step is skipped when its secret is absent. The tokens are exposed only to their own publish step.
 
 `npm run vscode:prepublish` lints before building, so packaging is gated on lint locally too; `npm run test:extension` compiles first so it never runs a stale `dist/`. Windows-specific code paths (ProcessHost, Job Objects) run in CI on Windows, but still deserve a manual check on a real machine after changes.
 
@@ -52,6 +54,8 @@ node test/performance/cache-membership.cjs
 node test/performance/live-updates.cjs
 node test/performance/discovery.cjs
 ```
+
+Each benchmark mirrors its JSON result lines into `.benchmarks/<script>-<timestamp>.jsonl` (git-ignored; override with `TESTY_BENCH_DIR`), while scratch workspaces live in the OS temp directory. Keep ad-hoc logs and reports there rather than in `out/`, which holds only `tsc` output. `npm run clean` removes it.
 
 See [validation evidence](docs/1.0-validation.md) for measured performance and platform limits, and the [performance review](docs/performance-review.md) for optimization measurements and remaining candidates.
 

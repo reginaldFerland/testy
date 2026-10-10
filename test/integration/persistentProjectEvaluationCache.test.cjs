@@ -2,10 +2,17 @@ const {test}=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {TestEngine}=require('../../out/services/engine'),{normalizePath}=require('../../out/core/paths');
 const projects=require('../../out/services/projects'),processes=require('../../out/services/process');
-const xml=value=>value.replaceAll('&','&amp;').replaceAll('"','&quot;').replaceAll('<','&lt;');
-const source=name=>`using Microsoft.VisualStudio.TestTools.UnitTesting; [TestClass] public class ${name} { [TestMethod] public void Pass() => Assert.AreEqual(1, Core.Feature.Value); }`;
-function deferred(){let resolve;const promise=new Promise(done=>{resolve=done;});return{promise,resolve};}
+const xml=(/** @type {string} */ value)=>value.replaceAll('&','&amp;').replaceAll('"','&quot;').replaceAll('<','&lt;');
+const source=(/** @type {string} */ name)=>`using Microsoft.VisualStudio.TestTools.UnitTesting; [TestClass] public class ${name} { [TestMethod] public void Pass() => Assert.AreEqual(1, Core.Feature.Value); }`;
+/** @returns {{promise: Promise<void>, resolve: () => void}} */
+function deferred(){let resolve=()=>{}; // replaced synchronously by the promise executor
+ /** @type {Promise<void>} */ const promise=new Promise(done=>{resolve=done;});return{promise,resolve};}
+/** @typedef {(...args: Parameters<typeof import('../../out/services/projects').restoreProjects>) => Promise<void>} RestoreHook */
 
+/**
+ * @param {import('node:test').TestContext} t
+ * @param {{privateAnalyzer?: boolean}} [options]
+ */
 async function fixture(t,{privateAnalyzer=false}={}){
  const temp=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-restart-evaluation-'))),root=path.join(temp,'workspace'),storage=path.join(temp,'state');
  const core=path.join(root,'Core'),tests=path.join(root,'Tests');await fs.mkdir(core,{recursive:true});await fs.mkdir(tests);
@@ -25,8 +32,12 @@ async function fixture(t,{privateAnalyzer=false}={}){
  await fs.writeFile(testFile,source('SmokeTests'));
  let analyzer=path.resolve('dist/analyzer/Testy.Analysis.dll');
  if(privateAnalyzer){const copy=path.join(temp,'analyzer');await fs.cp(path.dirname(analyzer),copy,{recursive:true});analyzer=path.join(copy,path.basename(analyzer));}
+ /** @type {{-readonly [K in keyof import('../../out/core/model').EngineConfiguration]: import('../../out/core/model').EngineConfiguration[K]}} */ // mutable copy: a test switches the build configuration
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:false,excludes:[],testArguments:[],timeout:60000,maxParallelProjects:2,maxParallelTestFiles:2};
- const control=new AbortController(),signal=AbortSignal.any([control.signal,t.signal]),output=[],results=new Map();let engine,afterRestore,inspect=0,restore=0,sdk=0;
+ const control=new AbortController(),signal=AbortSignal.any([control.signal,t.signal]),results=new Map();let inspect=0,restore=0,sdk=0;
+ /** @type {string[]} */ const output=[];
+ /** @type {import('../../out/services/engine').TestEngine} */ let engine;
+ /** @type {RestoreHook | undefined} */ let afterRestore;
  const evaluate=projects.evaluateProjects,restoreProjects=projects.restoreProjects,runProcess=processes.runProcess;
  projects.evaluateProjects=async(...args)=>{inspect++;return evaluate(...args);};
  projects.restoreProjects=async(...args)=>{restore++;await restoreProjects(...args);await afterRestore?.(...args);};
@@ -36,12 +47,12 @@ async function fixture(t,{privateAnalyzer=false}={}){
  engine=create();
  t.after(async()=>{control.abort();projects.evaluateProjects=evaluate;projects.restoreProjects=restoreProjects;processes.runProcess=runProcess;await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
  return{temp,root,tests,project,coreProject,testFile,storage,payload,imported,marker,failure,analyzer,config,output,signal,
-  get engine(){return engine;},counts:()=>({inspect,restore,sdk}),afterRestore:hook=>{afterRestore=hook;},
+  get engine(){return engine;},counts:()=>({inspect,restore,sdk}),afterRestore:(/** @type {RestoreHook | undefined} */ hook)=>{afterRestore=hook;},
   async restart(){await engine.dispose();engine=create();await engine.restore(signal);},
-  async baseline(extraSignal){results.clear();return engine.run({files:[],full:true},extraSignal?AbortSignal.any([signal,extraSignal]):signal);},
+  async baseline(/** @type {AbortSignal | undefined} */ extraSignal=undefined){results.clear();return engine.run({files:[],full:true},extraSignal?AbortSignal.any([signal,extraSignal]):signal);},
   identity:()=>engine.groups.flatMap(group=>group.tests.map(test=>[group.id,test.id,test.name,test.fullyQualifiedName])).sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b))),
   outcomes:()=>[...results].map(([id,result])=>[id,result.outcome]).sort(([a],[b])=>a.localeCompare(b)),
-  sourceFiles:()=>engine.projects.find(value=>value.file===normalizePath(project)).sourceFiles,
+  sourceFiles:()=>/** @type {import('../../out/core/model').Project} */ (engine.projects.find(value=>value.file===normalizePath(project))).sourceFiles,
   markerCount:async()=>(await fs.readFile(marker,'utf8')).trim().split(/\r?\n/).length};
 }
 
@@ -77,7 +88,7 @@ test('restart inventories discover added and deleted files and project reference
  await fs.writeFile(extraProject,'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>');
  const initial=await fs.readFile(f.project,'utf8');await fs.writeFile(f.project,initial.replace('</ItemGroup>','<ProjectReference Include="../Extra/Extra.csproj"/></ItemGroup>'));
  await f.restart();assert.equal((await f.baseline()).passed,1,f.output.join(''));assert.ok(f.counts().inspect>count);
- assert.ok(f.engine.projects.some(project=>project.file===normalizePath(extraProject)));assert.ok(f.engine.projects.find(project=>project.file===normalizePath(f.project)).references.includes(normalizePath(extraProject)));
+ assert.ok(f.engine.projects.some(project=>project.file===normalizePath(extraProject)));assert.ok(/** @type {import('../../out/core/model').Project} */ (f.engine.projects.find(project=>project.file===normalizePath(f.project))).references.includes(normalizePath(extraProject)));
  await fs.writeFile(f.project,initial);await fs.rm(library,{recursive:true});await f.restart();assert.equal((await f.baseline()).passed,1,f.output.join(''));
  assert.ok(!f.engine.projects.some(project=>project.file===normalizePath(extraProject)));
 });
@@ -86,8 +97,8 @@ test('failed and cancelled Restore cannot publish persisted graphs before recove
  const f=await fixture(t);assert.equal((await f.baseline()).passed,1,f.output.join(''));const initial=f.counts().inspect;
  await f.restart();await fs.writeFile(f.failure,'fail');await assert.rejects(f.baseline(),/controlled restart restore failure/);
  assert.equal(f.engine.projects.length,0);assert.equal(f.counts().inspect,initial);await fs.rm(f.failure);
- const restored=deferred(),abort=new AbortController();f.afterRestore(async(_dotnet,_files,_configuration,options)=>{
-  restored.resolve();await new Promise(resolve=>{if(options.signal.aborted)resolve();else options.signal.addEventListener('abort',resolve,{once:true});});options.signal.throwIfAborted();
+ const restored=deferred(),abort=new AbortController();f.afterRestore(async(_dotnet,_files,_configuration,/** @type {any} */ options)=>{ // any: this hook is only called with the run's signal set
+  restored.resolve();await new Promise((/** @type {(value?: any) => void} */ resolve)=>{if(options.signal.aborted)resolve();else options.signal.addEventListener('abort',resolve,{once:true});});options.signal.throwIfAborted();
  });
  const run=f.baseline(abort.signal);void run.catch(()=>undefined);
  await Promise.race([restored.promise,run.then(()=>{throw new Error('run finished before controlled Restore barrier');})]);abort.abort();await assert.rejects(run);

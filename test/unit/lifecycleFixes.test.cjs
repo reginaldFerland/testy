@@ -6,23 +6,26 @@ const {loadUi}=require('./support/ui.cjs');
 const {TestEngine}=require('../../out/services/engine');
 const {startProcess,Shutdown}=require('../../out/services/process');
 
-const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+const sleep=(/** @type {number} */ ms)=>new Promise(resolve=>setTimeout(resolve,ms));
 const summary={files:0,tests:0,passed:0,failed:0,skipped:0,duration:1,coverageAvailable:true,failedBatches:0};
 
-/** A controller with scripted engine calls; `consent` answers the baseline question through workspace state. */
+/** A controller with scripted engine calls; `consent` answers the baseline question through workspace state.
+ * @param {{configuration?: Record<string, any>, run?: (batch: {files: string[]}) => Promise<unknown>}} [options] */
 function fixture({configuration={},run}={}) {
  const f=createTesty({configuration:{debounce:20,excludes:['**/obj/**'],...configuration},api:{extensions:{getExtension:()=>undefined}},
   window:{showInformationMessage:async()=>undefined,showErrorMessage:async()=>undefined,showWarningMessage:async()=>undefined}});
- const calls=[];
+ /** @type {any[][]} */ const calls=[];
  f.testy.engine.restore=async()=>undefined;
- f.testy.engine.markChanged=async files=>{calls.push(['mark',[...files]]);};
- f.testy.engine.run=run??(async batch=>{calls.push(['run',[...batch.files]]);return summary;});
+ f.testy.engine.markChanged=async (/** @type {Iterable<string>} */ files)=>{calls.push(['mark',[...files]]);};
+ f.testy.engine.run=run??(async (/** @type {{files: Iterable<string>}} */ batch)=>{calls.push(['run',[...batch.files]]);return summary;});
  void f.testy.context.workspaceState.update('testy.baselineConsent','manual');
  return{...f,calls};
 }
 
 test('requests made while the cache restores are held, then run once startup applies the configured pause', async()=>{
- const f=fixture();let release;
+ const f=fixture();
+ /** @type {(value?: any) => void} */ let release=()=>{}; // replaced synchronously by the promise executor
+
  f.testy.engine.restore=()=>new Promise(resolve=>{release=resolve;});
  const starting=f.testy.start();
  assert.equal(f.testy.scheduler.isPaused,true,'the scheduler is held from construction');
@@ -49,7 +52,7 @@ test('a failing restore is logged and startup still applies the pause setting', 
 
 test('a cancelled restore still rejects startup', async()=>{
  const f=fixture();
- f.testy.engine.restore=async signal=>{signal.throwIfAborted();};
+ f.testy.engine.restore=async (/** @type {AbortSignal} */ signal)=>{signal.throwIfAborted();};
  f.testy.lifetime.abort();
  await assert.rejects(f.testy.start(),{name:'AbortError'});
  await f.testy.dispose();
@@ -69,13 +72,13 @@ test('a failed run is reported exactly once, automatic or manual', async()=>{
 
 test('bursts of file events mark the engine once; build output never reaches the filesystem', async()=>{
  const f=fixture();
- const uri=fsPath=>({scheme:'file',fsPath});
+ const uri=(/** @type {string} */ fsPath)=>({scheme:'file',fsPath});
  await Promise.all(['A','B','C'].map(name=>f.testy.changes.changed(uri(`/workspace/${name}.cs`))));
  await f.testy.changes.changed(uri('/workspace/obj/Debug/Gen.cs'));
  assert.deepEqual(f.calls,[],'marking waits for the coalescing window');
  await sleep(150);
  assert.equal(f.calls.length,1);
- assert.deepEqual(f.calls[0][1].map(file=>file.slice(file.lastIndexOf('/')+1)).sort(),['A.cs','B.cs','C.cs']);
+ assert.deepEqual(/** @type {[string, string[]][]} */ (f.calls)[0][1].map((/** @type {string} */ file)=>file.slice(file.lastIndexOf('/')+1)).sort(),['A.cs','B.cs','C.cs']);
  await f.testy.dispose();
 });
 
@@ -88,9 +91,9 @@ test('a run flushes pending marks before it reads sources', async()=>{
 });
 
 test('input directories merge into one watcher per root, keep outside directories non-recursive, and fall back to the whole root when oversized', () => {
- const patterns=[];
- const ui=loadUi({vscode:{RelativePattern:class{constructor(base,pattern){Object.assign(this,{base,pattern});}},
-  workspace:{createFileSystemWatcher:pattern=>{patterns.push(pattern);return{dispose(){},onDidChange(){},onDidCreate(){},onDidDelete(){}};}}}});
+ /** @type {any[]} */ const patterns=[];
+ const ui=loadUi({vscode:{RelativePattern:class{constructor(/** @type {string} */ base,/** @type {string} */ pattern){Object.assign(this,{base,pattern});}},
+  workspace:{createFileSystemWatcher:(/** @type {unknown} */ pattern)=>{patterns.push(pattern);return{dispose(){},onDidChange(){},onDidCreate(){},onDidDelete(){}};}}}});
  const context={watchers:[],roots:['/workspace'],config:{trigger:'fileSystem',pattern:'**/*.cs'},engine:{inputVersion:0,directories:[],
   knownFiles:['/workspace/a/x.props','/workspace/b/y.props','/workspace/b/z.props','/linked/c/w.props','/linked/d/v.props']}};
  ui.changeWatcher(context).watch();
@@ -98,16 +101,18 @@ test('input directories merge into one watcher per root, keep outside directorie
  patterns.length=0;context.engine.inputVersion++;
  context.engine.knownFiles=Array.from({length:65},(_,index)=>`/workspace/d${index}/x.props`);
  ui.changeWatcher(context).watch();
- assert.deepEqual(patterns.slice(1).map(pattern=>[pattern.base,pattern.pattern]),[['/workspace','**/*']]);
+ assert.deepEqual(patterns.map(pattern=>[pattern.base,pattern.pattern]),[['/workspace','**/*']],'only the changed root watcher is recreated');
 });
 
 test('disposal aborts runs with a shutdown reason so owned processes skip the graceful phase', async()=>{
- const engine=new TestEngine({roots:[],storage:'/unused/testy-state',events:{output(){}},configuration:()=>({})});
- let reason;const entered=Promise.withResolvers();
+ // Partial engine options and private members (any): only what disposal and run touch.
+ const engine=/** @type {any} */ (new TestEngine(/** @type {any} */ ({roots:[],storage:'/unused/testy-state',events:{output(){}},configuration:()=>({})})));
+ /** @type {any} */ let reason;
+ /** @type {PromiseWithResolvers<void>} */ const entered=Promise.withResolvers();
  engine.preparedOutputs={async dispose(){}};
- engine.runBatch=async(_batch,controller)=>{
+ engine.runBatch=async(/** @type {unknown} */ _batch,/** @type {AbortController} */ controller)=>{
   entered.resolve();
-  await new Promise(resolve=>controller.signal.addEventListener('abort',()=>{reason=controller.signal.reason;resolve();}));
+  await new Promise((/** @type {(value?: any) => void} */ resolve)=>controller.signal.addEventListener('abort',()=>{reason=controller.signal.reason;resolve();}));
  };
  const running=engine.run({files:[],full:true},new AbortController().signal);
  await entered.promise;await engine.dispose();await running.catch(()=>undefined);

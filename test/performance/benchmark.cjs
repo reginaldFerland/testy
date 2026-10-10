@@ -1,5 +1,6 @@
 // Defaults: two layouts, 240 files, 20 cases/file, three alternating serial/auto pairs.
 // Smoke: TESTY_BENCH_FILES=8 TESTY_BENCH_CASES=2 TESTY_BENCH_TRIALS=1 TESTY_BENCH_LAYOUTS=multiple npm run benchmark
+require('./artifacts.cjs');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const assert=require('node:assert/strict'),{createHash}=require('node:crypto');
 const {performance}=require('node:perf_hooks'),{execFile}=require('node:child_process'),{promisify}=require('node:util');
@@ -10,12 +11,14 @@ const projects=require('../../out/services/projects'),mtp=require('../../out/ser
 const {installCoverageTool}=require('../../out/services/coverageTool');
 const execute=promisify(execFile);
 
+/** @param {string} name @param {number} fallback */
 function integer(name,fallback){const value=Number(process.env[name]??fallback);assert.ok(Number.isSafeInteger(value)&&value>0,`${name} must be a positive integer`);return value;}
 const fileCount=integer('TESTY_BENCH_FILES',240),cases=integer('TESTY_BENCH_CASES',20),trials=integer('TESTY_BENCH_TRIALS',3);
 const layouts=(process.env.TESTY_BENCH_LAYOUTS||'multiple,single').split(',');
 assert.ok(layouts.length&&layouts.every(layout=>['multiple','single'].includes(layout)),'TESTY_BENCH_LAYOUTS must contain multiple and/or single');
 const automaticProjects=resolveConcurrency(),automaticFiles=resolveTestFileConcurrency();
 
+/** @param {string} workspace @param {number} projectCount */
 async function createWorkspace(workspace,projectCount){
  const layers=['Core','App','Infra','Web'];
  for(const [index,layer] of layers.entries()){
@@ -37,27 +40,38 @@ async function createWorkspace(workspace,projectCount){
 }
 
 // Wrap actual process boundaries, avoiding double counting runner worker delegation.
+/** @typedef {'evaluation'|'restore'|'build'|'discovery'|'test'} WorkKind */
 function workProbe(){
- const active={evaluation:0,restore:0,build:0,discovery:0,test:0},peak={...active},slots={...active},peakWorkerBudgets={...active},originals=[];
+ /** @type {Record<WorkKind, number>} */
+ const active={evaluation:0,restore:0,build:0,discovery:0,test:0};
+ const peak={...active},slots={...active},peakWorkerBudgets={...active};
+ /** @type {(() => unknown)[]} */
+ const originals=[];
+ /** @type {Record<'evaluation'|'restore'|'build', number>} */
  const batches={evaluation:0,restore:0,build:0};
- for(const [name,kind] of [['evaluateProjects','evaluation'],['restoreProjects','restore'],['buildProjects','build']]){
-  const original=projects[name];originals.push(()=>projects[name]=original);projects[name]=function(...args){batches[kind]++;return original.apply(this,args);};
+ // The probe monkey-patches module exports, so they are viewed as an untyped bag of functions.
+ const patchableProjects=/** @type {Record<string, any>} */ (projects);
+ for(const [name,kind] of /** @type {['evaluateProjects'|'restoreProjects'|'buildProjects', 'evaluation'|'restore'|'build'][]} */ ([['evaluateProjects','evaluation'],['restoreProjects','restore'],['buildProjects','build']])){
+  const original=patchableProjects[name];originals.push(()=>patchableProjects[name]=original);patchableProjects[name]=/** @param {any[]} args */ function(...args){batches[kind]++;return original.apply(this,args);};
  }
- function wrap(object,key,classify){const original=object[key];originals.push(()=>object[key]=original);object[key]=async function(...args){
+ /** @param {Record<string, any>} object @param {string} key @param {(args: any[]) => [WorkKind, number] | undefined} classify */
+ function wrap(object,key,classify){const original=object[key];originals.push(()=>object[key]=original);object[key]=/** @param {any[]} args */ async function(...args){
   const operation=classify(args);if(!operation)return original.apply(this,args);const [kind,budget]=operation;
   peak[kind]=Math.max(peak[kind],++active[kind]);slots[kind]+=budget;peakWorkerBudgets[kind]=Math.max(peakWorkerBudgets[kind],slots[kind]);
   try{return await original.apply(this,args);}finally{active[kind]--;slots[kind]-=budget;}
  };}
- wrap(processes,'runProcess',args=>{
+ wrap(/** @type {Record<string, any>} */ (processes),'runProcess',args=>{
   const kind=args[1].includes('-target:Inspect')?'evaluation':args[1].includes('-target:Restore')?'restore':args[1].includes('-target:Build')?'build':undefined;
-  return kind?[kind,Number(args[1].find(value=>value.startsWith('-maxcpucount:'))?.split(':')[1]||1)]:undefined;
+  return kind?[kind,Number(args[1].find(/** @param {string} value */ value=>value.startsWith('-maxcpucount:'))?.split(':')[1]||1)]:undefined;
  });
- wrap(mtp,'requestTests',args=>[args[1]==='discover'?'discovery':'test',1]);
+ wrap(/** @type {Record<string, any>} */ (mtp),'requestTests',args=>[args[1]==='discover'?'discovery':'test',1]);
  return{peak,peakWorkerBudgets,batches,restore(){originals.reverse().forEach(restore=>restore());assert.ok(Object.values(active).every(value=>value===0),'all workers settle before cleanup');}};
 }
 
 function resources(){
- let peakHeap=0,peakRss=0,peakTreeRss=0,last=performance.now(),maxTimerGapMs=0,pending;
+ let peakHeap=0,peakRss=0,peakTreeRss=0,last=performance.now(),maxTimerGapMs=0;
+ /** @type {Promise<void> | undefined} */
+ let pending;
  const sample=setInterval(()=>{const now=performance.now(),memory=process.memoryUsage();maxTimerGapMs=Math.max(maxTimerGapMs,now-last);last=now;peakHeap=Math.max(peakHeap,memory.heapUsed);peakRss=Math.max(peakRss,memory.rss);},20);
  const tree=setInterval(()=>{
   if(process.platform==='win32'||pending)return;
@@ -70,9 +84,10 @@ function resources(){
  return async()=>{clearInterval(sample);clearInterval(tree);await pending;return{maxTimerGapMs,peakNodeHeapMiB:peakHeap/1048576,peakNodeRssMiB:peakRss/1048576,peakParentAndDescendantRssMiB:peakTreeRss?peakTreeRss/1048576:null};};
 }
 
+/** @param {import('../../out/services/engine').TestEngine} engine @param {string} workspace */
 async function fingerprint(engine,workspace){
  workspace=normalizePath(workspace);
- const relative=file=>path.relative(workspace,file).replaceAll('\\','/'),hash=createHash('sha256');
+ const relative=/** @param {string | undefined} file */file=>path.relative(workspace,/** @type {string} */ (file)).replaceAll('\\','/'),hash=createHash('sha256');
  for(const group of [...engine.groups].sort((a,b)=>relative(a.file).localeCompare(relative(b.file)))){
   const trace=engine.coverage.traces.get(group.id);assert.ok(trace?.reliable,`${relative(group.file)} has a reliable per-file trace`);
   const dependencies=trace.dependencies.filter(file=>file.startsWith(workspace+'/')).map(relative).sort();
@@ -84,13 +99,25 @@ async function fingerprint(engine,workspace){
  return hash.digest('hex');
 }
 
+/** @typedef {{-readonly [K in keyof import('../../out/core/model').EngineConfiguration]: import('../../out/core/model').EngineConfiguration[K]}} MutableConfiguration */
+/** @param {string} directory @param {string} template @param {string} coverageTool @param {string} layout @param {number} projectCount @param {number} trial @param {'serial'|'auto'} mode @returns {Promise<Record<string, any>>} */
 async function runTrial(directory,template,coverageTool,layout,projectCount,trial,mode){
  const workspace=path.join(directory,'workspace');await fs.cp(template,workspace,{recursive:true,filter:file=>!/(^|[/\\])(bin|obj|TestResults)([/\\]|$)/.test(file)});
+ /** @type {MutableConfiguration} */
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:120000,coverageTool,
   maxParallelProjects:mode==='serial'?1:0,maxParallelTestFiles:mode==='serial'?1:0};
- let prepared=0,firstDiscoveryMs,firstResultMs,started,phaseTimings={},currentPhase='Preparing benchmark';
+ let prepared=0,currentPhase='Preparing benchmark';
+ /** @type {number | undefined} */
+ let firstDiscoveryMs;
+ /** @type {number | undefined} */
+ let firstResultMs;
+ /** @type {number} */
+ let started;
+ /** @type {Record<string, number>} */
+ let phaseTimings={};
  const progress=setInterval(()=>console.error(`Benchmark ${layout} pair ${trial}/${trials} ${mode}: ${currentPhase}`),30000);
  const probe=workProbe(),finishResources=resources();
+ /** @type {import('../../out/services/engine').TestEngine | undefined} */
  let engine;
  try{
   engine=new TestEngine({roots:[workspace],storage:path.join(directory,'state'),tools:path.join(directory,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
@@ -103,21 +130,28 @@ async function runTrial(directory,template,coverageTool,layout,projectCount,tria
   const baselineFingerprint=await fingerprint(engine,workspace),baselinePeak={...probe.peak},baselinePeakWorkerBudgets={...probe.peakWorkerBudgets},baselineBatches={...probe.batches};
   const projectLimit=mode==='serial'?1:automaticProjects,testLimit=mode==='serial'?1:automaticFiles;
   // Secondary lanes discover inside their file worker, after initial preparation.
+  /** @param {string} kind */
   const limitFor=kind=>kind==='test'?testLimit:kind==='discovery'?Math.max(projectLimit,testLimit):projectLimit;
   for(const [kind,value] of Object.entries(baselinePeak))assert.ok(value<=limitFor(kind),`${kind} peak ${value} exceeds ${limitFor(kind)}`);
   for(const [kind,value] of Object.entries(baselinePeakWorkerBudgets))assert.ok(value<=limitFor(kind),`${kind} worker budget ${value} exceeds ${limitFor(kind)}`);
-  for(const kind of ['evaluation','restore','build'])assert.ok(baselineBatches[kind]>0&&baselinePeak[kind]>0,`${kind} executes a measured batch`);
+  for(const kind of /** @type {('evaluation'|'restore'|'build')[]} */ (['evaluation','restore','build']))assert.ok(baselineBatches[kind]>0&&baselinePeak[kind]>0,`${kind} executes a measured batch`);
   if(testLimit>1&&fileCount>1)assert.ok(baselinePeak.test>1,'file execution overlaps, including within one project');
   if(projectLimit>1&&projectCount>1)assert.ok(baselinePeak.discovery>1,'independent target discovery overlaps');
   const source=normalizePath(path.join(workspace,'Web','Feature0.cs'));await fs.writeFile(source,(await fs.readFile(source,'utf8')).replace('Scale.Infra.Feature0.Value(value)','Scale.Infra.Feature0.Value(value) + 1'));
-  const save=engine.cache.save.bind(engine.cache),writtenTraces=[];
-  engine.cache.save=async(delta,...args)=>{writtenTraces.push(...delta.traces.map(trace=>trace.groupId));return save(delta,...args);};
+  // The cache is a private member; the benchmark counts its trace writes.
+  const internals=/** @type {any} */ (engine);
+  const save=internals.cache.save.bind(internals.cache);
+  /** @type {string[]} */
+  const writtenTraces=[];
+  internals.cache.save=/** @param {{traces: {groupId: string}[]}} delta @param {any[]} args */ async(delta,...args)=>{writtenTraces.push(...delta.traces.map(trace=>trace.groupId));return save(delta,...args);};
   await engine.markChanged([source]);const affected=await engine.run({files:[source],full:false},signal),affectedPhases=phaseTimings;phaseTimings={};
-  assert.equal(affected.tests,cases);assert.equal(affected.failed,cases);assert.equal(writtenTraces.length,1);engine.cache.save=save;
+  assert.equal(affected.tests,cases);assert.equal(affected.failed,cases);assert.equal(writtenTraces.length,1);internals.cache.save=save;
   const aggregates=engine.coverage.summarize(engine.hashes);let start=performance.now();
   for(let i=0;i<10000;i++)assert.equal(engine.coverage.summarize(engine.hashes),aggregates);
   const cachedAggregateMicroseconds=(performance.now()-start)*1000/10000;
-  let cacheBytes=0;async function size(directory){for(const entry of await fs.readdir(directory,{withFileTypes:true})){const file=path.join(directory,entry.name);if(entry.isDirectory())await size(file);else cacheBytes+=(await fs.stat(file)).size;}}
+  let cacheBytes=0;
+  /** @param {string} directory @returns {Promise<void>} */
+  async function size(directory){for(const entry of await fs.readdir(directory,{withFileTypes:true})){const file=path.join(directory,entry.name);if(entry.isDirectory())await size(file);else cacheBytes+=(await fs.stat(file)).size;}}
   await size(path.join(directory,'state','coverage-v2'));
   const shared=normalizePath(path.join(workspace,'Core','Shared.cs'));await fs.writeFile(shared,(await fs.readFile(shared,'utf8')).replace('value + 1','value + 2'));
   await engine.markChanged([shared]);const sharedCore=engine.select([shared]),sharedCoreSelectedCases=sharedCore.groups.reduce((count,group)=>count+group.tests.length,0);
@@ -145,18 +179,22 @@ async function main(){
   for(const layout of layouts){
    const projectCount=layout==='single'?1:Math.min(4,fileCount),template=path.join(root,layout,'template');await createWorkspace(template,projectCount);
    for(let project=0;project<projectCount;project++)processes.requireSuccess(await processes.runProcess('dotnet',['restore',path.join(template,`Tests${project}`,`Tests${project}.csproj`),'--nologo'],{cwd:template}), 'Warming package restore');
+   /** @type {Record<string, Record<string, any>>[]} */
    const pairs=[];
    for(let trial=1;trial<=trials;trial++){
+    /** @type {Record<string, Record<string, any>>} */
     const pair={};
-    for(const mode of trial%2?['serial','auto']:['auto','serial']){
+    for(const mode of /** @type {('serial'|'auto')[]} */ (trial%2?['serial','auto']:['auto','serial'])){
      const directory=path.join(root,layout,`${trial}-${mode}`);pair[mode]=await runTrial(directory,template,coverageTool,layout,projectCount,trial,mode);await fs.rm(directory,{recursive:true,force:true});
     }
     assert.equal(pair.auto.baselineFingerprint,pair.serial.baselineFingerprint,'parallel and serial inventories, coverage and dependency attribution agree');
     pairs.push(pair);
    }
+   /** @param {number[]} values */
    const median=values=>[...values].sort((a,b)=>a-b)[Math.floor(values.length/2)];
    const serialBaselineMs=median(pairs.map(pair=>pair.serial.baselineMs)),autoBaselineMs=median(pairs.map(pair=>pair.auto.baselineMs));
    const measurements=['baselineMs','firstDiscoveryMs','firstResultMs','affectedMs','runAllMs','peakNodeHeapMiB','peakNodeRssMiB','peakParentAndDescendantRssMiB','maxTimerGapMs'];
+   /** @param {string} mode */
    const summarize=mode=>({...Object.fromEntries(measurements.map(key=>[key,pairs.every(pair=>pair[mode][key]!==null)?median(pairs.map(pair=>pair[mode][key])):null])),
     baselinePhases:Object.fromEntries(Object.keys(pairs[0][mode].baselinePhases).map(key=>[key,median(pairs.map(pair=>pair[mode].baselinePhases[key]))]))});
    console.log(JSON.stringify({kind:'comparison',layout,trials,serialBaselineMs,autoBaselineMs,speedup:serialBaselineMs/autoBaselineMs,medianSerial:summarize('serial'),medianAuto:summarize('auto'),timingAssertion:false}));
@@ -170,6 +208,8 @@ async function main(){
  }
  let start=performance.now();store.summarize(hashes);const firstAggregateMs=performance.now()-start;
  start=performance.now();const packed=JSON.stringify(store.takeDelta());const serializeMs=performance.now()-start;
+ // Partial projects: ProjectIndex reads only file, sourceFiles and references.
+ /** @type {any} */
  const projects=Array.from({length:20},(_,i)=>({file:`/p${i}/p.csproj`,sourceFiles:Array.from({length:250},(_,n)=>`/p${i}/f${n}.cs`),references:[]}));
  const index=new ProjectIndex(projects);start=performance.now();for(let i=0;i<10000;i++) index.affected(['/p10/f100.cs']);const indexedLookupMicroseconds=(performance.now()-start)*1000/10000;
  console.log(JSON.stringify({kind:'synthetic',equivalentDenseLines:2000000,firstAggregateMs,serializeMs,packedBytes:Buffer.byteLength(packed),indexedLookupMicroseconds}));

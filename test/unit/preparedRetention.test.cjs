@@ -6,21 +6,23 @@ const {claimPreparedStorage}=require('../../out/services/preparedStorage');
 
 // The source is 14 bytes, so a retained preparation costs 28: its template plus its working copy.
 const footprint=28;
-const sha=value=>createHash('sha256').update(value).digest('hex');
+const sha=(/** @type {string} */ value)=>createHash('sha256').update(value).digest('hex');
+/** @param {import('node:test').TestContext} t */
 async function fixture(t){
  const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-retention-'))),source=path.join(root,'build'),storage=path.join(root,'state');
  await fs.mkdir(source);await fs.writeFile(path.join(source,'Tests.dll'),'binary');await fs.writeFile(path.join(source,'asset'),'original');
- const caches=[],leases=new Set();
- const cache=(limits={})=>{const identity=randomUUID(),value=new PreparedOutputCache(storage,identity,limits);caches.push(value);return Object.assign(value,{identity});};
- const create=async directory=>{
+ /** @type {any[]} */ const caches=[]; // caches are tagged with their (private) identity below, so they are typed any
+ /** @type {Set<import('../../out/services/preparedOutputCache').PreparedArtifactLease>} */ const leases=new Set();
+ const cache=(/** @type {import('../../out/services/preparedOutputCache').PreparedOutputLimits} */ limits={})=>{const identity=randomUUID(),value=new PreparedOutputCache(storage,identity,limits);caches.push(value);return /** @type {any} */ (Object.assign(value,{identity}));}; // the class keeps `identity` private; the tests read it
+ const create=async(/** @type {string} */ directory)=>{
   const template=path.join(directory,'template'),output=new PreparedOutput(template,path.join(directory,'assembly'));
   await copyOutput(source,template);await output.initialize();
   return{root:directory,output,session:randomUUID(),coverage:true,instrumented:[],reusable:true};
  };
- const acquire=async(cache,slot)=>{const lease=await cache.acquire(source,'context',create,undefined,slot);assert.ok(lease);leases.add(lease);return lease;};
- const release=async lease=>{await lease.release();leases.delete(lease);};
+ const acquire=async(/** @type {PreparedOutputCache} */ cache,/** @type {string} */ slot)=>{const lease=await cache.acquire(source,'context',create,undefined,slot);assert.ok(lease);leases.add(lease);return lease;};
+ const release=async(/** @type {import('../../out/services/preparedOutputCache').PreparedArtifactLease} */ lease)=>{await lease.release();leases.delete(lease);};
  const record=async()=>{
-  const directory=path.join(storage,'prepared-v2'),name=(await fs.readdir(directory)).find(name=>name.endsWith('.owner.json'));
+  const directory=path.join(storage,'prepared-v2'),name=/** @type {string} */ ((await fs.readdir(directory)).find(name=>name.endsWith('.owner.json')));
   return{directory:path.join(directory,name.slice(0,-'.owner.json'.length)),value:JSON.parse(await fs.readFile(path.join(directory,name),'utf8'))};
  };
  t.after(async()=>{await Promise.allSettled([...leases].map(lease=>lease.release(false)));for(const value of caches)await value.dispose();await fs.rm(root,{recursive:true,force:true});});
@@ -54,7 +56,7 @@ test('a container parked under a larger limit is trimmed oldest entry first by a
 
 test('active leases that exceed the byte budget do not evict every idle preparation',async t=>{
  const f=await fixture(t),cache=f.cache({maxEntries:16,maxBytes:footprint*2-6});
- const slot=(target,lane)=>JSON.stringify([target,lane]),exists=file=>fs.stat(file).then(()=>true,()=>false);
+ const slot=(/** @type {string} */ target,/** @type {number} */ lane)=>JSON.stringify([target,lane]),exists=(/** @type {string} */ file)=>fs.stat(file).then(()=>true,()=>false);
  const first=await f.acquire(cache,slot('a',0)),second=await f.acquire(cache,slot('b',0));
  // The two active leases alone exceed the budget.
  const lane0=await f.acquire(cache,slot('c',0));await f.release(lane0);
@@ -71,9 +73,10 @@ test('active leases that exceed the byte budget do not evict every idle preparat
 test('storage shrinks an oversized parked container through its owner’s hook and removes it whole when nothing fits',async t=>{
  const storage=path.join(await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-shrink-'))),'prepared');
  t.after(()=>fs.rm(path.dirname(storage),{recursive:true,force:true}));
- const exists=file=>fs.lstat(file).then(()=>true,()=>false),names=[randomUUID(),randomUUID(),randomUUID()];
+ const exists=(/** @type {string} */ file)=>fs.lstat(file).then(()=>true,()=>false),names=[randomUUID(),randomUUID(),randomUUID()];
  // Snapshots list their entries oldest first; the hook keeps the newest that fit the target.
- const shrink=(snapshot,target)=>{
+ const shrink=(/** @type {unknown} */ opaque,/** @type {import('../../out/services/preparedStorage').Retention} */ target)=>{
+  const snapshot=/** @type {{names: string[]}} */ (opaque); // the hook receives the opaque payload this test parked
   const kept=snapshot.names.slice(Math.max(0,snapshot.names.length-target.entries));
   return kept.length?{snapshot:{names:kept},retention:{entries:kept.length,bytes:kept.length},removed:snapshot.names.slice(0,snapshot.names.length-kept.length)}:undefined;
  };

@@ -5,9 +5,10 @@ import { createHash } from 'node:crypto';
 import { Minimatch } from 'minimatch';
 
 export const defaultExcludes = [
-    '**/bin/**', '**/obj/**', '**/TestResults/**', '**/node_modules/**', '**/.git/**',
+    '**/bin/**', '**/obj/**', '**/TestResults/**', '**/node_modules/**', '**/.git/**', '**/.vs/**', '**/.vscode/**', '**/.idea/**',
     '**/.testy/**', '**/*.g.cs', '**/*.g.i.cs', '**/*.generated.cs', '**/*.designer.cs'
 ] as const;
+Object.freeze(defaultExcludes);
 
 class TtlMap<T> {
     private readonly entries = new Map<string, { readonly value: T; readonly expires: number }>();
@@ -135,17 +136,21 @@ export function normalizePathAsync(file: string): Promise<string> { return norma
  * each distinct path once, with bounded concurrency, through one scoped directory cache.
  * A path that was not supplied is still resolved, synchronously, when it is looked up. */
 export async function preparePathNormalizer(files: Iterable<string>, signal?: AbortSignal, concurrency = 16): Promise<(file: string) => string> {
-    const directories = new DirectoryCache(), paths = new Map<string, string>(), pending = [...new Set(files)];
-    let next = 0;
+    const directories = new DirectoryCache(), paths = new Map<string, string>(), claimed = new Set<string>(), pending = files[Symbol.iterator]();
     signal?.throwIfAborted();
-    await Promise.all(Array.from({ length: Math.min(concurrency, pending.length) }, async () => {
-        for (let file = pending[next++]; file !== undefined; file = pending[next++]) {
-            paths.set(file, await normalizeWithAsync(file, directories));
+    // Workers share one iterator and skip claimed paths, so no synchronous pass over every path precedes or follows them.
+    await Promise.all(Array.from({ length: concurrency }, async () => {
+        for (let step = pending.next(); !step.done; step = pending.next()) {
+            const file = step.value;
+            if (claimed.has(file)) {continue;}
+            claimed.add(file);
+            const normalized = await normalizeWithAsync(file, directories);
+            paths.set(file, normalized);
+            // Normalization is idempotent: results (such as test IDs built from normalized files) are their own.
+            if (!paths.has(normalized)) {paths.set(normalized, normalized);}
             signal?.throwIfAborted();
         }
     }));
-    // Normalization is idempotent: results (such as test IDs built from normalized files) are their own.
-    for (const normalized of [...paths.values()]) {if (!paths.has(normalized)) {paths.set(normalized, normalized);}}
     return file => {
         let normalized = paths.get(file);
         if (normalized === undefined) {normalized = normalizeWith(file, directories); paths.set(file, normalized);}
@@ -219,8 +224,45 @@ export function matchesPattern(file: string, pattern: string, roots: readonly st
     return candidates.some(candidate => compiled.match(candidate.replace(/\\/g, '/')));
 }
 
+/** A literal directory pattern (globstar, name, globstar) or file suffix pattern (globstar, star and suffix) as minimatch
+ * (dot, nocase) matches it: a `name` segment followed by a slash, or a final segment (with at most one trailing slash)
+ * ending in `suffix`. A match on the absolute path is also a match of every root-relative candidate and vice versa. */
+function literalPattern(pattern: string): string | undefined {
+    const escape = (text: string): string => text.replace(/\./g, '\\.');
+    const segment = /^\*\*\/([A-Za-z0-9._-]+)\/\*\*$/.exec(pattern)?.[1];
+    if (segment && !/^\.+$/.test(segment)) {return `(?:^|/)${escape(segment)}/`;}
+    const suffix = /^\*\*\/\*([A-Za-z0-9._-]+)$/.exec(pattern)?.[1];
+    return suffix ? `${escape(suffix)}/?$` : undefined;
+}
+
+interface ExclusionPlan { readonly literal: RegExp | undefined; readonly globs: readonly string[] }
+const exclusionPlans = new Map<string, ExclusionPlan>();
+const plansByList = new WeakMap<readonly string[], ExclusionPlan>();
+function exclusionPlan(excludes: readonly string[]): ExclusionPlan {
+    const known = plansByList.get(excludes);
+    if (known) {return known;}
+    const key = excludes.join('\0');
+    let plan = exclusionPlans.get(key);
+    if (!plan) {
+        if (exclusionPlans.size >= 64) {exclusionPlans.clear();}
+        const literals = excludes.map(literalPattern);
+        const sources = literals.filter((source): source is string => !!source);
+        plan = { literal: sources.length ? new RegExp(sources.join('|'), 'i') : undefined,
+            globs: excludes.filter((_, index) => !literals[index]) };
+        exclusionPlans.set(key, plan);
+    }
+    // A caller may mutate its list later; only frozen lists, such as the defaults, are remembered by identity.
+    if (Object.isFrozen(excludes)) {plansByList.set(excludes, plan);}
+    return plan;
+}
+
+/** The default and other literal segment/suffix patterns are one regular expression; other patterns use minimatch. */
 export function isExcluded(file: string, excludes: readonly string[] = defaultExcludes, roots: readonly string[] = []): boolean {
-    return excludes.some(pattern => matchesPattern(file, pattern, roots));
+    const plan = exclusionPlan(excludes), slashed = file.replace(/\\/g, '/');
+    // Globstars never match `.` or `..` segments; such rare unnormalized paths take the exact path.
+    if (/(?:^|\/)\.\.?(?:\/|$)/.test(slashed)) {return excludes.some(pattern => matchesPattern(file, pattern, roots));}
+    if (plan.literal?.test(slashed)) {return true;}
+    return plan.globs.some(pattern => matchesPattern(file, pattern, roots));
 }
 
 /** Locale-independent string order for identities: localeCompare varies with the ICU
@@ -271,8 +313,29 @@ export function testTargetKey(project: string, framework: string): string {
     return `${project}\0${framework}`;
 }
 
+/** Files that MSBuild, NuGet, the SDK or the test platform find by name, so creating or editing one can change
+ * evaluation, restore or test configuration before any project lists it. Other files, such as an `appsettings.json`,
+ * matter only as evaluated inputs of the projects that own them; see ProjectIndex.isConfiguration. */
 export function isConfigurationFile(file: string): boolean {
-    return /\.(csproj|sln|slnx|slnf|props|targets|runsettings|json|config|resx|editorconfig|globalconfig|ruleset)$/i.test(file);
+    const name = path.basename(file).toLowerCase();
+    return /\.(csproj|fsproj|vbproj|proj|projitems|shproj|sln|slnx|slnf|props|targets|runsettings|editorconfig|globalconfig|ruleset)$/.test(name)
+        || /^(global\.json|nuget\.config|packages\.lock\.json|directory\.build\.rsp|xunit\.runner\.json|launchsettings\.json|(.+\.)?testconfig\.json)$/.test(name);
+}
+
+/** Well-known configuration of non-.NET tooling (npm, TypeScript, linters, formatters, editor workspaces). Outside every
+ * project directory and not evaluated by any project, such a file cannot change a .NET build or test, so it selects nothing;
+ * any other unowned file may be data that tests read at runtime and selects every project. */
+export function isToolingFile(file: string): boolean {
+    const name = path.basename(file).toLowerCase();
+    return /^(package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|biome\.json|renovate\.json)$/.test(name)
+        || /^(tsconfig|jsconfig)(\..*)?\.json$/.test(name) || /^(\.eslintrc|\.prettierrc|\.markdownlint)/.test(name)
+        || /^eslint\.config\./.test(name) || name.endsWith('.code-workspace');
+}
+
+/** Configuration that can change what Restore produces: project and MSBuild files, SDK pins and NuGet settings. */
+export function isRestoreInput(file: string): boolean {
+    const name = path.basename(file).toLowerCase();
+    return /\.(csproj|fsproj|vbproj|proj|projitems|shproj|props|targets)$/.test(name) || /^(global\.json|nuget\.config|packages\.lock\.json|directory\.build\.rsp)$/.test(name);
 }
 
 export function isCompilerConfiguration(file: string): boolean { return /\.(editorconfig|globalconfig|ruleset)$/i.test(file); }

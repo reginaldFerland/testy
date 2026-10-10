@@ -3,17 +3,30 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {createHash}=require('node:crypto');
 const {TestEngine}=require('../../out/services/engine');
-const {RunnerSession}=require('../../out/services/runner');
+const {RunnerPreparations}=require('../../out/services/runnerPreparation');
 const analysis=require('../../out/services/analysis'),processes=require('../../out/services/process');
 
-function deferred(){let resolve,reject;const promise=new Promise((done,fail)=>{resolve=done;reject=fail;});void promise.catch(()=>{});return{promise,resolve,reject};}
+/** @returns {{promise: Promise<unknown>, resolve: (value?: unknown) => void, reject: (reason?: unknown) => void}} */
+function deferred(){
+ /** @type {any} */ let resolve;
+ /** @type {any} */ let reject;
+ const promise=new Promise((done,fail)=>{resolve=done;reject=fail;});void promise.catch(()=>{});return{promise,resolve,reject};
+}
+/**
+ * @param {{promise: Promise<unknown>}} gate
+ * @param {AbortSignal} [signal]
+ */
 async function waitFor(gate,signal){
  signal?.throwIfAborted();if(!signal)return gate.promise;
- let abort;const cancelled=new Promise((_,reject)=>{abort=()=>reject(signal.reason);signal.addEventListener('abort',abort,{once:true});});
+ /** @type {any} */ let abort;const cancelled=new Promise((_,reject)=>{abort=()=>reject(signal.reason);signal.addEventListener('abort',abort,{once:true});});
  try{await Promise.race([gate.promise,cancelled]);signal.throwIfAborted();}finally{signal.removeEventListener('abort',abort);}
 }
-const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
+const hash=(/** @type {import('node:crypto').BinaryLike} */ bytes)=>createHash('sha256').update(bytes).digest('hex');
 
+/**
+ * @param {import('node:test').TestContext} t
+ * @param {number} limit
+ */
 async function fixture(t,limit){
  const temp=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-instrument-budget-'))),root=path.join(temp,'workspace'),storage=path.join(temp,'state');
  const names=['Core','App','Infra','Web','Tests'];
@@ -25,10 +38,15 @@ async function fixture(t,limit){
    ? `using Microsoft.VisualStudio.TestTools.UnitTesting; [TestClass] public class Feature${file}Tests { [TestMethod][DataRow(1)][DataRow(2)] public void Value(int value) { Assert.AreEqual(value+${file}, Layers.Web.Feature${file}.Value(value)); } }`
    : `namespace Layers.${name}; public static class Feature${file} { public static int Value(int value) => ${index?`Layers.${names[index-1]}.Feature${file}.Value(value)`:`value+${file}`}; }`);
  }
+ /** @type {import('../../out/services/engine').EngineConfiguration} */
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:60000,maxParallelProjects:limit,maxParallelTestFiles:2};
- const control=new AbortController(),signal=AbortSignal.any([control.signal,t.signal]),release=deferred(),parsed=deferred(),analyzed=deferred(),output=[];
+ const control=new AbortController(),signal=AbortSignal.any([control.signal,t.signal]),release=deferred(),parsed=deferred(),analyzed=deferred();
+ /** @type {string[]} */ const output=[];
+ /** @type {{instrumented: number, primaryCommands: number, active: number, peak: number, primaryActive: number, primaryPeak: number, privateActive: number, privatePeak: number, privatePreparations: number, callback: ((signal: AbortSignal, start: () => Promise<void>) => unknown) | undefined, analysisHeld: boolean, afterStart: (primary: boolean) => void, phase: unknown, [key: string]: any}} */
  const state={instrumented:0,primaryCommands:0,active:0,peak:0,primaryActive:0,primaryPeak:0,privateActive:0,privatePeak:0,privatePreparations:0,callback:undefined,analysisHeld:false,afterStart(){},phase:''};
- const originalRun=processes.runProcess,originalAnalyze=analysis.sourceAnalysisBatch,originalInstrument=RunnerSession.prototype.instrumentTemplate;
+ // instrumentTemplate is private; it is wrapped to observe private workers, so the prototype is typed any.
+ const preparations=/** @type {any} */ (RunnerPreparations.prototype);
+ const originalRun=processes.runProcess,originalAnalyze=analysis.sourceAnalysisBatch,originalInstrument=preparations.instrumentTemplate;
  let firstAnalysis=true,firstPrimary=true;
  analysis.sourceAnalysisBatch=async(...args)=>{
   if(!firstAnalysis)return originalAnalyze(...args);firstAnalysis=false;
@@ -37,7 +55,7 @@ async function fixture(t,limit){
   if(limit>1){try{await waitFor(release,args[4].signal);}finally{state.analysisHeld=false;}}
   return result;
  };
- RunnerSession.prototype.instrumentTemplate=function(...args){
+ preparations.instrumentTemplate=/** @this {any} @param {unknown[]} args */ function(...args){
   if(this.options.preparationLane){state.privatePreparations++;assert.equal(this.options.tryInstrumentation,undefined,'private workers cannot borrow project capacity');}
   else state.callback=this.options.tryInstrumentation;
   return originalInstrument.apply(this,args);
@@ -71,15 +89,16 @@ async function fixture(t,limit){
   },selected(){},result(){},started(){},coverage(){},invalidated(){}}});
  t.after(async()=>{
   control.abort();release.resolve();parsed.resolve();analyzed.resolve();await engine.dispose();
-  processes.runProcess=originalRun;analysis.sourceAnalysisBatch=originalAnalyze;RunnerSession.prototype.instrumentTemplate=originalInstrument;
+  processes.runProcess=originalRun;analysis.sourceAnalysisBatch=originalAnalyze;preparations.instrumentTemplate=originalInstrument;
   await fs.rm(temp,{recursive:true,force:true});
  });
  const stamps=async()=>Promise.all(names.flatMap(name=>['dll','pdb'].map(extension=>path.join(root,'Tests/bin/Debug/net10.0',`${name}.${extension}`))).map(async file=>{
   const stat=await fs.stat(file,{bigint:true});return[file,hash(await fs.readFile(file)),String(stat.mtimeNs),String(stat.ctimeNs)];
  }));
- return{engine,state,signal,output,storage,stamps,run:signal_=>engine.run({files:[],full:true},signal_??signal)};
+ return{engine,state,signal,output,storage,stamps,run:(/** @type {AbortSignal | undefined} */ signal_=undefined)=>engine.run({files:[],full:true},signal_??signal)};
 }
 
+/** @param {import('../../out/services/engine').TestEngine} engine */
 function fingerprint(engine){return JSON.stringify({groups:engine.groups,coverage:[...engine.coverage.traces].map(([id,trace])=>[id,trace.dependencies,trace.coverage,trace.moduleProjects,trace.reliable])});}
 
 for(const limit of [1,4])test(`managed DLL instrumentation shares ${limit} preparation slots with analysis and stays inside file-worker limits`,{timeout:180000},async t=>{
@@ -99,7 +118,7 @@ for(const limit of [1,4])test(`managed DLL instrumentation shares ${limit} prepa
 
 test('cancelling real parallel instrumentation drains processes and permits before a fresh preparation succeeds',{timeout:180000},async t=>{
  const f=await fixture(t,4),abort=new AbortController();let cancelled=false;
- f.state.afterStart=primary=>{if(primary&&f.state.primaryActive>1&&!cancelled){cancelled=true;abort.abort();}};
+ f.state.afterStart=(/** @type {boolean} */ primary)=>{if(primary&&f.state.primaryActive>1&&!cancelled){cancelled=true;abort.abort();}};
  await assert.rejects(f.run(AbortSignal.any([f.signal,abort.signal])),{name:'AbortError'});
  assert.equal(cancelled,true,'cancellation reaches concurrent real collector processes');assert.equal(f.state.active,0);
  assert.deepEqual(await fs.readdir(path.join(f.storage,'runs')),[],'owned run outputs are drained');

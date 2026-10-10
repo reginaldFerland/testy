@@ -1,21 +1,33 @@
 const test=require('node:test'),assert=require('node:assert/strict');
 const {CoverageStore}=require('../../out/core/coverage');
 
+/** @typedef {import('../../out/core/model').Trace} Trace */
+/** @typedef {import('../../out/core/model').FileCoverage} FileCoverage */
+/** @typedef {import('../../out/core/model').CoveredLine} CoveredLine */
+/** @typedef {import('../../out/core/coverage').CoverageSummary} CoverageSummary */
+/** @typedef {import('../../out/core/coverage').StoredTrace} StoredTrace */
+
+/** @type {(line:number,hits:number)=>CoveredLine} */
 const line=(line,hits)=>({line,hits});
+/** @type {(file:string,hash:string,lines:readonly CoveredLine[])=>FileCoverage} */
 const coverage=(file,hash,lines)=>({file,hash,lines});
+/** @type {(groupId:string,files:FileCoverage[],extra?:Partial<Trace>)=>Trace} */
 const trace=(groupId,files,extra={})=>({groupId,coverage:files,dependencies:[],inputs:{},moduleProjects:[],reliable:true,timestamp:1,...extra});
 const emptyDelta={sources:[],traces:[],removedSources:[],removedTraces:[]};
+/** @param {Iterable<string>} values */
 const sorted=values=>[...values].sort();
 
-function calculations(store){
- const original=store.calculation,calls=[];
- store.calculation=function*(file){calls.push(file);return yield*original.call(this,file);};
+/** @param {import('../../out/core/coverage').CoverageStore} coverageStore */
+function calculations(coverageStore){
+ // `calculation` is private; the probe wraps it to record which files are recalculated.
+ const store=/** @type {any} */ (coverageStore),calls=/** @type {string[]} */ ([]);const original=store.calculation;
+ store.calculation=function*(/** @type {string} */ file){calls.push(file);return yield*original.call(this,file);};
  return{calls,clear(){calls.length=0;}};
 }
 
 test('identical fresh zero and positive reports reuse summaries while trace metadata and durable deltas advance',async()=>{
  const store=new CoverageStore(),file='/Positive.cs',zero='/Zero.cs',hashes=new Map([[file,'v1'],[zero,'v1'],['/old-input','old'],
-  ...Array.from({length:4},(_,index)=>[`/input-${index}`,`v${index}`])]);
+  ...Array.from({length:4},(_,index)=>/** @type {[string,string]} */ ([`/input-${index}`,`v${index}`]))]);
  const files=[coverage(file,'v1',[line(1,2.5),line(2,0)]),coverage(zero,'v1',[line(5,0)])],live=new Set(['one']);
  store.replace([trace('one',files,{dependencies:['/old-input'],inputs:{'/old-input':'old'},moduleProjects:['/Old.csproj']})],live);
  const initial=store.summarize(hashes),saved=JSON.stringify(initial);store.takeDelta();const probe=calculations(store);
@@ -26,7 +38,7 @@ test('identical fresh zero and positive reports reuse summaries while trace meta
   assert.equal(next,initial,'no visible coverage change retains the public summary array');
   assert.equal(await store.summarizeAsync(new Map(hashes)),initial,'equal hash values in a new map preserve the same cached array');
   assert.equal(store.summary(file,hashes),initial.find(summary=>summary.file===file));
-  assert.equal(next.find(summary=>summary.file===file).lines,initial.find(summary=>summary.file===file).lines);
+  assert.equal(/** @type {CoverageSummary} */ (next.find(summary=>summary.file===file)).lines,/** @type {CoverageSummary} */ (initial.find(summary=>summary.file===file)).lines);
   assert.deepEqual(probe.calls,[],'equal reports do not calculate either positive or zero-hit summaries');
   assert.deepEqual(sorted(store.dependentGroups([dependency])),['one']);assert.deepEqual(sorted(store.dependentProjects([module])),['one']);
   assert.deepEqual(sorted(store.dependentGroups(['/old-input'])),[]);assert.deepEqual(sorted(store.dependentProjects(['/Old.csproj'])),[]);
@@ -81,7 +93,7 @@ test('historical-version stale counts skip nonzero and net-zero updates but stil
 
 test('retained memberships explicitly dirty changed and deleted positive contributions',async()=>{
  const store=new CoverageStore(),file='/Hits.cs',hashes=new Map([[file,'v1']]),live=new Set(['one','two']);
- const one=hits=>trace('one',[coverage(file,'v1',[line(1,hits),line(2,hits?2:0),line(3,0)])]);
+ const one=(/** @type {number} */ hits)=>trace('one',[coverage(file,'v1',[line(1,hits),line(2,hits?2:0),line(3,0)])]);
  store.replace([one(5),trace('two',[coverage(file,'v1',[line(1,2)])])],live);
  const initial=store.summarize(hashes),saved=JSON.stringify(initial),probe=calculations(store);
  await store.replaceAsync([one(4)],live);assert.deepEqual((await store.summarizeAsync(hashes))[0].lines,[line(1,4),line(2,2),line(3,0)]);
@@ -95,7 +107,7 @@ test('retained memberships explicitly dirty changed and deleted positive contrib
 
 test('historical hit removal, pending hash switches and geometry growth survive equal-report reuse',async()=>{
  const store=new CoverageStore(),file='/History.cs',live=new Set(['current','old']);let hashes=new Map([[file,'v2']]);
- const old=lines=>trace('old',[coverage(file,'v1',lines)]);
+ const old=(/** @type {CoveredLine[]} */ lines)=>trace('old',[coverage(file,'v1',lines)]);
  store.replace([trace('current',[coverage(file,'v2',[line(1,7)])]),old([line(5,3)])],live);
  const initial=store.summarize(hashes),saved=JSON.stringify(initial);assert.equal(initial[0].stale,true);const probe=calculations(store);
  await store.replaceAsync([old([line(5,0)])],live);const current=await store.summarizeAsync(hashes);
@@ -112,8 +124,8 @@ test('historical hit removal, pending hash switches and geometry growth survive 
 
 test('equal replacements preserve earlier dirty hits, geometry and unapplied freshness changes',async()=>{
  const store=new CoverageStore(),file='/Pending.cs',hashes=new Map([[file,'v1']]),live=new Set(['one','zero']);
- const positive=hits=>trace('one',[coverage(file,'v1',[line(1,hits)])]);
- const zero=lines=>trace('zero',[coverage(file,'v1',lines.map(number=>line(number,0)))]);
+ const positive=(/** @type {number} */ hits)=>trace('one',[coverage(file,'v1',[line(1,hits)])]);
+ const zero=(/** @type {number[]} */ lines)=>trace('zero',[coverage(file,'v1',lines.map(number=>line(number,0)))]);
  store.replace([positive(1),zero([2])],live);store.summarize(hashes);const probe=calculations(store);
  store.replace([positive(7)],live);await store.replaceAsync([positive(7)],live);
  assert.deepEqual((await store.summarizeAsync(hashes))[0].lines,[line(1,7),line(2,0)]);assert.deepEqual(probe.calls,[file]);probe.clear();
@@ -136,7 +148,7 @@ test('changing a group ID changes public ownership even when its entire report i
 
 test('dense comparisons detect a changed last value and a deleted positive tail',async()=>{
  const store=new CoverageStore(),file='/Dense.cs',hashes=new Map([[file,'v1']]),live=new Set(['one']),count=16384;
- const dense=last=>trace('one',[coverage(file,'v1',Array.from({length:count},(_,index)=>line(index+1,index===count-1?last:1)))]);
+ const dense=(/** @type {number} */ last)=>trace('one',[coverage(file,'v1',Array.from({length:count},(_,index)=>line(index+1,index===count-1?last:1)))]);
  store.replace([dense(1)],live);const initial=store.summarize(hashes),saved=JSON.stringify(initial),probe=calculations(store);
  await store.replaceAsync([dense(9)],live);let result=(await store.summarizeAsync(hashes))[0];
  assert.equal(result.total,count);assert.equal(result.covered,count);assert.deepEqual(result.lines.at(-1),line(count,9));
@@ -148,9 +160,9 @@ test('dense comparisons detect a changed last value and a deleted positive tail'
 
 for(const cancel of [true,false])test(`${cancel?'cancellation':'concurrent replacement'} during staged equality cannot reuse an obsolete aggregate`,{timeout:10000},async t=>{
  const store=new CoverageStore(),file='/Comparison.cs',hashes=new Map([[file,'v1']]),live=new Set(['one']),count=16384;
- let armed=false,oldReads=0,ready;const compared=new Promise(resolve=>ready=resolve);
+ let armed=false,oldReads=0;/** @type {() => void} */ let ready=()=>{};const compared=new Promise(resolve=>ready=()=>resolve(undefined));
  const oldLines=Array.from({length:count},(_,index)=>({line:index+1,get hits(){if(armed&&++oldReads===1)ready();return 3;}}));
- const incoming=hits=>trace('one',[coverage(file,'v1',Array.from({length:count},(_,index)=>line(index+1,hits)))],{timestamp:2,moduleProjects:['/Incoming.csproj']});
+ const incoming=(/** @type {number} */ hits)=>trace('one',[coverage(file,'v1',Array.from({length:count},(_,index)=>line(index+1,hits)))],{timestamp:2,moduleProjects:['/Incoming.csproj']});
  store.replace([trace('one',[coverage(file,'v1',oldLines)],{moduleProjects:['/Original.csproj']})],live);
  const initial=store.summarize(hashes),saved=JSON.stringify(initial),beforeTrace=JSON.stringify(store.traces.get('one'));store.takeDelta();
  const revision=store.revision,probe=calculations(store),control=new AbortController(),signal=AbortSignal.any([control.signal,t.signal]);
@@ -165,11 +177,11 @@ for(const cancel of [true,false])test(`${cancel?'cancellation':'concurrent repla
    assert.equal(store.revision,revision);assert.equal(await store.summarizeAsync(hashes),initial);assert.deepEqual(probe.calls,[]);
    assert.deepEqual(store.takeDelta(),emptyDelta);assert.equal(JSON.stringify(store.traces.get('one')),beforeTrace);
   }else{
-   store.replace([incoming(9)],live);const intervening=store.summary(file,hashes);assert.ok(intervening.lines.every(value=>value.hits===9));
+   store.replace([incoming(9)],live);const intervening=/** @type {CoverageSummary} */ (store.summary(file,hashes));assert.ok(intervening.lines.every(value=>value.hits===9));
    probe.clear();await replacing;
    const result=(await store.summarizeAsync(hashes))[0];assert.ok(result.lines.every(value=>value.hits===3));
    assert.notEqual(result,intervening);assert.deepEqual(probe.calls,[file],'the commit checks the current contribution before preserving its aggregate');
-   assert.ok(intervening.lines.every(value=>value.hits===9));assert.deepEqual(store.traces.get('one').moduleProjects,['/Incoming.csproj']);
+   assert.ok(intervening.lines.every(value=>value.hits===9));assert.deepEqual(/** @type {StoredTrace} */ (store.traces.get('one')).moduleProjects,['/Incoming.csproj']);
    assert.equal(store.takeDelta().traces[0].timestamp,2);
   }
   assert.equal(JSON.stringify(initial),saved);

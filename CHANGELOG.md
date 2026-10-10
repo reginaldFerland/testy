@@ -29,11 +29,21 @@
 - **Covering tests:** hovering a covered gutter line names the test files that cover it, and **Run Tests Covering This Line** in the editor context menu runs them.
 - Attachments reported by the test framework (for example TRX files or screenshots) are listed in the run output.
 
+- **Keybindings:** `Ctrl+; T` (`Cmd+; T`) runs affected tests now, and `Ctrl+; Ctrl+T` (`Cmd+; Cmd+T`) runs the tests covering the current line in a C# editor.
+- **Run Affected Tests for This Folder/Project** in the Explorer context menu of folders and `.csproj` files.
+- The Testing view shows a welcome message with links to the output and walkthrough when no MTP test project is found.
+- `testy.problems.publishBuildDiagnostics` (`auto`, `always`, `never`) controls whether build errors go to the Problems panel; `auto` skips them while the C# extension already reports them.
+- Run profiles have a configure (gear) action that opens their settings.
+- Stack frames with deterministic `/_/` paths link to the matching workspace file when it is unambiguous.
+- Class items in Test Explorer have a range, so classes get Run/Debug gutter actions and **Go to Test**.
+- In affected runs, test files that failed last time run first.
+- Test results survive a VS Code reload: each test's last outcome is saved with the cache, so the status bar shows the previous pass/fail counts and previously failing files still run first. **Reset Caches and Baseline** clears them.
+
 ### Changed
 
 - **Requires VS Code 1.140 or later** (previously 1.99). The extension is built for the Node 24 runtime that version ships.
 - Pausing automatic testing is remembered per workspace and no longer edits `.vscode/settings.json`; `testy.autoRun` is now only the default.
-- Test Explorer's refresh button rediscovers tests without running them. **Refresh and Run All C# Tests** still rebuilds and runs everything.
+- Test Explorer's refresh button rediscovers tests without running them. **Rebuild and Run All C# Tests** (renamed from **Refresh and Run All C# Tests**, with a run-all icon) still rebuilds and runs everything.
 - Gutter coverage markers are optional (`testy.showCoverage` now defaults to `false`), and have light and dark theme variants.
 - Output uses a log channel with levels (**Developer: Set Log Level…**).
 - The first open of a workspace asks before building and running the baseline (**Run Now**, **Not Now**, **Don't Ask Again**); until then, a save or a manual run starts it. Workspaces with a retained baseline start as before.
@@ -64,6 +74,16 @@
 - Coverage decorations are no longer recomputed on every keystroke while gutter coverage is hidden.
 - Source analysis is about 4x faster and uses less CPU and memory: fingerprints are streamed instead of building normalized copies of each file, and all analyzer requests share one CPU budget. Cached fingerprints are recomputed once after upgrading.
 - SDK resolver digests are kept on disk between project evaluations instead of being rehashed by each evaluation process.
+
+- Saving editor settings or non-.NET tooling files outside every project, such as `.vscode/settings.json`, a root `package.json` or `tsconfig.json`, lock files or ESLint and Prettier configuration, no longer restores every project and reruns every test. `.vscode`, `.vs` and `.idea` are excluded by default. Other files outside every project, such as test data that tests read at runtime, still run every test project, without a restore. Only changes that affect restore (project files, props/targets, `global.json`, `nuget.config`, lock files and evaluated imports) repeat `dotnet restore`.
+- The default `testy.fileWatcherPattern` also covers `.razor`, `.cshtml`, `.xaml`, `.axaml` and `.proto` files.
+- Test files containing skipped tests now get reliable traces, so changes select them precisely instead of falling back to their project.
+- Coverage saves from test files that finish close together are combined into one write. Cancelled runs still save completed files.
+- In `fileSystem` trigger mode, incremental runs check only changed files instead of every known source file. Every known input is still checked in the background after such a run, and a change found without a file event starts a follow-up run.
+- Coverage reports and runtime-observation logs are deleted as soon as each test file finishes, instead of at the end of the run.
+- Large workspaces block the editor less while loading project graphs, reading saved project evaluations and validating analysis results.
+- Startup and environment notifications are localized; the English detail stays in the output.
+- Production builds ship external source maps alongside the bundle for readable error reports.
 
 ### Fixed
 
@@ -111,6 +131,15 @@
 - Closing VS Code stops test processes immediately, and deactivation finishes within about 3 seconds.
 - An empty command passed to the Windows process host reports a clear error.
 
+- Test Explorer's refresh no longer cancels the first-baseline prompt; previously **Run Now** then did nothing and a later settings change started the baseline without asking.
+- Automatic runs during a continuous run are reported as part of that continuous run when it comes from the matching profile; with `testy.runWithCoverage`, a continuous **Run** does not receive them, so their coverage keeps its line detail.
+- File watchers are no longer all recreated after every input change, and a change reported by overlapping watchers starts one run. Input watchers still report files the `testy.fileWatcherPattern` watcher covers, since `files.watcherExclude` can hide them from it.
+- Testy commands work in Restricted Mode and without an open folder, and explain what is needed instead of failing with "command not found".
+- If a test process reports an error, such as a failed kill, Testy kills its whole process tree and waits for it to exit before reporting the failure.
+- On Windows, another window no longer takes over the storage lock from a live window after sleep/resume or a stall of up to 10 minutes.
+- The analyzer server bounds request line length and queues requests beyond a concurrency limit, and alias analysis honours cancellation and the shared CPU limit.
+- The runtime observer no longer serializes unrelated assembly loads in the test process, and never throws into it.
+
 ### Internal
 
 - Type-aware ESLint (including floating-promise checks) and stricter TypeScript checks are enforced; opted-in tests are type-checked.
@@ -126,6 +155,12 @@
 - The MTP client reports the real extension version; project-graph output carries a format version and uses source-generated JSON.
 - Checked-in xUnit v3 and NUnit fixtures, extension-host tests for every command and for each framework, process-level analyzer tests, and timing-independent waits in previously flaky tests.
 - `backend/global.json` was removed so backend tests use the pinned SDK; `SECURITY.md`, a code of conduct, and issue and PR templates were added.
+
+- Engine stages return results that the engine applies; pure selection, freshness and trace-reliability rules live in `src/core/runPolicy.ts` and `src/core/traceReliability.ts`. Runner lanes and preparation are separate modules, and both caches share one hash memo.
+- All analyzer JSON uses source-generated serialization with reflection disabled; the project graph task writes its output atomically.
+- New backend tests cover the Windows process host job, project graph edge cases, PDB source locations, startup hook concurrency and analyzer server limits.
+- CI compiles once per OS, gates TypeScript line coverage, checks l10n drift and runs the extension tests on the minimum VS Code version. Release secrets are scoped to the publish steps, actions are pinned to commit SHAs, and the published VSIX is the one that was checked.
+- Timing-based unit tests use explicit synchronization instead of sleeps. `npm run clean` removes build and benchmark output; benchmarks write results to `.benchmarks/`.
 
 ## 1.2.0
 

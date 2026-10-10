@@ -4,7 +4,7 @@ const {discoveredTest}=require('../../out/services/mtp');
 const {nodeTraits,traitTagIds}=require('../../out/core/traits');
 const {loadUi}=require('./support/ui.cjs');
 
-const plain=values=>JSON.parse(JSON.stringify(values)),ids=item=>plain(item.tags.map(tag=>tag.id));
+const plain=(/** @type {unknown} */ values)=>JSON.parse(JSON.stringify(values)),ids=(/** @type {{tags: {id: string}[]}} */ item)=>plain(item.tags.map(tag=>tag.id));
 
 test('discovery reads traits from the traits array, key/value map and flat trait.* properties',()=>{
  const array=discoveredTest({uid:'a','display-name':'A',traits:[{key:'TestCategory',value:'Integration'},{key:'Owner',value:'sam'},{key:'Owner',value:'sam'},{name:'Speed',value:'slow'},'Area=Billing','broken',{key:'',value:'x'}]});
@@ -14,7 +14,7 @@ test('discovery reads traits from the traits array, key/value map and flat trait
  assert.equal(discoveredTest({uid:'none','display-name':'None'}).traits,undefined,'tests without traits stay unchanged');
  assert.equal('traits' in discoveredTest({uid:'none'}),false);
  const flood=nodeTraits({uid:'x',traits:Array.from({length:500},(_,index)=>({key:'k',value:String(index)}))});
- assert.equal(flood.length,32,'the number of traits per test is bounded');
+ assert.equal(/** @type {readonly unknown[]} */ (flood).length,32,'the number of traits per test is bounded');
 });
 
 test('trait tags are filterable IDs, with a category tag for TestCategory',()=>{
@@ -24,13 +24,13 @@ test('trait tags are filterable IDs, with a category tag for TestCategory',()=>{
 });
 
 test('test items carry trait tags, cached across rebuilds, and notice trait changes',async()=>{
- const collection=()=>({values:[],replace(values){this.values=[...values];},add(value){this.values.push(value);}});
- const {TestTree}=loadUi({vscode:{Uri:{file:fsPath=>({fsPath})},Range:class{}}});
+ const collection=()=>({values:/** @type {unknown[]} */ ([]),replace(/** @type {Iterable<unknown>} */ values){this.values=[...values];},add(/** @type {unknown} */ value){this.values.push(value);}});
+ const {TestTree}=loadUi({vscode:{Uri:{file:(/** @type {string} */ fsPath)=>({fsPath})},Range:class{}}});
  const context={items:new Map(),testIds:new Map(),treeFiles:new Map(),treeProjects:new Map(),treeRoots:[],outcomes:new Map(),passed:0,failed:0,
-  engine:{knownTests:group=>group.tests},host:{disposed:false,activeRun:undefined,roots:[],updateStatus(){}},setOutcome:TestTree.prototype.setOutcome,item:TestTree.prototype.item,
-  controller:{items:collection(),createTestItem:(id,label,uri)=>({id,label,uri,tags:[],children:collection()})}};
- const node=traits=>discoveredTest({uid:'t1','display-name':'Adds','location.file':'/Tests.cs','location.line-start':3,'location.type':'Calc','location.method':'Adds',traits});
- const group=traits=>({id:'g',project:'/Tests.csproj',framework:'net10.0',assembly:'/Tests.dll',file:'/Tests.cs',tests:[node(traits)]});
+  engine:{knownTests:(/** @type {{tests: unknown[]}} */ group)=>group.tests},host:{disposed:false,activeRun:undefined,roots:[],updateStatus(){}},setOutcome:TestTree.prototype.setOutcome,item:TestTree.prototype.item,
+  controller:{items:collection(),createTestItem:(/** @type {string} */ id,/** @type {string} */ label,/** @type {unknown} */ uri)=>({id,label,uri,tags:[],children:collection()})}};
+ const node=(/** @type {{key: string, value: string}[] | undefined} */ traits)=>discoveredTest({uid:'t1','display-name':'Adds','location.file':'/Tests.cs','location.line-start':3,'location.type':'Calc','location.method':'Adds',traits});
+ const group=(/** @type {{key: string, value: string}[] | undefined} */ traits)=>({id:'g',project:'/Tests.csproj',framework:'net10.0',assembly:'/Tests.dll',file:'/Tests.cs',tests:[node(traits)]});
  await TestTree.prototype.update.call(context,[group([{key:'TestCategory',value:'Integration'}])]);
  const item=context.items.get('g:t1');
  assert.deepEqual(ids(item),['project:Tests','framework:net10.0','trait:TestCategory=Integration','category:Integration']);

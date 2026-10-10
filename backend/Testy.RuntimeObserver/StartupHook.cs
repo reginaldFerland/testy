@@ -24,12 +24,30 @@ internal static class StartupHook
             var seen = new HashSet<string>(StringComparer.Ordinal);
             var gate = new object();
             var failed = false;
-            var log = new FileStream(Path.Combine(directory, $"{Guid.NewGuid()}.log"), FileMode.CreateNew, FileAccess.Write, FileShare.Read);
-            var writer = new StreamWriter(log) { AutoFlush = true };
             var entry = Assembly.GetEntryAssembly()?.Location ?? "";
-            writer.WriteLine("ready\t" + Encode(entry));
+            var log = new FileStream(Path.Combine(directory, $"{Guid.NewGuid()}.log"), FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+            StreamWriter writer;
+            try
+            {
+                writer = new StreamWriter(log) { AutoFlush = true };
+                writer.WriteLine("ready\t" + Encode(entry));
+            }
+            catch
+            {
+                // The handle would otherwise stay open (and the file locked) for the life of the process.
+                log.Dispose();
+                throw;
+            }
+            // The set is complete before the first handler runs and is never written afterwards,
+            // so unlisted loads (nearly all of them) are dismissed without taking the gate.
+            bool Listed(Assembly assembly)
+            {
+                try { return names.Contains(assembly.GetName().Name ?? ""); }
+                catch { failed = true; return false; }
+            }
             void Loaded(Assembly assembly)
             {
+                if (!Listed(assembly)) { return; }
                 if (deferred is not null) { deferred.Add(assembly); return; }
                 lock (gate)
                 {
@@ -57,7 +75,12 @@ internal static class StartupHook
                 }
                 catch { failed = true; }
             }
-            AppDomain.CurrentDomain.AssemblyLoad += (_, args) => Loaded(args.LoadedAssembly);
+            AppDomain.CurrentDomain.AssemblyLoad += (_, args) =>
+            {
+                // A handler that throws would crash the observed process.
+                try { Loaded(args.LoadedAssembly); }
+                catch { failed = true; }
+            };
             // ProcessExit does not run when the process is killed or crashes. The
             // missing "complete" record is then the signal, so nothing else is
             // flushed or finalized on abnormal exit (lines are flushed as written).

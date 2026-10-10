@@ -1,15 +1,31 @@
 const test = require('node:test'), assert = require('node:assert/strict');
-const fs = require('node:fs/promises'), path = require('node:path'), os = require('node:os'), vm = require('node:vm');
+const fs = require('node:fs/promises'), path = require('node:path'), os = require('node:os');
 const { createRequire } = require('node:module'), { randomUUID } = require('node:crypto');
 const { setTimeout: delay } = require('node:timers/promises');
 const { Semaphore } = require('../../out/core/concurrency');
+const { loadRunner } = require('./support/runner.cjs');
 
-function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; }
+/** @typedef {{promise: Promise<void>, resolve: () => void}} Deferred */
+/** @typedef {{name: string, assembly: string, session: string, signal: AbortSignal}} Call */
+/** @typedef {{calls: Call[], active: Set<Call>, peak: number, removals: string[], discoveries: string[], runs: unknown[], messages: string[], borrows: number}} State */
+/** @typedef {{limit?: number, instrument?: (call: Call, state: State) => Promise<{code?: number} | void>, run?: (options: unknown, state: State) => Promise<void>, release?: () => void, unchanged?: string[], managed?: boolean, cache?: boolean}} Config */
+
+/** @returns {Deferred} */
+function deferred() {
+    /** @type {any} */ let resolve; // assigned synchronously by the executor
+    /** @type {Promise<void>} */ const promise = new Promise(done => { resolve = done; });
+    return { promise, resolve };
+}
+/** @param {() => unknown} predicate */
 async function eventually(predicate) {
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) { if (predicate()) { return; } await delay(1); }
     assert.fail('controlled work did not reach its expected state');
 }
+/**
+ * @param {import('node:test').TestContext} t
+ * @param {Config} [config]
+ */
 async function fixture(t, config = {}) {
     const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'testy-instruments-')));
     const source = path.join(root, 'build'), workspace = path.join(root, 'workspace');
@@ -19,15 +35,17 @@ async function fixture(t, config = {}) {
     const project = { file: path.join(workspace, 'Tests.csproj'), framework: 'net10.0', assembly: path.join(source, 'Tests.dll'),
         sourceFiles: ['A.cs', 'B.cs'].map(name => path.join(workspace, name)) };
     const control = new AbortController(), budget = new Semaphore(config.limit ?? 4);
-    const state = { calls: [], active: new Set(), peak: 0, removals: [], discoveries: [], runs: [], messages: [], borrows: 0 };
-    const file = path.resolve('out/services/runner.js'), realRequire = createRequire(file), exports = {};
+    const inspectable = /** @type {any} */ (budget); // tests read the semaphore's private active/waiting counters
+    /** @type {State} */ const state = { calls: [], active: new Set(), peak: 0, removals: [], discoveries: [], runs: [], messages: [], borrows: 0 };
+    const file = path.resolve('out/services/runner.js'), realRequire = createRequire(file);
+    /** @type {Record<string, any>} */ const exports = {}; // the runner exports, loaded into the stub sandbox
     const output = realRequire('./output'), processTools = realRequire('./process'), mtp = realRequire('./mtp'), cacheTools = realRequire('./preparedOutputCache');
     const nodes = project.sourceFiles.map((file, i) => ({ uid: `native-${i}`, 'display-name': `Test${i}`,
         'location.file': file, 'location.type': `Suite${i}`, 'location.method': 'Run' }));
     const modules = {
-        './process': { ...processTools, runProcess: async (_command, args, options) => {
+        './process': { ...processTools, runProcess: async (/** @type {string} */ _command, /** @type {string[]} */ args, /** @type {{signal?: AbortSignal}} */ options) => {
             assert.equal(args[0], 'instrument'); options.signal?.throwIfAborted();
-            const call = { name: path.basename(args[1], '.dll'), assembly: args[1], session: args[3], signal: options.signal };
+            /** @type {Call} */ const call = { name: path.basename(/** @type {string} */ (args[1]), '.dll'), assembly: /** @type {string} */ (args[1]), session: /** @type {string} */ (args[3]), signal: /** @type {AbortSignal} */ (options.signal) };
             state.calls.push(call); state.active.add(call); state.peak = Math.max(state.peak, state.active.size);
             try {
                 const result = await config.instrument?.(call, state);
@@ -35,58 +53,59 @@ async function fixture(t, config = {}) {
                 return { code: result?.code ?? 0, stdout: '', stderr: '' };
             } finally { state.active.delete(call); }
         } },
-        './output': { ...output, removeOutput: async directory => {
+        './output': { ...output, removeOutput: async (/** @type {string} */ directory) => {
             for (const call of state.active) { assert.equal(call.assembly.startsWith(directory + path.sep), false, 'processes drain before output removal'); }
             state.removals.push(directory); return output.removeOutput(directory);
         } },
-        './mtp': { ...mtp, requestTests: async (options, operation, selected) => {
+        './mtp': { ...mtp, requestTests: async (/** @type {any} */ options, /** @type {string} */ operation, /** @type {any[] | undefined} */ selected) => // options is a partial mtp request mock
+             {
             const artifactRoot = path.dirname(path.dirname(options.assembly));
             for (const call of state.active) { assert.equal(call.assembly.startsWith(artifactRoot + path.sep), false, 'discovery/execution waits for its template instrumentation'); }
             if (operation === 'discover') { state.discoveries.push(options.assembly); return nodes; }
             state.runs.push(options);
             await config.run?.(options, state);
-            return (selected ?? options.expectedTests).map(node => ({ ...node, 'execution-state': 'passed' }));
+            return (selected ?? options.expectedTests).map((/** @type {any} */ node) => ({ ...node, 'execution-state': 'passed' }));
         } },
-        './preparedOutputCache': { ...cacheTools, preparationToolIdentity: async command => command ?? '' },
-        './preparationIdentity': { windowsPreparationTools: async options => ({ dotnet: options.dotnet, collector: options.coverageTool, analyzer: options.analyzer, instrumentationLaunch: 'node' }) },
+        './preparedOutputCache': { ...cacheTools, preparationToolIdentity: async (/** @type {string | undefined} */ command) => command ?? '' },
+        './preparationIdentity': { windowsPreparationTools: async (/** @type {{dotnet: string, coverageTool: string, analyzer: string}} */ options) => ({ dotnet: options.dotnet, collector: options.coverageTool, analyzer: options.analyzer, instrumentationLaunch: 'node' }) },
         './coverageReader': { CoverageReader: class { async read() { return []; } async dispose() {} } },
-        './runtimeObservation': { RuntimeObservation: class { static async start(_directory, _assembly, _modules, _instrumented, env) {
+        './runtimeObservation': { RuntimeObservation: class { static async start(/** @type {string} */ _directory, /** @type {string} */ _assembly, /** @type {unknown} */ _modules, /** @type {unknown} */ _instrumented, /** @type {unknown} */ env) {
             return { env, dependencies: async () => ({ files: [], projects: [] }) };
         } } }
     };
-    vm.runInNewContext(await fs.readFile(file, 'utf8'), { exports, process, AbortController, require: name => modules[name] ?? realRequire(name) });
+    Object.assign(exports, loadRunner(modules, { process, AbortController }));
     const cache = config.cache ? new cacheTools.PreparedOutputCache(path.join(root, 'cache'), randomUUID()) : undefined;
-    const sessions = [];
+    /** @type {any[]} */ const sessions = [];
     let enabled = true;
-    const borrow = (signal, work) => { state.borrows++; return enabled ? budget.tryRun(signal, work) : undefined; };
-    const createSession = (overrides = {}) => {
+    const borrow = (/** @type {AbortSignal} */ signal, /** @type {() => Promise<unknown>} */ work) => { state.borrows++; return enabled ? budget.tryRun(signal, work) : undefined; };
+    const createSession = (overrides = /** @type {Record<string, unknown>} */ ({})) => {
         const session = new exports.RunnerSession({ dotnet: 'dotnet', storage: path.join(root, 'runs'), testArguments: [], signal: control.signal, cleanupDescendants: false,
             coverageTool: 'collector', managedCoverageTool: config.managed ?? true, assemblies: names.map(name => path.join(source, `${name}.dll`)),
-            preparedOutputCache: cache, tryInstrumentation: borrow, output: message => state.messages.push(message), ...overrides });
+            preparedOutputCache: cache, tryInstrumentation: borrow, output: (/** @type {string} */ message) => state.messages.push(message), ...overrides });
         sessions.push(session); return session;
     };
     const session = createSession();
     t.after(async () => {
         control.abort(); config.release?.();
-        await Promise.allSettled(sessions.map(session => session.dispose())); await cache?.dispose();
+        await Promise.allSettled(sessions.map((/** @type {any} */ session) => session.dispose())); await cache?.dispose();
         assert.equal(state.active.size, 0); await fs.rm(root, { recursive: true, force: true });
     });
     const start = (runner = session, target = project) => budget.run(control.signal, () => runner.discover(target));
-    const pristine = async directory => {
+    const pristine = async (/** @type {string} */ directory) => {
         for (const name of [...names, 'External']) { assert.equal(await fs.readFile(path.join(directory, `${name}.dll`), 'utf8'), `pristine-${name}`); }
     };
-    return { root, source, project, names, state, session, createSession, control, budget, start, pristine,
+    return { root, source, project, names, state, session, createSession, control, budget: inspectable, start, pristine,
         disableBorrowing: () => { enabled = false; }, hashes: new Map(project.sourceFiles.map(file => [file, 'hash'])) };
 }
 
 test('DLLs share one session, borrow only spare capacity, and retain original result order', { timeout: 10000 }, async t => {
     const gates = new Map(['App', 'Core', 'Infra', 'Tests', 'Web'].map(name => [name, deferred()]));
-    const f = await fixture(t, { instrument: call => gates.get(call.name).promise, release: () => { for (const gate of gates.values()) { gate.resolve(); } } });
+    const f = await fixture(t, { instrument: call => /** @type {Deferred} */ (gates.get(call.name)).promise, release: () => { for (const gate of gates.values()) { gate.resolve(); } } });
     const pending = f.start();
     await eventually(() => f.state.calls.length === 4);
     assert.equal(f.state.peak, 4); assert.equal(f.budget.active, 4); assert.equal(f.budget.waiting.length, 0);
-    gates.get('Core').resolve(); await eventually(() => f.state.calls.length === 5);
-    for (const name of ['Web', 'Tests', 'Infra', 'App']) { gates.get(name).resolve(); }
+    /** @type {Deferred} */ (gates.get('Core')).resolve(); await eventually(() => f.state.calls.length === 5);
+    for (const name of ['Web', 'Tests', 'Infra', 'App']) { /** @type {Deferred} */ (gates.get(name)).resolve(); }
     await pending;
     const preparation = [...f.session.prepared.values()][0];
     assert.deepEqual(Array.from(preparation.instrumented, file => path.basename(file, '.dll')), f.names);
@@ -144,14 +163,14 @@ for (const scenario of ['inherited failure', 'borrowed failure', 'cancellation']
         const f = await fixture(t, { instrument: async call => {
             await fs.appendFile(call.assembly, ':partial');
             if (scenario !== 'cancellation' && call.name === (scenario === 'inherited failure' ? 'App' : 'Core')) { await fail.promise; return { code: 17 }; }
-            await new Promise(resolve => {
+            await new Promise(/** @type {(resolve: (value?: unknown) => void) => void} */ (resolve) => {
                 if (call.signal.aborted) { aborted++; resolve(); }
                 else { call.signal.addEventListener('abort', () => { aborted++; resolve(); }, { once: true }); }
             });
             await drain.promise; call.signal.throwIfAborted();
         }, release: () => { fail.resolve(); drain.resolve(); } });
         const pending = f.start();
-        const observed = scenario === 'cancellation' ? assert.rejects(pending, error => error.name === 'AbortError') : pending;
+        const observed = scenario === 'cancellation' ? assert.rejects(pending, (/** @type {Error} */ error) => error.name === 'AbortError') : pending;
         await eventually(() => f.state.calls.length === 4);
         if (scenario !== 'cancellation') { fail.resolve(); } else { f.control.abort(); }
         await eventually(() => aborted === (scenario !== 'cancellation' ? 3 : 4));

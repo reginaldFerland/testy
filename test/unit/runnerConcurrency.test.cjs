@@ -1,31 +1,49 @@
 const test=require('node:test'),assert=require('node:assert/strict');
-const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os'),vm=require('node:vm');
+const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {randomUUID}=require('node:crypto');
 const {createRequire}=require('node:module'),{setTimeout:delay}=require('node:timers/promises');
 const {normalizePath}=require('../../out/core/paths');
+const {loadRunner}=require('./support/runner.cjs');
 
-function deferred(){let resolve;const promise=new Promise(done=>resolve=done);return{promise,resolve};}
+/** @typedef {import('../../out/core/model').TestFile} TestFile */
+/** @typedef {import('../../out/core/testUpdates').TestNode} TestNode */
+/** @typedef {{token: string, file: string, name: string, type?: string, method?: string}} Definition */
+/** @typedef {{assembly: string, secondary: boolean, ids: string[], wrapper: any, bytes: string, env: any}} Call */
+/** @typedef {{promise: Promise<void>, resolve: () => void}} Deferred */
+/** @typedef {{discoveries: {assembly: string, secondary: boolean, env: any}[], runs: Call[], instruments: {assembly: string, session: string, env: any}[], prepared: number, claims: number, active: number, peak: number, activeAssemblies: Set<string>, primaryStarted: Deferred, secondaryStarted: Deferred, release: Deferred, fallback: Deferred, reports: Map<string, string[]>}} State */
+/**
+ * @typedef {{definitions?: Definition[], stableIds?: boolean, idsFromBytes?: boolean, failDiscover?: (secondary: boolean, count: number) => boolean,
+ *   secondaryNodes?: (nodes: TestNode[]) => TestNode[], mutateDiscovery?: boolean, artifacts?: boolean | 'attachments', holdAll?: boolean, holdPrimary?: boolean,
+ *   runDelay?: number, failRun?: (call: Call, count: number) => boolean, instrument?: (args: string[], state: State, signal: AbortSignal) => Promise<void>,
+ *   toolIdentity?: (command: string, ...rest: any[]) => Promise<string>, failClaim?: (claims: number) => boolean, coverage?: boolean, cache?: boolean,
+ *   managedCoverageTool?: boolean, env?: Record<string, string>, deferCoverage?: (() => boolean) | undefined, expectDisposeFailure?: boolean}} Config
+ */
+
+/** @returns {Deferred} */
+function deferred(){/** @type {() => void} */ let resolve=()=>{};const promise=new Promise(done=>{resolve=()=>done(undefined);});return{promise,resolve};}
+/** @template T @param {Promise<T>} promise @param {AbortSignal} [signal] */
 async function until(promise,signal){
- signal?.throwIfAborted();let abort;
- try{return await Promise.race([promise,new Promise((_,reject)=>{abort=()=>reject(signal.reason);signal?.addEventListener('abort',abort,{once:true});})]);}
+ signal?.throwIfAborted();/** @type {() => void} */ let abort=()=>{};
+ try{return await Promise.race([promise,new Promise((_,reject)=>{abort=()=>reject(/** @type {AbortSignal} */ (signal).reason);signal?.addEventListener('abort',abort,{once:true});})]);}
  finally{signal?.removeEventListener('abort',abort);}
 }
 
+/** @param {import('node:test').TestContext} t @param {Config} [config] */
 async function fixture(t,config={}){
  const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-runner-lanes-')));
  const source=path.join(root,'build'),workspace=path.join(root,'workspace');
  await fs.mkdir(source);await fs.mkdir(workspace);
  await fs.writeFile(path.join(source,'Tests.dll'),'assembly');await fs.writeFile(path.join(source,'asset'),'pristine');
  const definitions=config.definitions??[{token:'a',file:'A.cs',name:'A'},{token:'b',file:'B.cs',name:'B'}];
- const project={file:path.join(workspace,'Tests.csproj'),framework:'net10.0',assembly:path.join(source,'Tests.dll'),
+ /** @type {any} */ const project={file:path.join(workspace,'Tests.csproj'),framework:'net10.0',assembly:path.join(source,'Tests.dll'),
   sourceFiles:[...new Set(definitions.map(node=>normalizePath(path.join(workspace,node.file))))]};
- const state={discoveries:[],runs:[],instruments:[],prepared:0,claims:0,active:0,peak:0,activeAssemblies:new Set(),
+ /** @type {State} */ const state={discoveries:[],runs:[],instruments:[],prepared:0,claims:0,active:0,peak:0,activeAssemblies:new Set(),
   primaryStarted:deferred(),secondaryStarted:deferred(),release:deferred(),fallback:deferred(),reports:new Map()};
- const control=new AbortController(),file=path.resolve('out/services/runner.js'),realRequire=createRequire(file),exports={};
+ const control=new AbortController(),file=path.resolve('out/services/runner.js'),realRequire=createRequire(file),exports=/** @type {{RunnerSession: typeof import('../../out/services/runner').RunnerSession}} */ ({});
  const mtp=realRequire('./mtp'),output=realRequire('./output'),processTools=realRequire('./process'),ownership=realRequire('./runOutputs'),cacheTools=realRequire('./preparedOutputCache');
- const nodesFor=(assembly,bytes)=>definitions.map(node=>({uid:(config.stableIds?node.token:`${path.dirname(assembly)}:${node.token}`)+(config.idsFromBytes?`:${bytes}`:''),'display-name':node.name,
+ const nodesFor=/** @param {string} assembly @param {string} bytes @returns {TestNode[]} */ (assembly,bytes)=>definitions.map(node=>({uid:(config.stableIds?node.token:`${path.dirname(assembly)}:${node.token}`)+(config.idsFromBytes?`:${bytes}`:''),'display-name':node.name,
   'location.file':path.join(workspace,node.file),'location.type':node.type??node.name,'location.method':node.method??'Run'}));
- const requestTests=async(options,operation,selected)=>{
+ const requestTests=async(/** @type {any} */ options,/** @type {string} */ operation,/** @type {TestNode[] | undefined} */ selected=undefined)=>{
   const secondary=options.assembly.includes(`${path.sep}lanes${path.sep}`);
   const bytes=await fs.readFile(options.assembly,'utf8');let nodes=nodesFor(options.assembly,bytes);
   if(operation==='discover'){
@@ -35,10 +53,16 @@ async function fixture(t,config={}){
    if(config.mutateDiscovery)await fs.writeFile(path.join(path.dirname(options.assembly),'asset'),'discovery mutation');
    return nodes;
   }
-  const requested=selected??options.expectedTests;
+  /** @type {TestNode[]} */ const requested=selected??options.expectedTests;
   assert.ok(requested.every(node=>nodes.some(candidate=>candidate.uid===node.uid)),'only lane-native UIDs may reach MTP');
   const call={assembly:options.assembly,secondary,ids:requested.map(node=>node.uid),wrapper:options.wrapper,bytes,env:options.env};
   state.runs.push(call);state.active++;state.peak=Math.max(state.peak,state.active);state.activeAssemblies.add(options.assembly);
+  if(config.artifacts){
+   // As the collector and MTP do: a report beside the output, and a results directory that may hold attachments.
+   if(options.wrapper)await fs.writeFile(options.wrapper.args.at(-1),'<coverage/>');
+   const results=options.args[options.args.indexOf('--results-directory')+1];await fs.mkdir(results,{recursive:true});
+   if(config.artifacts==='attachments')await fs.writeFile(path.join(results,'attachment.log'),'kept');
+  }
   (secondary?state.secondaryStarted:state.primaryStarted).resolve();
   try{
    assert.equal(await fs.readFile(path.join(path.dirname(options.assembly),'asset'),'utf8'),'pristine','restore each reusable lane before executing it');
@@ -48,37 +72,42 @@ async function fixture(t,config={}){
    if(config.failRun?.(call,state.runs.length))throw new Error('controlled execution failure');
    assert.equal(await fs.readFile(path.join(path.dirname(options.assembly),'asset'),'utf8'),requested[0].uid,'another lane must not restore this run output');
    const results=requested.map(node=>({...node,'execution-state':'passed'}));
-   if(options.wrapper){const report=options.wrapper.args.at(-1);state.reports.set(report,[...new Set(requested.map(node=>node['location.file']))]);}
+   if(options.wrapper){const report=options.wrapper.args.at(-1);state.reports.set(report,[...new Set(requested.map(node=>/** @type {string} */ (node['location.file'])))]);}
    for(const node of results)options.onNode?.(node);
    return results;
   }finally{state.active--;state.activeAssemblies.delete(options.assembly);}
  };
  const modules={
   './mtp':{...mtp,requestTests},
-  './process':{...processTools,runProcess:async(_command,args,options)=>{
+  './process':{...processTools,runProcess:async(/** @type {string} */ _command,/** @type {string[]} */ args,/** @type {any} */ options)=>{
    assert.equal(args[0],'instrument');state.instruments.push({assembly:args[1],session:args[3],env:options.env});
    await config.instrument?.(args,state,control.signal);
    await fs.appendFile(args[1],args[3]);return{code:0,stdout:'',stderr:''};
   }},
-  './preparedOutputCache':{...cacheTools,preparationToolIdentity:async(command,...rest)=>config.toolIdentity?config.toolIdentity(command,...rest):command},
-  './preparationIdentity':{windowsPreparationTools:async options=>({dotnet:options.dotnet,collector:options.coverageTool,analyzer:options.analyzer,instrumentationLaunch:'node'})},
-  './output':{...output,removeOutput:async directory=>{
+  './preparedOutputCache':{...cacheTools,preparationToolIdentity:async(/** @type {string} */ command,/** @type {any[]} */ ...rest)=>config.toolIdentity?config.toolIdentity(command,...rest):command},
+  './preparationIdentity':{windowsPreparationTools:async(/** @type {any} */ options)=>({dotnet:options.dotnet,collector:options.coverageTool,analyzer:options.analyzer,instrumentationLaunch:'node'})},
+  './output':{...output,removeOutput:async(/** @type {string} */ directory)=>{
    for(const assembly of state.activeAssemblies)assert.equal(assembly.startsWith(directory+path.sep),false,'cleanup must await the owning run');
    return output.removeOutput(directory);
   }},
-  './runOutputs':{...ownership,claimRunOutputs:async(...args)=>{state.claims++;await delay(5);if(config.failClaim?.(state.claims))throw new Error('controlled claim failure');return ownership.claimRunOutputs(...args);}},
-  './coverageReader':{CoverageReader:class{async read(report,_cwd,hashes){return(state.reports.get(report)??[]).map(normalizePath).map(file=>({file,hash:hashes.get(file),lines:[{line:1,hits:1}]}));}async dispose(){}}},
-  './runtimeObservation':{RuntimeObservation:class{static async start(_directory,_assembly,_modules,_instrumented,env){return{env,dependencies:async()=>({files:[],projects:[]})};}}}
+  './runOutputs':{...ownership,claimRunOutputs:async(/** @type {any[]} */ ...args)=>{state.claims++;await delay(5);if(config.failClaim?.(state.claims))throw new Error('controlled claim failure');return ownership.claimRunOutputs(...args);}},
+  './coverageReader':{CoverageReader:class{async read(/** @type {string} */ report,/** @type {unknown} */ _cwd,/** @type {Map<string, string>} */ hashes){return(state.reports.get(report)??[]).map(normalizePath).map((/** @type {string} */ file)=>({file,hash:hashes.get(file),lines:[{line:1,hits:1}]}));}async dispose(){}}},
+  './runtimeObservation':{RuntimeObservation:class{static async start(/** @type {string} */ directory,/** @type {unknown} */ _assembly,/** @type {unknown} */ _modules,/** @type {unknown} */ _instrumented,/** @type {any} */ env){
+   if(config.artifacts){await fs.mkdir(directory,{recursive:true});await fs.writeFile(path.join(directory,'host.log'),'complete\ttrue');}
+   return{env,dependencies:async()=>({files:[],projects:[]})};
+  }}}
  };
- vm.runInNewContext(await fs.readFile(file,'utf8'),{exports,process,require:name=>modules[name]??realRequire(name)});
- const emitted=[],sessions=[],cache=config.cache?new cacheTools.PreparedOutputCache(path.join(root,'cache'),randomUUID()):undefined;
- const createSession=(overrides={})=>{const session=new exports.RunnerSession({dotnet:'dotnet',storage:path.join(root,'runs'),testArguments:[],signal:control.signal,cleanupDescendants:false,
+ Object.assign(exports,loadRunner(modules,{process}));
+ /** @type {{group: TestFile, result: import('../../out/core/model').TestResult}[]} */ const emitted=[];
+ /** @type {import('../../out/services/runner').RunnerSession[]} */ const sessions=[];
+ const cache=config.cache?new cacheTools.PreparedOutputCache(path.join(root,'cache'),randomUUID()):undefined;
+ const createSession=(/** @type {Record<string, unknown>} */ overrides={})=>{const session=new exports.RunnerSession(/** @type {any} */ ({dotnet:'dotnet',storage:path.join(root,'runs'),testArguments:[],signal:control.signal,cleanupDescendants:false,
   coverageTool:config.coverage?'collector':undefined,managedCoverageTool:config.managedCoverageTool,env:config.env,assemblies:[project.assembly],onPrepared:()=>state.prepared++,
-  deferCoverage:config.deferCoverage,preparedOutputCache:cache,onResult:(group,result)=>emitted.push({group,result}),
-  output:message=>{if(message.includes('primary runner'))state.fallback.resolve();},...overrides});sessions.push(session);return session;};
+  deferCoverage:config.deferCoverage,preparedOutputCache:cache,onResult:(/** @type {TestFile} */ group,/** @type {import('../../out/core/model').TestResult} */ result)=>emitted.push({group,result}),
+  output:(/** @type {string} */ message)=>{if(message.includes('primary runner'))state.fallback.resolve();},...overrides}));sessions.push(session);return session;};
  const session=createSession();
- t.after(async()=>{state.release.resolve();for(const runner of sessions)await runner.dispose().catch(error=>{if(!config.expectDisposeFailure)throw error;});await cache?.dispose();await fs.rm(root,{recursive:true,force:true});});
- return{root,source,project,state,session,createSession,cache,control,emitted,hashes:new Map(project.sourceFiles.map(file=>[file,'v1']))};
+ t.after(async()=>{state.release.resolve();for(const runner of sessions)await runner.dispose().catch((/** @type {unknown} */ error)=>{if(!config.expectDisposeFailure)throw error;});await cache?.dispose();await fs.rm(root,{recursive:true,force:true});});
+ return{root,source,project,state,session,createSession,cache,control,emitted,hashes:new Map(project.sourceFiles.map((/** @type {string} */ file)=>[file,'v1']))};
 }
 
 test('concurrent target discovery claims one lease and prepares each target once',async t=>{
@@ -88,14 +117,14 @@ test('concurrent target discovery claims one lease and prepares each target once
 });
 
 test('managed collector ignores only controlled editor variables in cache identity and preserves discovery and test environments',async t=>{
- const firstEnv={SHLVL:'2',VSCODE_PID:'1001',TESTY_COLLECTOR_OPTION:'original'};
+ /** @type {Record<string, string>} */ const firstEnv={SHLVL:'2',VSCODE_PID:'1001',TESTY_COLLECTOR_OPTION:'original'};
  const f=await fixture(t,{coverage:true,cache:true,managedCoverageTool:true,env:firstEnv});
  const groups=await f.session.discover(f.project);await f.session.run([groups[0]],f.hashes);await f.session.dispose();
  assert.equal(f.state.instruments.length,1);
  for(const key of ['SHLVL','VSCODE_PID'])assert.equal(f.state.instruments[0].env[key],undefined,'instrumentation receives the same controlled environment used by its fingerprint');
  assert.equal(f.state.instruments[0].env.TESTY_COLLECTOR_OPTION,'original');
  for(const call of [f.state.discoveries[0],f.state.runs[0]])for(const key of Object.keys(firstEnv))assert.equal(call.env[key],firstEnv[key]);
- const nextEnv={...firstEnv,SHLVL:'5',VSCODE_PID:'2002'},next=f.createSession({env:nextEnv});
+ /** @type {Record<string, string>} */ const nextEnv={...firstEnv,SHLVL:'5',VSCODE_PID:'2002'},next=f.createSession({env:nextEnv});
  const fresh=await next.discover(f.project);await next.run([fresh[0]],f.hashes);await next.dispose();
  assert.equal(f.state.instruments.length,1,'the pinned collector reuses its artifact across editor/shell identity changes');
  for(const call of [f.state.discoveries[1],f.state.runs[1]])for(const key of Object.keys(nextEnv))assert.equal(call.env[key],nextEnv[key]);
@@ -113,8 +142,8 @@ test('custom collector retains every environment variable and invalidates on edi
   const env={...previous,...update},session=f.createSession({env}),before=f.state.instruments.length;
   const groups=await session.discover(f.project);await session.run([groups[0]],f.hashes);await session.dispose();
   assert.equal(f.state.instruments.length,before+1,'all custom collector inputs remain part of the fingerprint');
-  assert.equal(f.state.instruments.at(-1).env,env,'custom instrumentation receives the untouched caller environment');
-  assert.equal(f.state.discoveries.at(-1).env,env);assert.equal(f.state.runs.at(-1).env,env);previous=env;
+  assert.equal(/** @type {State['instruments'][number]} */ (f.state.instruments.at(-1)).env,env,'custom instrumentation receives the untouched caller environment');
+  assert.equal(/** @type {State['discoveries'][number]} */ (f.state.discoveries.at(-1)).env,env);assert.equal(/** @type {Call} */ (f.state.runs.at(-1)).env,env);previous=env;
  }
  const warm=f.createSession({env:previous});await warm.discover(f.project);assert.equal(f.state.instruments.length,4,'unchanged custom inputs still reuse');
 });
@@ -178,7 +207,7 @@ test('cancelled deferred upgrade drains and removes its partially instrumented c
  const f=await fixture(t,{coverage:true,cache:true,deferCoverage:()=>true,instrument:async(args,_state,signal)=>{
   await fs.appendFile(args[1],'partial instrumentation');entered.resolve();await until(finish.promise,signal);
  }}),groups=await f.session.discover(f.project);
- const run=f.session.run([groups[0]],f.hashes),rejected=assert.rejects(run,error=>error.name==='AbortError');
+ const run=f.session.run([groups[0]],f.hashes),rejected=assert.rejects(run,(/** @type {Error} */ error)=>error.name==='AbortError');
  await entered.promise;f.control.abort();await Promise.all([rejected,f.session.dispose()]);await f.cache.dispose();
  assert.equal(f.state.runs.length,0);assert.deepEqual(await fs.readdir(path.join(f.root,'cache','prepared')),[]);
 });
@@ -256,7 +285,7 @@ test('partial files, exclusions, project batches and runtime fallback stay on th
  const partial=f.session.run([{...b,tests:[b.tests[0]]}],f.hashes,1);
  const excluded=f.session.run([{...b,excludedTestIds:[b.tests[1].id]}],f.hashes,2);
  const project=f.session.run(groups,f.hashes,3);
- const runtime=f.session.run([{...a,id:'runtime',file:undefined,runtimeOnly:true,tests:[{id:'unknown',name:'Unknown',line:1,node:{uid:'unknown'}}]}],f.hashes,4);
+ const runtime=f.session.run([/** @type {any} */ ({...a,id:'runtime',file:undefined,runtimeOnly:true,tests:[{id:'unknown',name:'Unknown',line:1,node:{uid:'unknown'}}]})],f.hashes,4); // partial runtime row: no fullyQualifiedName
  assert.equal(f.state.discoveries.length,1);f.state.release.resolve();
  const results=await Promise.all([primary,partial,excluded,project,runtime]);
  assert.equal(results[1].results.length,1);assert.equal(results[2].results.length,1);assert.equal(results[3].results.length,3);
@@ -293,12 +322,12 @@ test('shared cancellation stops active lanes and disposal waits before removing 
 test('disposal releases every cached owner even when one cleanup fails, and concurrent disposal shares the drain',async t=>{
  const f=await fixture(t,{expectDisposeFailure:true}),other={...f.project,file:path.join(path.dirname(f.project.file),'Other.csproj')};
  await Promise.all([f.session.discover(f.project),f.session.discover(other)]);
- const entered=deferred(),finish=deferred(),released=[];
- const preparations=[...f.session.prepared.values()];
+ const entered=deferred(),finish=deferred(),/** @type {string[]} */ released=[];
+ const preparations=[.../** @type {any} */ (f.session).prepared.values()];
  preparations[0].lease={release:async()=>{released.push('first');throw new Error('controlled lease cleanup failure');}};
  preparations[1].lease={release:async()=>{released.push('second');entered.resolve();await finish.promise;}};
  const disposal=f.session.dispose();assert.equal(f.session.dispose(),disposal);
- let completed=false;const rejected=assert.rejects(disposal,error=>error.name==='AggregateError'&&error.errors.some(error=>/controlled lease cleanup failure/.test(error.message))).then(()=>{completed=true;});
+ let completed=false;const rejected=assert.rejects(disposal,(/** @type {AggregateError} */ error)=>error.name==='AggregateError'&&error.errors.some((/** @type {Error} */ error)=>/controlled lease cleanup failure/.test(error.message))).then(()=>{completed=true;});
  await entered.promise;await delay(5);assert.equal(completed,false);finish.resolve();await rejected;
  assert.deepEqual(released.sort(),['first','second']);assert.deepEqual(await fs.readdir(path.join(f.root,'runs')),[]);
 });
@@ -308,10 +337,10 @@ test('a lane whose output lease failed is discarded, so a later batch creates a 
  assert.equal(f.state.claims,0,'the cached primary needs no run lease');
  const primary=f.session.run([groups[0]],f.hashes,0);await f.state.primaryStarted.promise;
  await assert.rejects(f.session.run([groups[1]],f.hashes,1),/controlled claim failure/);
- assert.equal(f.session.lanes.size,0);
+ assert.equal(/** @type {any} */ (f.session).lanes.size,0);
  const result=await f.session.run([groups[1]],f.hashes,1);
  // Completed while the primary is held, so it ran in a separate lane output.
- assert.equal(f.state.peak,2);assert.notEqual(f.state.runs.at(-1).assembly,f.state.runs[0].assembly);
+ assert.equal(f.state.peak,2);assert.notEqual(/** @type {Call} */ (f.state.runs.at(-1)).assembly,/** @type {Call} */ (f.state.runs[0]).assembly);
  assert.deepEqual(Array.from(result.results,item=>item.id),Array.from(groups[1].tests,item=>item.id));
  f.state.release.resolve();await primary;
 });
@@ -323,4 +352,25 @@ test('a failed preparation tool identity is not cached for later targets',async 
  await f.session.discover(f.project);const first=calls;
  await f.session.discover(other);
  assert.ok(calls>first,'the second target identifies its tools again');
+});
+
+test('each batch removes its coverage report and observer logs once they are consumed, and on cancellation',async t=>{
+ const f=await fixture(t,{coverage:true,artifacts:true}),groups=await f.session.discover(f.project);
+ const root=[.../** @type {any} */ (f.session).prepared.values()][0].root,artifacts=async()=>(await fs.readdir(root)).filter(name=>/^(coverage|modules|results)-/.test(name)).sort();
+ const first=await f.session.run([groups[0]],f.hashes);assert.equal(first.coverageAvailable,true);
+ assert.deepEqual(await artifacts(),[],'a committed batch leaves no per-run files behind');
+ await f.session.run([groups[1]],f.hashes);assert.deepEqual(await artifacts(),[]);
+ const kept=await fixture(t,{coverage:true,artifacts:'attachments'}),keptGroups=await kept.session.discover(kept.project);
+ await kept.session.run([keptGroups[0]],kept.hashes);
+ const keptRoot=[.../** @type {any} */ (kept.session).prepared.values()][0].root;
+ assert.deepEqual((await fs.readdir(keptRoot)).filter(name=>/^(coverage|modules|results)-/.test(name)),['results-1'],'reported attachments stay until the session ends');
+});
+
+test('a cancelled batch removes its per-run files before it settles',async t=>{
+ const f=await fixture(t,{coverage:true,artifacts:true,holdAll:true}),groups=await f.session.discover(f.project);
+ const root=[.../** @type {any} */ (f.session).prepared.values()][0].root;
+ const run=f.session.run([groups[0]],f.hashes);await f.state.primaryStarted.promise;
+ assert.deepEqual((await fs.readdir(root)).filter(name=>/^(coverage|modules|results)-/.test(name)).sort(),['coverage-1.xml','modules-1','results-1']);
+ f.control.abort();await assert.rejects(run,{name:'AbortError'});
+ assert.deepEqual((await fs.readdir(root)).filter(name=>/^(coverage|modules|results)-/.test(name)),[]);
 });

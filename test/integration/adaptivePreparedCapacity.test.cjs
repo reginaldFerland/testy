@@ -5,12 +5,24 @@ const {TestEngine}=require('../../out/services/engine');
 const {normalizePath}=require('../../out/core/paths');
 const processes=require('../../out/services/process'),mtp=require('../../out/services/mtp');
 
+/** @typedef {{assembly: string, session: string | undefined}} Invocation */
+/** @typedef {{instruments: Invocation[], discoveries: Invocation[], runs: Invocation[], builds: number, activeInstruments: number, activeRequests: number, activeRuns: number, peakInstruments: number, peakRequests: number, peakRuns: number}} Probe */
+/** @typedef {{output: string[], results: (import('../../out/core/model').TestResult & {group: string})[]}} State */
+/** @typedef {{engine: TestEngine, state: State}} Instance */
+/** @typedef {{session: string, directory: string, coverage: boolean, coveragePending?: boolean}} OwnerEntry */
+/** @typedef {{identity: string, token: string, state: string, pid: number, retention: {entries: number, bytes: number}, snapshot: {entries: OwnerEntry[]}}} Owner */
+
 test('seventeen test targets retain every instrumented preparation through warm runs and clean restart',{timeout:300000},async t=>{
  const count=17,temp=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-adaptive-prepared-')));
  const root=path.join(temp,'workspace'),storage=path.join(temp,'state'),core=path.join(root,'Core','Core.cs');
- const engines=[],states=[],operations=new Set(),control=new AbortController(),signal=AbortSignal.any([t.signal,control.signal]);
- let completed=false,stage='creating fixture',phase,probe;
- const track=operation=>{
+ /** @type {TestEngine[]} */ const engines=[];
+ /** @type {State[]} */ const states=[];
+ /** @type {Set<Promise<unknown>>} */ const operations=new Set();
+ const control=new AbortController(),signal=AbortSignal.any([t.signal,control.signal]);
+ let completed=false,stage='creating fixture';
+ /** @type {unknown} */ let phase;
+ /** @type {Probe} */ let probe;
+ const track=/** @template T @param {Promise<T>} operation @returns {Promise<T>} */ operation=>{
   operations.add(operation);void operation.then(()=>operations.delete(operation),()=>operations.delete(operation));return operation;
  };
  const runProcess=processes.runProcess,requestTests=mtp.requestTests;
@@ -35,7 +47,7 @@ test('seventeen test targets retain every instrumented preparation through warm 
   await fs.writeFile(path.join(directory,`${name}Tests.cs`),`using Microsoft.VisualStudio.TestTools.UnitTesting;
  [TestClass] public class ${name}Tests { [TestMethod] public void UsesSharedCore() { Assert.AreEqual(${index+1},Core.Value(${index})); } }`);
  }
- const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:60000,
+ /** @type {import('../../out/core/model').EngineConfiguration} */ const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:60000,
   coverageTool:process.env.TESTY_COVERAGE_TOOL,maxParallelProjects:4,maxParallelTestFiles:1};
  probe={instruments:[],discoveries:[],runs:[],builds:0,activeInstruments:0,activeRequests:0,activeRuns:0,peakInstruments:0,peakRequests:0,peakRuns:0};
  processes.runProcess=async(command,args,...rest)=>{
@@ -58,13 +70,13 @@ test('seventeen test targets retain every instrumented preparation through warm 
   probe.instruments=[];probe.discoveries=[];probe.runs=[];probe.builds=0;probe.peakRequests=0;probe.peakRuns=0;probe.peakInstruments=0;
  };
  const makeEngine=()=>{
-  const state={output:[],results:[]};states.push(state);
+  /** @type {State} */ const state={output:[],results:[]};states.push(state);
   const engine=new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
-   events:{output:text=>state.output.push(text),phase:value=>{phase=value;},discovered(){},selected(){},result:(group,result)=>state.results.push({group:group.id,...result}),
+   events:{output:(/** @type {string} */ text)=>state.output.push(text),phase:(/** @type {unknown} */ value)=>{phase=value;},discovered(){},selected(){},result:(/** @type {import('../../out/core/model').TestFile} */ group,/** @type {import('../../out/core/model').TestResult} */ result)=>state.results.push({group:group.id,...result}),
     started(){},coverage(){},invalidated(){}}});
   engines.push(engine);return{engine,state};
  };
- const snapshot=instance=>{
+ const snapshot=(/** @type {Instance} */ instance)=>{
   const {engine,state}=instance,seen=new Set(),results=new Map();
   for(const result of state.results){const key=JSON.stringify([result.group,result.id]);assert.ok(!seen.has(key),'each canonical test emits exactly one terminal result');seen.add(key);results.set(key,result);}
   assert.equal(results.size,count);assert.equal(engine.groups.length,count);assert.equal(engine.coverage.traces.size,count);
@@ -80,7 +92,7 @@ test('seventeen test targets retain every instrumented preparation through warm 
     dependencies:[...trace.dependencies].sort(),coverage:trace.coverage.map(file=>({file:file.file,hash:file.hash,lines:file.lines})).sort((a,b)=>a.file.localeCompare(b.file))};
   }).sort((a,b)=>a.id.localeCompare(b.id));
  };
- const run=async(instance,label)=>{
+ const run=async(/** @type {Instance} */ instance,/** @type {string} */ label)=>{
   stage=label;phase=undefined;
   instance.state.results=[];instance.state.output=[];
   const summary=await track(instance.engine.run({files:[],full:true},signal));
@@ -89,14 +101,14 @@ test('seventeen test targets retain every instrumented preparation through warm 
   assert.equal(probe.peakRuns,1,'test execution is deliberately sequential');
   assert.ok(probe.peakRequests<=4&&probe.peakInstruments<=4,'initial preparation stays within four project workers');
   assert.equal(probe.activeRequests+probe.activeRuns+probe.activeInstruments,0);
-  assert.equal(instance.engine.preparedOutputs.entries.size,count,'all seventeen private templates remain retained after the run');
+  assert.equal(/** @type {any} */ (instance.engine.preparedOutputs).entries.size /* private member */,count,'all seventeen private templates remain retained after the run');
   assert.deepEqual(await fs.readdir(path.join(storage,'runs')),[]);
   return snapshot(instance);
  };
  const invocations=()=>[...probe.runs].sort((a,b)=>a.assembly.localeCompare(b.assembly));
  const owners=async()=>{
   const directory=path.join(storage,'prepared-v2');
-  return Promise.all((await fs.readdir(directory)).filter(name=>name.endsWith('.owner.json')).map(async name=>JSON.parse(await fs.readFile(path.join(directory,name),'utf8'))));
+  return Promise.all((await fs.readdir(directory)).filter(name=>name.endsWith('.owner.json')).map(async name=>/** @type {Owner} */ (JSON.parse(await fs.readFile(path.join(directory,name),'utf8')))));
  };
  const assertParked=async()=>{
   const saved=await owners();assert.equal(saved.length,1);const [owner]=saved;

@@ -38,8 +38,8 @@ Click the Testy status bar item to open its action menu. Every action is also av
 | Command | What it does |
 | --- | --- |
 | **Testy: Pause Automatic Testing** / **Resume Automatic Testing** | Stop or restart runs on save. Remembered per workspace without changing your settings. |
-| **Testy: Run Affected Tests Now** | Run the tests affected by pending changes immediately. |
-| **Testy: Refresh and Run All C# Tests** | Rebuild, rediscover, and run everything to replace the baseline. |
+| **Testy: Run Affected Tests Now** | Run the tests affected by pending changes immediately (`Ctrl+;` `T`, `Cmd+;` `T` on macOS). |
+| **Testy: Rebuild and Run All C# Tests** | Rebuild, rediscover, and run everything to replace the baseline. |
 | **Testy: Cancel Current Run** | Cancel the active run. |
 | **Testy: Clear Coverage** | Discard retained coverage. |
 | **Testy: Export Coverage…** | Write the current merged coverage as LCOV or Cobertura XML (default `coverage/testy.lcov` or `coverage/testy.cobertura.xml`), with paths relative to the workspace. In a multi-root workspace, choose one folder (only its files, relative to it) or all folders. Stale coverage is not exported. |
@@ -47,6 +47,8 @@ Click the Testy status bar item to open its action menu. Every action is also av
 | **Testy: Show Output** | Open the Testy log, including build output and why each selection was made. |
 | **Testy: Show Actions** | Open the status bar menu. |
 | **Run Affected Tests for This File** | In the editor and Explorer context menus of a `.cs` file: run the tests affected by that file, as if it had been saved. |
+| **Run Affected Tests for This Folder or Project** | In the Explorer context menu of a folder or `.csproj`: run the tests affected by the C# source files Testy knows in it. |
+| **Run Tests Covering This Line** | In the editor context menu: run the test files whose retained coverage hits the cursor line (`Ctrl+;` `Ctrl+T`, `Cmd+;` `Cmd+T` on macOS). |
 
 Test Explorer items also have **Why Was This Selected?**, which explains whether and why the item ran in the latest run, and project items have **Exclude Project from Testy**, which adds the project to `testy.projects.exclude` (per folder in a multi-root workspace). A failure message's context menu has **Show Output**.
 
@@ -102,13 +104,14 @@ See [How Testy works](docs/how-it-works.md) for the full details: caching, evalu
 | `testy.debounceTime` | `500` | Delay after the latest change, in milliseconds. |
 | `testy.runWithCoverage` | `true` | Collect coverage. Disabling it uses project fallback. |
 | `testy.showCoverage` | `false` | Also show coverage and stale markers in editor gutters. |
+| `testy.problems.publishBuildDiagnostics` | `auto` | Publish build errors to the Problems panel: `auto` skips them while the C# extension is active (it reports them too), or `always` / `never`. |
 | `testy.solution` | (empty) | Optional `.sln`, `.slnx`, or `.slnf` whose projects limit the entry points. Relative paths resolve against the folder that sets it. `${workspaceFolder}` is supported. *Per folder.* |
 | `testy.projects.include` | `[]` | Globs for entry-point projects to include, for example `tests/**/*.csproj`. *Per folder.* |
 | `testy.projects.exclude` | `[]` | Globs for entry-point projects to exclude. Exclusions win over inclusions. *Per folder.* |
 | `testy.exclude` | `[]` | Additional file patterns to ignore. *Per folder.* |
 | `testy.fileWatcherPattern` | Source and configuration files | Which files can trigger runs. |
 | `testy.buildConfiguration` | `Debug` | MSBuild configuration for automatic runs and the default profiles. |
-| `testy.additionalConfigurations` | `[]` | Extra MSBuild configurations such as `Release`. Each adds `Run (Release)` and `Run with coverage (Release)` profiles that build and run manual selections with that configuration. |
+| `testy.additionalConfigurations` | `[]` | Extra MSBuild configurations such as `Release`. Each adds `Run (Release)`, `Run with coverage (Release)` and `Debug (Release)` profiles that build and run or debug manual selections with that configuration. |
 | `testy.maxParallelProjects` | `0` (automatic) | Workers for initial project preparation, builds, source analysis, and discovery. |
 | `testy.maxParallelTestFiles` | `0` (automatic) | Workers for test-file execution. Use `1` for tests that share databases, ports, or other external resources. |
 | `testy.dotnetPath` | `dotnet` | Path to the .NET CLI. *Machine-overridable.* |
@@ -132,7 +135,7 @@ Testy does not need C# Dev Kit, but they can be installed together. If both are 
 - **Something looks wrong.** Run **Testy: Show Output**. The log includes build output, resolved worker limits, phase timings, and why each test was selected. Use **Developer: Set Log Level…** and choose Testy for more detail.
 - **A project's tests are missing.** VSTest projects and test targets older than .NET 10 are skipped and listed in Output. Check `testy.solution` and `testy.projects.*` too.
 - **Coverage is unavailable.** The status tooltip explains why. If NuGet access is blocked, install `dotnet-coverage` yourself and set `testy.coverageToolPath`.
-- **Results seem stale or selections too narrow.** Run **Testy: Reset Caches and Baseline**, or **Refresh and Run All C# Tests** after changing external data, services, or environment variables.
+- **Results seem stale or selections too narrow.** Run **Testy: Reset Caches and Baseline**, or **Rebuild and Run All C# Tests** after changing external data, services, or environment variables.
 - **A test batch could not run.** The status bar shows batch errors. The affected tests are marked errored, the remaining batches continue, and Output has the details.
 - **Tests interfere with each other.** Set `testy.maxParallelTestFiles` to `1`.
 

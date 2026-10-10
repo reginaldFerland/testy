@@ -3,10 +3,10 @@ const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:
 const {parseCobertura}=require('../../out/services/reports');
 const {normalizePath}=require('../../out/core/paths');
 
-const escape=value=>value.replaceAll('&','&amp;').replaceAll('"','&quot;').replaceAll('<','&lt;').replaceAll('>','&gt;');
-const report=(classes,attributes='')=>`<coverage ${attributes}><packages><package><classes>${classes}</classes></package></packages></coverage>`;
-const cls=(file,lines,methods='')=>`<class filename="${escape(file)}"><methods>${methods}</methods><lines>${lines}</lines></class>`;
-const line=(number,hits)=>`<line number="${number}" hits="${hits}"/>`;
+const escape=(/** @type {string} */ value)=>value.replaceAll('&','&amp;').replaceAll('"','&quot;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+const report=(/** @type {string} */ classes,attributes='')=>`<coverage ${attributes}><packages><package><classes>${classes}</classes></package></packages></coverage>`;
+const cls=(/** @type {string} */ file,/** @type {string} */ lines,methods='')=>`<class filename="${escape(file)}"><methods>${methods}</methods><lines>${lines}</lines></class>`;
+const line=(/** @type {number|string} */ number,/** @type {number|string} */ hits)=>`<line number="${number}" hits="${hits}"/>`;
 
 test('class lines preserve max hits, sorted geometry and zero-hit files regardless of duplicate method details',()=>{
  const cwd=process.cwd(),file=normalizePath(path.join(cwd,'Shared.cs')),zero=normalizePath(path.join(cwd,'Uncovered.cs'));

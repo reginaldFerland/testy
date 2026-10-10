@@ -19,3 +19,22 @@ test('process output decodes split UTF-8 and bounds both streams',async()=>{
  const result=await runProcess(process.execPath,['-e',script],{cwd:process.cwd(),timeoutMs:10000});assert.equal(result.code,0);
  for(const [value,char] of [[result.stdout,'A'],[result.stderr,'B']]){assert.equal(value.length,8*1024*1024);assert.equal(value,char.repeat(8*1024*1024-'🌍 end'.length)+'🌍 end');}
 });
+
+test('a child error after spawn kills the owned tree and releases listeners before rejecting',async t=>{
+ const {startProcess}=require('../../out/services/process'),{getEventListeners}=require('node:events');
+ const fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path'),{setTimeout:delay}=require('node:timers/promises');
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-process-error-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));
+ const pidFile=path.join(root,'pid'),abort=new AbortController();
+ const script=`const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(child.pid));setInterval(()=>{},1000);`;
+ const owned=startProcess(process.execPath,['-e',script],{cwd:root,signal:abort.signal,timeoutMs:60000});
+ let pid;
+ for(let n=0;n<500 && !pid;n++){pid=Number(await fs.readFile(pidFile,'utf8').catch(()=>''))||undefined;if(!pid)await delay(10);}
+ assert.ok(pid);
+ let closed=false;owned.child.once('close',()=>{closed=true;});
+ // Simulates a failed kill: the child reports an error while its tree still runs.
+ const failure=new Error('kill EPERM');owned.child.emit('error',failure);
+ await assert.rejects(owned.done,error=>error===failure);
+ assert.equal(closed,true,'completion must wait for the tree to close');
+ assert.equal(getEventListeners(abort.signal,'abort').length,0);
+ assert.throws(()=>process.kill(pid,0),{code:'ESRCH'});
+});

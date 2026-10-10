@@ -9,12 +9,21 @@ const {EventEmitter}=require('node:events');
 
 const OWNER='12345678-1234-1234-1234-123456789abc';
 
-/** Load a compiled service in a sandbox with a fake ps, process table and kill. */
+/** Narrows a value the test knows is present (type-only; no runtime check). @template T @param {T | null | undefined} value @returns {T} */
+const need=value=>/** @type {T} */(value);
+
+/**
+ * Load a compiled service in a sandbox with a fake ps, process table and kill.
+ * @param {{ platform: string, table: () => [number, string][], environments: Record<number, string>, fileReads?: string[] }} options
+ */
 function posixProcesses({platform,table,environments,fileReads=[]}){
- const file=path.resolve('out/services/posixProcesses.js'),exports={},queries=[],killed=[];
+ /** @type {{ cleanupPosixOwner?: (...args: any[]) => Promise<void> }} */ // sandbox module exports, filled by the evaluated script
+ const exports={};
+ const file=path.resolve('out/services/posixProcesses.js'),/** @type {string[][]} */ queries=[],/** @type {number[]} */ killed=[];
  const live=new Set(Object.keys(environments).map(Number));
+ /** @param {string} command @param {string[]} args */
  const spawn=(command,args)=>{
-  const child=new EventEmitter();child.stdout=Object.assign(new EventEmitter(),{setEncoding(){}});
+  const child=Object.assign(new EventEmitter(),{stdout:Object.assign(new EventEmitter(),{setEncoding(){}})});
   queries.push(args);
   setImmediate(()=>{
    let text='',code=0;
@@ -28,12 +37,12 @@ function posixProcesses({platform,table,environments,fileReads=[]}){
   });
   return child;
  };
- const fsPromises={readdir:async()=>[...live].map(String),readFile:async name=>{
-  fileReads.push(name);return `${environments[Number(/\/proc\/(\d+)\//.exec(name)[1])]}\0`;
+ const fsPromises={readdir:async()=>[...live].map(String),readFile:async (/** @type {string} */ name)=>{
+  fileReads.push(name);return `${environments[Number(need(/\/proc\/(\d+)\//.exec(name))[1])]}\0`;
  }};
- vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,process:{platform,pid:99,kill:(pid)=>{killed.push(pid);live.delete(pid);}},
-  require:name=>name==='node:child_process'?{spawn}:name==='node:fs/promises'?fsPromises:createRequire(file)(name)});
- return{cleanup:(...args)=>exports.cleanupPosixOwner(...args),queries,killed};
+ vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,process:{platform,pid:99,kill:(/** @type {number} */ pid)=>{killed.push(pid);live.delete(pid);}},
+  require:(/** @type {string} */ name)=>name==='node:child_process'?{spawn}:name==='node:fs/promises'?fsPromises:createRequire(file)(name)});
+ return{cleanup:(/** @type {any[]} */ ...args)=>need(exports.cleanupPosixOwner)(...args),queries,killed};
 }
 const owned=`TESTY_PROCESS_OWNER=${OWNER}`;
 
@@ -56,7 +65,7 @@ test('POSIX cleanup skips the environment scan when nothing started since the la
 });
 
 test('Linux cleanup inspects only candidate /proc entries and still finds an escaped nonce holder',async()=>{
- const fileReads=[];
+ /** @type {string[]} */ const fileReads=[];
  const s=posixProcesses({platform:'linux',fileReads,environments:{100:owned,200:'OTHER=1',300:'OTHER=2'},table:()=>[[100,'00:02'],[200,'05:00:00'],[300,'00:00']]});
  await s.cleanup(OWNER,Date.now()-1000);
  assert.deepEqual(s.killed,[100]);
@@ -71,13 +80,13 @@ test('cleanup without a launch time inspects every process',async()=>{
 });
 
 test('the Windows owner receives code-injecting variables under another name',()=>{
- const file=path.resolve('out/services/process.js'),exports={},spawned=[];
+ const file=path.resolve('out/services/process.js'),/** @type {{ startProcess?: (...args: any[]) => { child: EventEmitter } }} */ exports={},/** @type {{ command: string, args: string[], options: { env: Record<string, string | undefined> } }[]} */ spawned=[];
  const child=Object.assign(new EventEmitter(),{pid:7,stdin:Object.assign(new EventEmitter(),{writable:true,write(){}}),
   stdout:Object.assign(new EventEmitter(),{setEncoding(){}}),stderr:Object.assign(new EventEmitter(),{setEncoding(){}})});
  const fakeProcess={platform:'win32',env:{Path:'C:\\bin',DOTNET_STARTUP_HOOKS:'C:\\user.dll'},pid:1,execPath:'node'};
  vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,process:fakeProcess,__dirname:path.dirname(file),setTimeout:()=>({unref(){}}),clearTimeout(){},
-  require:name=>name==='node:child_process'?{spawn:(command,args,options)=>{spawned.push({command,args,options});return child;}}:createRequire(file)(name)});
- const owned=exports.startProcess('C:\\tools\\tool.exe',['a'],{cwd:'C:\\work',env:{DOTNET_STARTUP_HOOKS:'C:\\observer.dll',TESTY_RUNTIME_OBSERVATION:'C:\\manifest.txt'}});
+  require:(/** @type {string} */ name)=>name==='node:child_process'?{spawn:(/** @type {string} */ command,/** @type {string[]} */ args,/** @type {{ env: Record<string, string | undefined> }} */ options)=>{spawned.push({command,args,options});return child;}}:createRequire(file)(name)});
+ const owned=need(exports.startProcess)('C:\\tools\\tool.exe',['a'],{cwd:'C:\\work',env:{DOTNET_STARTUP_HOOKS:'C:\\observer.dll',TESTY_RUNTIME_OBSERVATION:'C:\\manifest.txt'}});
  owned.child.emit('exit',0,null);
  const env=spawned[0].options.env;
  assert.equal(env.DOTNET_STARTUP_HOOKS,undefined);assert.equal(env.TESTY_RUNTIME_OBSERVATION,undefined);
@@ -98,13 +107,13 @@ test('owned commands resolve on PATH only, never in the working directory',async
   assert.equal(await resolveOwnedCommand('tool.exe',{PATH:`.${path.delimiter}${bin}`},work),path.join(bin,'tool.exe'));
   await assert.rejects(resolveOwnedCommand('tool',{PATH:'.'},work),/Cannot find tool/);
   const explicit=path.join(work,'tool.exe');assert.equal(await resolveOwnedCommand(explicit,{PATH:bin},work),explicit);
- }finally{Object.defineProperty(process,'platform',platform);}
+ }finally{Object.defineProperty(process,'platform',need(platform));}
 });
 
 test('the observation manifest names the host assembly for the hook',async t=>{
  const {RuntimeObservation}=require('../../out/services/runtimeObservation');
  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'testy-manifest-'));t.after(()=>fs.rmSync(directory,{recursive:true,force:true}));
  const observation=await RuntimeObservation.start(path.join(directory,'reports'),'/work/Tests.dll',[{name:'Plugin',sources:[]}],[]);
- const lines=fs.readFileSync(observation.env.TESTY_RUNTIME_OBSERVATION,'utf8').split('\n').map(line=>Buffer.from(line,'base64').toString());
+ const lines=fs.readFileSync(need(observation.env.TESTY_RUNTIME_OBSERVATION),'utf8').split('\n').map(line=>Buffer.from(line,'base64').toString());
  assert.deepEqual(lines,[path.join(directory,'reports'),'/work/Tests.dll','Plugin']);
 });

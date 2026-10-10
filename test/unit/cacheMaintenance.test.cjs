@@ -4,13 +4,16 @@ const {execFile}=require('node:child_process'),{promisify}=require('node:util');
 const {CoverageCache}=require('../../out/services/cache'),{CoverageStore}=require('../../out/core/coverage');
 const reader=require('../../out/services/cacheReader'),{contentHash}=require('../../out/core/paths');
 const execute=promisify(execFile);
-const source=(index,hash='v1',lines=[1,2])=>{const file=`/Source${index}.cs`;return{id:contentHash(`${file}\0${hash}`),file,hash,lines};};
-const trace=(groupId,sources,timestamp=1)=>({groupId,timestamp,reliable:true,stale:false,
+/** @typedef {{id: string, file: string, hash: string, lines: number[]}} Source */
+const source=(/** @type {number} */ index,hash='v1',/** @type {number[]} */ lines=[1,2])=>{const file=`/Source${index}.cs`;return{id:contentHash(`${file}\0${hash}`),file,hash,lines};};
+const trace=(/** @type {string} */ groupId,/** @type {Source[]} */ sources,timestamp=1)=>({groupId,timestamp,reliable:true,stale:false,
  dependencies:sources.map(source=>source.file),inputs:Object.fromEntries(sources.map(source=>[source.file,source.hash])),
  sourceIds:sources.map(source=>source.id),coverage:sources.map(source=>({file:source.file,hash:source.hash,lines:[{line:1,hits:timestamp}]}))});
-const delta=(sources,traces=[],removedTraces=[])=>({sources,traces,removedSources:[],removedTraces});
+const delta=(/** @type {Source[]} */ sources,/** @type {ReturnType<typeof trace>[]} */ traces=[],/** @type {string[]} */ removedTraces=[])=>({sources,traces,removedSources:[],removedTraces});
+/** @param {import('node:test').TestContext} t */
 async function fixture(t,restore=true){
- const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-cache-maintenance-test-')),directory=path.join(root,'coverage-v2'),warnings=[];
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-cache-maintenance-test-')),directory=path.join(root,'coverage-v2');
+ /** @type {string[]} */ const warnings=[];
  const cache=new CoverageCache(root,text=>warnings.push(text));let reads=0;
  const read=reader.readCache;reader.readCache=async function(...args){reads++;return read.apply(this,args);};
  t.after(async()=>{reader.readCache=read;await fs.rm(root,{recursive:true,force:true});});
@@ -18,12 +21,12 @@ async function fixture(t,restore=true){
  const initialReads=reads,checkpoint=delta([], [trace('tick',[])]);
  return{root,directory,cache,warnings,get reads(){return reads-initialReads;},
   async fill(count=128){for(let index=0;index<count;index++)await cache.save(checkpoint,t.signal);},
-  sourceFile:source=>path.join(directory,'sources',`${source.id}.json`),traceFile:id=>path.join(directory,'traces',`${contentHash(id)}.json`),
+  sourceFile:(/** @type {Source} */ source)=>path.join(directory,'sources',`${source.id}.json`),traceFile:(/** @type {string} */ id)=>path.join(directory,'traces',`${contentHash(id)}.json`),
   async clean(){await assert.rejects(fs.stat(directory+'.lock'),{code:'ENOENT'});
    for(const kind of ['sources','traces'])assert.ok((await fs.readdir(path.join(directory,kind))).every(name=>name.endsWith('.json')));
   }};
 }
-const missing=file=>assert.rejects(fs.stat(file),{code:'ENOENT'});
+const missing=(/** @type {string} */ file)=>assert.rejects(fs.stat(file),{code:'ENOENT'});
 
 test('a complete empty restore skips sweeps for additions and fresh equal membership arrays',async t=>{
  const f=await fixture(t),sources=[source(0),source(1),source(2)];
@@ -46,8 +49,8 @@ test('direct saves remain conservative until their first completed 128-save swee
 
 test('changed memberships reclaim old geometry even when retryDelta loses removedSources',async t=>{
  const f=await fixture(t),a=source(0),b=source(0,'v2'),store=new CoverageStore();
- const raw=source=>({groupId:'one',timestamp:1,reliable:true,dependencies:[source.file],inputs:{[source.file]:source.hash},
-  coverage:[{file:source.file,hash:source.hash,lines:source.lines.map(line=>({line,hits:1}))}]});
+ const raw=(/** @type {Source} */ source)=>({groupId:'one',timestamp:1,reliable:true,dependencies:[source.file],inputs:{[source.file]:source.hash},
+  coverage:[{file:source.file,hash:source.hash,lines:source.lines.map((/** @type {number} */ line)=>({line,hits:1}))}]});
  store.replace([raw(a)],new Set(['one']));await f.cache.save(store.takeDelta(),t.signal);
  store.replace([raw(b)],new Set(['one']));const failed=store.takeDelta();assert.ok(failed.removedSources.includes(a.id));
  const aborted=new AbortController();aborted.abort();await assert.rejects(f.cache.save(failed,aborted.signal),{name:'AbortError'});
@@ -122,8 +125,9 @@ test('an interrupted prune retains dirty state and retries the remaining orphane
 test('an unreadable prune directory cannot be mistaken for a complete cleanup',async t=>{
  const f=await fixture(t),a=source(0),orphan=source(1);
  await f.cache.save(delta([a],[trace('one',[a])]),t.signal);await f.cache.save(delta([orphan]),t.signal);await f.fill(125);
- const list=fs.readdir;let denied=0;
- fs.readdir=async function(directory,...args){if(String(directory)===path.join(f.directory,'sources')){denied++;throw Object.assign(new Error('controlled unreadable source directory'),{code:'EACCES'});}return list.call(this,directory,...args);};
+ /** @type {any} */ const list=fs.readdir; // any: pass-through wrapper over an overloaded function
+ let denied=0;
+ /** @type {any} */ (fs).readdir=async function(/** @type {any} */ directory,/** @type {any[]} */ ...args){if(String(directory)===path.join(f.directory,'sources')){denied++;throw Object.assign(new Error('controlled unreadable source directory'),{code:'EACCES'});}return list.call(this,directory,...args);};
  try{await f.fill(1);}finally{fs.readdir=list;}
  assert.equal(denied,1);assert.equal(f.reads,0);await fs.access(f.sourceFile(orphan));await f.fill(128);
  assert.equal(f.reads,1);await missing(f.sourceFile(orphan));await fs.access(f.sourceFile(a));await f.clean();

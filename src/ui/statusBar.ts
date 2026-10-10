@@ -120,7 +120,7 @@ export async function showMenu(state: { readonly paused: boolean; readonly runni
         state.paused ? { label: `$(debug-start) ${l10n.t('Resume Automatic Testing')}`, run: () => actions.setPaused(false) }
             : { label: `$(debug-pause) ${l10n.t('Pause Automatic Testing')}`, run: () => actions.setPaused(true) },
         { label: `$(play) ${l10n.t('Run Affected Tests Now')}`, run: () => actions.runAffected() },
-        { label: `$(refresh) ${l10n.t('Refresh and Run All C# Tests')}`, run: () => actions.refreshAll() },
+        { label: `$(run-all) ${l10n.t('Rebuild and Run All C# Tests')}`, run: () => actions.refreshAll() },
         ...state.running ? [{ label: `$(debug-stop) ${l10n.t('Cancel Current Run')}`, run: () => actions.cancel() }] : [],
         { label: `$(clear-all) ${l10n.t('Clear Coverage')}`, run: () => actions.clearCoverage() },
         { label: `$(export) ${l10n.t('Export Coverage…')}`, run: () => actions.exportCoverage() },

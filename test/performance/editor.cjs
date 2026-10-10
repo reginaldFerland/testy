@@ -1,5 +1,6 @@
 // @ts-check
 // Actual editor method with mocked VS Code rendering; aggregation remains real.
+require('./artifacts.cjs');
 const {loadUi}=require('../unit/support/ui.cjs'),coverageView=loadUi({vscode:{Range:class{}}}).CoverageView;
 const {CoverageStore}=require('../../out/core/coverage'),{normalizePath}=require('../../out/core/paths');
 (async()=>{

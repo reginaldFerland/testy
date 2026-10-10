@@ -5,19 +5,26 @@ const {spawn}=require('node:child_process');
 
 // Virtual Windows filesystem tests run on every platform; the final test checks
 // actual Node launch selection on Windows rather than a second resolver oracle.
+/**
+ * @param {Record<string, any>} [entries]
+ * @param {Record<string, string | undefined>} [parent]
+ * @param {{lstat?: (file: string) => unknown, stat?: (file: string) => unknown, realpath?: (file: string) => unknown}} [hooks]
+ */
 function windows(entries={},parent={PATH:'C:\\inherited'},hooks={}){
- const file=path.resolve('out/services/executable.js'),realRequire=createRequire(file),exports={},calls=[];
- const key=file=>path.win32.normalize(file).toLowerCase(),files=new Map(Object.entries(entries).map(([file,value])=>[key(file),value]));
- const missing=file=>Object.assign(new Error(`missing ${file}`),{code:'ENOENT'});
+ const file=path.resolve('out/services/executable.js'),realRequire=createRequire(file);
+ /** @type {any} */ const exports={}; // populated by the vm-evaluated compiled module, so its shape is dynamic
+ /** @type {string[][]} */ const calls=[];
+ const key=(/** @type {string} */ file)=>path.win32.normalize(file).toLowerCase(),files=new Map(Object.entries(entries).map(([file,value])=>[key(file),value]));
+ const missing=(/** @type {string} */ file)=>Object.assign(new Error(`missing ${file}`),{code:'ENOENT'});
  const fake={
-  async lstat(file){calls.push(['lstat',file]);await hooks.lstat?.(file);const value=files.get(key(file));if(value===undefined)throw missing(file);if(value instanceof Error)throw value;return{isFile:()=>!value?.directory&&!value?.link,isDirectory:()=>!!value?.directory,isSymbolicLink:()=>!!value?.link};},
-  async stat(file){calls.push(['stat',file]);await hooks.stat?.(file);const value=files.get(key(file));if(value===undefined)throw missing(file);if(value instanceof Error)throw value;return{isFile:()=>value?.directory!==true};},
-  async realpath(file){calls.push(['realpath',file]);await hooks.realpath?.(file);const value=files.get(key(file));if(value===undefined)throw missing(file);return value?.real??path.win32.normalize(file);},
+  async lstat(/** @type {string} */ file){calls.push(['lstat',file]);await hooks.lstat?.(file);const value=files.get(key(file));if(value===undefined)throw missing(file);if(value instanceof Error)throw value;return{isFile:()=>!value?.directory&&!value?.link,isDirectory:()=>!!value?.directory,isSymbolicLink:()=>!!value?.link};},
+  async stat(/** @type {string} */ file){calls.push(['stat',file]);await hooks.stat?.(file);const value=files.get(key(file));if(value===undefined)throw missing(file);if(value instanceof Error)throw value;return{isFile:()=>value?.directory!==true};},
+  async realpath(/** @type {string} */ file){calls.push(['realpath',file]);await hooks.realpath?.(file);const value=files.get(key(file));if(value===undefined)throw missing(file);return value?.real??path.win32.normalize(file);},
   async access(){throw new Error('Windows resolution must not use POSIX execute bits');}
  };
  vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,process:{platform:'win32',env:parent},
-  require:name=>name==='node:fs/promises'?fake:name==='node:path'?path.win32:realRequire(name)});
- return{...exports,calls,files,key,resolve:(command,env={Path:'C:\\bin'},cwd='C:\\work',signal)=>exports.resolveNodeExecutable(command,env,cwd,signal)};
+  require:(/** @type {string} */ name)=>name==='node:fs/promises'?fake:name==='node:path'?path.win32:realRequire(name)});
+ return{...exports,calls,files,key,resolve:(/** @type {string} */ command,/** @type {Record<string, string | undefined>} */ env={Path:'C:\\bin'},cwd='C:\\work',/** @type {AbortSignal | undefined} */ signal=undefined)=>exports.resolveNodeExecutable(command,env,cwd,signal)};
 }
 
 test('Windows env lookup matches Node sorted duplicate precedence including undefined winners',()=>{
@@ -43,7 +50,7 @@ test('Windows lookup checks cwd before PATH and .com before .exe without PATHEXT
  assert.equal(await f.resolve('tool',{Path:'C:\\bin',PATHEXT:'.BAT;.EXE'}),'C:\\work\\tool.exe');
  f.files.delete(f.key('C:\\work\\tool.exe'));
  assert.equal(await f.resolve('tool',{Path:'C:\\bin',PATHEXT:'.BAT;.EXE'}),'C:\\bin\\tool.com');
- assert.ok(f.calls.every(([,file])=>!file.endsWith('.bat')));
+ assert.ok(f.calls.every((/** @type {string[]} */ [,file])=>!file.endsWith('.bat')));
 });
 
 test('Windows extension and directory handling matches direct Node forms and ignores shadow directories',async()=>{
@@ -74,7 +81,7 @@ test('ambiguous Windows path and cwd-search forms decline instead of selecting a
 
 test('owned Windows command resolution is memoized by command and search path, never caching a failure',async()=>{
  const f=windows({'C:\\bin\\tool.exe':{},'C:\\other\\tool.exe':{}});
- const stats=()=>f.calls.filter(([kind])=>kind==='stat').length;
+ const stats=()=>f.calls.filter((/** @type {string[]} */ [kind])=>kind==='stat').length;
  assert.equal(await f.resolveOwnedCommand('tool',{PATH:'C:\\bin'},'C:\\work'),'C:\\bin\\tool.exe');
  const first=stats();
  assert.deepEqual(await Promise.all([1,2,3].map(()=>f.resolveOwnedCommand('tool',{PATH:'C:\\bin'},'C:\\elsewhere'))),Array(3).fill('C:\\bin\\tool.exe'));
@@ -89,23 +96,26 @@ test('a selected Windows candidate is never replaced by a later one after identi
  const denied=Object.assign(new Error('selected file denied'),{code:'EACCES'});
  const f=windows({'C:\\work\\tool.exe':{},'C:\\bin\\tool.exe':{}},undefined,{realpath:()=>{throw denied;}});
  await assert.rejects(f.resolve('tool'),error=>error===denied);
- assert.ok(!f.calls.some(([,file])=>file.startsWith('C:\\bin')),'launch cannot fall through after choosing a file');
+ assert.ok(!f.calls.some((/** @type {string[]} */ [,file])=>file.startsWith('C:\\bin')),'launch cannot fall through after choosing a file');
 });
 
 test('uncertain Windows candidates decline while ordinary file symlinks retain canonical identity',async()=>{
  const denied=Object.assign(new Error('unknown candidate metadata'),{code:'EACCES'});
  const f=windows({'C:\\work\\tool.com':denied,'C:\\bin\\tool.exe':{}});
- assert.equal(await f.resolve('tool'),undefined);assert.ok(!f.calls.some(([,file])=>file.startsWith('C:\\bin')));
+ assert.equal(await f.resolve('tool'),undefined);assert.ok(!f.calls.some((/** @type {string[]} */ [,file])=>file.startsWith('C:\\bin')));
  const linked=windows({'C:\\work\\tool.exe':{link:true,real:'C:\\installed\\tool.exe'},'C:\\installed\\tool.exe':{},'C:\\bin\\tool.exe':{}});
  assert.equal(await linked.resolve('tool'),'C:\\installed\\tool.exe');
  const broken=windows({'C:\\work\\tool.exe':{link:true},'C:\\bin\\tool.exe':{}},undefined,{realpath:()=>{throw Object.assign(new Error('broken link'),{code:'ENOENT'});}});
- await assert.rejects(broken.resolve('tool'),{code:'ENOENT'});assert.ok(!broken.calls.some(([,file])=>file.startsWith('C:\\bin')));
+ await assert.rejects(broken.resolve('tool'),{code:'ENOENT'});assert.ok(!broken.calls.some((/** @type {string[]} */ [,file])=>file.startsWith('C:\\bin')));
 });
 
 test('resolver cancellation checks before I/O and after an admitted filesystem operation',{timeout:5000},async t=>{
  const early=new AbortController();early.abort();const f=windows();
  await assert.rejects(f.resolve('tool',undefined,undefined,early.signal),{name:'AbortError'});assert.deepEqual(f.calls,[]);
- let finish,entered;const gate=new Promise(resolve=>{finish=resolve;}),started=new Promise(resolve=>{entered=resolve;});
+ // resolvers captured from Promise executors
+ /** @type {any} */ let finish;
+ /** @type {any} */ let entered;
+ const gate=new Promise(resolve=>{finish=resolve;}),started=new Promise(resolve=>{entered=resolve;});
  t.after(()=>finish());
  const abort=new AbortController(),pendingFs=windows({'C:\\work\\tool.exe':{}},undefined,{realpath:async()=>{entered();await gate;}});
  const pending=pendingFs.resolve('tool',undefined,undefined,abort.signal),rejected=assert.rejects(pending,{name:'AbortError'});
@@ -142,7 +152,7 @@ test('POSIX identity preserves symlink-sensitive parent traversal in commands an
  const execute=require('node:util').promisify(require('node:child_process').execFile);
  const {preparationToolIdentity}=require('../../out/services/preparedOutputCache');
  const expectedIdentity=await preparationToolIdentity(actual,{});
- for(const [command,env] of [[`${root}/link/../tool`,{}],['./link/../tool',{}],['tool',{PATH:'link/..'}]]){
+ for(const [command,env] of /** @type {[string, Record<string, string>][]} */ ([[`${root}/link/../tool`,{}],['./link/../tool',{}],['tool',{PATH:'link/..'}]])){
   assert.equal(await resolveNodeExecutable(command,env,root),actual);
   assert.equal(await preparationToolIdentity(command,env,undefined,root),expectedIdentity,'preparation hashes the same actual executable');
   assert.equal((await execute(command,[],{cwd:root,env,timeout:5000})).stdout,'actual','identity follows the real Node launch');
@@ -187,14 +197,14 @@ test('Windows resolver agrees with actual shell:false launch for cwd and COM/EXE
  const parentKeys=Object.keys(process.env).filter(key=>key.toUpperCase()==='NODEFAULTCURRENTDIRECTORYINEXEPATH');
  const prior=new Map(parentKeys.map(key=>[key,process.env[key]]));for(const key of parentKeys)delete process.env[key];
  t.after(()=>{for(const [key,value] of prior)process.env[key]=value;});
- const duplicate=async destination=>{try{await io.link(process.execPath,destination);}catch(error){if(error.code!=='EXDEV')throw error;await io.copyFile(process.execPath,destination);}};
+ const duplicate=async(/** @type {string} */ destination)=>{try{await io.link(process.execPath,destination);}catch(error){if(/** @type {NodeJS.ErrnoException} */ (error).code!=='EXDEV')throw error;await io.copyFile(process.execPath,destination);}};
  for(const file of [path.join(root,'probe.exe'),path.join(bin,'probe.com'),path.join(bin,'probe.exe')])await duplicate(file);
  const env={...process.env};for(const key of Object.keys(env))if(['PATH','PATHEXT'].includes(key.toUpperCase()))delete env[key];
  env.Path=bin;env.Pathext='.BAT;.EXE';
- const launch=command=>new Promise((resolve,reject)=>{
+ const launch=(/** @type {string} */ command)=>new Promise((resolve,reject)=>{
   const child=spawn(command,['-p','process.execPath'],{cwd:root,env,shell:false,windowsHide:true,stdio:['ignore','pipe','pipe']});children.add(child);
   let stdout='',stderr='';child.stdout.setEncoding('utf8');child.stderr.setEncoding('utf8');child.stdout.on('data',value=>{stdout+=value;});child.stderr.on('data',value=>{stderr+=value;});
-  let failure;child.once('error',error=>{failure=error;});child.once('close',code=>{children.delete(child);if(failure)reject(failure);else if(code!==0)reject(new Error(stderr||`exit ${code}`));else resolve(stdout.trim());});
+  /** @type {Error | undefined} */ let failure;child.once('error',error=>{failure=error;});child.once('close',code=>{children.delete(child);if(failure)reject(failure);else if(code!==0)reject(new Error(stderr||`exit ${code}`));else resolve(stdout.trim());});
  });
  const expected=[path.join(root,'probe.exe'),path.join(bin,'probe.com')];
  for(const file of expected){
@@ -202,5 +212,5 @@ test('Windows resolver agrees with actual shell:false launch for cwd and COM/EXE
   assert.equal((await io.realpath(await launch('probe'))).toLowerCase(),resolved.toLowerCase());
   if(file===expected[0])await io.rm(file);
  }
- const explicit=path.join(bin,'probe.exe');assert.equal((await launch(explicit)).toLowerCase(),(await resolveNodeExecutable(explicit,env,root)).toLowerCase());
+ const explicit=path.join(bin,'probe.exe');assert.equal((await launch(explicit)).toLowerCase(),(/** @type {string} */ (await resolveNodeExecutable(explicit,env,root))).toLowerCase());
 });

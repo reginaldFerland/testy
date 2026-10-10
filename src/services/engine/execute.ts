@@ -1,6 +1,7 @@
 import * as path from 'node:path';
 import { TestFile, TestResult } from '../../core/model';
-import { sourceVersion, testTargetKey } from '../../core/paths';
+import { testTargetKey } from '../../core/paths';
+import { commitIsCurrent, completesCheckpoint, requestsComplete, TargetReports } from '../../core/runPolicy';
 import { Cancelled } from '../process';
 import { FileRun, projectCoverageId } from '../runner';
 import { mapConcurrentByKey, SerialQueue } from '../../core/concurrency';
@@ -18,10 +19,7 @@ export async function executeSelection(host: EngineHost, run: RunContext, built:
     const originalGroups = new Map(host.groups.map(group => [group.id, group]));
     const projectGroups = new Map<string, TestFile[]>();
     for (const group of host.groups) {const key = testTargetKey(group.project, group.framework); const groups = projectGroups.get(key) ?? []; groups.push(group); projectGroups.set(key, groups);}
-    const completeFiles = new Set(selection.groups.filter(group => {
-        const requested = new Set(group.tests.map(test => test.id)), original = originalGroups.get(group.id);
-        return original && original.tests.every(test => requested.has(test.id));
-    }).map(group => group.id));
+    const completeFiles = new Set(selection.groups.filter(group => requestsComplete([group], originalGroups)).map(group => group.id));
     const completeProjects = new Set(selection.groups.map(group => testTargetKey(group.project, group.framework)));
     for (const group of host.groups) {if (!completeFiles.has(group.id)) {completeProjects.delete(testTargetKey(group.project, group.framework));}}
     for (const group of selection.groups) {
@@ -34,7 +32,8 @@ export async function executeSelection(host: EngineHost, run: RunContext, built:
     }
     const results: TestResult[] = [];
     const executedFiles = new Set<string>();
-    const runtimeResults = baseline?.runtimeResults ?? new Map<string, ReadonlySet<string>>();
+    const targetFiles = (key: string): readonly string[] => projectGroups.get(key)?.map(group => group.id) ?? [];
+    const runtimeResults = baseline?.reports(targetFiles) ?? new TargetReports(new Map(), targetFiles);
     let available = !!coverageTool, failedBatches = 0;
     const commits = new SerialQueue();
     let completed = 0, active = 0;
@@ -47,30 +46,24 @@ export async function executeSelection(host: EngineHost, run: RunContext, built:
         results.push(...run.results); available &&= run.coverageAvailable;
         signal.throwIfAborted();
         await host.sources.refresh(run.trace.dependencies, signal);
-        const current = topology === host.topology && !obsoleteBuild && revision === host.sources.revision
-            && Object.entries(run.trace.inputs ?? {}).every(([file, hash]) => sourceVersion(host.hashes, file) === hash);
-        if (!current) {
+        if (!commitIsCurrent({ topology, revision, obsoleteBuild }, { topology: host.topology, revision: host.sources.revision }, run.trace, host.hashes)) {
             host.coverage.markStale(new Set(groups.map(group => group.id)));
             if (!manual && !manualOperation) {events.invalidated(changes); throw new Cancelled();}
             return;
         }
-        const complete = groups.every(group => {
-            const requested = new Set(group.tests.map(test => test.id));
-            return originalGroups.get(group.id)?.tests.every(test => requested.has(test.id));
-        });
+        const complete = requestsComplete(groups, originalGroups);
+        const key = testTargetKey(target.project, target.framework);
         if (complete) {
             const reported = new Set(run.results.map(result => result.id));
-            for (const group of groups) {runtimeResults.set(group.id, reported);}
+            for (const group of groups) {runtimeResults.set(key, group.id, reported); host.lastOutcomes.settle(group.id, reported);}
             // Containers are retired only once every file of the target has completed.
-            const project = projectGroups.get(testTargetKey(target.project, target.framework));
-            const targetReported = project?.every(group => runtimeResults.has(group.id)) ? new Set(project.flatMap(group => [...runtimeResults.get(group.id)!])) : undefined;
-            prepared.runtimeTreeChanged ||= host.runtime.retireUnreported(groups, reported, targetReported);
+            prepared.runtimeTreeChanged ||= host.runtime.retireUnreported(groups, reported, runtimeResults.target(key));
         } else {
             // A partial manual run may reveal another deferred row, but
             // cannot retire rows from an earlier complete checkpoint.
             for (const group of groups) {
                 const previous = runtimeResults.get(group.id);
-                if (previous) {runtimeResults.set(group.id, new Set([...previous, ...run.results.map(result => result.id)]));}
+                if (previous) {runtimeResults.set(key, group.id, new Set([...previous, ...run.results.map(result => result.id)]));}
             }
         }
         if (prepared.runtimeTreeChanged) {prepared.runtimeTreeChanged = false; await events.discovered(host.displayGroups);}
@@ -87,14 +80,15 @@ export async function executeSelection(host: EngineHost, run: RunContext, built:
             if (revision !== host.sources.revision) {host.coverage.markStale(new Set([run.trace.groupId]));}
             const aggregate = projectCoverageId(target);
             if (groups.length === 1 && host.coverage.traces.has(aggregate)
-                && projectGroups.get(testTargetKey(target.project, target.framework))!.every(group => {
+                && projectGroups.get(key)!.every(group => {
                     const trace = host.coverage.traces.get(group.id); return trace && !trace.stale;
                 })) {
                 liveIds.delete(aggregate); host.coverage.replace([], liveIds);
             }
         } else if (!manual) {retainWithoutCoverage(host, groups, liveIds);}
-        if (complete && config.configuration === configured.configuration && (!manual || !configured.coverage || run.coverageAvailable)) {for (const group of groups) {baseline?.completed.add(group.id);}}
-        await host.publishCoverage(signal); await host.save(signal);
+        if (completesCheckpoint(complete, { configuration: config.configuration, configured, manual: !!manual }, run.coverageAvailable)) {baseline?.complete(groups.map(group => group.id));}
+        // Publish each contribution at once; saves completing close together share one locked write.
+        await host.publishCoverage(signal); host.scheduleSave();
     };
     /** A batch that could not run reports its tests as errored; other batches continue. */
     const fail = async (groups: readonly TestFile[], error: unknown, reported: ReadonlySet<string>): Promise<void> => {
@@ -107,14 +101,14 @@ export async function executeSelection(host: EngineHost, run: RunContext, built:
             for (const test of group.tests) {
                 if (reported.has(test.id)) {continue;}
                 const result: TestResult = { id: test.id, name: test.name, fullyQualifiedName: test.fullyQualifiedName, outcome: 'errored', duration: 0, message, node: test.node };
-                results.push(result); events.result(group, result);
+                results.push(result); host.lastOutcomes.record(group.id, result); events.result(group, result);
             }
         }
         // Nothing was learned. Retain earlier coverage, and complete the baseline
         // for these files so a persistent failure cannot hold it open forever.
         if (!manual) {retainWithoutCoverage(host, groups, liveIds);}
-        if (!manual) {for (const group of groups) {baseline?.completed.add(group.id);}}
-        await host.publishCoverage(signal); await host.save(signal);
+        if (!manual) {baseline?.complete(groups.map(group => group.id));}
+        await host.publishCoverage(signal); host.scheduleSave();
     };
     await mapConcurrentByKey(batches, testLimit, signal, groups => testTargetKey(groups[0].project, groups[0].framework), async (requestedGroups, _index, _workerSignal, worker) => {
         active++; progress();

@@ -2,35 +2,53 @@ const test=require('node:test'),assert=require('node:assert/strict');
 const {setImmediate:turn}=require('node:timers/promises');
 const {CoverageStore}=require('../../out/core/coverage');
 
+/** @typedef {import('../../out/core/model').FileCoverage} FileCoverage */
+/** @typedef {import('../../out/core/model').Trace} Trace */
+/** @typedef {import('../../out/core/coverage').CoverageSource} CoverageSource */
+/** @typedef {import('../../out/core/coverage').StoredTrace} StoredTrace */
+/** @typedef {import('../../out/core/coverage').CoverageDelta} CoverageDelta */
+/** @typedef {import('../../out/core/coverage').CoverageSummary} CoverageSummary */
+
+/** Narrows a lookup the test knows is present (type-only; no runtime check). @template T @param {T | undefined} value @returns {T} */
+const need=value=>/** @type {T} */(value);
+/** @param {number} line @param {number} hits */
 const line=(line,hits)=>({line,hits});
+/** @param {string} file @param {string} hash @param {{ line: number, hits: number }[]} lines @returns {FileCoverage} */
 const coverage=(file,hash,lines)=>({file,hash,lines});
+/** @param {string} groupId @param {FileCoverage[]} files @param {Partial<Trace>} [extra] @returns {Trace} */
 const trace=(groupId,files,extra={})=>({groupId,dependencies:files.map(file=>file.file),coverage:files,reliable:true,timestamp:1,...extra});
 const emptyDelta={sources:[],traces:[],removedSources:[],removedTraces:[]};
+/** @template T @param {T} value @returns {T} */
 const clone=value=>structuredClone(value);
+/** @template {{ file: string }} T @param {Iterable<T>} values */
 const byFile=values=>[...values].sort((a,b)=>a.file.localeCompare(b.file));
+/** @param {Iterable<string>} values */
 const ids=values=>[...values].sort();
 
 // A disk-checkpoint model uses only public deltas. Every query below scans its
 // plain records rather than sharing CoverageStore's ownership/staleness indexes.
 class Checkpoint {
- sources=new Map();traces=new Map();
+ /** @type {Map<string, CoverageSource>} */ sources=new Map();/** @type {Map<string, StoredTrace>} */ traces=new Map();
+ /** @param {CoverageDelta} delta */
  apply(delta){
   for(const id of delta.removedTraces)this.traces.delete(id);
   for(const id of delta.removedSources)this.sources.delete(id);
   for(const source of delta.sources)this.sources.set(source.id,clone(source));
   for(const value of delta.traces)this.traces.set(value.groupId,clone(value));
  }
+ /** @param {string[]} files @param {boolean} [module] */
  dependencies(files,module=false){
-  return ids([...this.traces.values()].filter(trace=>(module?trace.moduleProjects??[]:trace.dependencies).some(file=>files.includes(file))).map(trace=>trace.groupId));
+  return ids([...this.traces.values()].filter(trace=>/** @type {readonly string[]} */ (module?trace.moduleProjects??[]:trace.dependencies).some(file=>files.includes(file))).map(trace=>trace.groupId));
  }
+ /** @param {ReadonlyMap<string, string>} hashes */
  summaries(hashes){
-  const files=new Map();
+  /** @type {Map<string, { source: CoverageSource, owners: StoredTrace[] }[]>} */ const files=new Map();
   for(const source of this.sources.values()){
    const owners=[...this.traces.values()].filter(trace=>trace.sourceIds.includes(source.id));
    if(owners.length){const versions=files.get(source.file)??[];versions.push({source,owners});files.set(source.file,versions);}
   }
   return byFile([...files].map(([file,versions])=>{
-   const current=versions.find(version=>version.source.hash===hashes.get(file)),displayed=current??versions.at(-1),hits=new Map(),owners=new Set();
+   const current=versions.find(version=>version.source.hash===hashes.get(file)),displayed=need(current??versions.at(-1)),/** @type {Map<number, number>} */ hits=new Map(),/** @type {Set<string>} */ owners=new Set();
    let stale=!current;
    for(const version of versions)for(const owner of version.owners){
     owners.add(owner.groupId);stale||=!!owner.stale;
@@ -41,6 +59,7 @@ class Checkpoint {
    return{file,lines,stale,total:lines.length,covered:lines.filter(line=>line.hits>0).length,groupIds:ids(owners)};
   }));
  }
+ /** @param {CoverageStore} store @param {ReadonlyMap<string, string>} hashes @param {readonly CoverageSummary[]} summaries */
  check(store,hashes,summaries){
   assert.deepEqual(ids(store.traces.keys()),ids(this.traces.keys()));
   for(const [id,value]of this.traces)assert.deepEqual(store.traces.get(id),value,`public delta preserves trace ${id}`);
@@ -70,8 +89,8 @@ test('same-owner replacements update hits, dependencies and module ownership wit
   assert.deepEqual(actual[0].groupIds,['one','two'],'duplicate source reports create one ownership membership');
   assert.deepEqual(actual[0].lines,[line(1,Math.max(2,replacement%3)),line(2,0),line(3,0),line(4,0)]);
   assert.deepEqual(ids(store.dependentGroups(['/old-input'])),[]);assert.deepEqual(ids(store.dependentProjects(['/Old.csproj'])),[]);
-  store.markStale(new Set(['one']));assert.equal(store.summary(file,hashes).stale,true);
-  store.markStale(new Set(['one']),false);assert.equal(store.summary(file,hashes).stale,false,'a duplicated membership cannot leave a stale owner behind');
+  store.markStale(new Set(['one']));assert.equal(need(store.summary(file,hashes)).stale,true);
+  store.markStale(new Set(['one']),false);assert.equal(need(store.summary(file,hashes)).stale,false,'a duplicated membership cannot leave a stale owner behind');
   checkpoint.apply(store.takeDelta());
  }
  store.replace([],new Set(['two']));const remaining=store.summarize(hashes);checkpoint.apply(store.takeDelta());checkpoint.check(store,hashes,remaining);
@@ -85,20 +104,20 @@ test('stale reversal, invalidation and historical ownership preserve checkpoint 
   trace('current',[coverage(file,'v2',[line(1,3),line(2,0)])],{dependencies:[],inputs:{}}),
   trace('old-zero',[coverage(file,'v1',[line(5,0)])],{dependencies:[],inputs:{}})
  ],live);
- const initial=store.summary(file,hashes);store.takeDelta();assert.equal(initial.stale,false);
- store.markStale(new Set(['old-zero']));assert.equal(store.summary(file,hashes).stale,true);
- store.markStale(new Set(['old-zero']),false);assert.equal(store.summary(file,hashes).stale,false);
+ const initial=need(store.summary(file,hashes));store.takeDelta();assert.equal(initial.stale,false);
+ store.markStale(new Set(['old-zero']));assert.equal(need(store.summary(file,hashes)).stale,true);
+ store.markStale(new Set(['old-zero']),false);assert.equal(need(store.summary(file,hashes)).stale,false);
  assert.deepEqual(store.takeDelta(),emptyDelta,'an unpersisted stale transition and its reversal cancel the delta');
- store.invalidate(new Set(['old-zero']),false);assert.equal(store.traces.get('old-zero').reliable,false);assert.equal(store.summary(file,hashes).stale,false);
+ store.invalidate(new Set(['old-zero']),false);assert.equal(need(store.traces.get('old-zero')).reliable,false);assert.equal(need(store.summary(file,hashes)).stale,false);
  assert.deepEqual(store.takeDelta().traces.map(trace=>[trace.groupId,trace.reliable,trace.stale]),[['old-zero',false,false]]);
  store.markStale(new Set(['current']));const saved=store.takeDelta();store.markStale(new Set(['current']),false);store.retryDelta(saved);
  const retried=store.takeDelta();assert.equal(retried.traces.length,1);assert.equal(retried.traces[0].stale,false,'retry emits the current trace, not the stale saved object');
  store.replace([trace('old-hit',[coverage(file,'v1',[line(5,1)])],{dependencies:[],inputs:{}})],live);
- const olderHit=store.summary(file,hashes);assert.equal(olderHit.stale,true);assert.equal(olderHit.lines,initial.lines);
+ const olderHit=need(store.summary(file,hashes));assert.equal(olderHit.stale,true);assert.equal(olderHit.lines,initial.lines);
  store.markHistorical(new Set(['old-zero']));store.markStale(new Set(['old-zero']),false);
- assert.equal(store.traces.get('old-zero').historical,true);assert.equal(store.traces.get('old-zero').stale,true);
- store.replace([],new Set(['current','old-zero']));assert.equal(store.summary(file,hashes).stale,true,'historical zero-hit ownership remains stale after removing old positive hits');
- store.replace([],new Set(['current']));assert.equal(store.summary(file,hashes).stale,false);
+ assert.equal(need(store.traces.get('old-zero')).historical,true);assert.equal(need(store.traces.get('old-zero')).stale,true);
+ store.replace([],new Set(['current','old-zero']));assert.equal(need(store.summary(file,hashes)).stale,true,'historical zero-hit ownership remains stale after removing old positive hits');
+ store.replace([],new Set(['current']));assert.equal(need(store.summary(file,hashes)).stale,false);
  assert.equal(initial.stale,false);assert.deepEqual(initial.groupIds,['current','old-zero']);
 });
 
@@ -109,26 +128,29 @@ test('replacing or removing an owner with an unapplied stale transition preserve
    trace('pending',[coverage(file,'v1',[line(1,2)])],{dependencies:[],inputs:{}}),
    trace('stale',[coverage(file,'v1',[line(2,0)])],{dependencies:[],inputs:{},stale:true})
   ],live);
-  assert.equal(store.summary(file,hashes).stale,true);store.takeDelta();
+  assert.equal(need(store.summary(file,hashes)).stale,true);store.takeDelta();
   store.markStale(new Set(['pending']));
   if(operation==='remove')store.replace([],new Set(['stale']));
   else store.replace([trace('pending',[coverage(file,operation==='change-version'?'v2':'v1',[line(1,2)])],{dependencies:[],inputs:{}})],live);
   const current=operation==='change-version'?new Map([[file,'v2']]):hashes;
-  assert.equal(store.summary(file,current).stale,true,`${operation} must not consume the other owner's already-applied stale membership`);
+  assert.equal(need(store.summary(file,current)).stale,true,`${operation} must not consume the other owner's already-applied stale membership`);
   store.markStale(new Set(['stale']),false);
-  assert.equal(store.summary(file,current).stale,false,`${operation} must not leave a stale count after both surviving owners are fresh`);
+  assert.equal(need(store.summary(file,current)).stale,false,`${operation} must not leave a stale count after both surviving owners are fresh`);
  }
 });
 
 test('ownership summaries and deltas match a scanned checkpoint through a deterministic mixed operation trace',async()=>{
  const store=new CoverageStore(),checkpoint=new Checkpoint(),files=Array.from({length:7},(_,index)=>`/File${index}.cs`);
- let hashes=new Map(files.map(file=>[file,'v1'])),seed=0x63b5f729;const retained=[];
+ let hashes=new Map(files.map(file=>[file,'v1'])),seed=0x63b5f729;
+ /** @type {[unknown, string][]} */
+ const retained=[];
+ /** @param {number} max */
  const random=max=>{seed^=seed<<13;seed^=seed>>>17;seed^=seed<<5;return(seed>>>0)%max;};
  for(let step=0;step<180;step++){
   const live=new Set(checkpoint.traces.keys()),group=`group${random(15)}`,operation=random(10);
   if(operation<5||!live.size){
    live.add(group);const selected=files.filter(()=>random(3)===0);if(!selected.length)selected.push(files[random(files.length)]);
-   const values=selected.map(file=>coverage(file,random(4)?hashes.get(file):`v${1+random(3)}`,
+   const values=selected.map(file=>coverage(file,random(4)?need(hashes.get(file)):`v${1+random(3)}`,
     Array.from({length:1+random(8)},(_,index)=>line(index+1,random(4)))));
    if(random(3)===0)values.push(coverage(values[0].file,values[0].hash,[line(10,0)]));
    const module=`/Project${random(4)}.csproj`,next=trace(group,values,{reliable:random(4)!==0,moduleProjects:[module,module],timestamp:step});
@@ -162,22 +184,23 @@ test('packed restoration rebuilds ownership and module queries identically for s
   assert.deepEqual(ids(store.dependentProjects(['/Core.csproj'])),['module-only','one']);assert.deepEqual(store.takeDelta(),emptyDelta);
   store.replace([trace('one',[coverage('/A.cs','v1',[line(1,7)])],{moduleProjects:['/New.csproj']})],new Set(['one','two','module-only']));
   assert.deepEqual(ids(store.dependentProjects(['/Core.csproj'])),['module-only']);assert.deepEqual(ids(store.dependentProjects(['/New.csproj'])),['one']);
-  store.markStale(new Set(['two']),false);assert.equal(store.summary('/A.cs',hashes).stale,false);
-  assert.deepEqual(store.summary('/A.cs',hashes).lines,[line(1,7),line(3,0),line(4,0)]);
+  store.markStale(new Set(['two']),false);assert.equal(need(store.summary('/A.cs',hashes)).stale,false);
+  assert.deepEqual(need(store.summary('/A.cs',hashes)).lines,[line(1,7),line(3,0),line(4,0)]);
  }
  assert.deepEqual(byFile(await asyncStore.summarizeAsync(hashes)),byFile(sync.summarize(hashes)));
  assert.deepEqual(asyncStore.takeDelta(),sync.takeDelta());
 });
 
+/** @param {number} count */
 const wideFiles=count=>Array.from({length:count},(_,index)=>coverage(`/Wide${index}.cs`,'v1',[line(1,1)]));
 
 test('an unrelated synchronous summary cannot double-apply a paused asynchronous stale-membership update',async()=>{
- const store=new CoverageStore(),files=wideFiles(5000),unrelated='/Unrelated.cs',hashes=new Map([...files.map(file=>[file.file,file.hash]),[unrelated,'v1']]);
+ const store=new CoverageStore(),files=wideFiles(5000),unrelated='/Unrelated.cs',hashes=new Map([...files.map(file=>/** @type {[string, string]} */ ([file.file,file.hash])),/** @type {[string, string]} */ ([unrelated,'v1'])]);
  store.replace([trace('wide',files),trace('unrelated',[coverage(unrelated,'v1',[line(1,3)])])],new Set(['wide','unrelated']));
  const initial=store.summarize(hashes),saved=JSON.stringify(initial),originalUnrelated=initial.find(summary=>summary.file===unrelated);
  store.takeDelta();store.markStale(new Set(['wide']));
  const pending=store.summarizeAsync(hashes);await turn();
- assert.equal(store.summary(unrelated,hashes),originalUnrelated,'an editor read of an unrelated source preserves its cached summary');
+ assert.equal(need(store.summary(unrelated,hashes)),originalUnrelated,'an editor read of an unrelated source preserves its cached summary');
  const stale=await pending;assert.equal(stale.filter(summary=>summary.stale).length,files.length);
  store.markStale(new Set(['wide']),false);
  assert.ok((await store.summarizeAsync(hashes)).every(summary=>!summary.stale),'reversing one stale transition clears every wide-source membership exactly once');
@@ -194,13 +217,13 @@ test('cancelled dirty-owner traversal retries completely and concurrent membersh
  await turn();
  store.replace([
   trace('wide',[coverage(files[0].file,'v1',[line(1,7)])]),
-  trace('survivor',[coverage(files.at(-1).file,'v1',[line(1,0)])])
+  trace('survivor',[coverage(need(files.at(-1)).file,'v1',[line(1,0)])])
  ],new Set(['wide','survivor']));
  store.markHistorical(new Set(['wide']));
- const editor=store.summary(files[0].file,hashes),completed=await pending;
+ const editor=need(store.summary(files[0].file,hashes)),completed=await pending;
  assert.equal(completed.length,2);assert.equal(completed.find(summary=>summary.file===files[0].file),editor);
  assert.equal(editor.stale,true);assert.deepEqual(editor.lines,[line(1,7)]);
- assert.equal(completed.find(summary=>summary.file===files.at(-1).file).stale,false);
+ assert.equal(need(completed.find(summary=>summary.file===need(files.at(-1)).file)).stale,false);
  assert.deepEqual(ids(store.dependentGroups([files[1].file])),[],'removed memberships cannot remain in dependency queries');
  assert.equal(JSON.stringify(initial),saved);
 });
@@ -219,7 +242,7 @@ test('cancelled replacement and obsolete packed restoration never publish partia
  assert.deepEqual(ids(store.dependentGroups([files[0].file])),[]);
  await store.restorePackedAsync(packed.sources,packed.traces);
  assert.deepEqual(ids(store.traces.keys()),['disk']);assert.deepEqual(ids(store.dependentProjects(['/Newer.csproj'])),[]);
- assert.deepEqual(ids(store.dependentProjects(['/Disk.csproj'])),['disk']);assert.deepEqual(ids(store.dependentGroups([files.at(-1).file])),['disk']);
+ assert.deepEqual(ids(store.dependentProjects(['/Disk.csproj'])),['disk']);assert.deepEqual(ids(store.dependentGroups([need(files.at(-1)).file])),['disk']);
  assert.deepEqual(store.takeDelta(),emptyDelta);
 });
 

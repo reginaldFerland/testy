@@ -3,18 +3,26 @@ const { setImmediate: turn } = require('node:timers/promises');
 const { CoverageStore } = require('../../out/core/coverage');
 const { contentHash } = require('../../out/core/paths');
 
+/** @typedef {import('../../out/core/coverage').CoverageSummary} Summary */
+/** @typedef {import('../../out/core/coverage').CoverageSource} Source */
 const emptyDelta = () => ({ sources: [], traces: [], removedSources: [], removedTraces: [] });
+/** @param {string} file @param {string} [hash] @param {number[]} [lines] @returns {Source} */
 const source = (file, hash = 'v1', lines = [1, 2]) => ({ id: contentHash(`${file}\0${hash}`), file, hash, lines });
+/** @param {Source} source @param {number} [hits] */
 const contribution = (source, hits = 1) => ({ file: source.file, hash: source.hash, lines: [{ line: 1, hits }] });
+/** @param {string} groupId @param {Source[]} sources @param {import('../../out/core/model').FileCoverage[]} [coverage] @param {Partial<import('../../out/core/model').Trace>} [extra] */
 const trace = (groupId, sources, coverage = [], extra = {}) => ({ groupId, sourceIds: sources.map(source => source.id), coverage,
     dependencies: sources.map(source => source.file), moduleProjects: ['/Project.csproj'], inputs: {}, reliable: true, stale: false, timestamp: 1, ...extra });
+/** @param {Source[]} sources */
 const hashes = sources => new Map(sources.map(source => [source.file, source.hash]));
 
+/** @param {import('../../out/core/coverage').CoverageStore} store @param {ReadonlyMap<string,string>} versions @param {string[]} [dependencyFiles] @param {string[]} [projects] */
 function facts(store, versions, dependencyFiles = [], projects = ['/Project.csproj']) {
     return { traces: [...store.traces], summaries: store.summarize(versions),
         dependencies: dependencyFiles.map(file => [file, [...store.dependentGroups([file])]]),
         projects: projects.map(project => [project, [...store.dependentProjects([project])]]) };
 }
+/** @param {Source[]} sources @param {import('../../out/core/coverage').StoredTrace[]} traces */
 async function restored(sources, traces) {
     const actual = new CoverageStore(), expected = new CoverageStore();
     // The synchronous API retains the unchanged general installation path.
@@ -34,12 +42,12 @@ test('staged restore matches generic installation for zero owners, max hits and 
         trace('other', [current], [contribution(current, 5)])];
     const { actual, expected } = await restored(sources, traces), versions = hashes(sources);
     assert.deepEqual(facts(actual, versions, sources.map(value => value.file)), facts(expected, versions, sources.map(value => value.file)));
-    assert.deepEqual(actual.summary('/Code.cs', versions).lines, [{ line: 1, hits: 5 }, { line: 3, hits: 0 }]);
-    assert.deepEqual(actual.summary('/Zero.cs', versions).groupIds, ['fresh', 'old']);
-    assert.equal(actual.summary('/Zero.cs', versions).stale, true);
+    assert.deepEqual(/** @type {Summary} */ (actual.summary('/Code.cs', versions)).lines, [{ line: 1, hits: 5 }, { line: 3, hits: 0 }]);
+    assert.deepEqual(/** @type {Summary} */ (actual.summary('/Zero.cs', versions)).groupIds, ['fresh', 'old']);
+    assert.equal(/** @type {Summary} */ (actual.summary('/Zero.cs', versions)).stale, true);
     assert.equal(actual.summary('/Unused.cs', versions), undefined);
     assert.ok([...actual.traces.values()].every(value => !value.reliable && value.stale));
-    assert.equal(actual.traces.get('old').historical, true);
+    assert.equal(/** @type {import('../../out/core/coverage').StoredTrace} */ (actual.traces.get('old')).historical, true);
 });
 
 test('duplicate source IDs count one stale owner and later freshness/removal stays exact', async () => {
@@ -47,15 +55,15 @@ test('duplicate source IDs count one stale owner and later freshness/removal sta
     const { actual, expected } = await restored([code], traces), versions = hashes([code]);
     for (const store of [actual, expected]) { store.markStale(new Set(['one', 'two']), false); }
     assert.deepEqual(facts(actual, versions), facts(expected, versions));
-    assert.equal(actual.summary(code.file, versions).stale, false, 'duplicate IDs cannot leave excess stale counts');
-    assert.deepEqual(actual.summary(code.file, versions).groupIds, ['one', 'two']);
+    assert.equal(/** @type {Summary} */ (actual.summary(code.file, versions)).stale, false, 'duplicate IDs cannot leave excess stale counts');
+    assert.deepEqual(/** @type {Summary} */ (actual.summary(code.file, versions)).groupIds, ['one', 'two']);
     for (const store of [actual, expected]) {
         store.markStale(new Set(['one'])); store.summarize(versions);
         store.replace([], new Set(['two']));
     }
     assert.deepEqual(facts(actual, versions), facts(expected, versions));
-    assert.equal(actual.summary(code.file, versions).stale, false);
-    assert.deepEqual(actual.summary(code.file, versions).groupIds, ['two']);
+    assert.equal(/** @type {Summary} */ (actual.summary(code.file, versions)).stale, false);
+    assert.deepEqual(/** @type {Summary} */ (actual.summary(code.file, versions)).groupIds, ['two']);
     assert.deepEqual(actual.takeDelta(), expected.takeDelta());
 });
 
@@ -68,8 +76,8 @@ test('last valid duplicate group replaces indexes while an invalid later duplica
     assert.deepEqual(facts(actual, versions, ['/old', '/new'], ['/Old.csproj', '/New.csproj']),
         facts(expected, versions, ['/old', '/new'], ['/Old.csproj', '/New.csproj']));
     assert.deepEqual([...actual.traces.keys()], ['same', 'middle']);
-    assert.equal(actual.traces.get('same').timestamp, 2);
-    assert.deepEqual(actual.summary(a.file, versions).lines, [{ line: 1, hits: 0 }, { line: 2, hits: 0 }]);
+    assert.equal(/** @type {import('../../out/core/coverage').StoredTrace} */ (actual.traces.get('same')).timestamp, 2);
+    assert.deepEqual(/** @type {Summary} */ (actual.summary(a.file, versions)).lines, [{ line: 1, hits: 0 }, { line: 2, hits: 0 }]);
     assert.deepEqual([...actual.dependentGroups(['/old'])], []);
     assert.deepEqual([...actual.dependentProjects(['/New.csproj'])], ['same']);
 });
@@ -79,10 +87,10 @@ test('duplicate geometry unions and duplicate contributions retain last-entry se
     const traces = [trace('first', [a], [contribution(a, 9), contribution(a, 2), contribution(b, 4)]), trace('owner', [b])];
     const { actual, expected } = await restored([a, expanded, b], traces), versions = hashes([a, b]);
     assert.deepEqual(facts(actual, versions), facts(expected, versions));
-    assert.deepEqual(actual.summary(a.file, versions).lines, [{ line: 1, hits: 2 }, { line: 3, hits: 0 }]);
+    assert.deepEqual(/** @type {Summary} */ (actual.summary(a.file, versions)).lines, [{ line: 1, hits: 2 }, { line: 3, hits: 0 }]);
     // The direct store API historically accepts this shape; disk validation is stricter.
-    assert.deepEqual(actual.summary(b.file, versions).lines, [{ line: 1, hits: 4 }, { line: 2, hits: 0 }]);
-    assert.deepEqual(actual.summary(b.file, versions).groupIds, ['owner']);
+    assert.deepEqual(/** @type {Summary} */ (actual.summary(b.file, versions)).lines, [{ line: 1, hits: 4 }, { line: 2, hits: 0 }]);
+    assert.deepEqual(/** @type {Summary} */ (actual.summary(b.file, versions)).groupIds, ['owner']);
     for (const store of [actual, expected]) { store.retryDelta({ ...emptyDelta(), sources: [a, b] }); }
     assert.deepEqual(actual.takeDelta(), expected.takeDelta(), 'restored shared geometry is the same durable union');
 });

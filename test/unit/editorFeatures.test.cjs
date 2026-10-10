@@ -10,6 +10,8 @@ const {CoverageStore}=require('../../out/core/coverage');
 const {normalizePath}=require('../../out/core/paths');
 const {loadUi}=require('./support/ui.cjs');
 
+/** @typedef {import('../../out/core/diagnostics').BuildDiagnostic} BuildDiagnostic */
+/** @typedef {import('../../out/core/model').TestResult} TestResult */
 const root=path.resolve('/repo');
 
 test('classic solutions list project paths and skip solution folders',()=>{
@@ -40,7 +42,7 @@ test('solution filters resolve projects against their solution and reject malfor
 
 test('entry points are limited by solution, then include and exclude globs; the filter files become inputs',async t=>{
  const dir=normalizePath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-solution-')));t.after(()=>fs.rm(dir,{recursive:true,force:true}));
- const project=name=>normalizePath(path.join(dir,name,`${name}.csproj`));
+ const project=(/** @type {string} */ name)=>normalizePath(path.join(dir,name,`${name}.csproj`));
  const found=[project('App'),project('App.Tests'),project('Other.Tests'),project('Slow.Tests')];
  await fs.writeFile(path.join(dir,'All.sln'),found.map((file,index)=>`Project("{X}") = "P${index}", "${path.relative(dir,file)}", "{G${index}}"`).join('\n'));
  await fs.writeFile(path.join(dir,'Fast.slnf'),JSON.stringify({solution:{path:'All.sln',projects:[path.relative(dir,found[0]),path.relative(dir,found[1]),path.relative(dir,found[3])]}}));
@@ -58,10 +60,10 @@ test('build diagnostics parse compiler and MSBuild locations, node prefixes and 
   {file:'/w/App/Calc.cs',line:12,column:17,severity:'error',code:'CS0103',message:'The name \'x\' does not exist in the current context',project:'/w/App/App.csproj'});
  assert.deepEqual(parseBuildDiagnostic('  3>C:\\src\\A.cs(4,1,4,9): warning CS0168: The variable \'e\' is declared but never used'),
   {file:'C:\\src\\A.cs',line:4,column:1,endLine:4,endColumn:9,severity:'warning',code:'CS0168',message:'The variable \'e\' is declared but never used'});
- assert.equal(parseBuildDiagnostic('/w/App/App.csproj(10): error MSB4025: The project file could not be loaded.').column,1);
+ assert.equal(/** @type {BuildDiagnostic} */ (parseBuildDiagnostic('/w/App/App.csproj(10): error MSB4025: The project file could not be loaded.')).column,1);
  assert.equal(parseBuildDiagnostic('MSBUILD : error MSB1009: Project file does not exist.'),undefined);
  assert.equal(parseBuildDiagnostic('Build succeeded.'),undefined);
- const a=parseBuildDiagnostic('/a.cs(1,2): error CS1: m [/p.csproj]'),b=parseBuildDiagnostic('/a.cs(1,2): error CS1: m [/q.csproj]');
+ const a=/** @type {BuildDiagnostic} */ (parseBuildDiagnostic('/a.cs(1,2): error CS1: m [/p.csproj]')),b=/** @type {BuildDiagnostic} */ (parseBuildDiagnostic('/a.cs(1,2): error CS1: m [/q.csproj]'));
  assert.equal(diagnosticKey(a),diagnosticKey(b),'the summary repeat of a message is one diagnostic');
  const lines=new LineSplitter();
  assert.deepEqual(lines.push('first\r\nsec'),['first']);assert.deepEqual(lines.push('ond\nthird'),['second']);
@@ -80,26 +82,26 @@ test('stack traces yield clickable frames and the innermost workspace frame',()=
   {label:'Demo.Tests.ArithmeticTests.Adds()',file:'/w/Tests/ArithmeticTests.cs',line:12},
   {label:'System.Runtime.CompilerServices.TaskAwaiter.ThrowForNonSuccess(Task task)'},
   {label:'Demo.Lib.Calc.Add(Int32 a, Int32 b)',file:'C:\\w\\Lib\\Calc.cs',line:3}]);
- assert.equal(failingFrame(frames,file=>file.startsWith('/w/')).line,12);
+ assert.equal(/** @type {import('../../out/core/stackTrace').StackFrame} */ (failingFrame(frames,file=>file.startsWith('/w/'))).line,12);
  assert.equal(failingFrame(frames,()=>false),undefined);
  assert.deepEqual(parseStackTrace(undefined),[]);
 });
 
 test('MTP assertion values and declaration end lines are retained',()=>{
- const result=testResult({uid:'a','display-name':'Adds','execution-state':'failed','error.message':'Values differ','assert.expected':'3','assert.actual':'4'});
+ const result=/** @type {TestResult} */ (testResult({uid:'a','display-name':'Adds','execution-state':'failed','error.message':'Values differ','assert.expected':'3','assert.actual':'4'}));
  assert.equal(result.expected,'3');assert.equal(result.actual,'4');
- assert.equal(testResult({uid:'b','execution-state':'failed','assert.expected':'3'}).expected,undefined,'a diff needs both values');
- assert.equal(testResult({uid:'b','execution-state':'failed','assert.expected':'','assert.actual':''}).expected,undefined,'MSTest sends empty values');
+ assert.equal(/** @type {TestResult} */ (testResult({uid:'b','execution-state':'failed','assert.expected':'3'})).expected,undefined,'a diff needs both values');
+ assert.equal(/** @type {TestResult} */ (testResult({uid:'b','execution-state':'failed','assert.expected':'','assert.actual':''})).expected,undefined,'MSTest sends empty values');
  assert.equal(discoveredTest({uid:'c','location.file':'/a.cs','location.line-start':5,'location.line-end':9}).endLine,9);
  assert.equal(discoveredTest({uid:'c','location.file':'/a.cs','location.line-start':5,'location.line-end':2}).endLine,undefined);
 });
 
 test('a debugged test host reports its process before connecting, and attaches once',async t=>{
  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'testy-debug-'));t.after(()=>fs.rm(dir,{recursive:true,force:true}));
- const marker=path.join(dir,'attached'),attached=[];
+ const marker=path.join(dir,'attached'),/** @type {number[]} */ attached=[];
  const options={dotnet:process.execPath,assembly:path.resolve('test/fixtures/mtp-peer.cjs'),cwd:process.cwd(),timeoutMs:15000,
   env:{TESTY_ATTACHED_FILE:marker,TESTY_UPDATES:JSON.stringify([{uid:'t','node-type':'action','display-name':'t','execution-state':'passed'}])},
-  debug:async processId=>{attached.push(processId);await fs.writeFile(marker,'');}};
+  debug:async (/** @type {number} */ processId)=>{attached.push(processId);await fs.writeFile(marker,'');}};
  const nodes=await requestTests(options,'run');
  assert.equal(attached.length,1);assert.ok(Number.isSafeInteger(attached[0])&&attached[0]>0);
  assert.equal(nodes[0]['execution-state'],'passed');
@@ -110,30 +112,30 @@ test('a debugged test host reports its process before connecting, and attaches o
 });
 
 test('scheduler exposes pending changes for an immediate run and cancels the active run without losing them',async()=>{
- let release,signalSeen;
- const scheduler=new Scheduler({debounce:0,schedule:callback=>{callback();return()=>{};},run:async(_batch,signal)=>{signalSeen=signal;await new Promise(resolve=>{release=resolve;signal.addEventListener('abort',resolve);});}});
+ let release=/** @type {(()=>void)|undefined} */ (undefined),signalSeen=/** @type {AbortSignal|undefined} */ (undefined);
+ const scheduler=new Scheduler({debounce:0,schedule:callback=>{callback();return()=>{};},run:async(_batch,signal)=>{signalSeen=signal;await new Promise(resolve=>{release=/** @type {()=>void} */ (resolve);signal.addEventListener('abort',resolve);});}});
  scheduler.setPaused(true);scheduler.request(['/a.cs']);scheduler.request([],true);
  const batch=scheduler.pendingBatch;assert.deepEqual(batch.files,['/a.cs']);assert.equal(batch.full,true);assert.ok(batch.generation);
  scheduler.setPaused(false);await new Promise(resolve=>setImmediate(resolve));
- assert.equal(scheduler.isRunning,true);scheduler.cancel();assert.equal(signalSeen.aborted,true);
+ assert.equal(scheduler.isRunning,true);scheduler.cancel();assert.equal(/** @type {AbortSignal} */ (signalSeen).aborted,true);
  await new Promise(resolve=>setImmediate(resolve));
  assert.deepEqual(scheduler.pendingBatch.files,['/a.cs'],'cancelled changes stay pending');release?.();scheduler.dispose();
 });
 
 test('per-test-file coverage contributions use the displayed source geometry',()=>{
  const store=new CoverageStore(),file=normalizePath('/w/Calc.cs'),hashes=new Map([[file,'v1']]);
- const trace=(groupId,hits)=>({groupId,dependencies:[file],coverage:[{file,hash:'v1',lines:[1,2,3].map(line=>({line,hits:hits.includes(line)?1:0}))}],reliable:true,timestamp:1,inputs:{[file]:'v1'}});
+ const trace=(/** @type {string} */ groupId,/** @type {number[]} */ hits)=>({groupId,dependencies:[file],coverage:[{file,hash:'v1',lines:[1,2,3].map(line=>({line,hits:hits.includes(line)?1:0}))}],reliable:true,timestamp:1,inputs:{[file]:'v1'}});
  store.replace([trace('a',[1]),trace('b',[2])],new Set(['a','b']));
  assert.deepEqual(store.contribution(file,new Set(['a']),hashes),[{line:1,hits:1},{line:2,hits:0},{line:3,hits:0}]);
- assert.deepEqual(store.contribution(file,new Set(['a','b']),hashes).map(line=>line.hits),[1,1,0]);
+ assert.deepEqual(/** @type {readonly import('../../out/core/model').CoveredLine[]} */ (store.contribution(file,new Set(['a','b']),hashes)).map(line=>line.hits),[1,1,0]);
  assert.equal(store.contribution(normalizePath('/w/None.cs'),new Set(['a']),hashes),undefined);
 });
 
 test('failure messages use assertion diffs, stack frames and the failing workspace line',()=>{
- const created=[];
- class TestMessage{constructor(message){this.message=message;}static diff(message,expected,actual){return Object.assign(new TestMessage(message),{expectedOutput:expected,actualOutput:actual});}}
- const vscode={l10n:{t:message=>message},TestMessage,Uri:{file:fsPath=>({fsPath})},Position:class{constructor(line,character){Object.assign(this,{line,character});}},
-  Location:class{constructor(uri,range){Object.assign(this,{uri,range});}},TestMessageStackFrame:class{constructor(label,uri,position){created.push(label);Object.assign(this,{label,uri,position});}}};
+ /** @type {string[]} */ const created=[];
+ class TestMessage{constructor(/** @type {string} */ message){this.message=message;}static diff(/** @type {string} */ message,/** @type {string} */ expected,/** @type {string} */ actual){return Object.assign(new TestMessage(message),{expectedOutput:expected,actualOutput:actual});}}
+ const vscode={l10n:{t:(/** @type {string} */ message)=>message},TestMessage,Uri:{file:(/** @type {string} */ fsPath)=>({fsPath})},Position:class{constructor(/** @type {number} */ line,/** @type {number} */ character){Object.assign(this,{line,character});}},
+  Location:class{constructor(/** @type {unknown} */ uri,/** @type {unknown} */ range){Object.assign(this,{uri,range});}},TestMessageStackFrame:class{constructor(/** @type {string} */ label,/** @type {unknown} */ uri,/** @type {unknown} */ position){created.push(label);Object.assign(this,{label,uri,position});}}};
  const exports={failureMessage:loadUi({vscode}).failureMessage};
  const workspace=normalizePath(path.resolve('/w')),test=normalizePath(path.join(workspace,'Tests','T.cs'));
  const item={uri:{fsPath:test},range:{start:0}};

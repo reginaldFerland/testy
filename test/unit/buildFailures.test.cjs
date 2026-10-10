@@ -4,21 +4,23 @@ const {loadUi}=require('./support/ui.cjs');
 
 class MarkdownString{
  constructor(value=''){this.value=value;}
- appendCodeblock(code,language){this.value+=`\n\`\`\`${language}\n${code}\n\`\`\`\n`;return this;}
- appendText(text){this.value+=text;return this;}
- appendMarkdown(text){this.value+=text;return this;}
+ appendCodeblock(/** @type {string} */ code,/** @type {string} */ language){this.value+=`\n\`\`\`${language}\n${code}\n\`\`\`\n`;return this;}
+ appendText(/** @type {string} */ text){this.value+=text;return this;}
+ appendMarkdown(/** @type {string} */ text){this.value+=text;return this;}
 }
 
 /** A tree with two test projects, built through the real presenter. */
 async function fixture() {
+ /** @returns {{values: any[], replace(values: Iterable<any>): void, add(value: any): void}} */
  const collection=()=>({values:[],replace(values){this.values=[...values];},add(value){this.values.push(value);}});
- const ui=loadUi({vscode:{MarkdownString,TestRunRequest:class{},Uri:{file:fsPath=>({fsPath})},Range:class{}}});
- const controller={items:collection(),createTestItem:(id,label,uri)=>({id,label,uri,tags:[],children:collection()}),invalidateTestResults(){}};
- const tree=new ui.TestTree(controller,{knownTests:group=>group.tests},{disposed:false,activeRun:undefined,roots:[],updateStatus(){}});
- const group=project=>({id:`${project}:a`,project:`/w/${project}/${project}.csproj`,framework:'net10.0',file:`/w/${project}/A.cs`,tests:[{id:'t',name:'t',file:`/w/${project}/A.cs`,line:1}]});
+ const ui=loadUi({vscode:{MarkdownString,TestRunRequest:class{},Uri:{file:(/** @type {string} */ fsPath)=>({fsPath})},Range:class{}}});
+ const controller={items:collection(),createTestItem:(/** @type {string} */ id,/** @type {string} */ label,/** @type {unknown} */ uri)=>({id,label,uri,tags:[],children:collection()}),invalidateTestResults(){}};
+ const tree=new ui.TestTree(controller,{knownTests:(/** @type {{tests: unknown[]}} */ group)=>group.tests},{disposed:false,activeRun:undefined,roots:[],updateStatus(){}});
+ const group=(/** @type {string} */ project)=>({id:`${project}:a`,project:`/w/${project}/${project}.csproj`,framework:'net10.0',file:`/w/${project}/A.cs`,tests:[{id:'t',name:'t',file:`/w/${project}/A.cs`,line:1}]});
  await tree.update([group('One'),group('Two')]);
  return{ui,tree,one:tree.items.get('project:/w/One/One.csproj'),two:tree.items.get('project:/w/Two/Two.csproj')};
 }
+/** @param {string | undefined} project @param {Record<string, unknown>} [extra] */
 const error=(project,message='Missing semicolon',extra={})=>({file:`/w/${project}/A.cs`,line:3,column:7,severity:'error',code:'CS1002',message,project:project&&`/w/${project}/${project}.csproj`,...extra});
 
 test('build errors mark the failing project and leave the others untouched',async()=>{
@@ -54,15 +56,19 @@ test('a successful build clears the errors of every project',async()=>{
 });
 
 /** Runs `execute` against a stub engine that reaches the build phase and then fails or succeeds. */
+/** @param {unknown} t @param {{fail: boolean, aborted?: boolean}} options */
 async function execute(t,{fail,aborted=false}) {
- const f=await fixture(),calls=[];
+ const f=await fixture();
+ /** @type {unknown[][]} */
+ const calls=[];
  const proto=f.ui.Testy.prototype;
  const run={token:{onCancellationRequested:()=>({dispose(){}})},end(){},appendOutput(){}};
  const abort=new AbortController();
- const context={changes:{flush:async()=>{}},controller:{createTestRun:()=>run},runProfile:{},coverageProfile:{},debugProfile:{},config:{coverage:false},continuousCoverage:new Set(),runName:()=>'Testy',coverage:{beginRun(){}},
-  tree:{showBuildFailures:(diagnostics,fallback)=>calls.push(['show',[...diagnostics].map(d=>d.code),fallback]),clearBuildFailures:()=>calls.push(['clear'])},
+ /** @type {Record<string, any>} Partial mock of the extension host; `engine` and `build` are attached below. */
+ const context={changes:{flush:async()=>{}},controller:{createTestRun:()=>run},runProfile:{},coverageProfile:{},debugProfile:{},config:{coverage:false},continuousCoverage:new Set(),continuous:new Map(),continuousRequest:()=>undefined,runName:()=>'Testy',coverage:{beginRun(){}},
+  tree:{setBusy(){},showBuildFailures:(/** @type {{code: string}[]} */ diagnostics,/** @type {string} */ fallback)=>calls.push(['show',[...diagnostics].map(d=>d.code),fallback]),clearBuildFailures:()=>calls.push(['clear'])},
   diagnostics:{items:new Map(),begin(){this.items=new Map();},flush(){},get values(){return this.items.values();},publish:()=>calls.push(['diagnostics'])},output:{info(){},warn(){}},lastError:'',updateStatus(){},
-  reportError(error){context.lastError=error.message;}};
+  reportError(/** @type {Error} */ error){context.lastError=error.message;}};
  context.engine={run:async()=>{
   context.build='building';context.diagnostics.items.set('k',error('One'));
   if(aborted)abort.abort();

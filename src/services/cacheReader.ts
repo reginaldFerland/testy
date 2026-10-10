@@ -6,7 +6,7 @@ import { CoveredLine } from '../core/model';
 import type { CacheSnapshot } from './cacheWorker';
 import { CacheLimits, defaultCacheLimits } from './cacheFormat';
 
-export type CacheContents = Pick<CacheSnapshot, 'stats' | 'warnings' | 'corrupt' | 'evicted' | 'complete'> & { sources: CoverageSource[]; traces: StoredTrace[] };
+export type CacheContents = Pick<CacheSnapshot, 'outcomes' | 'stats' | 'warnings' | 'corrupt' | 'evicted' | 'complete'> & { sources: CoverageSource[]; traces: StoredTrace[] };
 
 /** Parsing and validation are interruptible even for dense, valid cache records. */
 export async function readCache(directory: string, signal?: AbortSignal, limits: CacheLimits = defaultCacheLimits): Promise<CacheContents> {
@@ -52,6 +52,6 @@ export async function readCache(directory: string, signal?: AbortSignal, limits:
             traces.push({ ...trace, sourceIds, coverage });
         }
         signal?.throwIfAborted();
-        return { sources, traces, stats: snapshot.stats, warnings: snapshot.warnings, corrupt: snapshot.corrupt, evicted: snapshot.evicted, complete: snapshot.complete };
+        return { sources, traces, outcomes: snapshot.outcomes, stats: snapshot.stats, warnings: snapshot.warnings, corrupt: snapshot.corrupt, evicted: snapshot.evicted, complete: snapshot.complete };
     } finally {signal?.removeEventListener('abort', abort); await worker.terminate();}
 }

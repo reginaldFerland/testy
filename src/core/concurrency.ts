@@ -142,6 +142,16 @@ export class SerialQueue {
     }
 }
 
+/** Wait for shared work, but stop waiting when the caller is cancelled; the work itself continues. */
+export function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+    if (signal.aborted) {return Promise.reject(signal.reason as Error);}
+    return new Promise<T>((resolve, reject) => {
+        const abort = (): void => reject(signal.reason as Error);
+        signal.addEventListener('abort', abort, { once: true });
+        work.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+    });
+}
+
 /** A shared I/O budget; release before recursively scheduling more work. */
 export class Semaphore {
     private active = 0;

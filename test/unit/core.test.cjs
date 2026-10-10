@@ -4,19 +4,24 @@ const path = require('node:path');
 const {selectTests} = require('../../out/core/selection');
 const {CoverageStore} = require('../../out/core/coverage');
 const {normalizePath, isExcluded, matchesPattern} = require('../../out/core/paths');
+/** @param {string} file */
 const p = file => normalizePath(path.resolve('/workspace', file));
+/** @type {any} partial Project mocks: only the fields selection reads */
 const projects = [
  {file:p('App/App.csproj'),sourceFiles:[p('App/A.cs'),p('App/B.cs')],references:[]},
  {file:p('Tests/Tests.csproj'),sourceFiles:[p('Tests/ATests.cs'),p('Tests/BTests.cs')],references:[p('App/App.csproj')]},
  {file:p('Other/Other.csproj'),sourceFiles:[p('Other/C.cs')],references:[]}
 ];
+/** @type {any} partial TestFile mocks: only the fields selection reads */
 const groups = [
  {id:'a',file:p('Tests/ATests.cs'),project:p('Tests/Tests.csproj')},
  {id:'b',file:p('Tests/BTests.cs'),project:p('Tests/Tests.csproj')},
  {id:'c',file:p('Other/CTests.cs'),project:p('Other/Other.csproj')}
 ];
+/** @param {string} groupId @param {string} file @param {string} [hash] @param {number} [hits] */
 const trace = (groupId, file, hash='old', hits=1) => ({groupId,dependencies:[file],coverage:[{file,hash,lines:[{line:5,hits}]}],reliable:true,timestamp:1});
 const traces = new Map([['a',trace('a',p('App/A.cs'))],['b',trace('b',p('App/B.cs'))],['c',trace('c',p('Other/C.cs'))]]);
+/** @param {string[]} changes @param {ReadonlyMap<string,import('../../out/core/model').Trace>} [records] @param {'affected'|'all'} [mode] */
 const selected = (changes, records=traces, mode='affected') => selectTests(groups,projects,records,changes.map(p),mode).groups.map(group=>group.id);
 
 test('selects the test files that exercised changed source',()=>assert.deepEqual(selected(['App/A.cs']),['a']));
@@ -24,7 +29,7 @@ test('combines all changed files',()=>assert.deepEqual(selected(['App/A.cs','App
 test('unknown source falls back to dependent projects, without unrelated projects',()=>assert.deepEqual(selected(['App/New.cs']),['a','b']));
 test('configuration changes conservatively include all dependent tests',()=>assert.deepEqual(selected(['App/App.csproj']),['a','b']));
 test('solution-wide configuration selects all projects',()=>assert.deepEqual(selected(['Directory.Build.props']),['a','b','c']));
-test('incomplete traces cannot exclude a test file',()=>assert.deepEqual(selected(['App/A.cs'],new Map([['a',traces.get('a')]])),['a','b']));
+test('incomplete traces cannot exclude a test file',()=>assert.deepEqual(selected(['App/A.cs'],new Map([['a',/** @type {import('../../out/core/model').Trace} */ (traces.get('a'))]])),['a','b']));
 test('all mode includes the full suite',()=>assert.deepEqual(selected(['App/A.cs'],traces,'all'),['a','b','c']));
 test('changed test source selects its whole file',()=>assert.deepEqual(selected(['Tests/ATests.cs']),['a']));
 test('generated files and build artifacts are excluded',()=>{
@@ -55,10 +60,10 @@ test('coverage from different source versions is not merged into false green lin
  assert.equal(store.summarize(new Map([[file,'new']]))[0].stale,false);
 });
 test('a failure retains historical dependencies and loses selection trust',()=>{
- const store=new CoverageStore();store.replace([traces.get('a')],new Set(['a']));
+ const store=new CoverageStore();store.replace([/** @type {import('../../out/core/model').Trace} */ (traces.get('a'))],new Set(['a']));
  store.replace([{...trace('a',p('App/B.cs')),reliable:false}],new Set(['a']));
- assert.deepEqual(store.traces.get('a').dependencies,[p('App/A.cs'),p('App/B.cs')]);
- assert.equal(store.traces.get('a').reliable,false);
+ assert.deepEqual(/** @type {NonNullable<ReturnType<typeof store.traces.get>>} */ (store.traces.get('a')).dependencies,[p('App/A.cs'),p('App/B.cs')]);
+ assert.equal(/** @type {NonNullable<ReturnType<typeof store.traces.get>>} */ (store.traces.get('a')).reliable,false);
 });
 
 test('generated-header classification uses the same byte prefix for saves and disk events',()=>{

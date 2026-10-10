@@ -2,9 +2,17 @@ const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const {Scheduler} = require('../../out/core/scheduler');
 const flush = async()=>{for(let i=0;i<12;i++) await Promise.resolve();};
-const gate=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};};
+/** @returns {{promise:Promise<void>,resolve:()=>void,reject:(error?:unknown)=>void}} */
+const gate=()=>{let resolve=/** @type {()=>void} */ (()=>{}),reject=/** @type {(error?:unknown)=>void} */ (()=>{});const promise=new Promise((yes,no)=>{resolve=/** @type {()=>void} */ (yes);reject=no;});return {promise,resolve,reject};};
+/** @typedef {ReturnType<typeof gate> & {batch:import('../../out/core/scheduler').ChangeBatch,signal:AbortSignal}} Run */
 function setup(){
- let callback; const runs=[]; const errors=[];
+
+ /** @type {(()=>void)|undefined} */
+ let callback;
+ /** @type {Run[]} */
+ const runs=[];
+ /** @type {unknown[]} */
+ const errors=[];
  const scheduler=new Scheduler({debounce:100, schedule:fn=>{callback=fn;return ()=>{if(callback===fn)callback=undefined;};},error:error=>errors.push(error),run:(batch,signal)=>{const wait=gate();runs.push({batch,signal,...wait});return wait.promise;}});
  return {scheduler,runs,errors,tick:async()=>{const fn=callback;callback=undefined;fn?.();await flush();}};
 }
@@ -19,8 +27,8 @@ test('cancels immediately but waits for exit and debounce before restart',async(
  assert.deepEqual(s.runs[1].batch,{files:['a','b'],full:true,generation:s.runs[0].batch.generation});s.runs[1].resolve();await flush();s.scheduler.dispose();
 });
 test('a save does not cancel a manual run',async()=>{
- const s=setup();const manual=gate();let signal;const task=s.scheduler.runManual(token=>{signal=token;return manual.promise;});
- s.scheduler.request(['a']);await s.tick();assert.equal(signal.aborted,false);assert.equal(s.runs.length,0);
+ const s=setup();const manual=gate();let signal=/** @type {AbortSignal|undefined} */ (undefined);const task=s.scheduler.runManual(token=>{signal=token;return manual.promise;});
+ s.scheduler.request(['a']);await s.tick();assert.equal(/** @type {AbortSignal} */ (signal).aborted,false);assert.equal(s.runs.length,0);
  manual.resolve();await task;await flush();assert.equal(s.runs.length,1);s.runs[0].resolve();await flush();s.scheduler.dispose();
 });
 test('a failed build preserves pending changes without spinning in retries',async()=>{
@@ -41,22 +49,22 @@ test('disposal cancels work and removes queued startup timers',async()=>{
 });
 
 test('queued manual cancellation settles immediately without cancelling active work or consuming changes',async()=>{
- const s=setup(),wait=gate(),abort=new AbortController();let activeSignal,ran=false;
+ const s=setup(),wait=gate(),abort=new AbortController();let activeSignal=/** @type {AbortSignal|undefined} */ (undefined);let ran=false;
  const active=s.scheduler.runManual(signal=>{activeSignal=signal;return wait.promise;});
  s.scheduler.request(['a'],true);await s.tick();
  const queued=s.scheduler.runManual(async()=>{ran=true;},abort.signal,true);
  const cancelled=assert.rejects(queued,{name:'AbortError'});abort.abort();await flush();
- assert.equal(s.scheduler.manual.length,0);await cancelled;assert.equal(ran,false);assert.equal(activeSignal.aborted,false);
+ assert.equal(/** @type {any} */ (s.scheduler).manual.length,0);await cancelled;assert.equal(ran,false);assert.equal(/** @type {AbortSignal} */ (activeSignal).aborted,false);
  wait.resolve();await active;await flush();assert.deepEqual(s.runs[0].batch.files,['a']);assert.equal(s.runs[0].batch.full,true);
  s.runs[0].resolve();await flush();s.scheduler.dispose();
 });
 
 test('removing cancelled queued jobs preserves remaining manual FIFO order',async()=>{
- const s=setup(),wait=gate(),abort=new AbortController(),order=[];
+ const s=setup(),wait=gate(),abort=new AbortController(),/** @type {string[]} */ order=[];
  const first=s.scheduler.runManual(()=>wait.promise);
- const cancelled=s.scheduler.runManual(async()=>order.push('cancelled'),abort.signal);
+ const cancelled=s.scheduler.runManual(async()=>{order.push('cancelled');},abort.signal);
  const rejection=assert.rejects(cancelled,{name:'AbortError'});
- const second=s.scheduler.runManual(async()=>order.push('second')),third=s.scheduler.runManual(async()=>order.push('third'));
+ const second=s.scheduler.runManual(async()=>{order.push('second');}),third=s.scheduler.runManual(async()=>{order.push('third');});
  abort.abort();await rejection;wait.resolve();await Promise.all([first,second,third]);
  assert.deepEqual(order,['second','third']);s.scheduler.dispose();
 });

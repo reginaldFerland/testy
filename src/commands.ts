@@ -40,8 +40,33 @@ export function registerCommands(handlers: CommandHandlers): vscode.Disposable[]
         vscode.commands.registerCommand('testy.explainSelection', (item?: vscode.TestItem) => handlers.explainSelection(item)),
         vscode.commands.registerCommand('testy.excludeProject', (item?: vscode.TestItem) => handlers.excludeProject(item)),
         vscode.commands.registerCommand('testy.runCoveringTests', () => handlers.runCoveringTests()),
-        vscode.commands.registerCommand('testy.runFile', (uri?: vscode.Uri, uris?: readonly vscode.Uri[]) => handlers.runFile(uris?.length ? uris : uri ? [uri] : []))
+        vscode.commands.registerCommand('testy.runFile', (uri?: vscode.Uri, uris?: readonly vscode.Uri[]) => handlers.runFile(uris?.length ? uris : uri ? [uri] : [])),
+        vscode.commands.registerCommand('testy.runFolder', (uri?: vscode.Uri, uris?: readonly vscode.Uri[]) => handlers.runFile(uris?.length ? uris : uri ? [uri] : []))
     ];
+}
+
+/** Every contributed command; `registerCommands` registers the same set. */
+export const commandIds = ['testy.refreshTests', 'testy.toggleAutoRun', 'testy.pause', 'testy.resume', 'testy.runAffected', 'testy.cancelRun', 'testy.clearCoverage', 'testy.exportCoverage',
+    'testy.resetCaches', 'testy.showOutput', 'testy.showMenu', 'testy.explainSelection', 'testy.excludeProject', 'testy.runCoveringTests', 'testy.runFile', 'testy.runFolder'] as const;
+
+/**
+ * Before Testy can start (Restricted Mode, or no folder open), its commands only explain why:
+ * walkthrough links and keybindings then work instead of failing with an unknown command.
+ * Dispose the registrations before `registerCommands` registers the real ones.
+ */
+export function registerInactiveCommands(reason: 'restricted' | 'noFolder'): vscode.Disposable {
+    const explain = async (): Promise<void> => {
+        if (reason === 'noFolder') {
+            const open = l10n.t('Open Folder');
+            const choice = await vscode.window.showInformationMessage(l10n.t('Testy needs an open folder with C# test projects.'), open);
+            if (choice === open) {await vscode.commands.executeCommand('workbench.action.files.openFolder');}
+            return;
+        }
+        const manage = l10n.t('Manage Workspace Trust');
+        const choice = await vscode.window.showInformationMessage(l10n.t('Testy builds and runs workspace code, so it starts only after you trust this workspace.'), manage);
+        if (choice === manage) {await vscode.commands.executeCommand('workbench.trust.manage');}
+    };
+    return vscode.Disposable.from(...commandIds.map(id => vscode.commands.registerCommand(id, explain)));
 }
 
 /** Add a project to `testy.projects.exclude`, at folder level in a multi-root workspace. */

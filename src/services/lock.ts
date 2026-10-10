@@ -7,9 +7,11 @@ import { currentProcessStamp, isProcessAlive, isProcessStamp } from './processSt
 /** Holders refresh their owner file. A lock is taken over when its holder has
  * exited. A silent heartbeat only matters for holders whose stamp cannot tell a
  * reused PID from the original process; elsewhere a paused holder (suspended
- * laptop, blocked event loop) is slow, not gone. `cleanupWaitMs` bounds waits
- * on shutdown paths, where a hung live holder must not block disposal. */
-export const lockTiming = { heartbeatMs: 5_000, staleMs: 60_000, cleanupWaitMs: 10_000 };
+ * laptop, blocked event loop) is slow, not gone. Windows stamps never carry a
+ * start time, so there the silence must last `windowsStaleMs` while the contender
+ * itself keeps running. `cleanupWaitMs` bounds waits on shutdown paths, where a
+ * hung live holder must not block disposal. */
+export const lockTiming = { heartbeatMs: 5_000, staleMs: 60_000, windowsStaleMs: 600_000, cleanupWaitMs: 10_000 };
 
 export class LockTimeoutError extends Error {
     constructor(directory: string) {super(`Timed out waiting for the lock ${directory}.`); this.name = 'LockTimeoutError';}
@@ -23,7 +25,10 @@ export interface LockOptions {
     readonly timeoutMs?: number;
 }
 
-async function abandoned(directory: string, name: string): Promise<boolean> {
+/** Heartbeat silence a waiting contender has watched, by owner file name. */
+type Silence = Map<string, { readonly mtimeMs: number; readonly since: number; seen: number }>;
+
+async function abandoned(directory: string, name: string, silence: Silence): Promise<boolean> {
     const pid = Number(name.split('-')[0]);
     if (!Number.isSafeInteger(pid) || pid <= 0) {return false;}
     const file = path.join(directory, name);
@@ -36,7 +41,17 @@ async function abandoned(directory: string, name: string): Promise<boolean> {
     if (!await isProcessAlive(pid, stamp)) {return true;}
     // The stamp identifies a live holder. Without a start time, a reused PID
     // looks identical, so only then does a silent heartbeat prove abandonment.
-    return stamp.start === undefined && Date.now() - stat.mtimeMs > lockTiming.staleMs;
+    if (stamp.start !== undefined) {return false;}
+    if (process.platform !== 'win32') {return Date.now() - stat.mtimeMs > lockTiming.staleMs;}
+    // Every Windows holder lacks a start time. Count only silence observed while this
+    // contender ran: after a suspend both resume together, and the live holder's
+    // next heartbeat must get its turn. A gap between polls restarts the watch.
+    const now = Date.now(), watched = silence.get(name);
+    if (!watched || watched.mtimeMs !== stat.mtimeMs || now - watched.seen > lockTiming.heartbeatMs) {
+        silence.set(name, { mtimeMs: stat.mtimeMs, since: now, seen: now }); return false;
+    }
+    watched.seen = now;
+    return now - watched.since > lockTiming.windowsStaleMs;
 }
 
 /** A process-owned directory serializes shared storage without blocking the host.
@@ -46,7 +61,7 @@ export async function withLock<T>(directory: string, signal: AbortSignal | undef
     options: LockOptions = {}): Promise<T> {
     await fs.mkdir(path.dirname(directory), { recursive: true });
     const owner = `${process.pid}-${randomUUID()}`;
-    const deadline = options.timeoutMs === undefined ? Infinity : Date.now() + options.timeoutMs;
+    const deadline = options.timeoutMs === undefined ? Infinity : Date.now() + options.timeoutMs, silence: Silence = new Map();
     for (;;) {
         signal?.throwIfAborted();
         try {await fs.mkdir(directory); break;}
@@ -54,7 +69,7 @@ export async function withLock<T>(directory: string, signal: AbortSignal | undef
         try {
             const names = await fs.readdir(directory);
             for (const name of names) {
-                if (!await abandoned(directory, name)) {continue;}
+                if (!await abandoned(directory, name, silence)) {continue;}
                 // Only the contender that removes this unique owner may
                 // remove the directory. It cannot remove a successor's lock.
                 await fs.unlink(path.join(directory, name)); await fs.rmdir(directory);

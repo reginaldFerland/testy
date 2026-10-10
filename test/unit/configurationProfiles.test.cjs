@@ -3,6 +3,7 @@ const assert=require('node:assert/strict');
 const {additionalConfigurations}=require('../../out/core/buildConfigurations');
 const {createTesty}=require('./support/controller.cjs');
 
+/** @param {unknown} value */
 const plain=value=>JSON.parse(JSON.stringify(value));
 const token={isCancellationRequested:false,onCancellationRequested:()=>({dispose(){}})};
 
@@ -12,9 +13,9 @@ test('additional configurations are trimmed, distinct and never repeat the autom
 });
 
 test('each additional configuration gets non-default Run, Coverage and Debug profiles, recreated when the setting changes',async()=>{
- let changed;
+ /** @type {any} */ let changed; // assigned by the stubbed onDidChangeConfiguration
  const {testy,profiles,settings}=createTesty({configuration:{additionalConfigurations:['Release']},
-  workspace:{onDidChangeConfiguration:handler=>{changed=handler;return{dispose(){}};}}});
+  workspace:{onDidChangeConfiguration:(/** @type {(event:any)=>void} */ handler)=>{changed=handler;return{dispose(){}};}}});
  const labels=()=>profiles.filter(profile=>!profile.disposed).map(profile=>profile.label);
  assert.deepEqual(labels(),['Run','Run with coverage','Debug','Run (Release)','Run with coverage (Release)','Debug (Release)']);
  const release=profiles.filter(profile=>profile.label.endsWith('(Release)'));
@@ -22,15 +23,15 @@ test('each additional configuration gets non-default Run, Coverage and Debug pro
  assert.equal(typeof release[1].loadDetailedCoverage,'function','coverage detail loads through extra coverage profiles too');
  assert.equal(typeof release[1].loadDetailedCoverageForTest,'function');
 
- const unrelated=()=>({affectsConfiguration:key=>key==='testy'});
+ const unrelated=()=>({affectsConfiguration:(/** @type {string} */ key)=>key==='testy'});
  changed(unrelated());
  assert.equal(profiles.length,6,'unrelated changes keep the profiles');
- settings.additionalConfigurations=['Release','Staging'];
- changed({affectsConfiguration:key=>key==='testy'||key==='testy.additionalConfigurations'});
+ /** @type {Record<string,any>} */ (settings).additionalConfigurations=['Release','Staging'];
+ changed({affectsConfiguration:(/** @type {string} */ key)=>key==='testy'||key==='testy.additionalConfigurations'});
  assert.ok(release.every(profile=>profile.disposed),'old profiles are disposed');
  assert.deepEqual(labels(),['Run','Run with coverage','Debug','Run (Release)','Run with coverage (Release)','Debug (Release)','Run (Staging)','Run with coverage (Staging)','Debug (Staging)']);
  settings.additionalConfigurations=[];
- changed({affectsConfiguration:key=>key==='testy'||key==='testy.additionalConfigurations'});
+ changed({affectsConfiguration:(/** @type {string} */ key)=>key==='testy'||key==='testy.additionalConfigurations'});
  assert.deepEqual(labels(),['Run','Run with coverage','Debug']);
  await testy.dispose();
 });
@@ -38,10 +39,11 @@ test('each additional configuration gets non-default Run, Coverage and Debug pro
 test('a manual run through a configuration profile carries the configuration; other profiles and automatic runs do not',async()=>{
  const {testy,profiles}=createTesty({configuration:{additionalConfigurations:['Release']},
   tests:{createTestRun:()=>({token:{onCancellationRequested:()=>({dispose(){}})},appendOutput(){},end(){},enqueued(){}})}});
+ /** @type {Record<string,any>[]} */
  const manuals=[];
- testy.engine.run=async(batch,signal,manual)=>{manuals.push(manual);return{files:0,tests:0,passed:0,failed:0,skipped:0,duration:1,coverageAvailable:false};};
- const profile=label=>profiles.find(item=>item.label===label);
- const request=chosen=>({include:undefined,exclude:undefined,profile:chosen,continuous:false});
+ testy.engine.run=async(/** @type {unknown} */ batch,/** @type {unknown} */ signal,/** @type {Record<string,any>} */ manual)=>{manuals.push(manual);return{files:0,tests:0,passed:0,failed:0,skipped:0,duration:1,coverageAvailable:false};};
+ const profile=(/** @type {string} */ label)=>profiles.find(item=>item.label===label);
+ const request=(/** @type {unknown} */ chosen)=>({include:undefined,exclude:undefined,profile:chosen,continuous:false});
  await profile('Run (Release)').handler(request(profile('Run (Release)')),token);
  await profile('Run with coverage (Release)').handler(request(profile('Run with coverage (Release)')),token);
  await profile('Run').handler(request(profile('Run')),token);
@@ -54,8 +56,9 @@ test('a manual run through a configuration profile carries the configuration; ot
 test('a debug profile for an additional configuration debugs with that configuration',async()=>{
  const {testy,profiles}=createTesty({configuration:{additionalConfigurations:['Release']},api:{extensions:{getExtension:()=>({})}},
   tests:{createTestRun:()=>({token:{onCancellationRequested:()=>({dispose(){}})},appendOutput(){},end(){},enqueued(){}})}});
+ /** @type {Record<string,any>[]} */
  const manuals=[];
- testy.engine.run=async(batch,signal,manual)=>{manuals.push(manual);return{files:0,tests:0,passed:0,failed:0,skipped:0,duration:1,coverageAvailable:false};};
+ testy.engine.run=async(/** @type {unknown} */ batch,/** @type {unknown} */ signal,/** @type {Record<string,any>} */ manual)=>{manuals.push(manual);return{files:0,tests:0,passed:0,failed:0,skipped:0,duration:1,coverageAvailable:false};};
  const debug=profiles.find(item=>item.label==='Debug (Release)');
  await debug.handler({include:undefined,exclude:undefined,profile:debug,continuous:false},token);
  assert.deepEqual(plain(manuals.map(manual=>[manual.configuration,manual.debug,manual.coverage])),[['Release',true,false]]);

@@ -1,6 +1,6 @@
 import * as path from 'node:path';
 import { Project, TestFile, Trace } from './model';
-import { isConfigurationFile } from './paths';
+import { isConfigurationFile, isToolingFile } from './paths';
 
 export interface Selection {
     readonly groups: readonly TestFile[];
@@ -65,7 +65,8 @@ export class ProjectIndex {
     private readonly dependents = new Map<string, Set<string>>();
     private readonly projectIds: ReadonlySet<string>;
 
-    constructor(readonly projects: readonly Project[]) {
+    /** `evaluated`: owned inputs that project evaluation itself read, such as imports with other extensions. */
+    constructor(readonly projects: readonly Project[], private readonly evaluated: ReadonlySet<string> = new Set()) {
         this.projectIds = new Set(projects.map(project => project.file));
         const assemblies = new Map(projects.flatMap(project => (project.assemblies ?? [project.assembly]).map(assembly => [assembly, project.file] as const)));
         for (const project of projects) {
@@ -78,17 +79,20 @@ export class ProjectIndex {
 
     hasSource(file: string): boolean { return this.owners.has(file); }
 
+    /** A change that requires project evaluation again: a file found by name (see isConfigurationFile) or read while evaluating. */
+    isConfiguration(file: string): boolean { return isConfigurationFile(file) || this.evaluated.has(file); }
+
+    /** A file no project owns, outside every project directory. */
+    isOutsideProjects(file: string): boolean { return !this.owners.has(file) && !this.directoryOwners(file); }
+
     affected(changes: readonly string[]): Set<string> {
         const affected = new Set<string>();
         for (const file of changes) {
             const exact = this.owners.get(file);
             if (exact) {for (const owner of exact) {affected.add(owner);} continue;}
-            let directory = path.dirname(file);
-            let owners = this.directories.get(directory);
-            while (!owners && path.dirname(directory) !== directory) {
-                directory = path.dirname(directory); owners = this.directories.get(directory);
-            }
-            for (const owner of owners ?? this.projectIds) {affected.add(owner);}
+            // Above every project, configuration (a new Directory.Build.props or nuget.config) can affect all of them, and so can
+            // an unknown file that tests read at runtime, such as shared test data. Only well-known non-.NET tooling is ignored.
+            for (const owner of this.directoryOwners(file) ?? (isToolingFile(file) && !isConfigurationFile(file) ? [] : this.projectIds)) {affected.add(owner);}
         }
         const queue = [...affected];
         for (const project of queue) {
@@ -97,6 +101,16 @@ export class ProjectIndex {
             }
         }
         return affected;
+    }
+
+    /** Projects whose directory contains the file, nearest first. */
+    private directoryOwners(file: string): ReadonlySet<string> | undefined {
+        let directory = path.dirname(file);
+        let owners = this.directories.get(directory);
+        while (!owners && path.dirname(directory) !== directory) {
+            directory = path.dirname(directory); owners = this.directories.get(directory);
+        }
+        return owners;
     }
 
     private add(index: Map<string, Set<string>>, key: string, value: string): void {
@@ -130,8 +144,11 @@ export function selectTests(
             || coarse.has(group.id) || (observed ? observed.has(group.id) : traces.get(group.id)?.dependencies.includes(change)));
         if (coarse.size) {fallback = true;}
         for (const group of mapped) {projectsForChange.add(group.project);}
-        const broad = isConfigurationFile(change) || conservativeChanges.has(change) || mapped.length === 0;
-        const broadReason: FallbackReason = isConfigurationFile(change) ? 'configuration' : conservativeChanges.has(change) ? 'unanalyzed' : 'unmapped';
+        // Non-.NET tooling configuration outside every project directory (see isToolingFile) cannot change a build or a trace.
+        if (!mapped.length && !projectsForChange.size) {continue;}
+        const configuration = index.isConfiguration(change);
+        const broad = configuration || conservativeChanges.has(change) || mapped.length === 0;
+        const broadReason: FallbackReason = configuration ? 'configuration' : conservativeChanges.has(change) ? 'unanalyzed' : 'unmapped';
         if (broad) {fallback = true;}
         for (const group of mapped) {log.add(group, (group.file ?? group.project) === change ? 'edited' : 'covers', change);}
         if (broad && !groups.some(group => projectsForChange.has(group.project))) {

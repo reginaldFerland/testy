@@ -5,14 +5,19 @@ const {filterEntryPoints}=require('../../out/services/projects');
 const {matchesPattern,normalizePath}=require('../../out/core/paths');
 const {loadUi}=require('./support/ui.cjs');
 
+/** @param {unknown} value */
 const plain=value=>JSON.parse(JSON.stringify(value));
 
-/** The real `configuration()` over workspace-level and folder-level setting values. */
+/**
+ * The real `configuration()` over workspace-level and folder-level setting values.
+ * @param {string[]} folders
+ * @param {{workspace?:Record<string,any>,folder?:Record<string,Record<string,any>>}} [options]
+ */
 function configurationFor(folders,{workspace={},folder={}}={}) {
  const workspaceFolders=folders.map((fsPath,index)=>({uri:{fsPath},name:path.basename(fsPath),index}));
- const vscode={workspace:{workspaceFolders,getConfiguration:(section,scope)=>({
-  get:(key,fallback)=>key in workspace?workspace[key]:fallback,
-  inspect:key=>({workspaceValue:workspace[key],workspaceFolderValue:scope?folder[scope.fsPath]?.[key]:undefined})
+ const vscode={workspace:{workspaceFolders,getConfiguration:(/** @type {string} */ section,/** @type {{fsPath:string}|undefined} */ scope)=>({
+  get:(/** @type {string} */ key,/** @type {unknown} */ fallback)=>key in workspace?workspace[key]:fallback,
+  inspect:(/** @type {string} */ key)=>({workspaceValue:workspace[key],workspaceFolderValue:scope?folder[scope.fsPath]?.[key]:undefined})
  })}};
  return loadUi({vscode,stubs:{configuration:undefined}}).module('configuration').configuration();
 }
@@ -33,15 +38,18 @@ test('folder-level path settings apply to their folder, resolved against it',()=
   [b]:{solution:'${workspaceFolder}/sub/B.sln'}}});
  assert.equal(config.solution,undefined);
  assert.deepEqual(plain(config.solutions),[{file:path.join(a,'App.slnf'),root:a},{file:path.join(b,'sub','B.sln'),root:b}]);
- const excluded=file=>config.excludes.some(pattern=>matchesPattern(file,pattern,[a,b]));
+ /** @param {string} file */
+ const excluded=file=>config.excludes.some((/** @type {string} */ pattern)=>matchesPattern(file,pattern,[a,b]));
  assert.equal(excluded(path.join(a,'legacy','X.cs')),true);
  assert.equal(excluded(path.join(b,'legacy','X.cs')),false,'a folder-level exclude does not reach other folders');
  assert.equal(excluded(path.join(b,'Shared','X.cs')),true,'workspace patterns still apply everywhere');
- const included=file=>config.projects.include.some(pattern=>matchesPattern(file,pattern,[a,b]));
+ /** @param {string} file */
+ const included=file=>config.projects.include.some((/** @type {string} */ pattern)=>matchesPattern(file,pattern,[a,b]));
  assert.equal(included(path.join(a,'tests','T','T.csproj')),true);
  assert.equal(included(path.join(a,'src','App','App.csproj')),false);
  assert.equal(included(path.join(b,'src','App','App.csproj')),true,'a folder without include patterns keeps every project');
- const projectExcluded=file=>config.projects.exclude.some(pattern=>matchesPattern(file,pattern,[a,b]));
+ /** @param {string} file */
+ const projectExcluded=file=>config.projects.exclude.some((/** @type {string} */ pattern)=>matchesPattern(file,pattern,[a,b]));
  assert.equal(projectExcluded(path.join(a,'tests','Slow','Slow.csproj')),true);
  assert.equal(projectExcluded(path.join(b,'tests','Slow','Slow.csproj')),false);
 });
@@ -55,7 +63,7 @@ test('a workspace-level solution keeps applying to folders without their own val
 test('folder paths with glob characters are escaped when anchoring patterns',()=>{
  const a=normalizePath(path.resolve('/ws/a [x]')),b=normalizePath(path.resolve('/ws/b'));
  const config=configurationFor([a,b],{folder:{[a]:{exclude:['gen/**']}}});
- assert.equal(config.excludes.some(pattern=>matchesPattern(path.join(a,'gen','X.cs'),pattern,[a,b])),true);
+ assert.equal(config.excludes.some((/** @type {string} */ pattern)=>matchesPattern(path.join(a,'gen','X.cs'),pattern,[a,b])),true);
 });
 
 test('run-wide settings that differ between folders are reported and the workspace value is used',()=>{

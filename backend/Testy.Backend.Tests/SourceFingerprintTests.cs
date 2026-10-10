@@ -164,7 +164,7 @@ public class SourceFingerprintTests
     [InlineData("#if NEVER\nglobal using Hidden = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute;\n#endif", new[] { "Hidden" })]
     public void FindsGlobalExcludingAliases(string content, string[] expected)
     {
-        Assert.Equal(expected, SourceAnalysis.GlobalAliases(content).Order(StringComparer.Ordinal));
+        Assert.Equal(expected, SourceAnalysis.GlobalAliases(content, TestContext.Current.CancellationToken).Order(StringComparer.Ordinal));
     }
 
     [Fact]

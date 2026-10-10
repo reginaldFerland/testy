@@ -19,7 +19,9 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(TESTY_RELEASE)' == 'true'">
     <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
-    <!-- Packaged builds must restore exactly what the lock files record. -->
+  </PropertyGroup>
+  <!-- Packaged builds, and CI (GitHub Actions sets CI=true), must restore exactly what the lock files record. -->
+  <PropertyGroup Condition="'$(TESTY_RELEASE)' == 'true' Or '$(CI)' == 'true'">
     <RestoreLockedMode>true</RestoreLockedMode>
   </PropertyGroup>
 </Project>

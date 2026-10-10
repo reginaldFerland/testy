@@ -85,6 +85,30 @@ function boundEntry(file: string, entry: EvaluationEntry): boolean {
     return entry.graph.every(covered);
 }
 
+/** The envelope exactly as encode() writes it. Its checksum covers the raw data bytes,
+ * which are verified before parsing; any other layout is not a snapshot of ours. */
+const envelope = /^\{"version":1,"epoch":"([^"]{1,64})","checksum":"([0-9a-f]{64})","data":/;
+const digestChunk = 4 * 1024 * 1024;
+
+/** Hash in slices so a snapshot near its size limit never blocks the host in one piece. */
+async function digest(bytes: Buffer, signal?: AbortSignal): Promise<string> {
+    const hasher = createHash('sha256');
+    for (let offset = 0; offset < bytes.length; offset += digestChunk) {
+        hasher.update(bytes.subarray(offset, offset + digestChunk)); await yieldTurn(); signal?.throwIfAborted();
+    }
+    return hasher.digest('hex');
+}
+
+/** array() for large tables, yielding between slices of validation work. */
+async function validArray<T>(value: unknown, valid: (item: unknown) => item is T, limit: number, signal?: AbortSignal): Promise<boolean> {
+    if (!Array.isArray(value) || value.length > limit) {return false;}
+    for (let index = 0; index < value.length; index++) {
+        if (!valid(value[index])) {return false;}
+        if (index % 16 === 15) {await yieldTurn(); signal?.throwIfAborted();}
+    }
+    return true;
+}
+
 function memoized<T extends object>(valid: (value: unknown) => value is T): (value: unknown) => value is T {
     const known = new WeakMap<object, boolean>();
     return (value: unknown): value is T => {
@@ -101,30 +125,31 @@ export async function readEvaluationSnapshot(storage: string, options: Evaluatio
     const stat = await fs.lstat(file);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > maxBytes) {return undefined;}
     const handle = await fs.open(file, constants.O_RDONLY | ((constants as { readonly O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0));
-    let contents: string;
+    let bytes: Buffer, count = 0;
     try {
         const current = await handle.stat();
         if (!current.isFile() || current.size > maxBytes) {return undefined;}
         // Cap the actual read too: a concurrently growing corrupt file cannot
         // make readFile allocate beyond the metadata limit checked above.
-        const bytes = Buffer.alloc(current.size + 1); let count = 0;
+        bytes = Buffer.alloc(current.size + 1);
         while (count < bytes.length) {
             signal?.throwIfAborted();
             const read = await handle.read(bytes, count, bytes.length - count, count);
             if (!read.bytesRead) {break;} count += read.bytesRead;
         }
         if (count !== current.size) {return undefined;}
-        contents = bytes.subarray(0, count).toString('utf8');
     } finally {await handle.close();}
     signal?.throwIfAborted();
-    const envelope: unknown = JSON.parse(contents);
-    if (!record(envelope) || !fields(envelope, ['version', 'epoch', 'checksum', 'data']) || envelope.version !== 1
-        || typeof envelope.epoch !== 'string' || !uuid.test(envelope.epoch) || !fingerprint(envelope.checksum) || !record(envelope.data)
-        || hash(JSON.stringify(envelope.data)) !== envelope.checksum) {return undefined;}
-    const data = envelope.data;
-    if (!fields(data, ['projects', 'inputs', 'entries']) || !array(data.projects, validProject, maximumNodes)
-        || !array(data.inputs, validInputs, maximumNodes) || !Array.isArray(data.entries) || data.entries.length > maxEntries) {return undefined;}
-    const projects = data.projects, inputs = data.inputs, entries = new Map<string, EvaluationEntry>();
+    const header = envelope.exec(bytes.toString('latin1', 0, Math.min(count, 256)));
+    if (!header || bytes[count - 1] !== 0x7d || !uuid.test(header[1]!)) {return undefined;}
+    // Verify the stored bytes themselves; re-serializing parsed data would cost as much as the parse.
+    const body = bytes.subarray(header[0].length, count - 1);
+    if (await digest(body, signal) !== header[2]) {return undefined;}
+    const data: unknown = JSON.parse(body.toString('utf8'));
+    if (!record(data) || !fields(data, ['projects', 'inputs', 'entries']) || !await validArray(data.projects, validProject, maximumNodes, signal)
+        || !await validArray(data.inputs, validInputs, maximumNodes, signal) || !Array.isArray(data.entries) || data.entries.length > maxEntries) {return undefined;}
+    // validArray() checked both tables above.
+    const projects = data.projects as Project[], inputs = data.inputs as EvaluationInputs[], entries = new Map<string, EvaluationEntry>();
     const indices = (value: unknown, length: number): value is number[] => array(value, (item): item is number => Number.isSafeInteger(item) && (item as number) >= 0 && (item as number) < length, maximumNodes) && value.length > 0;
     for (const value of data.entries) {
         signal?.throwIfAborted();
@@ -136,7 +161,7 @@ export async function readEvaluationSnapshot(storage: string, options: Evaluatio
         if (!boundEntry(value.file, entry)) {return undefined;} entries.set(value.file, entry);
         await yieldTurn();
     }
-    signal?.throwIfAborted(); return { epoch: envelope.epoch, entries };
+    signal?.throwIfAborted(); return { epoch: header[1]!, entries };
 }
 
 async function encode(entries: ReadonlyMap<string, EvaluationEntry>, options: EvaluationStorageLimits, signal?: AbortSignal): Promise<string> {

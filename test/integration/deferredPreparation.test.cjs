@@ -4,10 +4,18 @@ const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:
 const {TestEngine}=require('../../out/services/engine');
 const {normalizePath}=require('../../out/core/paths');
 
+/** @typedef {import('../../out/core/model').TestFile} TestFile */
+/** @typedef {import('../../out/core/model').TestResult} TestResult */
+/** @typedef {import('../../out/core/coverage').StoredTrace} StoredTrace */
+/** @typedef {{assembly:string,project:string}} InstrumentCall */
+/** @typedef {{assembly:string,instruments:number,nodes?:unknown}} RequestCall */
+/** @typedef {{instruments:InstrumentCall[],discoveries:RequestCall[],runs:RequestCall[],activeInstruments:number,activeRequests:number,afterInstrument?:((invocation:InstrumentCall)=>unknown)|undefined}} Probe */
+
+/** @param {import('node:test').TestContext} t @param {{dynamic?:'xunit'|'mstest'}} [options] */
 async function fixture(t,{dynamic}={}) {
  const temp=await fs.mkdtemp(path.join(os.tmpdir(),'testy-deferred-preparation-'));
  const root=path.join(temp,'workspace'),storage=path.join(temp,'state'),control=path.join(temp,'rows.txt');
- const file=relative=>normalizePath(path.join(root,relative));
+ const file=(/** @type {string} */ relative)=>normalizePath(path.join(root,relative));
  const layers=['Core','App','Infra','Web'];
  await fs.writeFile(control,'1');
  for(const [index,layer] of layers.entries()) {
@@ -33,14 +41,16 @@ async function fixture(t,{dynamic}={}) {
   }
   await fs.writeFile(file(`${name}/Feature${index}Tests.cs`),source);
  }
+ /** @type {import('../../out/core/model').EngineConfiguration} */
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:60000,
   coverageTool:process.env.TESTY_COVERAGE_TOOL,maxParallelProjects:4,maxParallelTestFiles:4};
- const state={output:[],results:[],selections:[]};
+ const state=/** @type {{output:string[],results:(TestResult&{group:TestFile})[],selections:import('../../out/core/selection').Selection[]}} */ ({output:[],results:[],selections:[]});
  const engine=new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
   events:{output:text=>state.output.push(text),phase(){},discovered(){},selected:selection=>state.selections.push(selection),
    result:(group,result)=>state.results.push({group,...result}),started(){},coverage(){},invalidated(){}}});
  const processes=require('../../out/services/process'),mtp=require('../../out/services/mtp');
  const runProcess=processes.runProcess,requestTests=mtp.requestTests;
+ /** @type {Probe} */
  const probe={instruments:[],discoveries:[],runs:[],activeInstruments:0,activeRequests:0};
  processes.runProcess=async(command,args,options)=>{
   if(args[0]!=='instrument')return runProcess(command,args,options);
@@ -50,12 +60,14 @@ async function fixture(t,{dynamic}={}) {
   }finally{probe.activeInstruments--;}
  };
  mtp.requestTests=async(options,operation,...rest)=>{
+  /** @type {RequestCall} */
   const invocation={assembly:options.assembly,instruments:probe.instruments.length};
   (operation==='discover'?probe.discoveries:probe.runs).push(invocation);probe.activeRequests++;
   try {const nodes=await requestTests(options,operation,...rest);invocation.nodes=nodes;return nodes;}
   finally{probe.activeRequests--;}
  };
  t.after(async()=>{await engine.dispose();processes.runProcess=runProcess;mtp.requestTests=requestTests;await fs.rm(temp,{recursive:true,force:true});});
+ /** @type {(batch?:import('../../out/core/scheduler').ChangeBatch,manual?:import('../../out/services/engine/types').ManualSelection)=>Promise<import('../../out/services/engine/types').RunSummary>} */
  const run=(batch={files:[],full:true},manual)=>engine.run(batch,new AbortController().signal,manual);
  const reset=()=>{probe.instruments.length=0;probe.discoveries.length=0;probe.runs.length=0;state.results.length=0;state.selections.length=0;state.output.length=0;};
  const change=async()=>{
@@ -65,7 +77,9 @@ async function fixture(t,{dynamic}={}) {
  return {temp,root,storage,file,control,config,state,engine,probe,run,reset,change};
 }
 
+/** @param {Probe} probe */
 function preparedProjects(probe) {return [...new Set(probe.instruments.map(item=>item.project))].sort();}
+/** @param {Probe} probe @param {string} name */
 function discoveriesFor(probe,name) {return probe.discoveries.filter(item=>path.basename(item.assembly)===`${name}.dll`);}
 
 test('an affected dependency rebuild freshly discovers every target but instruments only the selected project',{timeout:150000},async t=>{
@@ -79,15 +93,15 @@ test('an affected dependency rebuild freshly discovers every target but instrume
  assert.equal(f.probe.instruments.length,5,'unselected targets do not pay the four-layer instrumentation cost');
  assert.deepEqual(preparedProjects(f.probe),['Suite0']);
  assert.deepEqual(new Set(f.probe.instruments.map(item=>path.basename(item.assembly))),new Set(['Core.dll','App.dll','Infra.dll','Web.dll','Suite0.dll']));
- assert.equal(f.probe.runs.length,1);assert.equal(path.basename(f.probe.runs[0].assembly),'Suite0.dll');
- for(const group of f.engine.groups.filter(item=>path.basename(item.project)!=='Suite0.csproj'))assert.equal(f.engine.coverage.traces.get(group.id).reliable,true,'unchanged targets retain their previous reliable coverage');
+ assert.equal(f.probe.runs.length,1);assert.equal(path.basename(/** @type {RequestCall} */ (f.probe.runs[0]).assembly),'Suite0.dll');
+ for(const group of f.engine.groups.filter(item=>path.basename(item.project)!=='Suite0.csproj'))assert.equal(/** @type {StoredTrace} */ (f.engine.coverage.traces.get(group.id)).reliable,true,'unchanged targets retain their previous reliable coverage');
  assert.deepEqual(await fs.readdir(path.join(f.storage,'runs')),[]);
- const deferredPath=discoveriesFor(f.probe,'Suite2')[0].assembly;
- const manual={groups:new Set([f.engine.groups.find(group=>path.basename(group.project)==='Suite2.csproj').id])};
+ const deferredPath=/** @type {RequestCall} */ (discoveriesFor(f.probe,'Suite2')[0]).assembly;
+ const manual={groups:new Set([/** @type {TestFile} */ (f.engine.groups.find(group=>path.basename(group.project)==='Suite2.csproj')).id])};
  f.reset();assert.equal((await f.run({files:[],full:false},manual)).passed,1,f.state.output.join(''));
  assert.equal(f.probe.instruments.length,5,'a later manual run upgrades the retained discovery-only artifact');
  assert.equal(f.probe.discoveries.length,1,'eager promotion completes before its one fresh manual discovery');
- assert.equal(f.probe.discoveries[0].assembly,deferredPath,'a retained discovery-only cache entry preserves the canonical path when promoted');
+ assert.equal(/** @type {RequestCall} */ (f.probe.discoveries[0]).assembly,deferredPath,'a retained discovery-only cache entry preserves the canonical path when promoted');
  f.reset();assert.equal((await f.run({files:[],full:false},manual)).passed,1,f.state.output.join(''));
  assert.equal(f.probe.instruments.length,0,'the promoted artifact is reusable on the next unchanged run');
 });
@@ -101,14 +115,14 @@ test('changed dynamic inventories can select and upgrade a previously unanticipa
  const dynamic=discoveriesFor(f.probe,'Suite1');
  assert.equal(dynamic.length,2,'a newly selected target refreshes native identities after upgrading its discovery-only output');
  assert.equal(new Set(dynamic.map(item=>item.assembly)).size,1,'the upgrade retains the canonical private assembly path');
- assert.equal(f.engine.groups.find(group=>path.basename(group.project)==='Suite1.csproj').tests.length,2,'fresh dynamic rows replace the original inventory');
+ assert.equal(/** @type {TestFile} */ (f.engine.groups.find(group=>path.basename(group.project)==='Suite1.csproj')).tests.length,2,'fresh dynamic rows replace the original inventory');
  assert.equal(discoveriesFor(f.probe,'Suite2').length,1);assert.equal(discoveriesFor(f.probe,'Suite3').length,1);
  assert.equal(f.probe.activeInstruments,0);assert.equal(f.probe.activeRequests,0);
 });
 
 test('xUnit row selection and exclusion remain exact after a deferred coverage upgrade',{timeout:180000},async t=>{
  const f=await fixture(t,{dynamic:'xunit'});assert.equal((await f.run()).passed,4,f.state.output.join(''));
- const initial=f.engine.groups.find(group=>path.basename(group.project)==='Suite1.csproj'),originalId=initial.tests[0].id;
+ const initial=/** @type {TestFile} */ (f.engine.groups.find(group=>path.basename(group.project)==='Suite1.csproj')),originalId=/** @type {import('../../out/core/model').DiscoveredTest} */ (initial.tests[0]).id;
  f.reset();await fs.writeFile(f.control,'2');const changed=await f.change();
  const result=await f.run(changed);assert.equal(result.tests,3);assert.equal(result.passed,1);assert.equal(result.failed,2,f.state.output.join(''));
  const dynamic=discoveriesFor(f.probe,'Suite1');assert.equal(dynamic.length,2,'xUnit is rediscovered after lazy instrumentation');
@@ -136,7 +150,7 @@ test('cancelling a deferred upgrade drains preparation and retries with intact c
  f.probe.afterInstrument=undefined;f.reset();
  const retry=await f.run(changed);assert.equal(retry.tests,3);assert.equal(retry.passed,2);assert.equal(retry.failed,1,f.state.output.join(''));
  assert.ok(f.probe.instruments.some(item=>item.project==='Suite1'),'the cancelled upgrade is rebuilt before execution');
- const group=f.engine.groups.find(item=>path.basename(item.project)==='Suite1.csproj');assert.equal(f.engine.coverage.traces.get(group.id).reliable,true);
+ const group=/** @type {TestFile} */ (f.engine.groups.find(item=>path.basename(item.project)==='Suite1.csproj'));assert.equal(/** @type {StoredTrace} */ (f.engine.coverage.traces.get(group.id)).reliable,true);
  await f.engine.dispose();
  for(const name of (await fs.readdir(path.join(f.storage,'prepared-v2'))).filter(name=>name.endsWith('.owner.json'))){
   const owner=JSON.parse(await fs.readFile(path.join(f.storage,'prepared-v2',name),'utf8'));assert.equal(owner.state,'parked');assert.equal(owner.pid,0);

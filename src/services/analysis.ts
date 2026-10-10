@@ -1,5 +1,6 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { contentHash, preparePathNormalizer } from '../core/paths';
 import { Project } from '../core/model';
 import { EnvironmentError } from '../core/errors';
@@ -100,7 +101,10 @@ export async function sourceAnalysisBatch(dotnet: string, analyzer: string, file
     const analyses = new Map<string, SourceShape | null>();
     const sourceHashes = new Map<string, string>();
     const normalize = await preparePathNormalizer(expected, options.signal);
+    let work = 0;
     for (const file of expected) {
+        // Responses can hold tens of thousands of records; validate them in slices.
+        if (++work % 512 === 0) {await yieldTurn(); options.signal?.throwIfAborted();}
         if (!Object.hasOwn(value.analyses, file)) {throw new Error('Incomplete combined source analysis response.');}
         const shape = value.analyses[file];
         if (shape !== null && !sourceShape(shape)) {throw new Error('Invalid combined source analysis record.');}
@@ -145,7 +149,9 @@ export async function sourceAnalyses(dotnet: string, analyzer: string, files: re
     const parsed: unknown = JSON.parse(output);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {throw new Error('Invalid source analysis response.');}
     const result = new Map<string, SourceShape | null>(), normalize = await preparePathNormalizer(files, options.signal);
+    let work = 0;
     for (const file of files) {
+        if (++work % 512 === 0) {await yieldTurn(); options.signal?.throwIfAborted();}
         const value = (parsed as Record<string, Partial<SourceShape> | null>)[file];
         result.set(normalize(file), sourceShape(value) ? value : null);
     }

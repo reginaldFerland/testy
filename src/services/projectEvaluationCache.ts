@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { BigIntStats, Dirent } from 'node:fs';
+import type { Dirent } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { Project } from '../core/model';
@@ -7,6 +7,7 @@ import { mapConcurrent } from '../core/concurrency';
 import { EnvironmentError } from '../core/errors';
 import { EvaluationStorageLimits, readEvaluationSnapshot, writeEvaluationSnapshot } from './projectEvaluationStorage';
 import { isNativeExecutable, resolveNodeExecutable } from './executable';
+import { HashMemo } from './hashMemo';
 
 export interface EvaluationQuery {
     readonly kind: 'file' | 'directory' | 'exists' | 'files' | 'directories' | 'entries' | 'mtime' | 'imports';
@@ -83,31 +84,6 @@ function configurationCandidates(file: string): string[] {
         if (parent === directory) {return candidates;}
         directory = parent;
     }
-}
-
-/** A file whose timestamps are this close to the read could change without moving them. */
-const racyMs = 2000;
-const hashCapacity = 16384;
-
-/** Content hashes reused across validation passes while a file's identity and
- * timestamps are unchanged. Anything uncertain is hashed again. */
-class HashMemo {
-    private readonly known = new Map<string, { readonly stamp: string; readonly digest: string }>();
-    private static stamp(stat: BigIntStats): string { return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':'); }
-    get(file: string, stat: BigIntStats): string | undefined {
-        const entry = this.known.get(file);
-        if (!entry || entry.stamp !== HashMemo.stamp(stat)) {return undefined;}
-        this.known.delete(file); this.known.set(file, entry); return entry.digest;
-    }
-    /** `readAt` is taken before the read, so a later edit always postdates the recorded timestamps. */
-    set(file: string, stat: BigIntStats, digest: string, readAt: number): void {
-        const changed = Number((stat.mtimeNs > stat.ctimeNs ? stat.mtimeNs : stat.ctimeNs) / 1_000_000n);
-        this.known.delete(file);
-        if (!(readAt - changed > racyMs)) {return;}
-        this.known.set(file, { stamp: HashMemo.stamp(stat), digest });
-        if (this.known.size > hashCapacity) {this.known.delete(this.known.keys().next().value!);}
-    }
-    clear(): void { this.known.clear(); }
 }
 
 /** A validation pass shares filesystem reads across all requested root closures. */
@@ -238,7 +214,7 @@ export class ProjectEvaluationCache {
     private revision = 0;
     private dirty = false;
     private pending = Promise.resolve();
-    private readonly hashes = new HashMemo();
+    private readonly hashes = new HashMemo(16384);
     constructor(private readonly storage?: string, private readonly limits: EvaluationStorageLimits = {},
         private readonly log: (text: string) => void = () => undefined) {}
     retain(files: readonly string[]): void {

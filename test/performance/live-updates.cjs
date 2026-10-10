@@ -1,9 +1,11 @@
 // Real engine/UI/transport methods; synthetic scale, with VS Code rendering mocked.
+require('./artifacts.cjs');
 const path=require('node:path');
 const assert=require('node:assert/strict'),{setTimeout:delay}=require('node:timers/promises');
-const {TestEngine}=require('../../out/services/engine'),{ProjectIndex}=require('../../out/core/selection');
+const {TestEngine}=require('../../out/services/engine'),{RuntimeInventory}=require('../../out/services/runtimeInventory'),{ProjectIndex}=require('../../out/core/selection');
 const {startProcess}=require('../../out/services/process'),{requestTests}=require('../../out/services/mtp');
-const {loadUi}=require('../unit/support/ui.cjs'),testTree=loadUi({vscode:{Uri:{file:fsPath=>({fsPath})},Range:class{}}}).TestTree;
+const {loadUi}=require('../unit/support/ui.cjs'),testTree=loadUi({vscode:{Uri:{file:(/** @type {string} */ fsPath)=>({fsPath})},Range:class{}}}).TestTree;
+/** @template T @param {() => Promise<T>} callback */
 async function measure(callback) {
  let previous=performance.now(),maxTimerGapMs=0,ticks=0;
  const timer=setInterval(()=>{const now=performance.now();maxTimerGapMs=Math.max(maxTimerGapMs,now-previous);previous=now;ticks++;},1);
@@ -14,8 +16,8 @@ async function measure(callback) {
  for(const count of [50000,100000]) {
   const groups=Array.from({length:100},(_,i)=>({id:`g${i}`,project:'/w/Tests.csproj',framework:'net10.0',file:`/w/Test${i}.cs`,tests:Array.from({length:count/100},(_,j)=>({id:`t${j}`,name:`Case ${j}`,file:`/w/Test${i}.cs`,line:1}))}));
   let replacements=0;
-  const context={items:new Map(),testIds:new Map(),treeFiles:new Map(),treeProjects:new Map(),treeRoots:[],engine:{knownTests:g=>TestEngine.prototype.knownTests.call({runtime:new Map()},g)},host:{disposed:false,activeRun:undefined,roots:[],updateStatus(){}},setOutcome(){},
-   controller:{items:{replace(){replacements++;}},createTestItem(id,label,uri){return{id,label,uri,tags:[],children:{replace(){replacements++;}}};}},item:testTree.prototype.item};
+  const context={items:new Map(),testIds:new Map(),treeFiles:new Map(),treeProjects:new Map(),treeRoots:[],engine:{knownTests:(/** @type {any} */ g)=>TestEngine.prototype.knownTests.call(/** @type {any} */ ({runtime:new RuntimeInventory()}),g)},host:{disposed:false,activeRun:undefined,roots:[],updateStatus(){}},setOutcome(){},
+   controller:{items:{replace(){replacements++;}},createTestItem(/** @type {string} */ id,/** @type {string} */ label,/** @type {unknown} */ uri){return{id,label,uri,tags:[],children:{replace(){replacements++;}}};}},item:testTree.prototype.item};
   const initial=await measure(()=>testTree.prototype.update.call(context,groups));
   const before=replacements,unchanged=[];
   for(let i=0;i<3;i++)unchanged.push(await measure(()=>testTree.prototype.update.call(context,groups)));
@@ -23,10 +25,12 @@ async function measure(callback) {
   const discovery=await measure(()=>testTree.prototype.update.call(context,rediscovered));assert.equal(replacements,before);
   console.log(JSON.stringify({kind:'tree',count,initial,unchanged,rediscovered:discovery,unchangedReplacements:replacements-before}));
  }
- const engine=new TestEngine({roots:['/w'],storage:osUnused(),tools:osUnused(),analyzer:'unused',configuration:()=>({mode:'affected'}),events:{coverage(){},output(){}}});
+ // Partial mock options: the benchmark only exercises coverage and change marking.
+ const engine=new TestEngine(/** @type {any} */ ({roots:['/w'],storage:osUnused(),tools:osUnused(),analyzer:'unused',configuration:()=>({mode:'affected'}),events:{coverage(){},output(){}}}));
  const count=3000,sources=Array.from({length:1000},(_,i)=>`/w/Source${i}.cs`),hashes=new Map(sources.map(file=>[file,'v1']));
- engine.projects=[{file:'/w/Lib.csproj',assembly:'/w/Lib.dll',sourceFiles:sources,references:[]},{file:'/w/Tests.csproj',assembly:'/w/Tests.dll',sourceFiles:[],references:['/w/Lib.csproj']}];engine.index=new ProjectIndex(engine.projects);
- engine.groups=Array.from({length:count},(_,i)=>({id:`g${i}`,project:'/w/Tests.csproj',file:`/w/Test${i}.cs`,tests:[]}));engine.sources.current=hashes;
+ // Partial mocks: only the fields the engine reads here.
+ engine.projects=/** @type {any} */ ([{file:'/w/Lib.csproj',assembly:'/w/Lib.dll',sourceFiles:sources,references:[]},{file:'/w/Tests.csproj',assembly:'/w/Tests.dll',sourceFiles:[],references:['/w/Lib.csproj']}]);engine.index=new ProjectIndex(engine.projects);
+ engine.groups=/** @type {any} */ (Array.from({length:count},(_,i)=>({id:`g${i}`,project:'/w/Tests.csproj',file:`/w/Test${i}.cs`,tests:[]})));/** @type {any} */ (engine.sources).current=hashes; // private field, seeded directly
  await engine.coverage.replaceAsync(engine.groups.map((g,i)=>({groupId:g.id,dependencies:[sources[i%sources.length]],inputs:{[sources[i%sources.length]]:'v1'},reliable:true,timestamp:1,
   coverage:sources.map((file,j)=>({file,hash:'v1',lines:[{line:1,hits:i%sources.length===j?1:0}]}))})),new Set(engine.groups.map(g=>g.id)));
  await engine.coverage.summarizeAsync(hashes);await engine.coverage.takeDeltaAsync();

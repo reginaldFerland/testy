@@ -16,6 +16,19 @@ const {startProcess} = require('../../out/services/process');
 const {CoverageReader} = require('../../out/services/coverageReader');
 const {normalizePath} = require('../../out/core/paths');
 
+/** @typedef {import('../../out/core/model').Project} Project */
+/** @typedef {import('../../out/core/model').TestFile} TestFile */
+/** @typedef {import('../../out/core/coverage').CoverageSummary} CoverageSummary */
+/** @typedef {import('../../out/core/coverage').StoredTrace} StoredTrace */
+/** @typedef {{-readonly [K in keyof Project]: Project[K]}} MutableProject */
+
+/** Partial project mock: the identity at runtime, typed as a project.
+ * @param {Partial<MutableProject>} partial
+ * @returns {MutableProject}
+ */
+const mockProject=partial=>/** @type {MutableProject} */ (partial);
+
+/** @param {import('node:test').TestContext} t */
 async function temporary(t) {
  const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy services '));
  t.after(()=>fs.rm(root,{recursive:true,force:true})); return root;
@@ -42,10 +55,13 @@ test('cache membership restoration yields, publishes atomically and respects con
  try {await new CoverageCache(root,()=>{}).restore(store);}finally{clearInterval(timer);}
  assert.ok(beats>1);assert.equal(store.traces.size,200);assert.equal(store.traces.has('live'),false);
  assert.deepEqual([...store.dependentGroups(['/Source199.cs'])],['group199']);
- const summary=store.summary('/Source999.cs',new Map([['/Source999.cs','v1']]));
+ const summary=/** @type {CoverageSummary} */ (store.summary('/Source999.cs',new Map([['/Source999.cs','v1']])));
  assert.equal(summary.groupIds.length,200);assert.equal(summary.total,2);assert.equal(summary.covered,0);assert.equal(summary.stale,true);
  assert.deepEqual(store.takeDelta(),{sources:[],traces:[],removedSources:[],removedTraces:[]});
- let release,acquired;
+ /** @type {any} Assigned by the promise executors below. */
+ let release;
+ /** @type {any} */
+ let acquired;
  const gate=new Promise(resolve=>release=resolve),ready=new Promise(resolve=>acquired=resolve);
  const lock=withLock(path.join(root,'coverage-v2.lock'),undefined,async()=>{acquired();await gate;});await ready;
  const waiting=new CoverageCache(root,()=>{}).restore(store);
@@ -79,23 +95,23 @@ test('coverage caches summaries and shares zero-hit geometry; changed test input
  assert.equal(summary[0].stale,false);
  const changedHashes=new Map(hashes);changedHashes.set('/tests.cs','test2');
  const changed=store.summarize(changedHashes);
- assert.equal(changed[0].stale,true);assert.equal(store.traces.get('one').reliable,true);
- assert.equal(store.summary('/code.cs',changedHashes).stale,true);
+ assert.equal(changed[0].stale,true);assert.equal(/** @type {StoredTrace} */ (store.traces.get('one')).reliable,true);
+ assert.equal(/** @type {CoverageSummary} */ (store.summary('/code.cs',changedHashes)).stale,true);
 });
 
 test('zero-hit coverage becomes stale with its test and recovers without losing geometry',()=>{
  const store=new CoverageStore(), hashes=new Map([['/code.cs','v1'],['/tests.cs','test1']]);
  const zero={...trace(),dependencies:['/tests.cs'],inputs:{'/tests.cs':'test1'},coverage:[{file:'/code.cs',hash:'v1',lines:[{line:1,hits:0}]}]};
  store.replace([zero],new Set(['one']));
- assert.equal(store.summary('/code.cs',hashes).stale,false);
+ assert.equal(/** @type {CoverageSummary} */ (store.summary('/code.cs',hashes)).stale,false);
  const changed=new Map(hashes);changed.set('/tests.cs','test2');
- assert.equal(store.summary('/code.cs',changed).stale,true);
+ assert.equal(/** @type {CoverageSummary} */ (store.summary('/code.cs',changed)).stale,true);
  store.replace([{...zero,inputs:{'/tests.cs':'test2'}}],new Set(['one']));
- assert.equal(store.summary('/code.cs',changed).stale,false);
- assert.equal(store.summary('/code.cs',changed).total,1);
- store.invalidate(new Set(['one']));assert.equal(store.summary('/code.cs',changed).stale,true);
+ assert.equal(/** @type {CoverageSummary} */ (store.summary('/code.cs',changed)).stale,false);
+ assert.equal(/** @type {CoverageSummary} */ (store.summary('/code.cs',changed)).total,1);
+ store.invalidate(new Set(['one']));assert.equal(/** @type {CoverageSummary} */ (store.summary('/code.cs',changed)).stale,true);
  const restored=new CoverageStore(), delta=store.takeDelta();restored.restorePacked(delta.sources,delta.traces);
- assert.equal(restored.summary('/code.cs',changed).stale,true);
+ assert.equal(/** @type {CoverageSummary} */ (restored.summary('/code.cs',changed)).stale,true);
 });
 
 test('cache tolerates corruption, concurrent writers and orphaned geometry',async t=>{
@@ -110,17 +126,26 @@ test('cache tolerates corruption, concurrent writers and orphaned geometry',asyn
  assert.ok([...restored.traces.values()].every(trace=>trace.stale && !trace.reliable));
  first.replace([trace('one','v2')],new Set(['one']));await a.save(first.takeDelta());
  const again=new CoverageStore();await b.restore(again);
- assert.equal(again.traces.size,2);assert.equal(again.traces.get('two').coverage[0].hash,'v1');
+ assert.equal(again.traces.size,2);assert.equal(/** @type {StoredTrace} */ (again.traces.get('two')).coverage[0].hash,'v1');
 });
 
 test('cache lock cancellation returns before another writer releases ownership',async t=>{
  const root=await temporary(t), cache=new CoverageCache(root,()=>{}), store=new CoverageStore();
  store.replace([trace()],new Set(['one']));const delta=store.takeDelta();
- let release, acquired;const gate=new Promise(resolve=>release=resolve), ready=new Promise(resolve=>acquired=resolve);
+ /** @type {any} Assigned by the promise executors below. */
+ let release;
+ /** @type {any} */
+ let acquired;const gate=new Promise(resolve=>release=resolve), ready=new Promise(resolve=>acquired=resolve);
  const held=withLock(path.join(root,'coverage-v2.lock'),undefined,async()=>{acquired();await gate;});await ready;
  const abort=new AbortController();
  try{
-  const saving=cache.save(delta,abort.signal);await delay(20);abort.abort();
+  // Abort once the save is contending for the lock, not after a guessed delay.
+  const lock=path.join(root,'coverage-v2.lock'),mkdir=/** @type {any} */ (fs).mkdir;
+  /** @type {any} */
+  let contending;const waiting=new Promise(resolve=>contending=resolve);
+  /** @type {any} */ (fs).mkdir=async function(/** @type {import('node:fs').PathLike} */ target,/** @type {any[]} */ ...args){if(String(target)===lock)contending();return mkdir.call(this,target,...args);};
+  let saving;try{saving=cache.save(delta,abort.signal);await waiting;}finally{fs.mkdir=mkdir;}
+  abort.abort();
   await assert.rejects(Promise.race([saving,delay(2000).then(()=>{throw new Error('cancellation waited on cache ownership');})]),{name:'AbortError'});
  }finally{release();await held;}
  store.retryDelta(delta);await cache.save(store.takeDelta());
@@ -131,13 +156,13 @@ test('geometry memo avoids rereads but observes concurrent writers and pruning',
  const root=await temporary(t), a=new CoverageCache(root,()=>{}), b=new CoverageCache(root,()=>{});
  const store=new CoverageStore();store.replace([trace()],new Set(['one']));const delta=store.takeDelta();
  await a.save(delta);
- const read=fs.readFile;let sourceReads=0;
- fs.readFile=async function(file,...args){if(String(file).includes(`${path.sep}sources${path.sep}`))sourceReads++;return read.call(this,file,...args);};
+ const read=/** @type {any} */ (fs).readFile;let sourceReads=0;
+ /** @type {any} */ (fs).readFile=async function(/** @type {import('node:fs').PathLike} */ file,/** @type {any[]} */ ...args){if(String(file).includes(`${path.sep}sources${path.sep}`))sourceReads++;return read.call(this,file,...args);};
  try{await a.save(delta);assert.equal(sourceReads,0);}finally{fs.readFile=read;}
  const expanded=new CoverageStore();expanded.replace([{...trace('two'),coverage:[{file:'/code.cs',hash:'v1',lines:[{line:3,hits:1}]}]}],new Set(['two']));
  await b.save(expanded.takeDelta());await a.save(delta);
  const restored=new CoverageStore();await a.restore(restored);
- assert.deepEqual(restored.summary('/code.cs',new Map([['/code.cs','v1'],['/tests.cs','test1']])).lines.map(line=>line.line),[1,2,3]);
+ assert.deepEqual(/** @type {CoverageSummary} */ (restored.summary('/code.cs',new Map([['/code.cs','v1'],['/tests.cs','test1']]))).lines.map(line=>line.line),[1,2,3]);
  // A different writer can prune everything. The next write must restore its geometry.
  await b.save({sources:[],traces:[],removedSources:[],removedTraces:['one','two']});await b.restore(new CoverageStore());
  await a.save(delta);const again=new CoverageStore();await b.restore(again);assert.equal(again.traces.size,1);
@@ -154,9 +179,9 @@ test('coverage parsing yields host time, preserves lines, and can be cancelled a
  assert.ok(beats>=3,`parsing must allow the extension host to run, observed ${beats} timer ticks`);
  assert.equal(result[0].file,file);assert.equal(result[0].hash,'v1');assert.equal(result[0].lines.length,count);
  assert.deepEqual(result[0].lines.at(-1),{line:count,hits:1});
- const abort=new AbortController(), pending=reader.read(report,root,hashes,abort.signal);
- const cancelling=setTimeout(()=>abort.abort(),10);
- try{await assert.rejects(pending,{name:'AbortError'});}finally{clearTimeout(cancelling);}
+ // read() has posted the request to its worker by the time it returns, so this cancels it in flight.
+ const abort=new AbortController(), pending=reader.read(report,root,hashes,abort.signal);abort.abort();
+ await assert.rejects(pending,{name:'AbortError'});
  await fs.writeFile(report,`<coverage><packages><package><classes><class filename="${file}"><lines><line number="3" hits="2"/></lines></class></classes></package></packages></coverage>`);
  assert.deepEqual((await reader.read(report,root,hashes))[0].lines,[{line:3,hits:2}]);
 });
@@ -188,13 +213,14 @@ test('source refresh reuses unchanged hashes, includes aliases and accepts cance
 });
 
 test('ownership covers linked/multi-target files and binary dependencies; runtime edges bypass static candidates',()=>{
- const lib={file:'/w/Lib.csproj',assembly:'/w/bin/Lib.dll',sourceFiles:['/shared/Code.cs'],references:[],framework:'net10.0'};
- const tests={file:'/w/tests/Tests.csproj',assembly:'/w/tests/Tests.dll',sourceFiles:[],references:[],binaryReferences:[lib.assembly],framework:'net10.0'};
+ const lib=mockProject({file:'/w/Lib.csproj',assembly:'/w/bin/Lib.dll',sourceFiles:['/shared/Code.cs'],references:[],framework:'net10.0'});
+ const tests=mockProject({file:'/w/tests/Tests.csproj',assembly:'/w/tests/Tests.dll',sourceFiles:[],references:[],binaryReferences:[lib.assembly],framework:'net10.0'});
  const second={...lib,framework:'net10.0-windows',assembly:'/w/bin/windows/Lib.dll'};
  const graph=[tests,lib,second], index=new ProjectIndex(graph);
  assert.deepEqual([...index.affected(['/shared/Code.cs'])], [lib.file,tests.file]);
  assert.deepEqual(buildOrder(graph,new Set([tests.file])).map(project=>project.framework),['net10.0','net10.0-windows','net10.0']);
- const group={id:'runtime',project:'/other/plugin/Tests.csproj',file:'/other/plugin/Tests.cs'};
+ /** @type {TestFile} Partial mock: no framework, assembly or tests. */
+ const group=/** @type {any} */ ({id:'runtime',project:'/other/plugin/Tests.csproj',file:'/other/plugin/Tests.cs'});
  const selected=selectTests([group],[lib],new Map([['runtime',{...trace('runtime'),dependencies:['/shared/Code.cs']}]]),['/shared/Code.cs'],'affected');
  assert.equal(selected.groups[0],group);
  const unknown=selectTests([group],[lib],new Map(),['/shared/Code.cs'],'affected');
@@ -222,10 +248,10 @@ test('prepared output repairs mutated/deleted/new files and never follows links 
 
 test('collector installation is atomic, cancelable and serialized across windows',async t=>{
  const root=await temporary(t), abort=new AbortController();let calls=0;
- const fakeInstall=async(_command,args,options)=>{
+ const fakeInstall=async(/** @type {string} */ _command,/** @type {readonly string[]} */ args,/** @type {import('../../out/services/process').ProcessOptions} */ options)=>{
   calls++;const directory=args[args.indexOf('--tool-path')+1];
   await fs.writeFile(path.join(directory,process.platform==='win32'?'dotnet-coverage.exe':'dotnet-coverage'),'partial');
-  if(calls===1) {abort.abort();options.signal.throwIfAborted();}
+  if(calls===1) {abort.abort();/** @type {AbortSignal} */ (options.signal).throwIfAborted();}
   await delay(50);return {code:0,stdout:'',stderr:''};
  };
  await assert.rejects(installCoverageTool('dotnet',root,{cwd:root,signal:abort.signal},fakeInstall),{name:'AbortError'});
@@ -254,7 +280,7 @@ test('process cancellation terminates its own descendants before completion',asy
 test('normal process completion terminates descendants with ignored or inherited output',async t=>{
  const root=await temporary(t);
  for(const stdio of ['ignore','inherit']){
-  const script=`const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:${JSON.stringify(stdio)}});console.log(child.pid);child.unref();`;
+  const script=`const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:${JSON.stringify(stdio)}});process.stdout.write(String(child.pid));child.unref();`;
   const owned=startProcess(process.execPath,['-e',script],{cwd:root,timeoutMs:10000});
   const result=await owned.done;assert.equal(result.code,0);const pid=Number(result.stdout.trim());assert.ok(pid);
   let alive=true;
@@ -274,8 +300,9 @@ test('owned process arguments preserve whitespace, quoting, Unicode and shell ch
 test('project discovery stops between filesystem reads after cancellation',async()=>{
  const {findProjects}=require('../../out/services/projects'),original=fs.readdir;let reads=0;
  const abort=new AbortController();
- fs.readdir=async()=>{reads++;await delay(20);return [{name:'nested',isDirectory:()=>true,isFile:()=>false}];};
- try{const pending=findProjects(['/workspace'],[],abort.signal);setTimeout(()=>abort.abort(),5);await assert.rejects(pending,{name:'AbortError'});assert.equal(reads,1);}
+ // Cancellation arrives while the first read is in progress.
+ /** @type {any} Partial Dirent stub. */ (fs).readdir=async()=>{reads++;abort.abort();await delay(1);return [{name:'nested',isDirectory:()=>true,isFile:()=>false}];};
+ try{const pending=findProjects(['/workspace'],[],abort.signal);await assert.rejects(pending,{name:'AbortError'});assert.equal(reads,1);}
  finally{fs.readdir=original;}
 });
 
@@ -296,9 +323,10 @@ test('private output restores read-only assets and inaccessible directories and 
 
 test('manual containers include newly discovered children while leaf selections and exclusions remain exact',()=>{
  const {selectManual}=require('../../out/services/engine');
- const tests=ids=>ids.map(id=>({id}));
+ const tests=(/** @type {string[]} */ ids)=>ids.map(id=>({id}));
+ /** @type {any} Partial groups: no framework, assembly or full test records. */
  const groups=[{id:'file',project:'project',tests:tests(['old','new'])},{id:'new-file',project:'project',tests:tests(['new-file-test'])},{id:'other',project:'other',tests:tests(['other-test'])}];
- const ids=selection=>selectManual(groups,selection).flatMap(group=>group.tests.map(test=>test.id));
+ const ids=(/** @type {import('../../out/services/engine').ManualSelection} */ selection)=>selectManual(groups,selection).flatMap(group=>group.tests.map(test=>test.id));
  assert.deepEqual(ids({groups:new Set(['file'])}),['old','new']);
  assert.deepEqual(ids({groups:new Set(),projects:new Set(['project']),exclude:{groups:new Set(['file']),tests:new Map([['file',new Set(['old'])]])}}),['new','new-file-test']);
  assert.deepEqual(ids({groups:new Set(['file']),tests:new Map([['file',new Set(['old'])]])}),['old']);
@@ -309,23 +337,26 @@ test('dense caches larger than 16 MiB restore without losing geometry, yield hos
  const root=await temporary(t), count=1000000, lines=Array.from({length:10000},(_,i)=>({line:i+1,hits:1}));
  const store=new CoverageStore();store.replace([{groupId:'dense',dependencies:[],inputs:{},timestamp:1,reliable:true,
   coverage:Array.from({length:100},(_,i)=>({file:`/source/File${i}.cs`,hash:'v1',lines}))}],new Set(['dense']));
- const warnings=[],cache=new CoverageCache(root,text=>warnings.push(text));await cache.save(store.takeDelta());
+ /** @type {string[]} */ const warnings=[];
+ const cache=new CoverageCache(root,text=>warnings.push(text));await cache.save(store.takeDelta());
  const names=await fs.readdir(path.join(root,'coverage-v2/traces'));
  assert.ok((await fs.stat(path.join(root,'coverage-v2/traces',names[0]))).size>16*1024*1024);
  let beats=0;const timer=setInterval(()=>beats++,5),restored=new CoverageStore();
  try{await cache.restore(restored);}finally{clearInterval(timer);}
- assert.equal(restored.traces.get('dense').coverage.reduce((sum,file)=>sum+file.lines.length,0),count);
+ assert.equal(/** @type {StoredTrace} */ (restored.traces.get('dense')).coverage.reduce((sum,file)=>sum+file.lines.length,0),count);
  assert.equal((await fs.readdir(path.join(root,'coverage-v2/sources'))).length,100);assert.deepEqual(warnings,[]);assert.ok(beats>=3);
- const target=new CoverageStore(),abort=new AbortController(),pending=cache.restore(target,abort.signal);
- setTimeout(()=>abort.abort(),15);await assert.rejects(pending,{name:'AbortError'});assert.equal(target.traces.size,0);
+ // Cancel after the snapshot was read, as its records are applied: the target must stay untouched.
+ const target=new CoverageStore(),abort=new AbortController(),apply=target.restorePackedAsync.bind(target);
+ target.restorePackedAsync=(...args)=>{abort.abort();return apply(...args);};
+ await assert.rejects(cache.restore(target,abort.signal),{name:'AbortError'});assert.equal(target.traces.size,0);
 });
 
 
 test('private output catches same-size writes within one filesystem timestamp tick',async t=>{
  const root=await temporary(t),template=path.join(root,'template'),working=path.join(root,'working');
  await fs.mkdir(template);await fs.writeFile(path.join(template,'asset'),'original');
- const originalStat=fs.lstat;
- fs.lstat=async function(file,options){const stat=await originalStat.call(this,file,options);if(options?.bigint){stat.ctimeNs=1n;stat.mtimeNs=1n;}return stat;};
+ const originalStat=/** @type {any} */ (fs).lstat;
+ /** @type {any} */ (fs).lstat=async function(/** @type {import('node:fs').PathLike} */ file,/** @type {any} */ options){const stat=await originalStat.call(this,file,options);if(options?.bigint){stat.ctimeNs=1n;stat.mtimeNs=1n;}return stat;};
  try{
   const prepared=new PreparedOutput(template,working);await prepared.initialize();
   await fs.writeFile(path.join(working,'asset'),'modified');await prepared.restore();
@@ -337,23 +368,26 @@ test('private output catches same-size writes within one filesystem timestamp ti
 
 test('manual snapshots replace shared dependencies and remove vanished roots without evaluating independent projects',async()=>{
  const {refreshProjectSnapshots,mergeProjects,buildOrder}=require('../../out/services/projects');
- const node=(file,references=[],sourceFiles=[])=>({file,framework:'net10.0',assembly:`${file}.dll`,references,sourceFiles});
+ const node=(/** @type {string} */ file,/** @type {string[]} */ references=[],/** @type {string[]} */ sourceFiles=[])=>mockProject({file,framework:'net10.0',assembly:`${file}.dll`,references,sourceFiles});
  const old=new Map([['Tests',[node('Tests',['A']),node('A',['B'],['old.cs']),node('B')]],['A',[node('A',['B']),node('B')]],['B',[node('B')]],['Other',[node('Other')]],['Deleted',[node('Deleted')]]]);
  const fresh=new Map([['Tests',[node('Tests',['B']),node('B',['A']),node('A',[],['new.cs'])]],['A',[node('A',[],['new.cs'])]],['B',[node('B',['A']),node('A',[],['new.cs'])]]]);
- const evaluated=[];
- const snapshots=await refreshProjectSnapshots(old,['Tests','A','B','Other'],['Tests'],async file=>{evaluated.push(file);assert.notEqual(file,'Other');return fresh.get(file);});
+ /** @type {string[]} */ const evaluated=[];
+ const snapshots=await refreshProjectSnapshots(old,['Tests','A','B','Other'],['Tests'],async (/** @type {string} */ file)=>{evaluated.push(file);assert.notEqual(file,'Other');return /** @type {Project[]} */ (fresh.get(file));});
  assert.deepEqual(new Set(evaluated),new Set(['Tests','A','B']));assert.equal(snapshots.has('Deleted'),false);
  const projects=mergeProjects([...snapshots.values()].flat());
  assert.deepEqual(buildOrder(projects,new Set(['Tests'])).map(project=>project.file),['A','B','Tests']);
- assert.deepEqual(projects.find(project=>project.file==='A').sourceFiles,['new.cs']);
+ assert.deepEqual(/** @type {Project} */ (projects.find(project=>project.file==='A')).sourceFiles,['new.cs']);
  assert.equal(old.has('Deleted'),true,'snapshot replacement is atomic');
 });
 
 test('cache restoration failure allows startup baseline and cancellation still stops startup',async t=>{
  const {TestEngine}=require('../../out/services/engine');
- const root=await temporary(t),warnings=[];
+ const root=await temporary(t);
+ /** @type {string[]} */ const warnings=[];
  await fs.mkdir(path.join(root,'coverage-v2','epoch.json'),{recursive:true});
- const engine=new TestEngine({roots:[],storage:root,events:{output:text=>warnings.push(text)}});
+ /** @type {any} Partial options: only the storage root and output event matter for cache restoration. */
+ const options={roots:[],storage:root,events:{output:(/** @type {string} */ text)=>warnings.push(text)}};
+ const engine=new TestEngine(options);
  await engine.restore();assert.match(warnings.join(''),/fresh baseline/);assert.equal(engine.coverage.traces.size,0);
  // Optional cache failure leaves both the damaged path and recoverable data alone.
  assert.equal((await fs.stat(path.join(root,'coverage-v2','epoch.json'))).isDirectory(),true);
@@ -371,18 +405,19 @@ test('dense checkpoint preparation, aggregation and serialization yield, and abo
   const summary=await store.summarizeAsync(hashes);assert.ok(beats>packedBeats,'aggregation must yield');assert.equal(summary[0].covered,count);
   const aggregationBeats=beats;await cache.save(store.takeDelta());assert.ok(beats>aggregationBeats,'serialization must yield');
   const old=store.traces.get('one'),abort=new AbortController();
+  // replaceAsync runs its first slice before returning; cancelling then interrupts the replacement.
   const pending=store.replaceAsync([{...dense,timestamp:99}],new Set(['one']),abort.signal);
-  setTimeout(()=>abort.abort(),1);await assert.rejects(pending,{name:'AbortError'});assert.equal(store.traces.get('one'),old);
+  abort.abort();await assert.rejects(pending,{name:'AbortError'});assert.equal(store.traces.get('one'),old);
   const restored=new CoverageStore();await cache.restore(restored);
-  assert.equal(restored.traces.get('one').coverage[0].lines.length,count);
-  assert.deepEqual(restored.summary('/code.cs',hashes).lines,summary[0].lines);
+  assert.equal(/** @type {StoredTrace} */ (restored.traces.get('one')).coverage[0].lines.length,count);
+  assert.deepEqual(/** @type {CoverageSummary} */ (restored.summary('/code.cs',hashes)).lines,summary[0].lines);
  }finally{clearInterval(timer);}
 });
 
 test('detached children are cleaned on normal completion and cancellation without touching unrelated processes',{skip:process.platform==='win32'},async t=>{
  const {spawn}=require('node:child_process');
  const root=await temporary(t),background=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore',detached:true});
- t.after(()=>{try{process.kill(background.pid,'SIGKILL');}catch{}});
+ t.after(()=>{try{process.kill(/** @type {number} */ (background.pid),'SIGKILL');}catch{}});
  for(const cancel of [false,true]){
   const pidFile=path.join(root,`child-${cancel}`),abort=new AbortController();
   const script=`const child=require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});child.unref();require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(child.pid));${cancel?'setInterval(()=>{},1000);':''}`;
@@ -391,7 +426,7 @@ test('detached children are cleaned on normal completion and cancellation withou
   assert.ok(pid);t.after(()=>{try{process.kill(pid,'SIGKILL');}catch{}});
   if(cancel){abort.abort();await assert.rejects(owned.done,{name:'AbortError'});}else{assert.equal((await owned.done).code,0);}
   let alive=true;for(let i=0;i<100&&alive;i++){try{process.kill(pid,0);await delay(10);}catch{alive=false;}}
-  assert.equal(alive,false);assert.doesNotThrow(()=>process.kill(background.pid,0));
+  assert.equal(alive,false);assert.doesNotThrow(()=>process.kill(/** @type {number} */ (background.pid),0));
  }
 });
 
@@ -400,18 +435,18 @@ test('cancelling streamed cache writes preserves the previous atomic trace and c
  store.replace([trace()],new Set(['one']));await cache.save(store.takeDelta());
  const dense={...trace(),timestamp:99,coverage:[{file:'/code.cs',hash:'v1',lines:Array.from({length:50000},(_,i)=>({line:i+1,hits:1}))}]};
  await store.replaceAsync([dense],new Set(['one']));
- const abort=new AbortController(),open=fs.open;let interrupted=false;
- fs.open=async function(file,...args){
+ const abort=new AbortController(),open=/** @type {any} */ (fs).open;let interrupted=false;
+ /** @type {any} */ (fs).open=async function(/** @type {import('node:fs').PathLike} */ file,/** @type {any[]} */ ...args){
   const handle=await open.call(this,file,...args);
   if(String(file).includes(`${path.sep}traces${path.sep}`)&&String(file).endsWith('.tmp')){
    const write=handle.writeFile.bind(handle);
-   handle.writeFile=async(...args)=>{await write(...args);interrupted=true;abort.abort();};
+   handle.writeFile=async(/** @type {any[]} */ ...args)=>{await write(...args);interrupted=true;abort.abort();};
   }
   return handle;
  };
  try{await assert.rejects(cache.save(store.takeDelta(),abort.signal),{name:'AbortError'});}finally{fs.open=open;}
  assert.equal(interrupted,true,'cancel while writing the trace, after its first chunk');
- const restored=new CoverageStore();await cache.restore(restored);assert.equal(restored.traces.get('one').timestamp,1);
+ const restored=new CoverageStore();await cache.restore(restored);assert.equal(/** @type {StoredTrace} */ (restored.traces.get('one')).timestamp,1);
  assert.equal((await fs.readdir(path.join(root,'coverage-v2/traces'))).some(file=>file.endsWith('.tmp')),false);
 });
 
@@ -439,44 +474,46 @@ test('generated headers are consistently excluded while generator inputs and hea
 
 test('unchanged manual graphs refresh only the selected root, but shared context changes propagate',async()=>{
  const {refreshProjectSnapshots}=require('../../out/services/projects');
- const shared={file:'Lib',framework:'net10.0',assembly:'Lib.dll',references:[],sourceFiles:['a.cs','b.cs'],properties:{Flavor:'Default',Configuration:'Debug'},contextId:'lib',contextReferences:[]};
+ const shared=mockProject({file:'Lib',framework:'net10.0',assembly:'Lib.dll',references:[],sourceFiles:['a.cs','b.cs'],properties:{Flavor:'Default',Configuration:'Debug'},contextId:'lib',contextReferences:[]});
  const previous=new Map(Array.from({length:8},(_,i)=>[`Test${i}`,[{...shared,file:`Test${i}`,contextId:`test${i}`,contextReferences:['lib']},shared]]));
+ /** @type {string[]} */
  let calls=[];
- const unchanged=await refreshProjectSnapshots(previous,[...previous.keys()],['Test0'],async file=>{
-  calls.push(file);return previous.get(file).map(node=>({...node,sourceFiles:[...node.sourceFiles].reverse(),properties:{Configuration:'Debug',Flavor:'Default'}})).reverse();
+ const unchanged=await refreshProjectSnapshots(previous,[...previous.keys()],['Test0'],async (/** @type {string} */ file)=>{
+  calls.push(file);return /** @type {Project[]} */ (previous.get(file)).map(node=>({...node,sourceFiles:[...node.sourceFiles].reverse(),properties:{Configuration:'Debug',Flavor:'Default'}})).reverse();
  });
  assert.deepEqual(calls,['Test0']);assert.equal(unchanged.get('Test1'),previous.get('Test1'));
- calls=[];await refreshProjectSnapshots(previous,[...previous.keys()],['Test0'],async file=>{
-  calls.push(file);return previous.get(file).map(node=>node.file==='Lib'?{...node,properties:{...node.properties,Flavor:'Updated'}}:node);
+ calls=[];await refreshProjectSnapshots(previous,[...previous.keys()],['Test0'],async (/** @type {string} */ file)=>{
+  calls.push(file);return /** @type {Project[]} */ (previous.get(file)).map(node=>node.file==='Lib'?{...node,properties:{...node.properties,Flavor:'Updated'}}:node);
  });
  assert.equal(calls.length,8);
 });
 
 test('build planning preserves conditional context edges without losing merged source ownership',()=>{
  const {mergeProjects,buildRoots}=require('../../out/services/projects');
- const node=(file,id,edges,entryPoint=false)=>({file,framework:'net10.0',assembly:`${id}.dll`,sourceFiles:[`${id}.cs`],references:[],contextId:id,contextReferences:edges,entryPoint});
+ const node=(/** @type {string} */ file,/** @type {string} */ id,/** @type {string[]} */ edges,entryPoint=false)=>mockProject({file,framework:'net10.0',assembly:`${id}.dll`,sourceFiles:[`${id}.cs`],references:[],contextId:id,contextReferences:edges,entryPoint});
  const graph=[node('Tests','tests',['a'],true),node('A','a',['b']),node('B','b',['leaf']),node('A','leaf',[])];
  graph[0].isTestProject=true;graph[0].references=['A'];graph[1].references=['B'];graph[2].references=['A'];
  const merged=mergeProjects(graph),order=buildOrder(merged,new Set(['Tests']));
  assert.deepEqual(order.map(node=>node.contextId),['leaf','b','a','tests']);
  assert.deepEqual(buildRoots(order).map(node=>node.contextId),['tests']);
- assert.deepEqual(merged.find(node=>node.file==='A').sourceFiles,['a.cs','leaf.cs']);
+ assert.deepEqual(/** @type {Project} */ (merged.find(node=>node.file==='A')).sourceFiles,['a.cs','leaf.cs']);
  assert.throws(()=>buildOrder(mergeProjects([...graph.slice(0,3),node('A','leaf',['a'])]),new Set(['Tests'])),/cycle/);
 });
 
 test('POSIX owner handles host death and kills detached descendants without touching other processes',{skip:process.platform==='win32',timeout:15000},async t=>{
  const {spawn}=require('node:child_process'),root=await temporary(t),pidFile=path.join(root,'pids'),ownerFile=path.join(root,'owner');
  const background=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
- const pids=[background.pid];t.after(()=>{for(const pid of pids){try{process.kill(pid,'SIGKILL');}catch{}}});
+ /** @type {number[]} */
+ const pids=[/** @type {number} */ (background.pid)];t.after(()=>{for(const pid of pids){try{process.kill(pid,'SIGKILL');}catch{}}});
  const child=`const child=require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});child.unref();require('node:fs').writeFileSync(${JSON.stringify(pidFile)},JSON.stringify([process.pid,child.pid]));setInterval(()=>{},1000);`;
  const hostScript=`const owned=require(${JSON.stringify(path.resolve('out/services/process'))}).startProcess(process.execPath,['-e',${JSON.stringify(child)}],{cwd:${JSON.stringify(root)},cleanupDescendants:true});require('node:fs').writeFileSync(${JSON.stringify(ownerFile)},String(owned.child.pid));`;
- const host=spawn(process.execPath,['-e',hostScript],{stdio:'ignore'});pids.push(host.pid);
+ const host=spawn(process.execPath,['-e',hostScript],{stdio:'ignore'});pids.push(/** @type {number} */ (host.pid));
  let children;for(let i=0;i<300;i++){try{children=JSON.parse(await fs.readFile(pidFile,'utf8'));break;}catch{await delay(10);}}
  assert.ok(children);pids.push(...children,Number(await fs.readFile(ownerFile,'utf8')));
  host.kill('SIGKILL');
- const alive=pid=>{try{process.kill(pid,0);return true;}catch{return false;}};
+ const alive=(/** @type {number} */ pid)=>{try{process.kill(pid,0);return true;}catch{return false;}};
  for(let i=0;i<500&&children.some(alive);i++){await delay(10);}
- assert.deepEqual(children.filter(alive),[]);assert.equal(alive(background.pid),true);
+ assert.deepEqual(children.filter(alive),[]);assert.equal(alive(/** @type {number} */ (background.pid)),true);
 });
 
 test('POSIX supervision handles launch failure, timeout and original Electron environment',{skip:process.platform==='win32'},async t=>{
@@ -490,7 +527,7 @@ test('POSIX supervision handles launch failure, timeout and original Electron en
 
 test('build roots avoid redundant default contexts ahead of alternate binary consumers',()=>{
  const {buildRoots}=require('../../out/services/projects');
- const node=(id,file,assembly,edges=[])=>({contextId:id,file,framework:'net10.0',assembly,contextReferences:edges,references:[],sourceFiles:[]});
+ const node=(/** @type {string} */ id,/** @type {string} */ file,/** @type {string} */ assembly,/** @type {string[]} */ edges=[])=>mockProject({contextId:id,file,framework:'net10.0',assembly,contextReferences:edges,references:[],sourceFiles:[]});
  const special=node('special','Lib','Special.dll'),normal=node('normal','Lib','Lib.dll');
  const consumer={...node('consumer','Consumer','Consumer.dll'),isTestProject:true,entryPoint:true,binaryReferences:['Special.dll']};
  const tests={...node('tests','Tests','Tests.dll',['special']),isTestProject:true,entryPoint:true};

@@ -3,20 +3,24 @@ const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:
 const {PreparedOutputCache}=require('../../out/services/preparedOutputCache');
 const {copyOutput,PreparedOutput}=require('../../out/services/output');
 
+/** @param {import('node:test').TestContext} t */
 async function fixture(t){
  const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-persistent-output-'))),source=path.join(root,'build'),storage=path.join(root,'state');
  await fs.mkdir(source);await fs.writeFile(path.join(source,'Tests.dll'),'original module');await fs.writeFile(path.join(source,'asset'),'clean');
- const caches=[],leases=[],created=[];
+ /** @typedef {import('../../out/services/preparedOutputCache').PreparedOutputCache} Cache @typedef {import('../../out/services/preparedOutputCache').PreparedArtifactLease} Lease @typedef {import('../../out/services/preparedOutputCache').PreparedArtifact} Artifact */
+ /** @type {Cache[]} */ const caches=[];
+ /** @type {Lease[]} */ const leases=[];
+ /** @type {Artifact[]} */ const created=[];
  const cache=()=>{const result=new PreparedOutputCache(storage,randomUUID(),{persist:true});caches.push(result);return result;};
- const create=async directory=>{
+ const create=async(/** @type {string} */ directory)=>{
   const output=new PreparedOutput(path.join(directory,'template'),path.join(directory,'assembly'));
   await copyOutput(source,output.template);await output.initialize();
   const artifact={root:directory,output,session:randomUUID(),coverage:true,instrumented:[path.join(output.directory,'Tests.dll')],reusable:true};
   created.push(artifact);return artifact;
  };
- const acquire=async(owner,context='context',signal)=>{const lease=await owner.acquire(source,context,create,signal,'target/primary');if(lease)leases.push(lease);return lease;};
+ const acquire=async(/** @type {Cache} */ owner,context='context',/** @type {AbortSignal | undefined} */ signal=undefined)=>{const lease=await owner.acquire(source,context,create,signal,'target/primary');if(lease)leases.push(lease);return /** @type {Lease} */ (lease);};
  const record=async()=>{
-  const directory=path.join(storage,'prepared-v2'),name=(await fs.readdir(directory)).find(name=>name.endsWith('.owner.json'));
+  const directory=path.join(storage,'prepared-v2'),name=/** @type {string} */ ((await fs.readdir(directory)).find(name=>name.endsWith('.owner.json')));
   return{file:path.join(directory,name),value:JSON.parse(await fs.readFile(path.join(directory,name),'utf8'))};
  };
  t.after(async()=>{await Promise.all(leases.map(lease=>lease.release()));await Promise.all(caches.map(cache=>cache.dispose()));await fs.rm(root,{recursive:true,force:true});});
@@ -79,13 +83,13 @@ test('a corrupted or linked retained template is rejected before discovery or in
 
 test('a failed preparation cleanup cannot leave untracked working output in a parked container',async t=>{
  const f=await fixture(t),first=f.cache(),a=await f.acquire(first);await a.release();
- const outputTools=require('../../out/services/output'),remove=outputTools.removeOutput;let orphan;
+ const outputTools=require('../../out/services/output'),remove=outputTools.removeOutput;let orphan=/** @type {string | undefined} */ (undefined);
  outputTools.removeOutput=async directory=>{if(directory===orphan){outputTools.removeOutput=remove;throw new Error('controlled cleanup failure');}return remove(directory);};
  t.after(()=>{outputTools.removeOutput=remove;});
  await assert.rejects(first.acquire(f.source,'other',async directory=>{
   orphan=directory;await f.create(directory);await fs.writeFile(path.join(directory,'report.xml'),'private result');throw new Error('failed preparation');
  },undefined,'target/secondary'),/controlled cleanup failure/);
- assert.ok(await fs.stat(orphan));await first.dispose();
- await assert.rejects(fs.stat(orphan),{code:'ENOENT'});const {value}=await f.record();assert.equal(value.snapshot.entries.length,1);
+ assert.ok(await fs.stat(/** @type {string} */ (orphan)));await first.dispose();
+ await assert.rejects(fs.stat(/** @type {string} */ (orphan)),{code:'ENOENT'});const {value}=await f.record();assert.equal(value.snapshot.entries.length,1);
  const reused=await f.acquire(f.cache());assert.equal(reused.hit,true);
 });

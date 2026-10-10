@@ -6,12 +6,21 @@ const {CoverageCache}=require('../../out/services/cache');
 const {CoverageStore}=require('../../out/core/coverage');
 const {contentHash}=require('../../out/core/paths');
 const execute=promisify(execFile);
-const deferred=()=>{let resolve;const promise=new Promise(done=>resolve=done);return{promise,resolve};};
+/** @typedef {import('../../out/core/coverage').CoverageSummary} CoverageSummary */
+/** @returns {{promise:Promise<unknown>,resolve:(value?:any)=>void}} */
+const deferred=()=>{
+ /** @type {(value?:any)=>void} */
+ let resolve=()=>{};const promise=new Promise(done=>resolve=done);return{promise,resolve};};
+/** fs.promises is monkeypatched below, which its readonly overloaded types do not allow */
+const patched=/** @type {any} */ (fs);
+/** @param {number} index @param {number[]} [lines] */
 const source=(index,lines=[1,2])=>{const file=`/Source${index}.cs`,hash='v1';return{id:contentHash(`${file}\0${hash}`),file,hash,lines};};
+/** @param {ReturnType<typeof source>[]} sources @param {string} [groupId] @param {number} [timestamp] */
 const delta=(sources,groupId='one',timestamp=1)=>({sources,removedSources:[],removedTraces:[],traces:[{
  groupId,timestamp,reliable:true,stale:false,dependencies:[sources[0].file],inputs:{[sources[0].file]:'v1'},
  sourceIds:[...new Set(sources.map(source=>source.id))],coverage:[{file:sources[0].file,hash:'v1',lines:[{line:sources[0].lines[0],hits:1}]}]
 }]});
+/** @param {import('node:test').TestContext} t */
 async function fixture(t){
  const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-parallel-cache-'));
  t.after(()=>fs.rm(root,{recursive:true,force:true}));
@@ -24,7 +33,7 @@ test('independent geometry writes overlap within four slots, merge duplicate IDs
  const open=fs.open,rename=fs.rename,gate=deferred(),active=new Set(),completed=new Set();
  let peak=0,started=0,published=0;
  t.signal.addEventListener('abort',()=>gate.resolve(),{once:true});
- fs.open=async function(file,...args){
+ patched.open=async function(/** @type {any} */ file,/** @type {any[]} */ ...args){
   const handle=await open.call(this,file,...args);
   if(String(file).includes(`${path.sep}sources${path.sep}`)&&String(file).endsWith('.tmp')){
    const id=path.basename(String(file)).slice(0,64);
@@ -36,7 +45,7 @@ test('independent geometry writes overlap within four slots, merge duplicate IDs
   }
   return handle;
  };
- fs.rename=async function(from,to){
+ patched.rename=async function(/** @type {any} */ from,/** @type {any} */ to){
   if(String(to).includes(`${path.sep}traces${path.sep}`)){
    assert.equal(active.size,0,'all geometry file handles close before trace publication');
    assert.equal(completed.size,sources.length,'every referenced source is already published');
@@ -47,12 +56,12 @@ test('independent geometry writes overlap within four slots, merge duplicate IDs
   if(String(to).includes(`${path.sep}sources${path.sep}`))completed.add(path.basename(String(to),'.json'));
   return result;
  };
- try{await cache.save(checkpoint,t.signal);}finally{gate.resolve();fs.open=open;fs.rename=rename;}
+ try{await cache.save(checkpoint,t.signal);}finally{gate.resolve();patched.open=open;patched.rename=rename;}
  assert.equal(peak,4);assert.equal(started,13,'duplicate geometry merges are ordered and redundant union writes are skipped');assert.equal(published,1);
  assert.deepEqual(JSON.parse(await fs.readFile(path.join(directory,'sources',`${sources[0].id}.json`),'utf8')).lines,[1,2,3,4]);
  assert.equal((await fs.readdir(path.join(directory,'sources'))).some(name=>name.endsWith('.tmp')),false);
  const restored=new CoverageStore();await cache.restore(restored);
- assert.equal(restored.traces.size,1);assert.equal(restored.summary(sources[0].file,new Map([[sources[0].file,'v1']])).total,4);
+ assert.equal(restored.traces.size,1);assert.equal(/** @type {CoverageSummary} */ (restored.summary(sources[0].file,new Map([[sources[0].file,'v1']]))).total,4);
 });
 
 for(const failure of [false,true])test(`${failure?'failed':'cancelled'} geometry writes drain before unlocking, preserve the old trace and can retry`,{timeout:10000},async t=>{
@@ -60,16 +69,17 @@ for(const failure of [false,true])test(`${failure?'failed':'cancelled'} geometry
  await cache.save(delta([source(0,[1])]));
  const traceFile=path.join(directory,'traces',`${contentHash('one')}.json`),control=new AbortController();
  const signal=AbortSignal.any([control.signal,t.signal]);
- const open=fs.open,rm=fs.rm,rename=fs.rename,read=fs.readFile;
+ const open=fs.open,rm=fs.rm,rename=fs.rename,read=/** @type {any} */ (fs.readFile); // spread call through an overloaded signature
+ 
  const entered=deferred(),release=deferred(),fail=deferred(),failedCleanup=deferred();
- const workerSignals=[],started=new Set();let active=0,settled=false,traceWrites=0,competitorFinished=false;
+ /** @type {AbortSignal[]} */ const workerSignals=[];const started=new Set();let active=0,settled=false,traceWrites=0,competitorFinished=false;
  const error=new Error('controlled geometry write failure');
  t.signal.addEventListener('abort',()=>{fail.resolve();release.resolve();},{once:true});
- fs.readFile=async function(file,...args){
+ patched.readFile=async function(/** @type {any} */ file,/** @type {any[]} */ ...args){
   if(String(file).includes(`${path.sep}sources${path.sep}`)&&args[0]?.signal)workerSignals.push(args[0].signal);
   return read.call(this,file,...args);
  };
- fs.open=async function(file,...args){
+ patched.open=async function(/** @type {any} */ file,/** @type {any[]} */ ...args){
   const handle=await open.call(this,file,...args);
   if(String(file).includes(`${path.sep}sources${path.sep}`)&&String(file).endsWith('.tmp')){
    const id=path.basename(String(file)).slice(0,64),write=handle.writeFile.bind(handle);
@@ -82,15 +92,15 @@ for(const failure of [false,true])test(`${failure?'failed':'cancelled'} geometry
   }
   return handle;
  };
- fs.rm=async function(file,...args){
+ patched.rm=async function(/** @type {any} */ file,/** @type {any[]} */ ...args){
   const result=await rm.call(this,file,...args);
   if(String(file).includes(`${path.sep}sources${path.sep}${sources[0].id}.`)&&String(file).endsWith('.tmp'))failedCleanup.resolve();
   return result;
  };
- fs.rename=async function(from,to){if(String(to)===traceFile)traceWrites++;return rename.call(this,from,to);};
+ patched.rename=async function(/** @type {any} */ from,/** @type {any} */ to){if(String(to)===traceFile)traceWrites++;return rename.call(this,from,to);};
  const saving=cache.save(checkpoint,signal);void saving.then(()=>{settled=true;},()=>{settled=true;});
  const rejected=assert.rejects(saving,failure?value=>value===error:{name:'AbortError'});
- let competitor;
+ /** @type {Promise<void>|undefined} */ let competitor;
  try{
   await Promise.race([entered.promise,saving]);
   if(failure){fail.resolve();await failedCleanup.promise;}else control.abort();
@@ -106,15 +116,15 @@ for(const failure of [false,true])test(`${failure?'failed':'cancelled'} geometry
   await competitor;
  }finally{
   fail.resolve();release.resolve();await Promise.allSettled([saving,rejected,competitor]);
-  fs.open=open;fs.rm=rm;fs.rename=rename;fs.readFile=read;
+  patched.open=open;patched.rm=rm;patched.rename=rename;patched.readFile=read;
  }
  assert.equal(active,0);assert.equal(traceWrites,0);assert.equal(competitorFinished,true);
  assert.equal((await fs.readdir(path.join(directory,'sources'))).some(name=>name.endsWith('.tmp')),false);
  assert.equal(JSON.parse(await fs.readFile(traceFile,'utf8')).timestamp,1);
  await cache.save(checkpoint);
  const restored=new CoverageStore();await cache.restore(restored);
- assert.equal(restored.traces.size,2);assert.equal(restored.traces.get('one').timestamp,2);
- assert.deepEqual(restored.summary(sources[0].file,new Map([[sources[0].file,'v1']])).lines,[{line:1,hits:1},{line:2,hits:0}]);
+ assert.equal(restored.traces.size,2);assert.equal(/** @type {{timestamp:number}} */ (restored.traces.get('one')).timestamp,2);
+ assert.deepEqual(/** @type {CoverageSummary} */ (restored.summary(sources[0].file,new Map([[sources[0].file,'v1']]))).lines,[{line:1,hits:1},{line:2,hits:0}]);
 });
 
 test('an external cache writer invalidates the geometry memo after pruning and replacing a source',{timeout:10000},async t=>{

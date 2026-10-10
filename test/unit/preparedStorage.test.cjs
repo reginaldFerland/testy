@@ -7,12 +7,16 @@ const {setTimeout:delay}=require('node:timers/promises');
 const {claimPreparedStorage}=require('../../out/services/preparedStorage');
 const {withLock}=require('../../out/services/lock');
 
+/** @param {import('node:test').TestContext} t */
 async function fixture(t) {
  const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy prepared storage ')),storage=path.join(root,'prepared-v2');
  await fs.mkdir(storage);t.after(()=>fs.rm(root,{recursive:true,force:true}));return {root,storage};
 }
+/** @param {{ directory: string }} lease */
 const ownerFile=lease=>`${lease.directory}.owner.json`;
+/** @param {string} file */
 async function exists(file) {return fs.lstat(file).then(()=>true,error=>{if(error.code==='ENOENT')return false;throw error;});}
+/** @param {string} storage @param {Record<string, unknown>} [changes] */
 async function seed(storage,changes={}) {
  const identity=randomUUID(),directory=path.join(storage,identity);
  await fs.mkdir(directory);
@@ -40,7 +44,7 @@ test('two concurrent claimants cannot share one instrumented session',async t=>{
  await first.park({session},{entries:1,bytes:1});
  const leases=await Promise.all([claimPreparedStorage(storage),claimPreparedStorage(storage)]);
  assert.equal(new Set(leases.map(lease=>lease.directory)).size,2);
- assert.equal(leases.filter(lease=>lease.snapshot?.session===session).length,1);
+ assert.equal(leases.filter(lease=>/** @type {{ session?: string } | undefined} */ (lease.snapshot)?.session===session).length,1);
  await Promise.all(leases.map(lease=>lease.dispose()));
 });
 
@@ -145,7 +149,7 @@ test('oversized metadata is not loaded or published, and only recognized interru
 
 test('cancelling a blocked claim cannot consume a parked container',async t=>{
  const {storage}=await fixture(t),first=await claimPreparedStorage(storage);await first.park({ready:true},{entries:1,bytes:1});
- let unlock,entered;const gate=new Promise(resolve=>unlock=resolve),ready=new Promise(resolve=>entered=resolve);
+ let unlock=()=>{},entered=()=>{};const gate=new Promise(resolve=>unlock=()=>resolve(undefined)),ready=new Promise(resolve=>entered=()=>resolve(undefined));
  const locked=withLock(`${storage}.lock`,undefined,async()=>{entered();await gate;});await ready;
  const abort=new AbortController(),claim=claimPreparedStorage(storage,abort.signal);abort.abort();
  try {await assert.rejects(claim,{name:'AbortError'});}finally{unlock();await locked;}

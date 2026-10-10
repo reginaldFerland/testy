@@ -3,7 +3,9 @@ const assert=require('node:assert/strict');
 const path=require('node:path');
 const {loadUi}=require('./support/ui.cjs');
 const {createTesty}=require('./support/controller.cjs');
-const manifest=require('../../package.json'),nls=require('../../package.nls.json');
+/** @typedef {{command: string, when: string, group: string}} MenuEntry */
+/** @typedef {{contributes: {menus: Record<string, MenuEntry[]>, commands: {command: string, title: string}[], configuration: {properties: Record<string, {scope?: string}>}}, activationEvents: string[], capabilities: {untrustedWorkspaces: {supported: string, restrictedConfigurations: string[]}}}} Manifest */
+const manifest=/** @type {Manifest} */ (/** @type {unknown} */ (require('../../package.json'))),nls=/** @type {Record<string, string>} */ (require('../../package.nls.json'));
 
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
 
@@ -14,10 +16,10 @@ test('manifest: numeric navigation order, context menus with localized titles, l
  for(const [menu,command] of [['testing/item/context','testy.explainSelection'],['testing/item/context','testy.excludeProject'],
   ['testing/message/context','testy.showOutput'],['editor/context','testy.runFile'],['explorer/context','testy.runFile']]) {
   assert.ok(menus[menu].some(item=>item.command===command),`${menu} offers ${command}`);
-  assert.ok(nls[titles.get(command).slice(1,-1)],`${command} has a localized title`);
+  assert.ok(nls[/** @type {string} */ (titles.get(command)).slice(1,-1)],`${command} has a localized title`);
  }
  assert.match(menus['testing/message/context'][0].when,/testMessage == testy\.failure/);
- assert.match(menus['testing/item/context'].find(item=>item.command==='testy.excludeProject').when,/testId =~ \/\^project:\//);
+ assert.match(/** @type {MenuEntry} */ (menus['testing/item/context'].find(item=>item.command==='testy.excludeProject')).when,/testId =~ \/\^project:\//);
  assert.ok(manifest.activationEvents.includes('workspaceContains:**/*.slnf'));
  const trust=manifest.capabilities.untrustedWorkspaces;
  assert.equal(trust.supported,'limited');
@@ -28,7 +30,7 @@ test('manifest: numeric navigation order, context menus with localized titles, l
 });
 
 test('failure messages carry the context value the Show Output message action is bound to',()=>{
- const ui=loadUi({vscode:{TestMessage:class{constructor(message){this.message=message;}},Uri:{file:fsPath=>({fsPath})},Position:class{},Location:class{}}});
+ const ui=loadUi({vscode:{TestMessage:class{constructor(/** @type {string} */ message){this.message=message;}},Uri:{file:(/** @type {string} */ fsPath)=>({fsPath})},Position:class{},Location:class{}}});
  assert.equal(ui.failureMessage({outcome:'failed',message:'boom'},{},[]).contextValue,'testy.failure');
 });
 
@@ -47,12 +49,12 @@ test('"Why was this selected?" explains test, file and project items from the la
 
 test('Exclude Project adds a folder-relative pattern at workspace level, or folder level in a multi-root workspace',async()=>{
  for(const multiRoot of [false,true]) {
-  const updates=[],root=path.resolve('/workspace'),folder={uri:{fsPath:root},name:'workspace'};
+  /** @type {unknown[][]} */ const updates=[];const root=path.resolve('/workspace'),folder={uri:{fsPath:root},name:'workspace'};
   const f=createTesty({api:{ConfigurationTarget:{Workspace:2,WorkspaceFolder:3}},window:{showInformationMessage:async()=>undefined},workspace:{
    workspaceFolders:multiRoot?[folder,{uri:{fsPath:path.resolve('/other')},name:'other'}]:[folder],getWorkspaceFolder:()=>folder,
-   getConfiguration:()=>({get:(key,fallback)=>fallback,inspect:()=>({workspaceValue:['old/**'],workspaceFolderValue:multiRoot?['mine/**']:undefined}),
-    update:async(...args)=>{updates.push(args);}})}});
-  f.vscode.Uri.file=fsPath=>({fsPath});
+   getConfiguration:()=>({get:(/** @type {string} */ key,/** @type {unknown} */ fallback)=>fallback,inspect:()=>({workspaceValue:['old/**'],workspaceFolderValue:multiRoot?['mine/**']:undefined}),
+    update:async(/** @type {unknown[]} */ ...args)=>{updates.push(args);}})}});
+  f.vscode.Uri.file=(/** @type {string} */ fsPath)=>({fsPath});
   await f.testy.excludeProject({id:`project:${path.join(root,'tests','Slow [1]','Slow.csproj')}`,label:'Slow'});
   await f.testy.excludeProject({id:'file:g1',label:'not a project'});
   assert.deepEqual(JSON.parse(JSON.stringify(updates)),[['projects.exclude',[multiRoot?'mine/**':'old/**','tests/Slow [[]1[]]/Slow.csproj'],multiRoot?3:2]]);
@@ -61,6 +63,7 @@ test('Exclude Project adds a folder-relative pattern at workspace level, or fold
 });
 
 test('the status bar exposes its state and details to screen readers without icon names',()=>{
+ /** @type {any} The stub status bar item the extension created. */
  let item;
  const vscode={StatusBarAlignment:{Left:1},ThemeColor:class{},commands:{executeCommand:async()=>undefined},
   window:{createStatusBarItem:()=>(item={show(){},dispose(){}})}};
@@ -73,19 +76,55 @@ test('the status bar exposes its state and details to screen readers without ico
  assert.equal(item.command,'workbench.trust.manage');assert.match(item.accessibilityInformation.label,/^Testy: Restricted Mode\. /);
 });
 
+/** Command registrations of a stub `vscode`: the live ones by ID, and how often each ID was registered. */
+function commandRegistry() {
+ /** @type {Map<string, () => unknown>} */ const live=new Map();
+ /** @type {string[]} */ const registered=[];
+ return{live,registered,commands:{registerCommand:(/** @type {string} */ id,/** @type {() => unknown} */ handler)=>{assert.ok(!live.has(id),`${id} is registered once at a time`);live.set(id,handler);registered.push(id);return{dispose:()=>live.delete(id)};}},
+  Disposable:{from:(/** @type {{dispose(): unknown}[]} */ ...items)=>({dispose:()=>items.forEach(item=>item.dispose())})}};
+}
+
 test('in Restricted Mode activation executes nothing and starts Testy once trust is granted',async()=>{
- let grant,constructed=0,started=0,item;
- const subscriptions=[];
- const vscode={StatusBarAlignment:{Left:1},ExtensionMode:{Test:3},workspace:{isTrusted:false,workspaceFolders:[{uri:{fsPath:'/workspace'}}],onDidGrantWorkspaceTrust:handler=>{grant=handler;return{dispose(){}};}},
-  window:{createStatusBarItem:()=>(item={disposed:false,show(){},dispose(){item.disposed=true;}})}};
+ /** @type {any} Trust-grant callback captured from the stub. */
+ let grant;
+ /** @type {any} The stub status bar item the extension created. */
+ let item;
+ let constructed=0,started=0;
+ /** @type {{dispose(): unknown}[]} */ const subscriptions=[];const registry=commandRegistry();
+ const vscode={StatusBarAlignment:{Left:1},ExtensionMode:{Test:3},workspace:{isTrusted:false,workspaceFolders:[{uri:{fsPath:'/workspace'}}],onDidGrantWorkspaceTrust:(/** @type {() => void} */ handler)=>{grant=handler;return{dispose(){}};}},
+  window:{createStatusBarItem:()=>(item={disposed:false,show(){},dispose(){item.disposed=true;}})},commands:registry.commands,Disposable:registry.Disposable};
  class Testy {constructor(){constructed++;} start(){started++;return Promise.resolve();} snapshot(){return{started:true};} dispose(){return Promise.resolve();}}
  const extension=loadUi({vscode,stubs:{controller:{Testy}}}).module('extension');
- assert.equal(extension.activate({subscriptions,extensionMode:1}),undefined,'the snapshot API is for tests only');
+ assert.equal(extension.activate({subscriptions:[],extensionMode:1}),undefined,'the snapshot API is for tests only');
+ for(const subscription of subscriptions.splice(0))subscription.dispose();
+ registry.live.clear();
  const api=extension.activate({subscriptions,extensionMode:3});
  assert.equal(constructed,0);assert.deepEqual({...api.snapshot()},{restricted:true});
  assert.equal(item.text,'$(shield) Testy: Restricted Mode');
+ assert.ok(registry.live.has('testy.showOutput')&&registry.live.has('testy.showMenu'),'walkthrough links reach an explanation in Restricted Mode');
  grant();await tick();
+ assert.equal(registry.live.size,0,'the explanations make way for the full registration');
  assert.equal(constructed,1);assert.equal(started,1);assert.equal(item.disposed,true);
  assert.deepEqual({...api.snapshot()},{started:true});
  await extension.deactivate();
+});
+
+test('before Testy can start, its commands explain the trust requirement or the missing folder and offer the fix',async()=>{
+ const {commandIds}=loadUi({vscode:{commands:{registerCommand:()=>({dispose(){}})}}}).module('commands');
+ assert.deepEqual([...commandIds].sort(),manifest.contributes.commands.map(command=>command.command).sort(),'every contributed command has an inactive stand-in');
+ for(const [trusted,folders,fix] of [[false,[{uri:{fsPath:'/workspace'}}],'workbench.trust.manage'],[true,[],'workbench.action.files.openFolder']]) {
+  const registry=commandRegistry();
+  /** @type {string[]} */ const executed=[];
+  /** @type {string[]} */ const shown=[];
+  const vscode={StatusBarAlignment:{Left:1},ExtensionMode:{Test:3},commands:{...registry.commands,executeCommand:async (/** @type {string} */ command)=>{executed.push(command);}},Disposable:registry.Disposable,
+   workspace:{isTrusted:trusted,workspaceFolders:folders,onDidGrantWorkspaceTrust:()=>({dispose(){}})},
+   window:{createStatusBarItem:()=>({show(){},dispose(){}}),showInformationMessage:async(/** @type {string} */ message,/** @type {string[]} */ ...actions)=>{shown.push(message);return actions[0];}}};
+  /** @type {{dispose(): unknown}[]} */ const subscriptions=[];
+  loadUi({vscode,stubs:{controller:{Testy:class{}}}}).module('extension').activate({subscriptions,extensionMode:1});
+  assert.deepEqual([...registry.live.keys()].sort(),[...commandIds].sort());
+  await /** @type {() => unknown} */ (registry.live.get('testy.showMenu'))();
+  assert.match(shown[0],trusted?/open folder/:/trust this workspace/);assert.deepEqual(executed,[fix]);
+  for(const subscription of subscriptions)subscription.dispose();
+  assert.equal(registry.live.size,0);
+ }
 });

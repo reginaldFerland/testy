@@ -3,13 +3,16 @@ const assert = require('node:assert/strict');
 const { Semaphore } = require('../../out/core/concurrency');
 const turn = () => new Promise(resolve => setImmediate(resolve));
 
+/** @param {import('node:test').TestContext} t */
 function deferred(t) {
-    let resolve, reject;
+    /** @type {(value?: any) => void} */ let resolve = () => {};
+    /** @type {(reason?: any) => void} */ let reject = () => {};
     const promise = new Promise((done, failed) => { resolve = done; reject = failed; });
     t.after(() => resolve());
     return { promise, resolve, reject };
 }
 
+/** @param {Semaphore} pool @param {AbortSignal} [signal] */
 function unavailable(pool, signal) {
     let called = false;
     const result = pool.tryRun(signal, async () => { called = true; });
@@ -17,6 +20,7 @@ function unavailable(pool, signal) {
     assert.equal(called, false, 'declined work never starts');
 }
 
+/** @param {Semaphore} pool @param {number} limit @param {import('node:test').TestContext} t */
 async function fullCapacity(pool, limit, t) {
     const gate = deferred(t);
     const admitted = Array.from({ length: limit }, (_, index) => pool.tryRun(undefined, async () => { await gate.promise; return index; }));
@@ -27,7 +31,7 @@ async function fullCapacity(pool, limit, t) {
 }
 
 test('a one-slot parent continues serial work when borrowing is unavailable', async t => {
-    const pool = new Semaphore(1), seen = [];
+    const pool = new Semaphore(1), seen = /** @type {number[]} */ ([]);
     let declinedCalls = 0;
     await pool.run(undefined, async () => {
         for (let index = 0; index < 3; index++) {
@@ -43,18 +47,20 @@ test('a one-slot parent continues serial work when borrowing is unavailable', as
 });
 
 test('mixed ordinary and borrowed workers share one strict capacity bound', async t => {
-    const pool = new Semaphore(3), gates = Array.from({ length: 6 }, () => deferred(t)), started = [];
+    const pool = new Semaphore(3), gates = Array.from({ length: 6 }, () => deferred(t)), started = /** @type {number[]} */ ([]);
     let active = 0, peak = 0;
+    /** @param {number} index */
     const work = index => async () => {
         peak = Math.max(peak, ++active); started.push(index);
         try {await gates[index].promise; return index;} finally {active--;}
     };
-    const pending = [pool.run(undefined, work(0)), pool.tryRun(undefined, work(1)), pool.run(undefined, work(2)),
+    const pending = [pool.run(undefined, work(0)), /** @type {Promise<number>} */ (pool.tryRun(undefined, work(1))), // admitted: capacity is free
+        pool.run(undefined, work(2)),
         pool.run(undefined, work(3)), pool.run(undefined, work(4))];
     assert.deepEqual(started, [0, 1, 2]); unavailable(pool);
     gates[1].resolve(); await turn(); assert.deepEqual(started, [0, 1, 2, 3]); unavailable(pool);
     gates[0].resolve(); await turn(); assert.deepEqual(started, [0, 1, 2, 3, 4]); unavailable(pool);
-    gates[2].resolve(); await turn(); pending.push(pool.tryRun(undefined, work(5)));
+    gates[2].resolve(); await turn(); pending.push(/** @type {Promise<number>} */ (pool.tryRun(undefined, work(5)))); // admitted, asserted below
     assert.ok(pending[5] instanceof Promise); assert.deepEqual(started, [0, 1, 2, 3, 4, 5]); unavailable(pool);
     for (const gate of gates) {gate.resolve();}
     assert.deepEqual(await Promise.all(pending), [0, 1, 2, 3, 4, 5]);
@@ -63,7 +69,7 @@ test('mixed ordinary and borrowed workers share one strict capacity bound', asyn
 });
 
 test('released borrowed permits transfer to ordinary waiters in FIFO order', async t => {
-    const pool = new Semaphore(2), parent = deferred(t), extra = deferred(t), first = deferred(t), second = deferred(t), started = [];
+    const pool = new Semaphore(2), parent = deferred(t), extra = deferred(t), first = deferred(t), second = deferred(t), started = /** @type {string[]} */ ([]);
     const parentWork = pool.run(undefined, () => parent.promise);
     const borrowed = pool.tryRun(undefined, () => extra.promise);
     const firstWaiter = pool.run(undefined, async () => { started.push('first'); await first.promise; });
@@ -83,13 +89,13 @@ test('success, asynchronous rejection and synchronous throws release a borrowed 
     assert.equal(await pool.tryRun(undefined, async () => value), value);
     await fullCapacity(pool, 2, t);
     const gate = deferred(t), pending = pool.tryRun(undefined, () => gate.promise);
-    const rejected = assert.rejects(pending, failure => failure === error);
+    const rejected = assert.rejects(/** @type {Promise<unknown>} */ (pending), (/** @type {unknown} */ failure) => failure === error);
     gate.reject(error); await rejected;
     await fullCapacity(pool, 2, t);
-    let thrown;
+    /** @type {Promise<unknown> | undefined} */ let thrown;
     assert.doesNotThrow(() => { thrown = pool.tryRun(undefined, () => { throw error; }); });
     assert.ok(thrown instanceof Promise, 'callback throws become rejections of the owned operation');
-    await assert.rejects(thrown, failure => failure === error);
+    await assert.rejects(/** @type {Promise<unknown>} */ (thrown), (/** @type {unknown} */ failure) => failure === error);
     await fullCapacity(pool, 2, t);
 });
 
@@ -114,8 +120,8 @@ test('cancellation retains the borrowed permit until owned work and cleanup drai
         await new Promise(resolve => abort.signal.addEventListener('abort', resolve, { once: true }));
         stopped = true; await cleanup.promise; abort.signal.throwIfAborted();
     });
-    const rejected = assert.rejects(borrowed, error => error === reason);
-    void borrowed.then(() => { settled = true; }, () => { settled = true; });
+    const rejected = assert.rejects(/** @type {Promise<unknown>} */ (borrowed), (/** @type {unknown} */ error) => error === reason);
+    void /** @type {Promise<unknown>} */ (borrowed).then(() => { settled = true; }, () => { settled = true; });
     const queued = pool.run(undefined, async () => { queuedStarted = true; await next.promise; });
     abort.abort(reason); await turn();
     assert.equal(stopped, true); assert.equal(settled, false); assert.equal(queuedStarted, false); unavailable(pool);
@@ -126,7 +132,7 @@ test('cancellation retains the borrowed permit until owned work and cleanup drai
 });
 
 test('an aborted ordinary waiter passes the borrowed permit to the next live waiter', async t => {
-    const pool = new Semaphore(1), owner = deferred(t), live = deferred(t), abort = new AbortController(), started = [];
+    const pool = new Semaphore(1), owner = deferred(t), live = deferred(t), abort = new AbortController(), started = /** @type {string[]} */ ([]);
     const borrowed = pool.tryRun(undefined, () => owner.promise);
     const cancelled = pool.run(abort.signal, async () => { started.push('cancelled'); });
     const rejected = assert.rejects(cancelled, { name: 'AbortError' });

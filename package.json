@@ -56,7 +56,7 @@
         "command": "testy.refreshTests",
         "title": "%command.refreshTests%",
         "category": "Testy",
-        "icon": "$(refresh)"
+        "icon": "$(run-all)"
       },
       {
         "command": "testy.runAffected",
@@ -132,6 +132,12 @@
       {
         "command": "testy.runFile",
         "title": "%command.runFile%",
+        "category": "Testy",
+        "icon": "$(play)"
+      },
+      {
+        "command": "testy.runFolder",
+        "title": "%command.runFolder%",
         "category": "Testy",
         "icon": "$(play)"
       },
@@ -237,6 +243,10 @@
           "when": "testy.active && resourceScheme == file && resourceExtname == .cs"
         },
         {
+          "command": "testy.runFolder",
+          "when": "false"
+        },
+        {
           "command": "testy.runCoveringTests",
           "when": "testy.active && editorLangId == csharp"
         }
@@ -277,9 +287,35 @@
           "command": "testy.runFile",
           "when": "testy.active && resourceScheme == file && resourceExtname == .cs",
           "group": "testy@1"
+        },
+        {
+          "command": "testy.runFolder",
+          "when": "testy.active && resourceScheme == file && (explorerResourceIsFolder || resourceExtname == .csproj)",
+          "group": "testy@1"
         }
       ]
     },
+    "keybindings": [
+      {
+        "command": "testy.runAffected",
+        "key": "ctrl+; t",
+        "mac": "cmd+; t",
+        "when": "testy.active"
+      },
+      {
+        "command": "testy.runCoveringTests",
+        "key": "ctrl+; ctrl+t",
+        "mac": "cmd+; cmd+t",
+        "when": "testy.active && editorTextFocus && editorLangId == csharp"
+      }
+    ],
+    "viewsWelcome": [
+      {
+        "view": "workbench.view.testing",
+        "contents": "%viewsWelcome.noTestProjects%",
+        "when": "testy.noTestProjects"
+      }
+    ],
     "configuration": {
       "title": "Testy",
       "properties": {
@@ -372,7 +408,7 @@
         },
         "testy.fileWatcherPattern": {
           "type": "string",
-          "default": "**/*.{cs,csproj,sln,slnx,slnf,props,targets,runsettings,json,config,resx,editorconfig,globalconfig,ruleset}",
+          "default": "**/*.{cs,csproj,sln,slnx,slnf,props,targets,runsettings,json,config,resx,editorconfig,globalconfig,ruleset,razor,cshtml,xaml,axaml,proto}",
           "markdownDescription": "%config.fileWatcherPattern%",
           "scope": "window",
           "order": 9
@@ -459,6 +495,23 @@
           "markdownDescription": "%config.debugConfiguration%",
           "scope": "resource",
           "order": 19
+        },
+        "testy.problems.publishBuildDiagnostics": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "always",
+            "never"
+          ],
+          "enumDescriptions": [
+            "%config.problems.publishBuildDiagnostics.auto%",
+            "%config.problems.publishBuildDiagnostics.always%",
+            "%config.problems.publishBuildDiagnostics.never%"
+          ],
+          "markdownDescription": "%config.problems.publishBuildDiagnostics%",
+          "scope": "window",
+          "order": 20
         }
       }
     },
@@ -538,11 +591,15 @@
     "lint": "eslint src test scripts *.mjs",
     "typecheck:tests": "tsc -p tsconfig.tests.json",
     "test": "node --test test/unit/*.test.cjs",
+    "test:unit:only": "node --test test/unit/*.test.cjs",
     "test:integration": "npm run compile && node --test test/integration/*.test.cjs",
+    "test:integration:only": "node --test test/integration/*.test.cjs",
     "test:dotnet": "cd backend && dotnet test --project Testy.Backend.Tests",
     "pretest:extension": "npm run compile",
     "test:extension": "node test/extension/run.mjs",
-    "coverage": "node --test --experimental-test-coverage test/unit/*.test.cjs",
+    "test:extension:only": "node test/extension/run.mjs",
+    "coverage": "node --test --experimental-test-coverage --test-coverage-exclude=test/** --test-coverage-exclude=**/node_modules/** --test-coverage-lines=78 test/unit/*.test.cjs",
+    "clean": "node scripts/clean.mjs",
     "package": "vsce package --no-dependencies",
     "check:vsix": "node scripts/check-vsix-files.mjs",
     "benchmark": "npm run compile && node test/performance/benchmark.cjs",

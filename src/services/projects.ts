@@ -1,5 +1,6 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { Project } from '../core/model';
 import { defaultExcludes, isExcluded, isInside, matchesPattern, normalizePath, normalizePathAsync, normalizePathsAsync, pathNormalizer, preparePathNormalizer, testTargetKey } from '../core/paths';
 import { parseSolution } from '../core/solution';
@@ -109,7 +110,9 @@ export function sdkConfigurationFiles(file: string): readonly string[] {
 /** Share an SDK host only when its global.json search resolves to the same pin. */
 export async function sdkContextGroups(files: readonly string[], signal?: AbortSignal): Promise<readonly { key: string; cwd: string; files: readonly string[] }[]> {
     const pins = new Map<string, Promise<string>>();
-    const normalize = pathNormalizer();
+    // Every directory the search can visit and its candidate, resolved without blocking the host.
+    const candidates = [...new Set(files)].flatMap(sdkConfigurationCandidates);
+    const normalize = await preparePathNormalizer([...candidates, ...candidates.map(file => path.dirname(file))], signal);
     const pin = (directory: string): Promise<string> => {
         const key = normalize(directory), previous = pins.get(key);
         if (previous) {return previous;}
@@ -218,19 +221,31 @@ export async function evaluateProjects(dotnet: string, files: readonly string[],
         const normalize = await preparePathNormalizer([...files, ...graph.roots.map(root => root.file), ...graph.projects.flatMap(project => [
             project.file, project.assembly, ...project.sourceFiles, ...project.inputs ?? [], ...sdkConfigurationCandidates(project.file),
             ...project.outputDirectories ?? [], ...project.references, ...project.binaryReferences ?? []])], options.signal);
-        const projects = new Map(graph.projects.map(project => {
+        // Exclusion matching costs microseconds per path: a large graph yields between slices.
+        let work = 0;
+        const included = async (files: readonly string[]): Promise<string[]> => {
+            const kept: string[] = [];
+            for (const file of files) {
+                if (!isExcluded(file)) {kept.push(file);}
+                if (++work % 1024 === 0) {await yieldTurn(); options.signal?.throwIfAborted();}
+            }
+            return kept;
+        };
+        const projects = new Map<string, Project>();
+        for (const project of graph.projects) {
             const unsupported = unsupportedTestReason(project);
             const paths = (files: readonly string[]): string[] => [...new Set(files.map(normalize))];
             const analysisFiles = paths(project.sourceFiles);
             const normalized: Project = { ...project, file: normalize(project.file), assembly: normalize(project.assembly), runner: 'mtp',
                 analysisFiles,
-                sourceFiles: analysisFiles.filter(file => !isExcluded(file)),
-                inputs: paths([...project.inputs ?? [], ...sdkConfigurationCandidates(project.file)]).filter(file => !isExcluded(file)),
+                sourceFiles: await included(analysisFiles),
+                inputs: await included(paths([...project.inputs ?? [], ...sdkConfigurationCandidates(project.file)])),
                 outputDirectories: paths(project.outputDirectories ?? []),
                 references: paths(project.references), binaryReferences: paths(project.binaryReferences ?? []),
                 ...unsupported ? { unsupported } : {} };
-            return [contextId(normalized), normalized] as const;
-        }));
+            projects.set(contextId(normalized), normalized);
+            await yieldTurn(); options.signal?.throwIfAborted();
+        }
         const result = new Map<string, readonly Project[]>();
         for (const root of graph.roots) {
             const entries = new Set(root.entryPoints);
@@ -252,7 +267,7 @@ export async function evaluateProjects(dotnet: string, files: readonly string[],
 
 /** Single-entry compatibility adapter used by callers with a narrow refresh. */
 export async function evaluateProject(dotnet: string, file: string, configuration: string, options: ProcessOptions, analyzer: string): Promise<readonly Project[]> {
-    return (await evaluateProjects(dotnet, [file], configuration, options, analyzer)).get(normalizePath(file))!;
+    return (await evaluateProjects(dotnet, [file], configuration, options, analyzer)).get(await normalizePathAsync(file))!;
 }
 
 async function runProjectBatch(dotnet: string, body: string, target: string, options: ProcessOptions, concurrency: number, description: string, properties: readonly string[] = []): Promise<void> {
@@ -339,8 +354,7 @@ export function buildRoots(projects: readonly Project[]): readonly Project[] {
 
 const outputDirectories = (project: Project): readonly string[] => project.outputDirectories?.length
     ? project.outputDirectories : [path.dirname(project.assembly), path.join(path.dirname(project.file), 'obj')];
-function outputOverlap(): (left: string, right: string) => boolean {
-    const normalize = pathNormalizer();
+function outputOverlap(normalize: (file: string) => string): (left: string, right: string) => boolean {
     return (left, right) => {
         const a = normalize(left).replace(/\/$/, ''), b = normalize(right).replace(/\/$/, '');
         return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
@@ -371,10 +385,17 @@ class DirectoryIndex<T> {
     }
 }
 
+/** The output and binary directories buildSnapshotTargets and buildWaves compare, resolved
+ * asynchronously. Without it both resolve them with synchronous filesystem calls. */
+export async function prepareBuildPaths(projects: readonly Project[], signal?: AbortSignal): Promise<(file: string) => string> {
+    return preparePathNormalizer(buildContexts(projects).flatMap(project => [...outputDirectories(project), path.dirname(project.assembly),
+        ...(project.binaryReferences ?? []).map(assembly => path.dirname(assembly))]), signal);
+}
+
 /** Freeze a test binary before another context can overwrite any part of its output. */
-export function buildSnapshotTargets(projects: readonly Project[], roots: readonly Project[] = buildRoots(projects)): ReadonlySet<string> {
+export function buildSnapshotTargets(projects: readonly Project[], roots: readonly Project[] = buildRoots(projects), normalize = pathNormalizer()): ReadonlySet<string> {
     const contexts = buildContexts(projects);
-    const overlaps = outputOverlap();
+    const overlaps = outputOverlap(normalize);
     return new Set(roots.filter(root => root.isTestProject && root.entryPoint !== false && contexts.some(project =>
         contextId(project) !== contextId(root) && outputDirectories(project).some(directory => overlaps(path.dirname(root.assembly), directory))))
         .map(root => testTargetKey(root.file, root.framework)));
@@ -382,9 +403,10 @@ export function buildSnapshotTargets(projects: readonly Project[], roots: readon
 
 /** Compatible roots share one MSBuild session. Order output conflicts and binary
  * consumers across waves so snapshots remain valid and binary inputs stay stable. */
-export function buildWaves(projects: readonly Project[], roots: readonly Project[] = buildRoots(projects), sdkByFile?: ReadonlyMap<string, string>): readonly (readonly Project[])[] {
+export function buildWaves(projects: readonly Project[], roots: readonly Project[] = buildRoots(projects), sdkByFile?: ReadonlyMap<string, string>,
+    normalize = pathNormalizer()): readonly (readonly Project[])[] {
     const contexts = buildContexts(projects), byId = new Map(contexts.map(project => [contextId(project), project]));
-    const normalize = pathNormalizer(), directory = (value: string): string => normalize(value).replace(/\/$/, '');
+    const directory = (value: string): string => normalize(value).replace(/\/$/, '');
     const written = new Map<string, readonly string[]>();
     const writes = (project: Project): readonly string[] => {
         const id = contextId(project);

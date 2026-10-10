@@ -8,6 +8,13 @@ on:
   schedule:
     - cron: '23 4 * * 1'
 
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
@@ -25,19 +32,20 @@ jobs:
           - language: csharp
             build-mode: manual
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: matrix.language == 'csharp'
         with:
           node-version-file: .nvmrc
           cache: npm
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         if: matrix.language == 'csharp'
         with:
           global-json-file: global.json
 
-      - uses: github/codeql-action/init@v3
+      - uses: github/codeql-action/init@9f759ee644a3e7c15c1390abf49868036c00067b # v3.38.3
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -48,6 +56,6 @@ jobs:
           npm ci
           npm run build:dotnet
 
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@9f759ee644a3e7c15c1390abf49868036c00067b # v3.38.3
         with:
           category: /language:${{ matrix.language }}

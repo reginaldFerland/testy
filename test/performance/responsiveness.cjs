@@ -1,4 +1,5 @@
 // @ts-check
+require('./artifacts.cjs');
 const fs=require('node:fs/promises'),syncfs=require('node:fs'),path=require('node:path'),os=require('node:os'),vm=require('node:vm');
 const assert=require('node:assert/strict'),{createRequire}=require('node:module');
 const {CoverageReader}=require('../../out/services/coverageReader');

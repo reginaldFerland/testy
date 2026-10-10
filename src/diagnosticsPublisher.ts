@@ -2,13 +2,18 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { BuildDiagnostic, diagnosticKey, LineSplitter, parseBuildDiagnostic } from './core/diagnostics';
 
+/** Whether build errors go to the Problems panel; `auto` leaves them to the C# extension while it is active, which reports them too. */
+export type BuildDiagnosticsMode = 'auto' | 'always' | 'never';
+
+const csharpExtension = 'ms-dotnettools.csharp';
+
 /** Routes engine output to the log, collecting build diagnostics for the Problems panel. */
 export class DiagnosticsPublisher implements vscode.Disposable {
     private readonly collection = vscode.languages.createDiagnosticCollection('testy');
     private readonly lines = new LineSplitter();
     private diagnostics = new Map<string, BuildDiagnostic>();
 
-    constructor(private readonly output: vscode.LogOutputChannel, private readonly roots: () => readonly string[]) {}
+    constructor(private readonly output: vscode.LogOutputChannel, private readonly roots: () => readonly string[], private readonly mode: () => BuildDiagnosticsMode = () => 'always') {}
 
     get values(): IterableIterator<BuildDiagnostic> { return this.diagnostics.values(); }
 
@@ -46,6 +51,8 @@ export class DiagnosticsPublisher implements vscode.Disposable {
             const list = byFile.get(file) ?? []; list.push(diagnostic); byFile.set(file, list);
         }
         this.collection.clear();
+        const mode = this.mode();
+        if (mode === 'never' || (mode !== 'always' && vscode.extensions.getExtension(csharpExtension)?.isActive)) {return;}
         for (const [file, list] of byFile) {this.collection.set(vscode.Uri.file(file), list);}
     }
 

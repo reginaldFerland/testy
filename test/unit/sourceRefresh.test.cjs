@@ -4,10 +4,11 @@ const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:
 const {SourceTracker}=require('../../out/services/sources');
 const {normalizePath}=require('../../out/core/paths');
 
+/** @param {import('node:test').TestContext} t */
 async function temporary(t){const root=normalizePath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-sources-')));t.after(()=>fs.rm(root,{recursive:true,force:true}));return root;}
 
 test('only real global using directives keep their full source',async t=>{
- const root=await temporary(t),sources=new SourceTracker(),write=(name,text)=>fs.writeFile(path.join(root,name),text).then(()=>path.join(root,name));
+ const root=await temporary(t),sources=new SourceTracker(),write=(/** @type {string} */ name,/** @type {string} */ text)=>fs.writeFile(path.join(root,name),text).then(()=>path.join(root,name));
  const files=[
   await write('Real.cs','global using Alias = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute;'),
   await write('Spaced.cs','global /* note */ using static System.Math;'),
@@ -16,7 +17,7 @@ test('only real global using directives keep their full source',async t=>{
   await write('Prose.cs','// a global approach\nclass C { string global = "x"; }')];
  sources.setFiles(files);await sources.refresh(files);
  assert.deepEqual([...sources.aliasSources.keys()].sort(),[files[0],files[1]].sort());
- assert.equal(sources.aliasSources.get(files[0]).startsWith('global using Alias'),true);
+ assert.equal(/** @type {string} */ (sources.aliasSources.get(files[0])).startsWith('global using Alias'),true);
 });
 
 test('derived source maps are reused until the tracker changes',async t=>{
@@ -36,9 +37,9 @@ test('transient read errors make a version unknown and are retried without faili
  const before=sources.hashes.get(locked);assert.ok(before);
  await fs.writeFile(locked,'class Locked { int Changed; }');await fs.writeFile(other,'class Other { int Changed; }');
  const read=fs.readFile;
- fs.readFile=async(file,...rest)=>{if(file===locked){throw Object.assign(new Error('busy'),{code:'EBUSY'});}return read(file,...rest);};
+ /** @type {any} */ (fs).readFile=async(/** @type {any} */ file,/** @type {any[]} */ ...rest)=>{if(file===locked){throw Object.assign(new Error('busy'),{code:'EBUSY'});}return /** @type {any} */ (read)(file,...rest);}; // fs.readFile is monkey-patched; the wrapper forwards arbitrary overloads
  let changed;
- try{changed=await sources.refresh([locked,other]);}finally{fs.readFile=read;}
+ try{changed=await sources.refresh([locked,other]);}finally{/** @type {any} */ (fs).readFile=read;}
  assert.deepEqual([...changed].sort(),[locked,other].sort());
  assert.equal(sources.hashes.get(locked),undefined,'the unknown version cannot match a recorded trace');
  assert.ok(sources.hashes.get(other));

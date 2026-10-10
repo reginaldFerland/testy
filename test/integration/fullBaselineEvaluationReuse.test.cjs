@@ -5,10 +5,16 @@ const {TestEngine}=require('../../out/services/engine');
 const {normalizePath}=require('../../out/core/paths');
 const projects=require('../../out/services/projects'),processes=require('../../out/services/process');
 
-function deferred(){let resolve;const promise=new Promise(done=>{resolve=done;});return{promise,resolve};}
+/** @returns {{ promise: Promise<void>, resolve: () => void }} */
+function deferred(){let resolve=()=>{};const promise=/** @type {Promise<void>} */ (new Promise(done=>{resolve=done;}));return{promise,resolve};}
+/** @param {string} name */
 const testSource=name=>`using Microsoft.VisualStudio.TestTools.UnitTesting; [TestClass] public class ${name} { [TestMethod] public void Pass() => Assert.IsTrue(true); }`;
+/** @param {string} value */
 const xml=value=>value.replaceAll('&','&amp;').replaceAll('"','&quot;').replaceAll('<','&lt;');
 
+/** @typedef {(dotnet: string, files: readonly string[], configuration: string, options: import('../../out/services/process').ProcessOptions, concurrency?: number) => void | Promise<void>} RestoreHook */
+
+/** @param {import('node:test').TestContext} t @param {{ privateAnalyzer?: boolean }} [options] */
 async function fixture(t,{privateAnalyzer=false}={}){
  const temp=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-full-evaluation-'))),root=path.join(temp,'workspace');await fs.mkdir(root);
  const project=path.join(root,'Tests.csproj'),source=path.join(root,'Tests.cs'),payload=path.join(temp,'restore-payload.props');
@@ -26,21 +32,24 @@ async function fixture(t,{privateAnalyzer=false}={}){
  await fs.writeFile(source,testSource('SmokeTests'));
  let analyzer=path.resolve('dist/analyzer/Testy.Analysis.dll');
  if(privateAnalyzer){const directory=path.join(temp,'analyzer');await fs.cp(path.dirname(analyzer),directory,{recursive:true});analyzer=path.join(directory,path.basename(analyzer));}
+ /** @type {import('../../out/core/model').EngineConfiguration} */
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:false,excludes:[],testArguments:[],timeout:60000,maxParallelProjects:2,maxParallelTestFiles:2};
- const output=[],control=new AbortController(),signal=AbortSignal.any([control.signal,t.signal]);
+ /** @type {string[]} */ const output=[];
+ const control=new AbortController(),signal=AbortSignal.any([control.signal,t.signal]);
  const evaluate=projects.evaluateProjects,restore=projects.restoreProjects,runProcess=processes.runProcess;
- let evaluations=0,restores=0,sdkChecks=0,afterRestore;
- projects.evaluateProjects=async(...args)=>{evaluations++;return evaluate(...args);};
- projects.restoreProjects=async(...args)=>{restores++;await restore(...args);await afterRestore?.(...args);};
- processes.runProcess=(command,args,...rest)=>{if(args.length===1&&args[0]==='--version')sdkChecks++;return runProcess(command,args,...rest);};
+ let evaluations=0,restores=0,sdkChecks=0;
+ /** @type {RestoreHook | undefined} */ let afterRestore;
+ projects.evaluateProjects=async(/** @type {Parameters<typeof evaluate>} */ ...args)=>{evaluations++;return evaluate(...args);};
+ projects.restoreProjects=async(/** @type {Parameters<typeof restore>} */ ...args)=>{restores++;await restore(...args);await afterRestore?.(...args);};
+ processes.runProcess=(/** @type {string} */ command,/** @type {readonly string[]} */ args,/** @type {[import('../../out/services/process').ProcessOptions]} */ ...rest)=>{if(args.length===1&&args[0]==='--version')sdkChecks++;return runProcess(command,args,...rest);};
  const engine=new TestEngine({roots:[root],storage:path.join(temp,'state'),tools:path.join(temp,'tools'),analyzer,configuration:()=>config,
   events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result(){},started(){},coverage(){},invalidated(){}}});
  t.after(async()=>{control.abort();projects.evaluateProjects=evaluate;projects.restoreProjects=restore;processes.runProcess=runProcess;await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
  return{temp,root,project,source,payload,imported,marker,failure,analyzer,config,engine,output,signal,
-  counts:()=>({evaluations,restores,sdkChecks}),afterRestore:hook=>{afterRestore=hook;},
-  baseline:(extraSignal)=>engine.run({files:[],full:true},extraSignal?AbortSignal.any([signal,extraSignal]):signal),
+  counts:()=>({evaluations,restores,sdkChecks}),afterRestore:(/** @type {RestoreHook | undefined} */ hook)=>{afterRestore=hook;},
+  /** @param {AbortSignal} [extraSignal] */ baseline:(extraSignal)=>engine.run({files:[],full:true},extraSignal?AbortSignal.any([signal,extraSignal]):signal),
   manual:()=>engine.run({files:[],full:false},signal,{all:true,groups:new Set(),coverage:false}),
-  sourceFiles:()=>engine.projects.find(value=>value.file===normalizePath(project)).sourceFiles,
+  sourceFiles:()=>/** @type {import('../../out/core/model').Project} */ (engine.projects.find(value=>value.file===normalizePath(project))).sourceFiles,
   markerCount:async()=>(await fs.readFile(marker,'utf8')).trim().split(/\r?\n/).length};
 }
 
@@ -89,8 +98,9 @@ test('failed and cancelled restores do not publish a cached or partially refresh
  const recovered=f.engine.projects,inspected=f.counts().evaluations,restored=deferred(),abort=new AbortController();
  await fs.rm(f.payload);
  f.afterRestore(async(_dotnet,_files,_configuration,options)=>{
-  restored.resolve();await new Promise(resolve=>{if(options.signal.aborted)resolve();else options.signal.addEventListener('abort',resolve,{once:true});});
-  options.signal.throwIfAborted();
+  restored.resolve();const abortSignal=/** @type {AbortSignal} */ (options.signal);
+  await new Promise((/** @type {(value?: unknown) => void} */ resolve)=>{if(abortSignal.aborted)resolve();else abortSignal.addEventListener('abort',resolve,{once:true});});
+  abortSignal.throwIfAborted();
  });
  const run=f.baseline(abort.signal);void run.catch(()=>undefined);
  await Promise.race([restored.promise,run.then(()=>{throw new Error('baseline finished before the restore barrier');})]);

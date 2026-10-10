@@ -6,25 +6,31 @@ const {findProjects,sdkContextGroups,buildWaves,buildSnapshotTargets,buildOrder,
  restoreProjects,evaluateProjects,buildProjects,refreshProjectSnapshotBatches}=require('../../out/services/projects');
 const {normalizePath}=require('../../out/core/paths');
 
+/** @typedef {import('../../out/core/model').Project} Project */
+
+/** @param {import('node:test').TestContext} t */
 async function temporary(t){const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-project-parallel-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));return root;}
+/** @param {string} name @param {string[]} [references] @param {Partial<Project>} [extra] @returns {Project} */
 function node(name,references=[],extra={}){
- return{file:`/workspace/${name}/${name}.csproj`,framework:'net10.0',assembly:`/workspace/${name}/bin/${name}.dll`,
+ // A partial project: only the fields the build planner reads are populated.
+ return /** @type {Project} */ (/** @type {unknown} */ ({file:`/workspace/${name}/${name}.csproj`,framework:'net10.0',assembly:`/workspace/${name}/bin/${name}.dll`,
   sourceFiles:[],references:[],contextId:name,contextReferences:references,entryPoint:true,
-  outputDirectories:[`/workspace/${name}/bin`,`/workspace/${name}/obj`],...extra};
+  outputDirectories:[`/workspace/${name}/bin`,`/workspace/${name}/obj`],...extra}));
 }
 
 test('project traversal overlaps directory reads within its bound and deduplicates overlapping roots',async t=>{
  const root=await temporary(t);
  for(let i=0;i<12;i++){const directory=path.join(root,String(i));await fs.mkdir(directory);await fs.writeFile(path.join(directory,'A.csproj'),'');}
  await fs.mkdir(path.join(root,'obj'));await fs.writeFile(path.join(root,'obj','Excluded.csproj'),'');
- const read=fs.readdir,seen=new Map();let active=0,peak=0;
- fs.readdir=async(...args)=>{active++;peak=Math.max(peak,active);seen.set(args[0],(seen.get(args[0])??0)+1);try{await delay(5);return await read(...args);}finally{active--;}};
+ // The overloaded readdir is wrapped generically, so it is viewed as a plain function.
+ const read=/** @type {(...args: any[]) => any} */ (fs.readdir),seen=new Map();let active=0,peak=0;
+ fs.readdir=/** @param {any[]} args */ async(...args)=>{active++;peak=Math.max(peak,active);seen.set(args[0],(seen.get(args[0])??0)+1);try{await delay(5);return await read(...args);}finally{active--;}};
  try{
   const projects=await findProjects([root,path.join(root,'0')],undefined,undefined,3);
   assert.equal(projects.length,12);assert.deepEqual(projects,[...projects].sort());assert.ok(peak>1&&peak<=3);
   assert.equal(seen.get(path.join(root,'0')),1);assert.equal(seen.has(path.join(root,'obj')),false);assert.equal(active,0);
   const abort=new AbortController();let reads=0;
-  fs.readdir=async(...args)=>{if(++reads===3){abort.abort();}await delay(5);return read(...args);};
+  fs.readdir=/** @param {any[]} args */ async(...args)=>{if(++reads===3){abort.abort();}await delay(5);return read(...args);};
   await assert.rejects(findProjects([root],undefined,abort.signal,2),{name:'AbortError'});
   assert.ok(reads<=3,'cancellation stops queued directory reads');
  }finally{fs.readdir=read;}
@@ -50,9 +56,9 @@ test('compatible build roots share a wave while alternate contexts and SDK hosts
 });
 
 test('build conflict planning canonicalizes each output path once across a wide shared graph',()=>{
- const sync=require('node:fs'),realpath=sync.realpathSync.native;let calls=0;
+ const sync=require('node:fs'),realpath=/** @type {(...args: any[]) => any} */ (sync.realpathSync.native);let calls=0;
  const shared=node('Shared'),roots=Array.from({length:30},(_,i)=>node(`Tests${i}`,['Shared']));
- sync.realpathSync.native=(...args)=>{calls++;return realpath(...args);};
+ sync.realpathSync.native=/** @param {any[]} args */ (...args)=>{calls++;return realpath(...args);};
  try{assert.equal(buildWaves([shared,...roots],roots).length,1);assert.ok(calls<500,`${calls} filesystem calls for 31 projects`);}
  finally{sync.realpathSync.native=realpath;}
 });
@@ -68,14 +74,17 @@ test('binary readers finish before conflicting producers and nested outputs get 
 
 test('snapshot batches refresh shared changes in waves without evaluating unchanged siblings',async()=>{
  const shared=node('Shared'),roots=[node('A',['Shared']),node('B',['Shared']),node('C',['Shared'])];
- const previous=new Map(roots.map(root=>[root.file,[root,shared]])),calls=[];
- await refreshProjectSnapshotBatches(previous,[...previous.keys()],[roots[0].file],async files=>{calls.push(files);return new Map(files.map(file=>[file,previous.get(file)]));});
+ const previous=new Map(roots.map(root=>[root.file,[root,shared]]));
+// assert.deepEqual narrows calls to mutable arrays, so the readonly inputs are viewed as mutable when recorded.
+ /** @type {string[][]} */
+ const calls=[];
+ await refreshProjectSnapshotBatches(previous,[...previous.keys()],[roots[0].file],async files=>{calls.push(/** @type {string[]} */ (files));return new Map(files.map(file=>[file,/** @type {Project[]} */ (previous.get(file))]));});
  assert.deepEqual(calls,[[roots[0].file]]);calls.length=0;
  const next=await refreshProjectSnapshotBatches(previous,[...previous.keys()],[roots[0].file],async files=>{
-  calls.push(files);return new Map(files.map(file=>[file,previous.get(file).map(project=>project===shared?{...project,sourceFiles:['new.cs']}:project)]));
+  calls.push(/** @type {string[]} */ (files));return new Map(files.map(file=>[file,/** @type {Project[]} */ (previous.get(file)).map(project=>project===shared?{...project,sourceFiles:['new.cs']}:project)]));
  });
  assert.deepEqual(calls,[[roots[0].file],[roots[1].file,roots[2].file]]);assert.ok([...next.values()].every(graph=>graph[1].sourceFiles[0]==='new.cs'));
- calls.length=0;await refreshProjectSnapshotBatches(previous,[...previous.keys()],undefined,async files=>{calls.push(files);return previous;});
+ calls.length=0;await refreshProjectSnapshotBatches(previous,[...previous.keys()],undefined,async files=>{calls.push(/** @type {string[]} */ (files));return previous;});
  assert.deepEqual(calls,[[...previous.keys()]]);
 });
 
@@ -92,7 +101,7 @@ test('batched restore, inspection and build reuse a deep shared graph',{timeout:
  await restoreProjects('dotnet',files,'Debug',options,2);
  const snapshots=await evaluateProjects('dotnet',files,'Debug',options,path.resolve('dist/analyzer/Testy.Analysis.dll'),2);
  assert.deepEqual([...snapshots.values()].map(graph=>graph.length),[1,2,3,4,5,5]);
- for(const [file,graph] of snapshots){assert.deepEqual(graph.filter(project=>project.entryPoint).map(project=>project.file),[file]);assert.ok(graph.every(project=>project.outputDirectories.some(directory=>directory.includes('/obj'))));}
+ for(const [file,graph] of snapshots){assert.deepEqual(graph.filter(project=>project.entryPoint).map(project=>project.file),[file]);assert.ok(graph.every(project=>/** @type {readonly string[]} */ (project.outputDirectories).some(directory=>directory.includes('/obj'))));}
  const projects=mergeProjects([...snapshots.values()].flat()),order=buildOrder(projects,new Set(files)),roots=buildRoots(order);
  assert.equal(new Set([...snapshots.values()].flat().map(project=>project.contextId)).size,6);
  assert.deepEqual(new Set(roots.map(project=>project.file)),new Set(['TestsA','TestsB'].map(name=>normalizePath(path.join(root,name,`${name}.csproj`)))));

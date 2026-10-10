@@ -75,7 +75,7 @@ export default tseslint.config(
         }
     },
     {
-        // CommonJS test files. Syntax and scope rules only; no type-aware rules.
+        // CommonJS test files: syntax and scope rules (type-aware promise rules follow).
         files: ['test/**/*.cjs'],
         extends: [js.configs.recommended],
         languageOptions: {
@@ -90,6 +90,22 @@ export default tseslint.config(
             // Off for tests: the suites use dense one-line statements without braces.
             curly: 'off',
             'no-empty': ['error', { allowEmptyCatch: true }]
+        }
+    },
+    {
+        // Type-aware promise rules for every test file, using tsconfig.tests.json.
+        files: ['test/**/*.cjs'],
+        extends: [tseslint.configs.base],
+        languageOptions: {
+            parserOptions: { project: './tsconfig.tests.json', tsconfigRootDir: import.meta.dirname }
+        },
+        rules: {
+            // node:test registration calls return promises that the runner tracks itself.
+            '@typescript-eslint/no-floating-promises': ['error', {
+                allowForKnownSafeCalls: [{ from: 'package', package: 'node:test', name: ['test', 'it', 'describe', 'suite', 'before', 'after', 'beforeEach', 'afterEach'] }]
+            }],
+            '@typescript-eslint/no-misused-promises': 'error',
+            '@typescript-eslint/await-thenable': 'error'
         }
     },
     {

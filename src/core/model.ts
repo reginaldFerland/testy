@@ -126,4 +126,6 @@ export interface EngineConfiguration {
     readonly solutions?: readonly { readonly file: string; readonly root: string }[] | undefined;
     /** Entry-point project globs; exclusions win over inclusions. */
     readonly projects?: { readonly include: readonly string[]; readonly exclude: readonly string[] };
+    /** `fileSystem`: watcher events cover every input, so incremental runs read only the files they report. */
+    readonly trigger?: 'save' | 'fileSystem';
 }

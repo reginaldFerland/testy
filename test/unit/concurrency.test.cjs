@@ -2,7 +2,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { mapConcurrent, mapConcurrentByKey, resolveConcurrency, resolveTestFileConcurrency, SerialQueue, Semaphore } = require('../../out/core/concurrency');
 const turn = () => new Promise(resolve => setImmediate(resolve));
-function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; }
+/** @returns {{ promise: Promise<void>, resolve: () => void }} */
+function deferred() { let resolve = () => {}; const promise = /** @type {Promise<void>} */ (new Promise(done => { resolve = done; })); return { promise, resolve }; }
 
 test('automatic project budgets reserve a CPU and explicit limits remain configurable', () => {
     assert.equal(resolveConcurrency(0, 1), 1);
@@ -25,7 +26,7 @@ test('automatic test-file workers scale with available CPUs while project prepar
 });
 
 test('bounded workers overlap, retain input order and reuse stable worker numbers', async () => {
-    const gates = Array.from({ length: 5 }, deferred), started = [], workers = [];
+    const gates = Array.from({ length: 5 }, deferred), /** @type {number[]} */ started = [], /** @type {number[]} */ workers = [];
     let active = 0, peak = 0;
     const pending = mapConcurrent(gates, 2, undefined, async (gate, index, signal, worker) => {
         started.push(index); workers.push(worker); peak = Math.max(peak, ++active);
@@ -66,7 +67,7 @@ test('sequential mode and parent cancellation never launch queued jobs', async (
 });
 
 test('target scheduling admits idle targets first and retains FIFO and result order', async () => {
-    const items = ['A1', 'A2', 'A3', 'B1', 'B2', 'C1'], gates = items.map(deferred), started = [];
+    const items = ['A1', 'A2', 'A3', 'B1', 'B2', 'C1'], gates = items.map(deferred), /** @type {string[]} */ started = [];
     const pending = mapConcurrentByKey(items, 3, undefined, value => value[0], async (value, index) => {
         started.push(value); await gates[index].promise; return value;
     });
@@ -79,7 +80,7 @@ test('target scheduling admits idle targets first and retains FIFO and result or
 });
 
 test('target scheduling redistributes spare workers over skewed targets and reuses worker slots', async () => {
-    const items = ['A1', 'A2', 'A3', 'A4', 'B1'], gates = items.map(deferred), started = [], workers = [];
+    const items = ['A1', 'A2', 'A3', 'A4', 'B1'], gates = items.map(deferred), /** @type {string[]} */ started = [], /** @type {number[]} */ workers = [];
     let active = 0, peak = 0;
     const pending = mapConcurrentByKey(items, 3, undefined, value => value[0], async (value, index, _signal, worker) => {
         started.push(value); workers.push(worker); peak = Math.max(peak, ++active);
@@ -94,7 +95,7 @@ test('target scheduling redistributes spare workers over skewed targets and reus
 });
 
 test('exclusive target work leaves spare slots for eligible work on other targets', async () => {
-    const items = ['A1', 'A2', 'A3', 'B1', 'B2'], gates = items.map(deferred), started = [];
+    const items = ['A1', 'A2', 'A3', 'B1', 'B2'], gates = items.map(deferred), /** @type {string[]} */ started = [];
     const pending = mapConcurrentByKey(items, 3, undefined, value => value[0], async (value, index) => {
         started.push(value); await gates[index].promise; return value;
     }, undefined, value => value[0] !== 'A');
@@ -107,7 +108,7 @@ test('exclusive target work leaves spare slots for eligible work on other target
 });
 
 test('an exclusive item waits for active target work and prevents later FIFO items bypassing it', async () => {
-    const items = ['A1', 'A2', 'A3'], gates = items.map(deferred), started = [];
+    const items = ['A1', 'A2', 'A3'], gates = items.map(deferred), /** @type {string[]} */ started = [];
     const pending = mapConcurrentByKey(items, 3, undefined, value => value[0], async (value, index) => {
         started.push(value); await gates[index].promise; return value;
     }, undefined, value => value !== 'A2');
@@ -118,7 +119,7 @@ test('an exclusive item waits for active target work and prevents later FIFO ite
 });
 
 test('parallel eligibility is refreshed when a target learns it requires exclusive execution', async () => {
-    const items = ['A1', 'A2', 'A3', 'A4'], gates = items.map(deferred), started = [];
+    const items = ['A1', 'A2', 'A3', 'A4'], gates = items.map(deferred), /** @type {string[]} */ started = [];
     let parallel = true;
     const pending = mapConcurrentByKey(items, 2, undefined, value => value[0], async (value, index) => {
         started.push(value); await gates[index].promise; return value;
@@ -131,7 +132,7 @@ test('parallel eligibility is refreshed when a target learns it requires exclusi
 });
 
 test('target scheduler cancels and drains admitted work on the first failure', async () => {
-    const gate = deferred(), release = deferred(), error = new Error('failed'), started = [];
+    const gate = deferred(), release = deferred(), error = new Error('failed'), /** @type {string[]} */ started = [];
     let stopped = false, settled = false, failureCalls = 0;
     const pending = mapConcurrentByKey(['A1', 'A2', 'B1', 'B2'], 2, undefined, value => value[0], async (value, _index, signal) => {
         started.push(value);
@@ -147,7 +148,7 @@ test('target scheduler cancels and drains admitted work on the first failure', a
 });
 
 test('target scheduler wakes parked workers on cancellation and drains exclusive work', async () => {
-    const abort = new AbortController(), gate = deferred(), started = []; let settled = false;
+    const abort = new AbortController(), gate = deferred(), /** @type {string[]} */ started = []; let settled = false;
     const pending = mapConcurrentByKey(['A1', 'A2', 'A3'], 3, abort.signal, value => value[0], async value => {
         started.push(value); await gate.promise;
     }, undefined, () => false);
@@ -162,7 +163,7 @@ test('target scheduler handles empty inputs, validates limits and supports one w
     for (const limit of [0, -1, 1.5, NaN, Infinity]) {
         await assert.rejects(mapConcurrentByKey([], limit, undefined, value => value, async value => value), /Worker limit/);
     }
-    const items = ['A1', 'A2', 'B1'], started = [];
+    const items = ['A1', 'A2', 'B1'], /** @type {string[]} */ started = [];
     assert.deepEqual(await mapConcurrentByKey(items, 1, undefined, value => value[0], async value => {
         started.push(value); await turn(); return value;
     }), items);
@@ -170,7 +171,7 @@ test('target scheduler handles empty inputs, validates limits and supports one w
 });
 
 test('commits stay serialized even when one commit fails', async () => {
-    const queue = new SerialQueue(), gate = deferred(), seen = [];
+    const queue = new SerialQueue(), gate = deferred(), /** @type {number[]} */ seen = [];
     const first = queue.run(async () => { seen.push(1); await gate.promise; throw new Error('commit'); });
     const second = queue.run(async () => { seen.push(2); return 2; });
     await turn(); assert.deepEqual(seen, [1]); gate.resolve();

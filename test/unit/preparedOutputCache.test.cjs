@@ -1,22 +1,38 @@
 const test=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os'),{randomUUID}=require('node:crypto');
-const {setTimeout:delay}=require('node:timers/promises');
 const {PreparedOutputCache,outputManifest,preparationToolIdentity}=require('../../out/services/preparedOutputCache');
 const {copyOutput,PreparedOutput}=require('../../out/services/output');
 const outputTools=require('../../out/services/output');
 
-function deferred(){let resolve;const promise=new Promise(done=>resolve=done);return{promise,resolve};}
+/** @typedef {import('../../out/services/preparedOutputCache').PreparedArtifact} PreparedArtifact */
+/** @typedef {import('../../out/services/preparedOutputCache').PreparedArtifactLease} PreparedArtifactLease */
 
+/** @returns {{promise:Promise<unknown>,resolve:(value?:any)=>void}} */
+function deferred(){
+ /** @type {(value?:any)=>void} */
+ let resolve=()=>{};const promise=new Promise(done=>resolve=done);return{promise,resolve};}
+
+/**
+ * @param {import('node:test').TestContext} t
+ * @param {import('../../out/services/preparedOutputCache').PreparedOutputLimits} [limits]
+ */
 async function fixture(t,limits={}){
  const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-prepared-cache-'))),source=path.join(root,'build'),storage=path.join(root,'storage');
  await fs.mkdir(source);await fs.writeFile(path.join(source,'Tests.dll'),'binary');await fs.writeFile(path.join(source,'asset'),'original');
- const cache=new PreparedOutputCache(storage,randomUUID(),limits),leases=[],created=[];
+ const cache=new PreparedOutputCache(storage,randomUUID(),limits);
+ /** @type {PreparedArtifactLease[]} */
+ const leases=[];
+ /** @type {PreparedArtifact[]} */
+ const created=[];
+ /** @param {string} directory @returns {Promise<PreparedArtifact>} */
  const create=async directory=>{
   const template=path.join(directory,'template'),output=new PreparedOutput(template,path.join(directory,'assembly'));
   await copyOutput(source,template);await output.initialize();
   const artifact={root:directory,output,session:randomUUID(),coverage:true,instrumented:[],reusable:true};created.push(artifact);return artifact;
  };
- const acquire=async(context='context',prepare=create,signal,slot)=>{const lease=await cache.acquire(source,context,prepare,signal,slot);if(lease)leases.push(lease);return lease;};
+ // Typed as a lease: acquire only yields undefined for a closed cache or an owned slot, and the tests that expect that just compare against undefined.
+ /** @param {string} [context] @param {(root:string)=>Promise<PreparedArtifact>} [prepare] @param {AbortSignal} [signal] @param {string} [slot] @returns {Promise<PreparedArtifactLease>} */
+ const acquire=async(context='context',prepare=create,signal,slot)=>{const lease=await cache.acquire(source,context,prepare,signal,slot);if(lease)leases.push(lease);return /** @type {PreparedArtifactLease} */ (lease);};
  t.after(async()=>{for(const lease of leases)await lease.release();await cache.dispose();await fs.rm(root,{recursive:true,force:true});});
  return{root,source,storage,cache,created,create,acquire};
 }
@@ -58,9 +74,10 @@ test('release and disposal drain an in-flight upgrade, and later upgrades cannot
  outputTools.fileHash=async(file,signal)=>{if(file===path.join(first.artifact.output.template,'Tests.dll')){entered.resolve();await finish.promise;}return hash(file,signal);};
  t.after(()=>{finish.resolve();outputTools.fileHash=hash;});
  const updating=first.update({...first.artifact,coveragePending:false});await entered.promise;
- let complete=false;const releasing=first.release(),disposing=f.cache.dispose().then(()=>{complete=true;});await delay(5);assert.equal(complete,false);
+ const order=[],releasing=first.release(),disposing=f.cache.dispose().then(()=>{order.push('disposed');});
  await assert.rejects(first.update(first.artifact),/updating or releasing/);
- finish.resolve();await Promise.all([updating,releasing,disposing]);assert.deepEqual(await fs.readdir(path.join(f.storage,'prepared')),[]);
+ order.push('upgrade finishing');finish.resolve();await Promise.all([updating,releasing,disposing]);
+ assert.deepEqual(order,['upgrade finishing','disposed'],'disposal settles only after the in-flight upgrade');assert.deepEqual(await fs.readdir(path.join(f.storage,'prepared')),[]);
 });
 
 test('an unverifiable upgraded template is discarded instead of retaining partially prepared output',async t=>{
@@ -165,9 +182,10 @@ test('failed and partial preparations never enter the cache',async t=>{
 });
 
 test('disposal waits for active owners, then removes its prepared tree and refuses later use',async t=>{
- const f=await fixture(t),lease=await f.acquire();let disposed=false;
- const disposal=f.cache.dispose().then(()=>{disposed=true;});await delay(5);assert.equal(disposed,false);assert.ok(await fs.stat(lease.artifact.root));
- await lease.release();await disposal;assert.deepEqual(await fs.readdir(path.join(f.storage,'prepared')),[]);
+ const f=await fixture(t),lease=await f.acquire(),order=[];
+ const disposal=f.cache.dispose().then(()=>{order.push('disposed');});assert.ok(await fs.stat(lease.artifact.root));
+ order.push('released');await lease.release();await disposal;
+ assert.deepEqual(order,['released','disposed'],'disposal settles only after the active owner releases');assert.deepEqual(await fs.readdir(path.join(f.storage,'prepared')),[]);
  await assert.rejects(f.acquire(),/disposed/);
 });
 
@@ -175,9 +193,10 @@ test('disposal also drains an eviction already removed from the in-memory invent
  const f=await fixture(t,{maxEntries:0}),lease=await f.acquire(),entered=deferred(),finish=deferred(),remove=outputTools.removeOutput;
  outputTools.removeOutput=async directory=>{if(directory===lease.artifact.root){entered.resolve();await finish.promise;}return remove(directory);};
  t.after(()=>{finish.resolve();outputTools.removeOutput=remove;});
- const release=lease.release();await entered.promise;let disposed=false;
- const disposal=f.cache.dispose().then(()=>{disposed=true;});await delay(5);assert.equal(disposed,false);
- finish.resolve();await Promise.all([release,disposal]);assert.deepEqual(await fs.readdir(path.join(f.storage,'prepared')),[]);
+ const release=lease.release();await entered.promise;const order=[];
+ const disposal=f.cache.dispose().then(()=>{order.push('disposed');});assert.ok(await fs.stat(lease.artifact.root));
+ order.push('eviction finishing');finish.resolve();await Promise.all([release,disposal]);
+ assert.deepEqual(order,['eviction finishing','disposed']);assert.deepEqual(await fs.readdir(path.join(f.storage,'prepared')),[]);
 });
 
 test('cancellation during preparation removes incomplete output before disposal completes',async t=>{
@@ -186,8 +205,9 @@ test('cancellation during preparation removes incomplete output before disposal 
   const artifact=await f.create(directory);entered.resolve();await finish.promise;return artifact;
  },control.signal,'target/primary');
  const rejected=assert.rejects(pending,{name:'AbortError'});await entered.promise;control.abort();
- let disposed=false;const disposal=f.cache.dispose().then(()=>{disposed=true;});await delay(5);assert.equal(disposed,false);
- finish.resolve();await Promise.all([rejected,disposal]);assert.deepEqual(await fs.readdir(path.join(f.storage,'prepared')),[]);
+ const order=[],disposal=f.cache.dispose().then(()=>{order.push('disposed');});await fs.readdir(path.join(f.storage,'prepared'));
+ order.push('preparation finishing');finish.resolve();await Promise.all([rejected,disposal]);
+ assert.deepEqual(order,['preparation finishing','disposed']);assert.deepEqual(await fs.readdir(path.join(f.storage,'prepared')),[]);
 });
 
 test('unavailable cache storage falls back without executing the preparation callback',async t=>{
@@ -229,7 +249,8 @@ test('one operation hashes the same resolved executable once across project dire
  const f=await fixture(t),name=process.platform==='win32'?'collector.exe':'collector',command=path.join(f.root,name),alias=path.join(f.root,'alias');
  await fs.writeFile(command,'collector',{mode:0o755});await fs.symlink(command,alias);
  const left=path.join(f.root,'left'),right=path.join(f.root,'right');await fs.mkdir(left);await fs.mkdir(right);
- const hashes=[],hash=outputTools.fileHash;outputTools.fileHash=async(file,signal)=>{hashes.push(file);return hash(file,signal);};t.after(()=>{outputTools.fileHash=hash;});
+ /** @type {string[]} */
+ const hashes=[];const hash=outputTools.fileHash;outputTools.fileHash=async(/** @type {string} */ file,/** @type {AbortSignal|undefined} */ signal)=>{hashes.push(file);return hash(file,signal);};t.after(()=>{outputTools.fileHash=hash;});
  const identities=new Map(),env={PATH:f.root,PATHEXT:'.EXE'};
  const results=await Promise.all([
   preparationToolIdentity('collector',env,undefined,left,identities),preparationToolIdentity(`../${name}`,env,undefined,right,identities),

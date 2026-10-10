@@ -2,6 +2,8 @@ import { EngineConfiguration, Project, TestFile, TestResult } from '../../core/m
 import { ProjectIndex, Selection } from '../../core/selection';
 import { ProcessOptions } from '../process';
 import { RunnerSession } from '../runner';
+import type { SourceShape } from '../analysis';
+import type { Baseline } from './baseline';
 
 /** Progress of the current run stage; the extension formats and localizes it. */
 export interface RunPhase {
@@ -21,6 +23,8 @@ export interface EngineEvents {
     readonly output: (text: string) => void;
     readonly phase: (phase: RunPhase) => void;
     readonly inputsChanged?: () => void;
+    /** The cache restored saved state, such as `outcomes`. */
+    readonly restored?: () => void;
     readonly discovered: (groups: readonly TestFile[]) => void | Promise<void>;
     readonly selected: (selection: Selection) => void;
     readonly result: (group: TestFile, result: TestResult) => void;
@@ -98,6 +102,8 @@ export interface BuildPlan {
     readonly builds: readonly Project[];
     readonly testBuilds: readonly Project[];
     readonly sharedOutputs: ReadonlySet<string>;
+    /** Resolves build output paths without synchronous file system calls; prepared once per plan. */
+    readonly normalize?: (file: string) => string;
 }
 export interface BuildResult {
     readonly revision: number;
@@ -114,13 +120,27 @@ export interface PreparedTests {
     liveIds: Set<string>;
     currentShapes: ReadonlyMap<string, string | null>;
 }
-export interface SelectedRun { readonly selection: Selection; readonly currentShapes: ReadonlyMap<string, string | null>; }
+export interface SelectedRun {
+    readonly selection: Selection;
+    readonly currentShapes: ReadonlyMap<string, string | null>;
+    /** Baseline files to learn again, and the versions the remaining checkpoints now describe. */
+    readonly checkpoint?: { readonly invalidated: readonly string[]; readonly shapes: ReadonlyMap<string, string | null>; readonly inputs: ReadonlyMap<string, string> } | undefined;
+}
 export interface TestedRun { readonly results: readonly TestResult[]; readonly executedFiles: ReadonlySet<string>; readonly available: boolean; readonly failedBatches: number; }
 
-export interface Baseline {
-    readonly generation: string | number;
-    readonly completed: Set<string>;
-    readonly runtimeResults: Map<string, ReadonlySet<string>>;
-    shapes: ReadonlyMap<string, string | null>;
-    inputs: ReadonlyMap<string, string>;
+/** Retained source analyses, reused while bytes, aliases and the analyzer context match. */
+export interface AnalysisState {
+    readonly analyses: ReadonlyMap<string, SourceShape | null>;
+    readonly analyzedHashes: ReadonlyMap<string, string>;
+    readonly analysisContext: string | undefined;
+    readonly aliasStamp: string | undefined;
+    readonly excludedAliases: readonly string[];
+}
+/** The evaluated workspace a structural refresh produced. */
+export interface StructureState {
+    readonly projectSnapshots: ReadonlyMap<string, readonly Project[]>;
+    readonly buildGraph: readonly Project[];
+    readonly projects: readonly Project[];
+    readonly index: ProjectIndex;
+    readonly structureDirty: boolean;
 }

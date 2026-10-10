@@ -43,8 +43,17 @@ async function workspaceFor(name, fixture) {
     return workspace;
 }
 
+// TESTY_VSCODE_VERSION: a version, 'insiders', or 'min' for the engines.vscode minimum in package.json.
+let vscodeVersion = process.env.TESTY_VSCODE_VERSION;
+if (vscodeVersion === 'min') {
+    const manifest = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'));
+    vscodeVersion = /\d+\.\d+\.\d+/.exec(manifest.engines.vscode)?.[0];
+    if (!vscodeVersion) { throw new Error(`Cannot read a minimum version from engines.vscode '${manifest.engines.vscode}'.`); }
+}
+console.log(`VS Code: ${vscodeVersion ?? 'stable'}`);
+
 const vscodeExecutablePath = process.env.TESTY_VSCODE_PATH
-    ?? await downloadAndUnzipVSCode({ cachePath: cacheDir, version: process.env.TESTY_VSCODE_VERSION });
+    ?? await downloadAndUnzipVSCode({ cachePath: cacheDir, version: vscodeVersion });
 
 const failed = [];
 for (const configuration of selected) {

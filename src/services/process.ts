@@ -15,6 +15,10 @@ const processHostMarker = 'Testy could not own the process tree:';
 /** Abort reason for disposal: owned processes are killed at once, skipping the graceful phase. */
 export class Shutdown extends Cancelled {}
 
+/** After a child error (for example a failed signal) its tree is force-killed; completion
+ * waits this long for it to close before reporting the error anyway. */
+export const processTiming = { errorCloseMs: 5_000 };
+
 export interface ProcessResult {
     readonly code: number;
     readonly stdout: string;
@@ -70,6 +74,8 @@ export function startProcess(command: string, args: readonly string[], options: 
     let timedOut = false;
     let closed = false;
     let killTimer: NodeJS.Timeout | undefined;
+    let failure: Error | undefined;
+    let failureTimer: NodeJS.Timeout | undefined;
     const stdout = new OutputTail(8 * 1024 * 1024);
     const stderr = new OutputTail(8 * 1024 * 1024);
     const teardowns: Promise<void>[] = [];
@@ -127,7 +133,20 @@ export function startProcess(command: string, args: readonly string[], options: 
         child.stderr?.on('data', (text: string) => {
             stderr.append(text); options.output?.(text);
         });
-        child.once('error', reject);
+        const release = (): void => {
+            clearTimeout(timeout); clearTimeout(killTimer); clearTimeout(failureTimer);
+            options.signal?.removeEventListener('abort', stop);
+        };
+        // 'error' also follows a failed kill while the child still runs. Never report
+        // completion for a live tree: kill it and let 'close' settle, within a bound.
+        child.on('error', error => {
+            if (failure || closed) {return;}
+            failure = error;
+            if (child.pid === undefined) {return;} // Spawning failed; 'close' follows at once.
+            killTree(true);
+            failureTimer = setTimeout(() => {release(); reject(error);}, processTiming.errorCloseMs);
+            failureTimer.unref();
+        });
         child.once('exit', (code, signal) => {
             // A killed/crashed owner needs a fallback scan. Normal MTP failure
             // exit 2 already completed cleanup in the supervisor.
@@ -135,18 +154,17 @@ export function startProcess(command: string, args: readonly string[], options: 
         });
         child.once('close', code => {
             closed = true;
-            clearTimeout(timeout);
             // Kill any remaining descendants of our own detached process group
             // before reporting cancellation complete.
-            if (cancelled && !windowsOwner && !posixOwner) {killTree(true);}
-            if (killTimer) {clearTimeout(killTimer);}
-            options.signal?.removeEventListener('abort', stop);
+            if ((cancelled || failure) && !windowsOwner && !posixOwner) {killTree(true);}
+            release();
             void Promise.all(teardowns).then((): unknown => undefined, (error: unknown) => {
                 options.output?.(`Process cleanup failed: ${String(error)}\n`); return error;
             }).then(cleanupError => settle(code, cleanupError), reject);
         });
         const settle = (code: number | null, cleanupError: unknown): void => {
-            if (timedOut) {reject(new Error(`The command exceeded its time limit: ${command}`));}
+            if (failure) {reject(failure);}
+            else if (timedOut) {reject(new Error(`The command exceeded its time limit: ${command}`));}
             else if (cancelled) {reject(new Cancelled());}
             else if (cleanupError !== undefined) {reject(cleanupError instanceof Error ? cleanupError : new Error('Process cleanup failed.', { cause: cleanupError }));}
             else if (windowsOwner && code === processHostFailure && stderr.text().includes(processHostMarker)) {

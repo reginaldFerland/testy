@@ -4,8 +4,11 @@ const fs=require('node:fs/promises'),sync=require('node:fs'),path=require('node:
 const {normalizePath,normalizePathAsync,pathNormalizer,clearPathCache,isExcluded,matchesPattern}=require('../../out/core/paths');
 const {findProjects,refreshProjectSnapshotBatches}=require('../../out/services/projects');
 
+/** @typedef {import('../../out/core/model').Project} Project */
+
+/** @param {import('node:test').TestContext} t */
 async function temporary(t){const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-paths-')));t.after(()=>fs.rm(root,{recursive:true,force:true}));return root;}
-const link=(target,file)=>fs.symlink(target,file,process.platform==='win32'?'junction':'dir');
+const link=/** @param {string} target @param {string} file */ (target,file)=>fs.symlink(target,file,process.platform==='win32'?'junction':'dir');
 
 test('normalization resolves directory aliases for missing files, async variant included',async t=>{
  const root=await temporary(t),real=path.join(root,'real'),alias=path.join(root,'alias');
@@ -32,8 +35,8 @@ test('leaf symlinks resolve every time while directory resolutions are scoped to
 
 test('the shared directory cache is bounded and avoids repeated realpath calls',async t=>{
  const root=await temporary(t);await fs.mkdir(path.join(root,'dir'));clearPathCache();
- const original=sync.realpathSync.native;let calls=0;
- sync.realpathSync.native=(...args)=>{calls++;return original(...args);};
+ const original=/** @type {(...args: any[]) => any} */ (sync.realpathSync.native);let calls=0;
+ sync.realpathSync.native=/** @param {any[]} args */ (...args)=>{calls++;return original(...args);};
  try{
   for(let i=0;i<50;i++){normalizePath(path.join(root,'dir',`File${i}.cs`));}
   assert.equal(calls,1,'one directory resolution serves every sibling, existing or not');
@@ -64,12 +67,15 @@ test('project discovery matches csproj case-insensitively and follows symlinked 
 });
 
 test('snapshot comparison is independent of element order, so only real changes touch dependents',async()=>{
- const node=(name,extra={})=>({file:`/w/${name}/${name}.csproj`,framework:'net10.0',assembly:`/w/${name}.dll`,sourceFiles:['b.cs','a.cs'],references:[],...extra});
- const shared=node('Shared'),roots=['A','B'].map(name=>node(name,{references:[shared.file]})),previous=new Map(roots.map(root=>[root.file,[root,shared]])),calls=[];
+ // Partial projects: only the fields snapshot comparison reads are populated.
+ const node=/** @param {string} name @param {Partial<Project>} [extra] @returns {Project} */ (name,extra={})=>/** @type {Project} */ (/** @type {unknown} */ ({file:`/w/${name}/${name}.csproj`,framework:'net10.0',assembly:`/w/${name}.dll`,sourceFiles:['b.cs','a.cs'],references:[],...extra}));
+ const shared=node('Shared'),roots=['A','B'].map(name=>node(name,{references:[shared.file]})),previous=new Map(roots.map(root=>[root.file,[root,shared]]));
+ /** @type {string[][]} */
+ const calls=[];
  const reordered={...shared,sourceFiles:['a.cs','b.cs'],properties:{y:'1',x:'2'}},original={...shared,properties:{x:'2',y:'1'}};
  const baseline=new Map(roots.map(root=>[root.file,[root,original]]));
- await refreshProjectSnapshotBatches(baseline,[...baseline.keys()],[roots[0].file],async files=>{calls.push(files);return new Map(files.map(file=>[file,[baseline.get(file)[0],reordered]]));});
+ await refreshProjectSnapshotBatches(baseline,[...baseline.keys()],[roots[0].file],async files=>{calls.push(/** @type {string[]} */ (files));return new Map(files.map(file=>[file,[/** @type {Project[]} */ (baseline.get(file))[0],reordered]]));});
  assert.deepEqual(calls,[[roots[0].file]]);calls.length=0;
- await refreshProjectSnapshotBatches(previous,[...previous.keys()],[roots[0].file],async files=>{calls.push(files);return new Map(files.map(file=>[file,[previous.get(file)[0],{...shared,sourceFiles:['a.cs','c.cs']}]]));});
+ await refreshProjectSnapshotBatches(previous,[...previous.keys()],[roots[0].file],async files=>{calls.push(/** @type {string[]} */ (files));return new Map(files.map(file=>[file,[/** @type {Project[]} */ (previous.get(file))[0],{...shared,sourceFiles:['a.cs','c.cs']}]]));});
  assert.deepEqual(calls,[[roots[0].file],[roots[1].file]]);
 });

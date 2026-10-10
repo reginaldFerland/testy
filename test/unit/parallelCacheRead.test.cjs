@@ -5,15 +5,21 @@ const {CoverageCache}=require('../../out/services/cache');
 const {CoverageStore}=require('../../out/core/coverage');
 const {contentHash}=require('../../out/core/paths');
 const workerFile=require.resolve('../../out/services/cacheWorker');
-const source=(index,lines=[1,2])=>{const file=`/Source${index}.cs`,hash='v1';return{id:contentHash(`${file}\0${hash}`),file,hash,lines};};
-const trace=(index,sources)=>({groupId:`group${index}`,timestamp:index+1,reliable:true,stale:false,
+/** @typedef {{id: string, file: string, hash: string, lines: number[]}} Source */
+const source=(/** @type {number} */ index,/** @type {number[]} */ lines=[1,2])=>{const file=`/Source${index}.cs`,hash='v1';return{id:contentHash(`${file}\0${hash}`),file,hash,lines};};
+const trace=(/** @type {number} */ index,/** @type {Source[]} */ sources)=>({groupId:`group${index}`,timestamp:index+1,reliable:true,stale:false,
  dependencies:[sources[0].file],moduleProjects:['/Project.csproj'],inputs:{[sources[0].file]:'v1'},
- sourceIds:sources.map(source=>source.id),coverage:[{file:sources[0].file,hash:'v1',lines:[{line:1,hits:0.5}]}]});
+ sourceIds:sources.map((/** @type {Source} */ source)=>source.id),coverage:[{file:sources[0].file,hash:'v1',lines:[{line:1,hits:0.5}]}]});
 
+/**
+ * @param {import('node:test').TestContext} t
+ * @param {Record<string, any>[]} sources
+ * @param {Record<string, any>[]} traces
+ */
 async function fixture(t,sources,traces){
  const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-parallel-cache-read-')),directory=path.join(root,'coverage-v2');
  t.after(()=>fs.rm(root,{recursive:true,force:true}));
- for(const [kind,records]of [['sources',sources],['traces',traces]]){
+ for(const [kind,records]of /** @type {[string, Record<string, any>[]][]} */ ([['sources',sources],['traces',traces]])){
   await fs.mkdir(path.join(directory,kind),{recursive:true});
   for(const record of records)await fs.writeFile(path.join(directory,kind,`${kind==='sources'?record.id:contentHash(record.groupId)}.json`),JSON.stringify(record));
  }
@@ -22,6 +28,7 @@ async function fixture(t,sources,traces){
 
 // Run the production worker against real files, pausing admitted reads inside
 // that worker rather than replacing its scheduler or parser with test doubles.
+/** @param {{directory?: string, order?: Record<string, string[]>, gate?: boolean}} [options] */
 function bootstrap(options={}){
  return `const fs=require('node:fs/promises'),path=require('node:path'),{parentPort}=require('node:worker_threads');
  const options=${JSON.stringify(options)},read=fs.readFile,list=fs.readdir,waiting=new Map();let released=!options.gate;
@@ -36,32 +43,48 @@ function bootstrap(options={}){
  require(${JSON.stringify(workerFile)});`;
 }
 
+/**
+ * @param {import('node:worker_threads').Worker} worker
+ * @param {import('node:test').TestContext} t
+ */
 function observe(worker,t){
- const events=[],waiters=new Set();let active=0,peak=0,resolve,reject,failed,snapshot;
- const result=new Promise((done,fail)=>{resolve=done;reject=fail;});void result.catch(()=>{});
- const fail=error=>{failed=error;reject(error);for(const waiter of waiters)waiter.reject(error);waiters.clear();};
+ /** @type {any[]} */ const events=[];
+ const waiters=new Set();let active=0,peak=0;
+ /** @type {(value: any) => void} */ let resolve=()=>{}; // replaced synchronously by the promise executor
+ /** @type {(reason?: any) => void} */ let reject=()=>{};
+ /** @type {any} */ let failed;
+ /** @type {any} */ let snapshot;
+ /** @type {Promise<any>} */ const result=new Promise((done,fail)=>{resolve=done;reject=fail;});void result.catch(()=>{});
+ const fail=(/** @type {any} */ error)=>{failed=error;reject(error);for(const waiter of waiters)waiter.reject(error);waiters.clear();};
  worker.on('error',fail);
- const message=message=>{
+ const message=(/** @type {any} */ message)=>{
   if(message.event){events.push(message);active+=message.event==='admitted'?1:-1;peak=Math.max(peak,active);}
   else{snapshot=message;resolve(message);}
   for(const waiter of waiters)if(waiter.predicate()){waiters.delete(waiter);waiter.resolve();}
  };
  worker.on('message',message);worker.on('diagnostic',message);
- const exited=new Promise(done=>worker.once('exit',code=>{if(!snapshot)fail(new Error(`Worker exited before snapshot (${code})`));done(code);}));
+ const exited=new Promise(done=>worker.once('exit',(/** @type {number} */ code)=>{if(!snapshot)fail(new Error(`Worker exited before snapshot (${code})`));done(code);}));
  const abort=()=>{fail(t.signal.reason);void worker.terminate();};t.signal.addEventListener('abort',abort,{once:true});
  t.after(async()=>{t.signal.removeEventListener('abort',abort);await worker.terminate();});
  return{events,result,exited,get active(){return active;},get peak(){return peak;},
-  wait(predicate){if(failed)return Promise.reject(failed);if(predicate())return Promise.resolve();return new Promise((resolve,reject)=>waiters.add({predicate,resolve,reject}));},
-  release(key){worker.postMessage({release:key});},releaseAll(){worker.postMessage({all:true});}};
+  wait(/** @type {() => boolean} */ predicate){if(failed)return Promise.reject(failed);if(predicate())return Promise.resolve();return new Promise((resolve,reject)=>waiters.add({predicate,resolve,reject}));},
+  release(/** @type {string} */ key){worker.postMessage({release:key});},releaseAll(){worker.postMessage({all:true});}};
 }
 
 // File times are environmental; the snapshot reports one entry per trace.
+/** @param {{result: Promise<any>}} probe */
 async function settled(probe){const {stats,...rest}=await probe.result;assert.equal(stats.length,rest.traces.length);return rest;}
+/**
+ * @param {Source[]} sources
+ * @param {ReturnType<typeof trace>[]} traces
+ * @param {string[]} [warnings]
+ * @param {{corrupt?: string[], evicted?: string[], complete?: boolean}} [flags]
+ */
 function expected(sources,traces,warnings=[],{corrupt=[],evicted=[],complete=!warnings.length}={}){
  const indices=new Map(sources.map((source,index)=>[source.id,index]));
  return{sources:sources.map(source=>({...source,lines:Float64Array.from([...new Set(source.lines)].sort((a,b)=>a-b))})),
-  traces:traces.map(trace=>({...trace,sourceIds:Uint32Array.from(trace.sourceIds.map(id=>indices.get(id))),coverage:trace.coverage.map(file=>({
-   file:file.file,hash:file.hash,values:Float64Array.from(file.lines.flatMap(line=>[line.line,line.hits]))}))})),warnings,corrupt,evicted,complete};
+  traces:traces.map(trace=>({...trace,sourceIds:Uint32Array.from(trace.sourceIds.map(id=>/** @type {number} */ (indices.get(id)))),coverage:trace.coverage.map(file=>({
+   file:file.file,hash:file.hash,values:Float64Array.from(file.lines.flatMap(line=>[line.line,line.hits]))}))})),outcomes:[],warnings,corrupt,evicted,complete};
 }
 
 test('one four-read pool spans both cache tables and preserves exact inventory order despite reversed completion',{timeout:10000},async t=>{
@@ -105,7 +128,7 @@ test('out-of-order corrupt and missing records retain warning order, valid recor
  // Corrupt and dangling records are removed, so the valid set is authoritative and unused geometry is pruned.
  for(const name of [path.join('sources',brokenSource),path.join('traces',brokenTrace),path.join('traces',invalidTrace),path.join('sources',`${sources[1].id}.json`)])await assert.rejects(fs.access(path.join(directory,name)),{code:'ENOENT'});
  await fs.access(path.join(directory,'sources',`${sources[0].id}.json`));
- assert.equal(restored.summary(sources[0].file,new Map([[sources[0].file,'v1']])).stale,true);
+ assert.equal(/** @type {{stale?: boolean}} */ (restored.summary(sources[0].file,new Map([[sources[0].file,'v1']]))).stale,true);
 });
 
 test('missing tables are empty while unreadable tables mark the snapshot incomplete',{timeout:10000},async t=>{
@@ -122,11 +145,13 @@ test('cancelling a restore with four admitted reads terminates the worker withou
  const sources=Array.from({length:8},(_,index)=>source(index)),traces=[trace(0,sources)],{root,directory}=await fixture(t,sources,traces);
  const store=new CoverageStore(),old={groupId:'live',dependencies:[],coverage:[],inputs:{},timestamp:1,reliable:true};
  store.replace([old],new Set(['live']));store.takeDelta();
- const control=new AbortController(),signal=AbortSignal.any([control.signal,t.signal]),Original=threads.Worker;
- let ready;const started=new Promise(resolve=>ready=resolve);
- threads.Worker=class extends Original{
-  constructor(filename,options){assert.equal(filename,workerFile);super(bootstrap({directory,gate:true}),{...options,eval:true});ready(observe(this,t));}
-  emit(event,value,...args){return super.emit(event==='message'&&value?.event?'diagnostic':event,value,...args);}
+ const control=new AbortController(),signal=AbortSignal.any([control.signal,t.signal]);
+ /** @type {any} */ const Original=threads.Worker; // any: the subclass below narrows emit() and the constructor options
+ /** @type {(probe: ReturnType<typeof observe>) => void} */ let ready=()=>{}; // replaced synchronously by the promise executor
+ const started=/** @type {Promise<ReturnType<typeof observe>>} */ (new Promise(resolve=>ready=resolve));
+ /** @type {any} */ (threads).Worker=class extends Original{
+  constructor(/** @type {string} */ filename,/** @type {import('node:worker_threads').WorkerOptions} */ options){assert.equal(filename,workerFile);super(bootstrap({directory,gate:true}),{...options,eval:true});ready(observe(/** @type {any} */ (this),t));}
+  emit(/** @type {string} */ event,/** @type {any} */ value,/** @type {any[]} */ ...args){return super.emit(event==='message'&&value?.event?'diagnostic':event,value,...args);}
  };
  const cache=new CoverageCache(root,()=>{}),restoring=cache.restore(store,signal),rejected=assert.rejects(restoring,{name:'AbortError'});
  try{
@@ -137,5 +162,5 @@ test('cancelling a restore with four admitted reads terminates the worker withou
   await assert.rejects(fs.access(`${directory}.lock`),{code:'ENOENT'});
  }finally{control.abort();await Promise.allSettled([restoring,rejected]);threads.Worker=Original;}
  await cache.restore(store,t.signal);assert.deepEqual([...store.traces.keys()],['group0']);
- assert.equal(store.summary(sources[7].file,new Map([[sources[7].file,'v1']])).total,2);
+ assert.equal(/** @type {{total: number}} */ (store.summary(sources[7].file,new Map([[sources[7].file,'v1']]))).total,2);
 });

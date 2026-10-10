@@ -2,13 +2,17 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {TestEngine} = require('../../out/services/engine');
 
-function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return {promise, resolve}; }
+/** @returns {{promise: Promise<unknown>, resolve: (value?: unknown) => void}} */
+function deferred() {
+ /** @type {any} */ let resolve; const promise = new Promise(done => { resolve = done; }); return {promise, resolve};
+}
 
 test('engine disposal cancels and drains active runs before disposing prepared artifacts', async () => {
- const engine = new TestEngine({roots:[],storage:'/unused/testy-state',events:{output(){}},configuration:()=>({})});
- const entered = deferred(), drained = deferred(); let activeSignal, cacheDisposed = false;
+ // Partial mock: only output() and an empty configuration are exercised; private members are overridden, so the engine is typed any.
+ /** @type {any} */ const engine = new TestEngine(/** @type {any} */ ({roots:[],storage:'/unused/testy-state',events:{output(){}},configuration:()=>({})}));
+ const entered = deferred(), drained = deferred(); /** @type {AbortSignal | undefined} */ let activeSignal; let cacheDisposed = false;
  engine.preparedOutputs = {async dispose() { cacheDisposed = true; }};
- engine.runBatch = async (_batch, controller) => {
+ engine.runBatch = async (/** @type {unknown} */ _batch, /** @type {AbortController} */ controller) => {
   activeSignal = controller.signal; entered.resolve();
   await drained.promise; controller.signal.throwIfAborted();
  };
@@ -16,7 +20,7 @@ test('engine disposal cancels and drains active runs before disposing prepared a
  const rejected = assert.rejects(running, {name:'AbortError'});
  await entered.promise;
  const disposing = engine.dispose();
- assert.equal(activeSignal.aborted, true);
+ assert.equal(/** @type {AbortSignal} */ (/** @type {unknown} */ (activeSignal)).aborted, true);
  assert.equal(cacheDisposed, false, 'active collectors still own their prepared output');
  assert.equal(engine.dispose(), disposing, 'concurrent disposal waits for the same cleanup');
  await assert.rejects(engine.run({files:[],full:true}, new AbortController().signal), /disposed/);

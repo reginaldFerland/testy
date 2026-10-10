@@ -4,9 +4,16 @@ const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:
 const {TestEngine}=require('../../out/services/engine');
 const {normalizePath}=require('../../out/core/paths');
 
+/** @typedef {import('../../out/services/engine').TestEngine} Engine */
+/** @typedef {{assembly: string, session: string | undefined}} Invocation */
+/** @typedef {{output: string[], results: Record<string, any>[], started: (...args: any[]) => void}} EngineState */
+/** @typedef {{-readonly [K in keyof import('../../out/core/model').EngineConfiguration]: import('../../out/core/model').EngineConfiguration[K]}} MutableConfiguration */
+/** @typedef {{instruments: Invocation[], builds: number, discoveries: Invocation[], runs: Invocation[], activeInstruments: number, activeRequests: number, afterInstrument?: ((invocation: Invocation) => unknown) | undefined, beforeRun?: ((invocation: Invocation) => unknown) | undefined}} Probe */
+
+/** @param {import('node:test').TestContext} t @param {{xunit?: boolean}} [options] */
 async function fixture(t,{xunit=false}={}) {
  const temp=await fs.mkdtemp(path.join(os.tmpdir(),'testy-persistent-prepared-'));
- const root=path.join(temp,'workspace'),storage=path.join(temp,'state'),file=relative=>normalizePath(path.join(root,relative));
+ const root=path.join(temp,'workspace'),storage=path.join(temp,'state'),file=/** @param {string} relative */relative=>normalizePath(path.join(root,relative));
  const expected=path.join(temp,'expected.txt'),expectedAsset=path.join(temp,'expected-asset.txt'),rows=path.join(temp,'rows.txt');
  await fs.mkdir(file('Core'),{recursive:true});await fs.mkdir(file('Tests'));
  await fs.writeFile(expected,'2');await fs.writeFile(expectedAsset,'clean');await fs.writeFile(rows,'1');
@@ -26,10 +33,14 @@ async function fixture(t,{xunit=false}={}) {
  // A private analyzer copy allows testing real tool-identity invalidation without
  // changing the extension's bundled tools or another concurrently open workspace.
  const analyzerDirectory=path.join(temp,'analyzer');await fs.cp(path.resolve('dist/analyzer'),analyzerDirectory,{recursive:true});
+ /** @type {MutableConfiguration} */
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:60000,
   coverageTool:process.env.TESTY_COVERAGE_TOOL,maxParallelProjects:1,maxParallelTestFiles:1};
- const engines=[],states=[];
+ /** @type {Engine[]} */
+ const engines=[];/** @type {EngineState[]} */
+ const states=[];
  const makeEngine=()=>{
+  /** @type {EngineState} */
   const state={output:[],results:[],started(){}};states.push(state);
   const engine=new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer:path.join(analyzerDirectory,'Testy.Analysis.dll'),configuration:()=>config,
    events:{output:text=>state.output.push(text),phase(){},discovered(){},selected(){},result:(group,result)=>state.results.push({group,...result}),
@@ -38,6 +49,7 @@ async function fixture(t,{xunit=false}={}) {
  };
  const processes=require('../../out/services/process'),mtp=require('../../out/services/mtp');
  const runProcess=processes.runProcess,requestTests=mtp.requestTests;
+ /** @type {Probe} */
  const probe={instruments:[],builds:0,discoveries:[],runs:[],activeInstruments:0,activeRequests:0};
  processes.runProcess=async(command,args,options)=>{
   if(args.includes('-target:Build'))probe.builds++;
@@ -53,6 +65,7 @@ async function fixture(t,{xunit=false}={}) {
   finally{probe.activeRequests--;}
  };
  t.after(async()=>{await Promise.all(engines.map(engine=>engine.dispose()));processes.runProcess=runProcess;mtp.requestTests=requestTests;await fs.rm(temp,{recursive:true,force:true});});
+ /** @param {{engine: Engine, state: EngineState}} instance */
  const run=async(instance)=>{
   await instance.engine.restore();
   const result=await instance.engine.run({files:[],full:true},new AbortController().signal);
@@ -77,6 +90,7 @@ async function fixture(t,{xunit=false}={}) {
  return {temp,root,storage,file,expected,expectedAsset,rows,analyzerDirectory,config,probe,makeEngine,run,reset,owners,assertParked};
 }
 
+/** @param {Engine} engine */
 function snapshot(engine) {
  return {
   groups:engine.groups.map(group=>({id:group.id,tests:group.tests.map(test=>[test.id,test.name]).sort()})).sort((a,b)=>a.id.localeCompare(b.id)),
@@ -108,6 +122,7 @@ test('clean engine restarts reuse instrumentation while rebuilding and freshly d
 
 test('persisted templates invalidate for source, copied assets, preparation tools and build context',{timeout:180000},async t=>{
  const f=await fixture(t);let current=f.makeEngine();assert.equal((await f.run(current)).passed,1);await current.engine.dispose();
+ /** @type {[string, () => Promise<void>][]} */
  const changes=[
   ['source',async()=>{await fs.writeFile(f.file('Core/Core.cs'),'public static class Core { public static int Value(int value) => value + 2; }');await fs.writeFile(f.expected,'3');}],
   ['copied asset',async()=>{await fs.writeFile(f.file('Tests/asset.txt'),'updated');await fs.writeFile(f.expectedAsset,'updated');}],
@@ -141,7 +156,14 @@ test('cancelled and failed coverage preparations are not persisted for the next 
 });
 
 test('simultaneous engines keep exclusive containers and adopt only cleanly parked owners',{timeout:150000},async t=>{
- let release,firstAdmitted,bothAdmitted,timer;
+ /** @type {((value?: any) => void) | undefined} */
+ let release;
+ /** @type {(value?: any) => void} */
+ let firstAdmitted;
+ /** @type {(value?: any) => void} */
+ let bothAdmitted;
+ /** @type {NodeJS.Timeout | undefined} */
+ let timer;
  t.after(()=>{clearTimeout(timer);release?.();});
  const f=await fixture(t),first=f.makeEngine(),second=f.makeEngine();
  const gate=new Promise(resolve=>release=resolve),firstReady=new Promise(resolve=>firstAdmitted=resolve),bothReady=new Promise(resolve=>bothAdmitted=resolve);
@@ -152,7 +174,7 @@ test('simultaneous engines keep exclusive containers and adopt only cleanly park
  const invocations=[...f.probe.runs],owners=await f.owners();
  assert.equal(owners.length,2);assert.ok(owners.every(owner=>owner.state==='active'&&owner.pid===process.pid));
  assert.notEqual(invocations[0].assembly,invocations[1].assembly);assert.notEqual(invocations[0].session,invocations[1].session,'concurrent collectors never share instrumentation sessions');
- release();assert.equal((await firstRun).passed,1);assert.equal((await secondRun).passed,1);f.probe.beforeRun=undefined;
+ /** @type {(value?: any) => void} */ (release)();assert.equal((await firstRun).passed,1);assert.equal((await secondRun).passed,1);f.probe.beforeRun=undefined;
  await first.engine.dispose();const afterFirst=await f.owners();assert.equal(afterFirst.filter(owner=>owner.state==='parked').length,1);assert.equal(afterFirst.filter(owner=>owner.state==='active').length,1);
  const live=afterFirst.find(owner=>owner.state==='active');
  f.reset();const third=f.makeEngine();assert.equal((await f.run(third)).passed,1);

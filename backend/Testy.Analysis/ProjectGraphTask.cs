@@ -33,7 +33,7 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task, ICancelab
         {
             using var request = JsonDocument.Parse(File.ReadAllText(RequestFile));
             var files = request.RootElement.TryGetProperty("files", out var entries)
-                ? entries.Deserialize<string[]>()! : [request.RootElement.GetProperty("file").GetString()!];
+                ? entries.Deserialize(GraphJson.Default.StringArray)! : [request.RootElement.GetProperty("file").GetString()!];
             var configuration = request.RootElement.GetProperty("configuration").GetString()!;
             var concurrency = request.RootElement.TryGetProperty("concurrency", out var workers) ? Math.Clamp(workers.GetInt32(), 1, Environment.ProcessorCount) : 1;
             var inputs = new ConcurrentDictionary<ProjectInstance, string[]>();
@@ -147,7 +147,18 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task, ICancelab
             }).ToArray();
             var evaluations = graph.ProjectNodes.OrderBy(node => identities[node], StringComparer.Ordinal)
                 .ToDictionary(node => identities[node], node => evaluationInputs[node.ProjectInstance]);
-            File.WriteAllText(OutputFile, JsonSerializer.Serialize(new ProjectGraphOutput(ProjectGraphOutput.Current, projects, roots, evaluations), GraphJson.Default.ProjectGraphOutput));
+            // Written beside the output and renamed into place, so a reader never sees a partial graph.
+            var temporary = $"{OutputFile}.{Guid.NewGuid():N}.tmp";
+            try
+            {
+                File.WriteAllText(temporary, JsonSerializer.Serialize(new ProjectGraphOutput(ProjectGraphOutput.Current, projects, roots, evaluations), GraphJson.Default.ProjectGraphOutput));
+                File.Move(temporary, OutputFile, overwrite: true);
+            }
+            catch
+            {
+                try { File.Delete(temporary); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+                throw;
+            }
             return true;
         }
         // Not only OperationCanceledException: ProjectGraph can stop loading part-way and then fail

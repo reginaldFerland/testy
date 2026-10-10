@@ -1,8 +1,10 @@
 // Deterministic generator of varied Cobertura documents for the differential parser test.
 // Each document lists the class files (relative to the working directory) that are allowed.
 const files = ['A.cs', 'B.cs', 'src/C.cs', 'Déjà & 中文.cs', "it's.cs", 'x"y.cs'];
+/** @type {[RegExp, string][]} */
 const escapes = [[/&/g, '&amp;'], [/</g, '&lt;'], [/>/g, '&gt;']];
 
+/** @param {number} seed */
 function random(seed) {
     let state = seed >>> 0;
     return () => {
@@ -14,20 +16,21 @@ function random(seed) {
     };
 }
 
+/** @param {number} seed */
 function generate(seed) {
-    const next = random(seed), int = n => Math.floor(next() * n), pick = list => list[int(list.length)], chance = p => next() < p;
-    const escape = (value, quote) => {
+    const next = random(seed), int = (/** @type {number} */ n) => Math.floor(next() * n), pick = (/** @type {any[]} */ list) => list[int(list.length)], chance = (/** @type {number} */ p) => next() < p;
+    const escape = (/** @type {string} */ value, /** @type {string} */ quote) => {
         let text = escapes.reduce((s, [pattern, entity]) => s.replace(pattern, entity), value);
         text = text.replace(quote === '"' ? /"/g : /'/g, quote === '"' ? '&quot;' : '&apos;');
         return text;
     };
-    const attribute = (name, value) => {
+    const attribute = (/** @type {string} */ name, /** @type {unknown} */ value) => {
         const quote = chance(0.3) ? "'" : '"', gap = chance(0.2) ? ' \n\t' : ' ', equals = chance(0.1) ? ' = ' : '=';
         return `${gap}${name}${equals}${quote}${escape(String(value), quote)}${quote}`;
     };
-    const line = (number, hits) => `<line${attribute('number', number)}${attribute('hits', hits)}${chance(0.5) ? attribute('branch', 'False') : ''}${chance(0.5) ? '/>' : '></line>'}`;
+    const line = (/** @type {number} */ number, /** @type {number} */ hits) => `<line${attribute('number', number)}${attribute('hits', hits)}${chance(0.5) ? attribute('branch', 'False') : ''}${chance(0.5) ? '/>' : '></line>'}`;
     const lineSet = () => Array.from({ length: int(6) }, () => line(1 + int(30), chance(0.3) ? 0 : int(9))).join(chance(0.2) ? '\n  ' : '');
-    const method = (name, signature) => {
+    const method = (/** @type {string} */ name, /** @type {string} */ signature) => {
         const body = `<lines>${lineSet()}</lines>`;
         const open = `<method${attribute('name', name)}${chance(0.9) ? attribute('signature', signature) : ''}${chance(0.3) ? attribute('is_constructor', 'False') : ''}`;
         return chance(0.1) ? `${open}/>` : `${open}>${chance(0.1) ? '<!-- </methods> -->' : ''}${body}${chance(0.1) ? '<![CDATA[</method><line number="99" hits="1"/>]]>' : ''}</method>`;

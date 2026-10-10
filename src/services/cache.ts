@@ -3,10 +3,11 @@ import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { CoverageDelta, CoverageSource, CoverageStore, mergeDeclarations } from '../core/coverage';
 import { contentHash } from '../core/paths';
+import { OutcomeDelta, StoredOutcomes } from '../core/runPolicy';
 import { mapConcurrent } from '../core/concurrency';
 import { withLock } from './lock';
 
-export { validSource, validTrace } from './cacheFormat';
+export { validOutcomes, validSource, validTrace } from './cacheFormat';
 import { CacheLimits, defaultCacheLimits, validSource } from './cacheFormat';
 import { CacheContents, readCache } from './cacheReader';
 import { finishAsync, sortedUnion } from '../core/work';
@@ -40,7 +41,8 @@ class TraceIndex {
     }
 }
 
-/** Immutable source records and independently atomic traces avoid full-cache rewrites. */
+/** Immutable source records and independently atomic traces avoid full-cache rewrites; so do the latest
+ * test outcomes, one record per test file beside the traces. */
 export class CoverageCache {
     private readonly directory: string;
     private writes = 0;
@@ -51,9 +53,10 @@ export class CoverageCache {
     private readonly unsynced = new Set<string>();
     constructor(storage: string, private readonly output: (text: string) => void, private readonly limits: CacheLimits = defaultCacheLimits) { this.directory = path.join(storage, 'coverage-v2'); }
 
-    async restore(store: CoverageStore, signal?: AbortSignal): Promise<void> {
+    /** Resolves to the saved test outcomes. */
+    async restore(store: CoverageStore, signal?: AbortSignal): Promise<readonly StoredOutcomes[]> {
         const revision = store.revision;
-        await withLock(`${this.directory}.lock`, signal, async () => {
+        return withLock(`${this.directory}.lock`, signal, async () => {
             try {
                 await this.beginWrite(signal);
                 const snapshot = await readCache(this.directory, signal, this.limits);
@@ -63,16 +66,18 @@ export class CoverageCache {
                 await store.restorePackedAsync(snapshot.sources, snapshot.traces, signal, revision);
                 await this.finishMaintenance(snapshot, complete, signal);
                 await this.flush(signal);
+                return snapshot.outcomes;
             } catch (error) {this.invalidateMaintenance(); throw error;}
         });
     }
 
-    async save(delta: CoverageDelta, signal?: AbortSignal): Promise<void> {
+    async save(delta: CoverageDelta & { readonly outcomes?: OutcomeDelta }, signal?: AbortSignal): Promise<void> {
         signal?.throwIfAborted();
-        if (!delta.sources.length && !delta.traces.length && !delta.removedTraces.length) {return;}
+        const outcomes = delta.outcomes ?? { saved: [], removed: [] };
+        if (!delta.sources.length && !delta.traces.length && !delta.removedTraces.length && !outcomes.saved.length && !outcomes.removed.length) {return;}
         await withLock(`${this.directory}.lock`, signal, async () => {
             try {
-                await Promise.all(['sources', 'traces'].map(kind => fs.mkdir(path.join(this.directory, kind), { recursive: true })));
+                await Promise.all(['sources', 'traces', ...outcomes.saved.length ? ['outcomes'] : []].map(kind => fs.mkdir(path.join(this.directory, kind), { recursive: true })));
                 await this.beginWrite(signal);
                 if (delta.removedSources.length && this.index) {this.index.orphaned = true;}
                 const sources = new Map<string, CoverageSource[]>();
@@ -100,6 +105,9 @@ export class CoverageCache {
                     signal?.throwIfAborted(); await fs.rm(path.join(this.directory, 'traces', `${contentHash(id)}.json`), { force: true });
                     this.index?.delete(contentHash(id));
                 }
+                // Each file's outcomes replace its previous record whole; nothing else refers to them.
+                for (const stored of outcomes.saved) {await this.write('outcomes', contentHash(stored.groupId), stored, signal);}
+                for (const id of outcomes.removed) {signal?.throwIfAborted(); await fs.rm(path.join(this.directory, 'outcomes', `${contentHash(id)}.json`), { force: true });}
                 await this.flush(signal);
                 if (++this.writes % 128 === 0) {await this.maintain(signal);}
             } catch (error) {this.invalidateMaintenance(); throw error;}

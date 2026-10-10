@@ -5,11 +5,11 @@ const {CoverageStore,mergeDeclarations,declarationHits}=require('../../out/core/
 const {CoverageCache,validSource}=require('../../out/services/cache');
 const {contentHash,normalizePath}=require('../../out/core/paths');
 const {loadUi}=require('./support/ui.cjs');
-const plain=value=>JSON.parse(JSON.stringify(value));
+const plain=(/** @type {unknown} */ value)=>JSON.parse(JSON.stringify(value));
 
-const line=(number,hits)=>`<line number="${number}" hits="${hits}" branch="False" />`;
-const method=(name,signature,lines)=>`<method name="${name}" signature="${signature}"><lines>${lines.map(([number,hits])=>line(number,hits)).join('')}</lines></method>`;
-const cls=(name,methods,lines)=>`<class name="${name}" filename="Code.cs"><methods>${methods}</methods><lines>${lines.map(([number,hits])=>line(number,hits)).join('')}</lines></class>`;
+const line=(/** @type {number} */ number,/** @type {number} */ hits)=>`<line number="${number}" hits="${hits}" branch="False" />`;
+const method=(/** @type {string} */ name,/** @type {string} */ signature,/** @type {number[][]} */ lines)=>`<method name="${name}" signature="${signature}"><lines>${lines.map(([number,hits])=>line(number,hits)).join('')}</lines></method>`;
+const cls=(/** @type {string} */ name,/** @type {string} */ methods,/** @type {number[][]} */ lines)=>`<class name="${name}" filename="Code.cs"><methods>${methods}</methods><lines>${lines.map(([number,hits])=>line(number,hits)).join('')}</lines></class>`;
 // Shaped like dotnet-coverage 18.1 output: overloads, a lambda closure class, a local function and an async state machine.
 const report=`<?xml version="1.0" encoding="utf-8"?><coverage><packages><package name="app"><classes>${
  cls('Probe.Calc',method('Add','(int, int)',[[6,1],[7,1],[8,1]])+method('Add','(double)',[[9,0],[10,0],[11,0]])
@@ -33,14 +33,14 @@ test('declaration spans merge as geometry and count a method hit when its lines 
  assert.equal(mergeDeclarations(a,undefined),a);assert.equal(mergeDeclarations(a,[{...a[0]}]),a,'nothing new keeps the previous identity');
  assert.deepEqual(mergeDeclarations(a,b),[{name:'A()',start:1,end:3},{name:'B()',start:5,end:6}]);
  const lines=[{line:1,hits:0},{line:2,hits:4},{line:5,hits:0},{line:6,hits:0}];
- assert.deepEqual(declarationHits(lines,[...mergeDeclarations(a,b),{name:'Gone()',start:8,end:9}]).map(({declaration,hits})=>[declaration.name,hits]),[['A()',4],['B()',0]],
+ assert.deepEqual(declarationHits(lines,[.../** @type {readonly import('../../out/core/model').Declaration[]} */ (mergeDeclarations(a,b)),{name:'Gone()',start:8,end:9}]).map(({declaration,hits})=>[declaration.name,hits]),[['A()',4],['B()',0]],
   'spans without instrumented lines are omitted');
 });
 
 test('the store keeps spans on shared sources, not per-test hits, and summaries expose the displayed version',()=>{
  const file='/Code.cs',hashes=new Map([[file,'v1']]),store=new CoverageStore();
- const entry=(declarations,hits)=>({file,hash:'v1',lines:[{line:1,hits},{line:2,hits:0},{line:5,hits:0}],declarations});
- const trace=(groupId,coverage)=>({groupId,dependencies:[file],coverage:[coverage],reliable:true,timestamp:1});
+ const entry=(/** @type {import('../../out/core/model').Declaration[]} */ declarations,/** @type {number} */ hits)=>({file,hash:'v1',lines:[{line:1,hits},{line:2,hits:0},{line:5,hits:0}],declarations});
+ const trace=(/** @type {string} */ groupId,/** @type {ReturnType<typeof entry>} */ coverage)=>({groupId,dependencies:[file],coverage:[coverage],reliable:true,timestamp:1});
  store.replace([trace('one',entry([{name:'A()',start:1,end:2}],1)),trace('two',entry([{name:'B()',start:5,end:5}],0))],new Set(['one','two']));
  const summary=store.summarize(hashes)[0];
  assert.deepEqual(summary.declarations,[{name:'A()',start:1,end:2},{name:'B()',start:5,end:5}]);
@@ -63,13 +63,14 @@ test('the coverage cache rewrites a source whose geometry gained spans',async t=
  assert.deepEqual(store.summarize(new Map([[file,'v1']]))[0].declarations,[{name:'A()',start:1,end:2}]);
 });
 
+/** @param {{documents?: any[]}} [options] documents are partial TextDocument mocks */
 function view({documents=[]}={}){
- const vscode={window:{visibleTextEditors:[]},workspace:{textDocuments:documents},Uri:{file:fsPath=>({fsPath})},
-  FileCoverage:class{constructor(uri,statementCoverage,branchCoverage,declarationCoverage){Object.assign(this,{uri,statementCoverage,declarationCoverage});}},
-  StatementCoverage:class{constructor(executed,location){Object.assign(this,{kind:'statement',executed,location});}},
-  DeclarationCoverage:class{constructor(name,executed,location){Object.assign(this,{kind:'declaration',name,executed,location});}},
-  Position:class{constructor(line,character){Object.assign(this,{line,character});}},
-  Range:class{constructor(startLine,startCharacter,endLine,endCharacter){this.start={line:startLine,character:startCharacter};this.end={line:endLine,character:endCharacter};}}};
+ const vscode={window:{visibleTextEditors:[]},workspace:{textDocuments:documents},Uri:{file:(/** @type {string} */ fsPath)=>({fsPath})},
+  FileCoverage:class{constructor(/** @type {unknown} */ uri,/** @type {unknown} */ statementCoverage,/** @type {unknown} */ branchCoverage,/** @type {unknown} */ declarationCoverage){Object.assign(this,{uri,statementCoverage,declarationCoverage});}},
+  StatementCoverage:class{constructor(/** @type {unknown} */ executed,/** @type {unknown} */ location){Object.assign(this,{kind:'statement',executed,location});}},
+  DeclarationCoverage:class{constructor(/** @type {string} */ name,/** @type {unknown} */ executed,/** @type {unknown} */ location){Object.assign(this,{kind:'declaration',name,executed,location});}},
+  Position:class{constructor(/** @type {number} */ line,/** @type {number} */ character){Object.assign(this,{line,character});}},
+  Range:class{constructor(/** @type {number} */ startLine,/** @type {number} */ startCharacter,/** @type {number} */ endLine,/** @type {number} */ endCharacter){this.start={line:startLine,character:startCharacter};this.end={line:endLine,character:endCharacter};}}};
  return{vscode,ui:loadUi({vscode})};
 }
 
@@ -78,19 +79,19 @@ test('published file coverage carries method counts and detail includes declarat
   getText:()=>'class C {\n    void A() {\n        Run();\n    }\n    void B() { }\n}'}]});
  const summary={file,stale:false,covered:2,total:3,groupIds:[],lines:[{line:2,hits:1},{line:3,hits:1},{line:5,hits:0}],
   declarations:[{name:'A()',start:2,end:4},{name:'B()',start:5,end:5},{name:'Edited()',start:9,end:12}]};
- const added=[],context={host:{disposed:false,activeRun:{addCoverage:coverage=>added.push(coverage)},updateStatus(){}},
+ /** @type {any[]} */ const added=[];const context={host:{disposed:false,activeRun:{addCoverage:(/** @type {unknown} */ coverage)=>added.push(coverage)},updateStatus(){}},
   engine:{coverage:{summarize:()=>[summary]},hashes:new Map()},productionSources:new Set(),owners:new Map(),items:new Map(),publishedCoverage:new Map(),details:new WeakMap(),queue(){}};
  const proto=ui.CoverageView.prototype;proto.publish.call(context);
  assert.deepEqual(plain(added[0].declarationCoverage),{covered:1,total:2});
  const detail=await proto.detail.call(context,summary,summary.lines);
- assert.deepEqual(plain(detail.filter(item=>item.kind==='statement').map(item=>[item.location.start.line,item.location.start.character,item.location.end.character])),[[1,4,14],[2,8,14],[4,4,16]],
+ assert.deepEqual(plain(detail.filter((/** @type {any} */ item)=>item.kind==='statement').map((/** @type {any} */ item)=>[item.location.start.line,item.location.start.character,item.location.end.character])),[[1,4,14],[2,8,14],[4,4,16]],
   'ranges come from the open document text');
- assert.deepEqual(plain(detail.filter(item=>item.kind==='declaration').map(item=>[item.name,item.executed,item.location.start.line,item.location.end.line])),[['A()',1,1,3],['B()',0,4,4]],
+ assert.deepEqual(plain(detail.filter((/** @type {any} */ item)=>item.kind==='declaration').map((/** @type {any} */ item)=>[item.name,item.executed,item.location.start.line,item.location.end.line])),[['A()',1,1,3],['B()',0,4,4]],
   'spans beyond the open document are dropped');
 });
 
 test('detail for an unsaved editor uses its buffer rather than the file on disk',async()=>{
  const file=normalizePath(path.join(os.tmpdir(),'testy-missing-on-disk.cs')),{ui}=view({documents:[{uri:{scheme:'file',fsPath:file},lineCount:2,isDirty:true,getText:()=>'\n  Unsaved();'}]});
  const detail=await ui.CoverageView.prototype.detail.call({},{file,lines:[{line:2,hits:3},{line:3,hits:0}]},[{line:2,hits:3},{line:3,hits:0}]);
- assert.deepEqual(plain(detail.map(item=>[item.location.start.line,item.location.start.character,item.location.end.character])),[[1,2,12]]);
+ assert.deepEqual(plain(detail.map((/** @type {any} */ item)=>[item.location.start.line,item.location.start.character,item.location.end.character])),[[1,2,12]]);
 });

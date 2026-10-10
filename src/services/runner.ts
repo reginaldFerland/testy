@@ -1,47 +1,31 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { randomUUID } from 'node:crypto';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { DiscoveredTest, FileCoverage, Project, TestFile, TestResult } from '../core/model';
-import { compareCodeUnits, contentHash, preparePathNormalizer, sourceVersion, testFileId, testTargetKey } from '../core/paths';
+import { preparePathNormalizer, sourceVersion, testFileId, testTargetKey } from '../core/paths';
 import { projectCoverageId } from '../core/coverage';
+import { isReliableTrace } from '../core/traceReliability';
 import { requestTests, testConverter, TestNode, testResult } from './mtp';
-import { requireSuccess, runProcess } from './process';
 import { CoverageReader } from './coverageReader';
-import { copyOutput, fileHash, PreparedOutput, removeOutput } from './output';
+import { removeOutput } from './output';
 import { claimRunOutputs, RunOutputLease } from './runOutputs';
 import { RuntimeObservation } from './runtimeObservation';
-import { PreparedArtifact, PreparedArtifactLease, preparationToolIdentity } from './preparedOutputCache';
-import { windowsPreparationTools } from './preparationIdentity';
-import { stableEnvironment } from '../core/environment';
 
 import { discover, locationFiles, methodKey, nodeKey } from './runnerDiscovery';
-import { assemblyName, instrumentWithSpareCapacity, workspaceOutputs } from './runnerInstrumentation';
+import { matchesFile, RunnerLanes } from './runnerLanes';
+import { Preparation, RunnerPreparations } from './runnerPreparation';
 import type { FileRun, RunnerOptions } from './runnerTypes';
 
 export { discover, projectCoverageId };
 export type { FileRun, RunnerOptions };
-interface Preparation {
-    readonly root: string; output: PreparedOutput; readonly session: string; coverage: boolean; coveragePending?: boolean | undefined;
-    nodes: readonly TestNode[]; nativeById: ReadonlyMap<string, TestNode>;
-    byKey: ReadonlyMap<string, readonly TestNode[]>; instrumented?: readonly string[]; groups?: readonly TestFile[]; runs: number;
-    readonly lease?: PreparedArtifactLease | undefined;
-    /** An in-place coverage upgrade did not finish; the template must not be retained. */
-    interrupted?: { readonly error: unknown };
-    /** A collector using this instrumentation session was stopped or failed. Its
-     * session may retain partial state, so the template is not reused. */
-    collectorInterrupted?: boolean;
-}
-interface RunnerLane { readonly session: Promise<RunnerSession>; busy: boolean; }
 
 export class RunnerSession {
-    private readonly prepared = new Map<string, Preparation>();
-    private readonly preparations = new Map<string, Promise<Preparation>>();
     private readonly discoveries = new Map<string, Promise<readonly TestFile[]>>();
     private readonly projects = new Map<string, Project>();
-    private readonly lanes = new Map<string, RunnerLane[]>();
+    private readonly preparer: RunnerPreparations;
+    private readonly prepared: Map<string, Preparation>;
+    private readonly lanes: RunnerLanes<RunnerSession>;
     private readonly unsafeParallel = new Set<string>();
-    private laneSequence = 0;
     private readonly queues = new Map<string, Promise<void>>();
     private readonly running = new Set<Promise<FileRun>>();
     private readonly coverageReader = new CoverageReader();
@@ -49,11 +33,12 @@ export class RunnerSession {
     private lease: Promise<RunOutputLease> | undefined;
     private disposed = false;
     private disposal?: Promise<void>;
-    private readonly toolContexts: Map<string, Promise<string>>;
-    private readonly toolIdentities: Map<string, Promise<string>>;
     constructor(private readonly options: RunnerOptions) {
-        this.toolContexts = options.preparationTools ?? new Map<string, Promise<string>>();
-        this.toolIdentities = options.preparationToolIdentities ?? new Map<string, Promise<string>>();
+        const preparer = this.preparer = new RunnerPreparations(options, () => this.outputRoot(), this.projects);
+        this.prepared = preparer.prepared;
+        this.lanes = new RunnerLanes((number, slot) => this.outputRoot().then(root => new RunnerSession({ ...this.options,
+            outputRoot: path.join(root, 'lanes', String(number)), preparationLane: slot, preparationTools: preparer.toolContexts,
+            preparationToolIdentities: preparer.toolIdentities, deferCoverage: undefined, onPrepared: undefined, tryInstrumentation: undefined })));
     }
 
     async discover(project: Project): Promise<readonly TestFile[]> {
@@ -68,7 +53,7 @@ export class RunnerSession {
     }
 
     private async discoverProject(project: Project): Promise<readonly TestFile[]> {
-        const preparation = await this.prepare({ id: testFileId(project.file, project.framework), project: project.file,
+        const preparation = await this.preparer.prepare({ id: testFileId(project.file, project.framework), project: project.file,
             assembly: project.assembly, framework: project.framework, tests: [] });
         const groups = (await discover({ ...project, assembly: path.join(preparation.output.directory, path.basename(project.assembly)) }, this.options, preparation.nodes))
             .map(group => ({ ...group, assembly: project.assembly }));
@@ -80,7 +65,7 @@ export class RunnerSession {
         const group = groups[0];
         if (!group || groups.some(item => item.assembly !== group.assembly || item.project !== group.project || item.framework !== group.framework)) {throw new Error('A test batch must belong to one project and target framework.');}
         const options = this.projectOptions(group);
-        const preparation = await this.prepare(group);
+        const preparation = await this.preparer.prepare(group);
         // Discovery and execution use one stable private path, so exact native
         // UIDs work even when displayed theory names are indistinguishable.
         const { nativeById, byKey } = preparation;
@@ -171,33 +156,16 @@ export class RunnerSession {
         const key = testTargetKey(group.project, group.framework);
         const primary = this.prepared.get(key), project = this.projects.get(key);
         if (Number.isSafeInteger(workerIndex) && workerIndex > 0 && this.queues.has(key) && this.canRunParallel(groups) && primary && project) {
-            const lanes = this.lanes.get(key) ?? [];
-            let slot = lanes.find(lane => !lane.busy);
-            if (!slot) {
-                const number = ++this.laneSequence, laneIndex = lanes.length + 1;
-                const lane: RunnerLane = slot = { busy: false, session: this.outputRoot().then(root => new RunnerSession({ ...this.options,
-                    outputRoot: path.join(root, 'lanes', String(number)), preparationLane: laneIndex, preparationTools: this.toolContexts,
-                    preparationToolIdentities: this.toolIdentities, deferCoverage: undefined, onPrepared: undefined,
-                    tryInstrumentation: undefined })) };
-                lanes.push(lane); this.lanes.set(key, lanes);
-                // A lane that never started holds nothing to clean up; a later batch creates a fresh one.
-                void lane.session.catch(() => {
-                    const index = lanes.indexOf(lane);
-                    if (index >= 0) {lanes.splice(index, 1);}
-                    if (!lanes.length && this.lanes.get(key) === lanes) {this.lanes.delete(key);}
-                });
-            }
-            // Reserve before yielding; changing pool worker IDs must not grow the lane count.
-            slot.busy = true;
+            const reserved = this.lanes.reserve(key);
             try {
-                const lane = await slot.session;
+                const lane = await reserved.session;
                 await lane.discover(project);
                 const canonical = primary.groups!.find(item => item.id === group.id)!;
-                if (this.matchesFile(canonical, primary, lane.prepared.get(key)!)) {return await lane.run(groups, hashes);}
+                if (matchesFile(canonical, primary, lane.prepared.get(key)!)) {return await lane.run(groups, hashes);}
                 this.unsafeParallel.add(group.id);
                 this.options.output?.(`Parallel test identities could not be matched for ${path.basename(group.file!)}; using its primary runner.\n`);
             } finally {
-                slot.busy = false;
+                reserved.busy = false;
             }
         }
         // Fallbacks and partial selections share canonical native IDs and output.
@@ -212,42 +180,20 @@ export class RunnerSession {
         return execution;
     }
 
-    /** Never guess between indistinguishable rows or run a different file shape. */
-    private matchesFile(group: TestFile, primary: Preparation, lane: Preparation): boolean {
-        const local = lane.groups?.find(item => item.id === group.id && item.file === group.file);
-        if (!local || local.tests.length !== group.tests.length) {return false;}
-        const localIds = new Set(local.tests.map(test => test.id)), matched = new Set<string>();
-        for (const test of group.tests) {
-            const key = nodeKey(test.node as TestNode);
-            let native = lane.nativeById.get(test.id);
-            if (native && nodeKey(native) !== key) {return false;}
-            if (!native) {
-                const candidates = lane.byKey.get(key);
-                if (candidates?.length !== 1 || primary.byKey.get(key)?.length !== 1) {return false;}
-                native = candidates[0];
-                if (!native) {return false;}
-            }
-            if (!localIds.has(native.uid) || matched.has(native.uid)) {return false;}
-            matched.add(native.uid);
-        }
-        return matched.size === localIds.size;
-    }
-
     /** group: the batch's first file, which names its project and framework. */
     private async execute(group: TestFile, groups: readonly TestFile[], hashes: ReadonlyMap<string, string>): Promise<FileRun> {
         this.options.signal?.throwIfAborted();
-        const initial = await this.prepare(group);
+        const initial = await this.preparer.prepare(group);
         // Later batches of a target whose template upgrade was interrupted fail
         // fast; the template is in an unknown state until the next run.
         if (initial.interrupted) {throw initial.interrupted.error;}
         if (initial.coveragePending) {
-            try {await this.prepareSelectedCoverage(group, initial);}
+            try {await this.preparer.prepareSelectedCoverage(group, initial);}
             catch (error) {initial.interrupted = { error }; throw error;}
         }
         const { preparation, selected, executedGroups, originals } = await this.resolve(groups);
         const options = this.projectOptions(group), single = executedGroups.length === 1 ? executedGroups[0] : undefined;
         if (preparation.runs++) {await preparation.output.restore(options.signal);}
-        const report = path.join(preparation.root, `coverage-${preparation.runs}.xml`);
         let work = 0;
         const originalNode = (node: TestNode): TestNode => {
             const original = originals.get(node.uid);
@@ -274,81 +220,85 @@ export class RunnerSession {
         const selectedIds = new Set(selected.map(node => node.uid));
         const completeProject = preparation.nodes.every(node => selectedIds.has(node.uid));
         const assembly = path.join(preparation.output.directory, path.basename(group.assembly));
-        let observation: RuntimeObservation | undefined;
-        if (preparation.coverage) {
-            try {
-                observation = await RuntimeObservation.start(path.join(preparation.root, `modules-${preparation.runs}`), assembly,
-                    options.modules ?? (options.assemblies ?? [group.assembly]).map(file => ({ name: path.basename(file, path.extname(file)), sources: [...hashes.keys()] })),
-                    preparation.instrumented ?? [], options.env);
-            } catch (error) {options.signal?.throwIfAborted(); options.output?.(`Runtime observation unavailable; retaining conservative dependencies. ${String(error)}\n`);}
+        // A report and the observer logs are read once, below. Remove them as soon as this
+        // batch ends: a session lasts the whole run, and every test file adds a set.
+        const report = path.join(preparation.root, `coverage-${preparation.runs}.xml`), modules = path.join(preparation.root, `modules-${preparation.runs}`);
+        const resultsDirectory = path.join(preparation.root, `results-${preparation.runs}`);
+        try {
+            let observation: RuntimeObservation | undefined;
+            if (preparation.coverage) {
+                try {
+                    observation = await RuntimeObservation.start(modules, assembly,
+                        options.modules ?? (options.assemblies ?? [group.assembly]).map(file => ({ name: path.basename(file, path.extname(file)), sources: [...hashes.keys()] })),
+                        preparation.instrumented ?? [], options.env);
+                } catch (error) {options.signal?.throwIfAborted(); options.output?.(`Runtime observation unavailable; retaining conservative dependencies. ${String(error)}\n`);}
+            }
+            const collected = (work: Promise<readonly TestNode[]>): Promise<readonly TestNode[]> => preparation.coverage
+                ? work.catch((error: unknown) => {preparation.collectorInterrupted = true; throw error;}) : work;
+            const nodes = await collected(requestTests({
+                ...options, env: observation?.env ?? options.env, expectedTests: selected, assembly,
+                args: ['--results-directory', resultsDirectory, ...options.testArguments],
+                wrapper: preparation.coverage ? {
+                    command: options.coverageTool!, args: ['collect', '--nologo', '--session-id', preparation.session, '-f', 'cobertura', '-o', report]
+                } : undefined,
+                onNode: native => {
+                    if (native['node-type'] === 'group') {return;}
+                    const node = originalNode(native);
+                    const test = convert(node), item = groupFor(test);
+                    if (node['execution-state'] === 'in-progress') {options.onStarted?.(item, node.uid);}
+                    const result = testResult(node); if (result) {options.onResult?.(item, result, test);}
+                }
+            }, 'run', completeProject ? undefined : selected));
+            options.signal?.throwIfAborted();
+            const results = nodes.map(originalNode).map(testResult).filter((result): result is TestResult => !!result);
+            if (!results.length) {throw new Error(`No test results were received for ${group.file ?? group.project}.`);}
+            const coverage: FileCoverage[] = [];
+            let available = preparation.coverage;
+            if (available) {
+                try {
+                    coverage.push(...await this.coverageReader.read(report, options.cwd, hashes, options.signal));
+                } catch (error) {
+                    options.signal?.throwIfAborted(); available = false; preparation.collectorInterrupted = true;
+                    options.output?.(`Coverage unavailable for ${path.basename(group.project)}; test results are retained. ${String(error)}\n`);
+                }
+            }
+            let runtimeDependencies: readonly string[] = [], moduleProjects: readonly string[] = [], observed = !preparation.coverage;
+            if (preparation.coverage) {
+                try {
+                    if (!observation) {throw new Error('No runtime observer was available.');}
+                    const dependencies = await observation.dependencies(options.signal);
+                    runtimeDependencies = dependencies.files; moduleProjects = dependencies.projects; observed = true;
+                } catch (error) {
+                    options.signal?.throwIfAborted(); runtimeDependencies = [...hashes.keys()];
+                    moduleProjects = [...new Set(options.modules?.flatMap(module => module.project ? [module.project] : []) ?? [])];
+                    options.output?.(`Runtime observation incomplete; retaining workspace dependencies. ${String(error)}\n`);
+                }
+            }
+            const dependencies = [...new Set([...coverage.filter(file => file.lines.some(line => line.hits > 0)).map(file => file.file), ...runtimeDependencies,
+                ...executedGroups.flatMap(item => this.options.buildInputs?.get(item.project) ?? []),
+                ...executedGroups.map(item => item.file).filter((file): file is string => !!file)])];
+            const reliable = isReliableTrace({ file: single, coverageAvailable: available, observed, coverage, results });
+            return {
+                results, coverageAvailable: available, executedGroups,
+                trace: {
+                    groupId: single?.id ?? projectCoverageId(group), dependencies, moduleProjects, coverage, reliable, timestamp: Date.now(),
+                    inputs: Object.fromEntries(dependencies.map(file => [file, sourceVersion(hashes, file)]))
+                }
+            };
+        } finally {
+            // The results directory keeps attachments MTP reported (and logged) while it has any.
+            const artifacts = [...preparation.coverage ? [fs.rm(report, { force: true }), removeOutput(modules)] : [], fs.rmdir(resultsDirectory)];
+            await Promise.all(artifacts.map(cleanup => cleanup.catch(() => undefined)));
         }
-        const collected = (work: Promise<readonly TestNode[]>): Promise<readonly TestNode[]> => preparation.coverage
-            ? work.catch((error: unknown) => {preparation.collectorInterrupted = true; throw error;}) : work;
-        const nodes = await collected(requestTests({
-            ...options, env: observation?.env ?? options.env, expectedTests: selected, assembly,
-            args: ['--results-directory', path.join(preparation.root, `results-${preparation.runs}`), ...options.testArguments],
-            wrapper: preparation.coverage ? {
-                command: options.coverageTool!, args: ['collect', '--nologo', '--session-id', preparation.session, '-f', 'cobertura', '-o', report]
-            } : undefined,
-            onNode: native => {
-                if (native['node-type'] === 'group') {return;}
-                const node = originalNode(native);
-                const test = convert(node), item = groupFor(test);
-                if (node['execution-state'] === 'in-progress') {options.onStarted?.(item, node.uid);}
-                const result = testResult(node); if (result) {options.onResult?.(item, result, test);}
-            }
-        }, 'run', completeProject ? undefined : selected));
-        options.signal?.throwIfAborted();
-        const results = nodes.map(originalNode).map(testResult).filter((result): result is TestResult => !!result);
-        if (!results.length) {throw new Error(`No test results were received for ${group.file ?? group.project}.`);}
-        const coverage: FileCoverage[] = [];
-        let available = preparation.coverage;
-        if (available) {
-            try {
-                coverage.push(...await this.coverageReader.read(report, options.cwd, hashes, options.signal));
-            } catch (error) {
-                options.signal?.throwIfAborted(); available = false; preparation.collectorInterrupted = true;
-                options.output?.(`Coverage unavailable for ${path.basename(group.project)}; test results are retained. ${String(error)}\n`);
-            }
-        }
-        let runtimeDependencies: readonly string[] = [], moduleProjects: readonly string[] = [], observed = !preparation.coverage;
-        if (preparation.coverage) {
-            try {
-                if (!observation) {throw new Error('No runtime observer was available.');}
-                const dependencies = await observation.dependencies(options.signal);
-                runtimeDependencies = dependencies.files; moduleProjects = dependencies.projects; observed = true;
-            } catch (error) {
-                options.signal?.throwIfAborted(); runtimeDependencies = [...hashes.keys()];
-                moduleProjects = [...new Set(options.modules?.flatMap(module => module.project ? [module.project] : []) ?? [])];
-                options.output?.(`Runtime observation incomplete; retaining workspace dependencies. ${String(error)}\n`);
-            }
-        }
-        const dependencies = [...new Set([...coverage.filter(file => file.lines.some(line => line.hits > 0)).map(file => file.file), ...runtimeDependencies,
-            ...executedGroups.flatMap(item => this.options.buildInputs?.get(item.project) ?? []),
-            ...executedGroups.map(item => item.file).filter((file): file is string => !!file)])];
-        const reported = new Set(results.map(result => result.id));
-        const reliable = !!single?.file && available && observed && coverage.some(file => file.lines.some(line => line.hits > 0))
-            && results.every(result => result.outcome === 'passed') && single.tests.every(test => reported.has(test.id));
-        return {
-            results, coverageAvailable: available, executedGroups,
-            trace: {
-                groupId: single?.id ?? projectCoverageId(group), dependencies, moduleProjects, coverage, reliable, timestamp: Date.now(),
-                inputs: Object.fromEntries(dependencies.map(file => [file, sourceVersion(hashes, file)]))
-            }
-        };
     }
 
     dispose(): Promise<void> {
         this.disposed = true;
         return this.disposal ??= (async () => {
-            await Promise.allSettled([...this.running, ...this.discoveries.values(), ...this.preparations.values()]);
-            const lanes = await Promise.allSettled([...this.lanes.values()].flatMap(lanes => lanes.map(lane => lane.session)));
+            await Promise.allSettled([...this.running, ...this.discoveries.values(), ...this.preparer.pending()]);
+            const lanes = await Promise.allSettled(this.lanes.sessions());
             const actions = [() => this.coverageReader.dispose(), ...lanes.filter((lane): lane is PromiseFulfilledResult<RunnerSession> => lane.status === 'fulfilled')
-                // Cancelled or failed runs keep templates that were only discovered or
-                // whose executions completed: reacquiring a lease revalidates the
-                // template bytes. Interrupted upgrades and collector sessions are discarded.
-                .map(lane => () => lane.value.dispose()), ...[...this.prepared.values()].map(preparation => () => preparation.lease
-                ? preparation.lease.release(!preparation.interrupted && !preparation.collectorInterrupted) : removeOutput(preparation.root))];
+                .map(lane => () => lane.value.dispose()), ...this.preparer.releases()];
             // Every private owner must be released even if another owner's cleanup fails.
             const cleaned = await Promise.allSettled(actions.map(action => Promise.resolve().then(action)));
             this.prepared.clear();
@@ -361,11 +311,6 @@ export class RunnerSession {
     /** Processes for a target run in its project directory. */
     private projectOptions(group: Pick<TestFile, 'project'>): RunnerOptions { return { ...this.options, cwd: path.dirname(group.project) }; }
 
-    /** The build output a target is prepared from: its snapshot when one was taken. */
-    private outputSource(group: Pick<TestFile, 'project' | 'framework' | 'assembly'>): string {
-        return this.options.snapshots?.get(testTargetKey(group.project, group.framework)) ?? path.dirname(group.assembly);
-    }
-
     private assertOpen(): void {if (this.disposed) {throw new Error('The test runner session has been disposed.');}}
 
     private async outputRoot(): Promise<string> {
@@ -375,178 +320,5 @@ export class RunnerSession {
         }
         try {this.outputLease = await this.lease; return this.outputLease.directory;}
         catch (error) {this.lease = undefined; throw error;}
-    }
-
-    private async prepare(group: TestFile): Promise<Preparation> {
-        const key = testTargetKey(group.project, group.framework);
-        const existing = this.prepared.get(key); if (existing) {return existing;}
-        const preparing = this.preparations.get(key); if (preparing) {return preparing;}
-        const pending = this.prepareTarget(group);
-        this.preparations.set(key, pending);
-        try {return await pending;}
-        finally {this.preparations.delete(key);}
-    }
-
-    private async prepareTarget(group: TestFile): Promise<Preparation> {
-        const key = testTargetKey(group.project, group.framework);
-        const options = this.projectOptions(group);
-        const source = this.outputSource(group);
-        let lease: PreparedArtifactLease | undefined;
-        if (options.preparedOutputCache) {
-            let context: string | undefined;
-            try {context = await this.preparationContext(group);}
-            catch (error) {options.signal?.throwIfAborted(); options.output?.(`Prepared output caching unavailable for ${path.basename(group.project)}: ${String(error)}\n`);}
-            lease = await options.preparedOutputCache.acquire(source, context ?? randomUUID(), async root => {
-                const artifact = await this.createArtifact(group, source, root);
-                return context ? artifact : { ...artifact, reusable: false };
-            }, options.signal, JSON.stringify([key, options.preparationLane ?? 0]));
-            options.output?.(`Prepared output cache ${lease?.hit ? 'hit' : 'miss'} for ${path.basename(group.project)} (${group.framework}).\n`);
-        }
-        let artifact: PreparedArtifact;
-        if (lease) {artifact = lease.artifact;}
-        else {
-            const root = path.join(await this.outputRoot(), contentHash(key));
-            await fs.mkdir(root, { recursive: true });
-            try {artifact = await this.createArtifact(group, source, root);}
-            catch (error) {await removeOutput(root); throw error;}
-        }
-        const root = artifact.root;
-        try {
-            if (artifact.coveragePending && !options.deferCoverage?.(group)) {
-                artifact = await this.upgradeArtifact(group, source, artifact);
-                await lease?.update(artifact, options.signal);
-            }
-            const { output, session, coverage, coveragePending, instrumented } = artifact;
-            const prepared = { root, output, session, coverage, coveragePending, ...await this.discoverArtifact(group, output), instrumented, lease, runs: 0 };
-            this.prepared.set(key, prepared); options.onPrepared?.(group.project);
-            return prepared;
-        } catch (error) {
-            if (lease) {await lease.release(false);} else {await removeOutput(root);}
-            throw error;
-        }
-    }
-
-    private async discoverArtifact(group: TestFile, output: PreparedOutput): Promise<Pick<Preparation, 'nodes' | 'nativeById' | 'byKey'>> {
-        const options = this.projectOptions(group);
-        const nodes = await requestTests({ ...options, assembly: path.join(output.directory, path.basename(group.assembly)), args: options.testArguments }, 'discover');
-        // Discovery can also execute user code and mutate assets.
-        await output.restore(options.signal);
-        const nativeById = new Map<string, TestNode>(), byKey = new Map<string, TestNode[]>();
-        let work = 0;
-        for (const node of nodes) {
-            nativeById.set(node.uid, node);
-            const key = nodeKey(node); const matching = byKey.get(key) ?? []; matching.push(node); byKey.set(key, matching);
-            if (++work % 512 === 0) {await yieldTurn(); options.signal?.throwIfAborted();}
-        }
-        return { nodes, nativeById, byKey };
-    }
-
-    private async prepareSelectedCoverage(group: TestFile, preparation: Preparation): Promise<void> {
-        const source = this.outputSource(group);
-        this.options.output?.(`Preparing coverage for selected ${path.basename(group.project)} (${group.framework}).\n`);
-        const artifact = await this.upgradeArtifact(group, source, { root: preparation.root, output: preparation.output,
-            session: preparation.session, coverage: preparation.coverage, coveragePending: true, instrumented: preparation.instrumented ?? [],
-            reusable: preparation.lease?.artifact.reusable ?? true });
-        await preparation.lease?.update(artifact, this.options.signal);
-        Object.assign(preparation, artifact, await this.discoverArtifact(group, artifact.output));
-        // Providers may derive IDs from the rewritten binary. Resolve selections only
-        // against this refreshed inventory, retaining the ordinary ambiguity guards.
-        const project = this.projects.get(testTargetKey(group.project, group.framework));
-        if (project) {
-            preparation.groups = (await discover({ ...project, assembly: path.join(artifact.output.directory, path.basename(project.assembly)) }, this.options, preparation.nodes))
-                .map(item => ({ ...item, assembly: project.assembly }));
-        }
-    }
-
-    private async preparationContext(group: TestFile): Promise<string> {
-        const options = this.options;
-        const cwd = path.dirname(group.project);
-        let toolContext = this.toolContexts.get(cwd);
-        if (!toolContext) {const pending = toolContext = (async () => {
-            const env = this.preparationEnvironment();
-            let tools: unknown;
-            if (process.platform === 'win32') {tools = await windowsPreparationTools(options, env, cwd, this.toolIdentities);}
-            else {
-                const identities = await Promise.allSettled([options.dotnet, options.coverageTool, options.analyzer]
-                    .map(command => preparationToolIdentity(command, env, options.signal, cwd, this.toolIdentities)));
-                tools = identities.map(identity => {if (identity.status === 'rejected') {throw identity.reason;} return identity.value;});
-            }
-            return contentHash(JSON.stringify({ tools, env: Object.entries(env).sort(([left], [right]) => compareCodeUnits(left, right)),
-                arguments: options.testArguments, assemblies: [...(options.assemblies ?? [])].sort(), modules: options.modules,
-                runtime: process.version, platform: process.platform, architecture: process.arch }));
-        })(); this.toolContexts.set(cwd, pending);
-        // A failed or cancelled identification must not be reused by later preparations.
-        void pending.catch(() => {if (this.toolContexts.get(cwd) === pending) {this.toolContexts.delete(cwd);}});}
-        // Bump when preparation semantics change; retained templates can cross editor lifetimes.
-        // 4/5: identity keys are ordered by code units instead of the host locale.
-        return JSON.stringify({ version: process.platform === 'win32' ? 5 : 4, tools: await toolContext, project: group.project, framework: group.framework,
-            assembly: group.assembly, context: options.preparationContexts?.get(testTargetKey(group.project, group.framework)) });
-    }
-
-    private preparationEnvironment(): NodeJS.ProcessEnv {
-        const env = { ...process.env, ...this.options.env };
-        return this.options.managedCoverageTool ? stableEnvironment(env) : env;
-    }
-
-    private async createArtifact(group: TestFile, source: string, root: string): Promise<PreparedArtifact> {
-        const options = this.projectOptions(group);
-        const template = path.join(root, 'template');
-        const session = randomUUID();
-        try {
-            await copyOutput(source, template, options.signal);
-            const coveragePending = !!options.coverageTool && !!options.deferCoverage?.(group);
-            if (coveragePending) {options.output?.(`Deferring coverage preparation for ${path.basename(group.project)} (${group.framework}) until selection.\n`);}
-            const { coverage, instrumented } = coveragePending ? { coverage: false, instrumented: [] }
-                : await this.instrumentTemplate(group, source, template, root, session);
-            const output = new PreparedOutput(template, path.join(root, 'assembly'));
-            await output.initialize(options.signal);
-            return { root, output, session, coverage, coveragePending, instrumented, reusable: coveragePending || coverage === !!options.coverageTool };
-        } catch (error) {await removeOutput(root); throw error;}
-    }
-
-    private async upgradeArtifact(group: TestFile, source: string, artifact: PreparedArtifact): Promise<PreparedArtifact> {
-        const { coverage, instrumented } = await this.instrumentTemplate(group, source, artifact.output.template, artifact.root, artifact.session);
-        const output = new PreparedOutput(artifact.output.template, artifact.output.directory);
-        await removeOutput(output.directory);
-        await output.initialize(this.options.signal);
-        return { ...artifact, output, coverage, coveragePending: false, instrumented, reusable: artifact.reusable && coverage === !!this.options.coverageTool };
-    }
-
-    private async instrumentTemplate(group: TestFile, source: string, template: string, root: string, session: string): Promise<{ coverage: boolean; instrumented: string[] }> {
-        const options = { ...this.projectOptions(group), env: this.options.managedCoverageTool ? this.preparationEnvironment() : this.options.env };
-        let coverage = !!options.coverageTool;
-        const instrumented: string[] = [];
-        if (coverage) {
-            const assemblies = new Set((options.assemblies ?? [group.assembly]).map(assemblyName));
-            const files = await workspaceOutputs(template, assemblies, options.signal);
-            const instrument = async (assembly: string, signal: AbortSignal | undefined): Promise<string | undefined> => {
-                const before = await fileHash(assembly, signal);
-                requireSuccess(await runProcess(options.coverageTool!, ['instrument', assembly, '--session-id', session, '--nologo'],
-                    { ...options, signal }), `Instrumenting ${path.basename(assembly)}`);
-                // The collector can exit 0 after skipping a module (for
-                // example, no_symbols). An unchanged DLL must retain its
-                // whole-module dependency when the observer sees it load.
-                if (await fileHash(assembly, signal) !== before) {
-                    return path.join(root, 'assembly', path.relative(template, assembly));
-                }
-                options.output?.(`No instrumentation change in ${path.basename(assembly)}; retaining module dependencies.\n`);
-                return undefined;
-            };
-            try {
-                if (options.managedCoverageTool && options.tryInstrumentation) {
-                    const results = await instrumentWithSpareCapacity(files, options.signal, options.tryInstrumentation, instrument);
-                    instrumented.push(...results.filter((assembly): assembly is string => assembly !== undefined));
-                } else {
-                    for (const assembly of files) {const result = await instrument(assembly, options.signal); if (result) {instrumented.push(result);}}
-                }
-            } catch (error) {
-                options.signal?.throwIfAborted(); coverage = false;
-                options.output?.(`Coverage preparation failed; running tests without collection. ${String(error)}\n`);
-                // All sibling commands have drained before restoring the pristine template.
-                await removeOutput(template);
-                await copyOutput(source, template, options.signal);
-            }
-        }
-        return { coverage, instrumented };
     }
 }

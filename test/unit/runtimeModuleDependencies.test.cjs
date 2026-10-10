@@ -8,9 +8,9 @@ test('runtime module reports distinguish instrumented, external and in-memory lo
  const observer=await RuntimeObservation.start(path.join(directory,'reports'),assembly,[
   {name:'Plugin',project:'/Plugin.csproj',sources:['/Plugin.cs']},{name:'plugin',project:'/Alternative.csproj',sources:['/Alternative.cs']}
  ],[instrumented],{DOTNET_STARTUP_HOOKS:'/existing/hook.dll'});
- assert.ok(observer.env.DOTNET_STARTUP_HOOKS.endsWith(path.delimiter+'/existing/hook.dll'));
- const encode=s=>Buffer.from(s).toString('base64'),report=path.join(directory,'reports','host.log');
- const lines=location=>`ready\t${encode(assembly)}\r\nmodule\t${encode('Plugin')}\t${encode(location)}\r\ncomplete\ttrue\r\n`;
+ assert.ok(/** @type {string} */ (observer.env.DOTNET_STARTUP_HOOKS).endsWith(path.delimiter+'/existing/hook.dll'));
+ const encode=(/** @type {string} */ s)=>Buffer.from(s).toString('base64'),report=path.join(directory,'reports','host.log');
+ const lines=(/** @type {string} */ location)=>`ready\t${encode(assembly)}\r\nmodule\t${encode('Plugin')}\t${encode(location)}\r\ncomplete\ttrue\r\n`;
  await fs.writeFile(report,lines(instrumented));assert.deepEqual(await observer.dependencies(),{files:[],projects:[]});
  for(const location of ['/original/Plugin.dll','']){
   await fs.writeFile(report,lines(location));const observed=await observer.dependencies();
@@ -31,12 +31,13 @@ test('runtime module reports distinguish instrumented, external and in-memory lo
 test('module dependencies cover new source files across projects and survive cache restoration',async t=>{
  const {CoverageStore}=require('../../out/core/coverage'),{CoverageCache}=require('../../out/services/cache'),{selectTests,ProjectIndex}=require('../../out/core/selection');
  const directory=await fs.mkdtemp(path.join(os.tmpdir(),'testy-module-cache-'));t.after(()=>fs.rm(directory,{recursive:true,force:true}));
- const projects=[{file:'/Plugin/Plugin.csproj',assembly:'/Plugin.dll',sourceFiles:['/Plugin/Old.cs'],references:[]},
+ // Partial Project and TestFile records (any): only the fields selection reads.
+ /** @type {any} */ const projects=[{file:'/Plugin/Plugin.csproj',assembly:'/Plugin.dll',sourceFiles:['/Plugin/Old.cs'],references:[]},
   {file:'/Tests/Tests.csproj',assembly:'/Tests.dll',sourceFiles:['/Tests/Dynamic.cs'],references:[]}];
- const groups=[{id:'dynamic',project:'/Tests/Tests.csproj',file:'/Tests/Dynamic.cs'}];
+ /** @type {any} */ const groups=[{id:'dynamic',project:'/Tests/Tests.csproj',file:'/Tests/Dynamic.cs'}];
  const trace={groupId:'dynamic',moduleProjects:['/Plugin/Plugin.csproj'],dependencies:['/Plugin/Old.cs'],inputs:{},coverage:[],reliable:true,timestamp:0};
  const store=new CoverageStore();store.replace([trace],new Set(['dynamic']));
- const selected=store=>selectTests(groups,projects,store.traces,['/Plugin/New.cs'],'affected',false,new Set(),new ProjectIndex(projects),file=>store.dependentGroups([file]),project=>store.dependentProjects([project]));
+ const selected=(/** @type {import('../../out/core/coverage').CoverageStore} */ store)=>selectTests(groups,projects,store.traces,['/Plugin/New.cs'],'affected',false,new Set(),new ProjectIndex(projects),file=>store.dependentGroups([file]),project=>store.dependentProjects([project]));
  assert.equal(selected(store).groups.length,1);
  const cache=new CoverageCache(directory,()=>{});await cache.save(store.takeDelta());const restored=new CoverageStore();await cache.restore(restored);
  assert.deepEqual([...restored.dependentProjects(['/Plugin/Plugin.csproj'])],['dynamic']);assert.equal(selected(restored).groups.length,1);

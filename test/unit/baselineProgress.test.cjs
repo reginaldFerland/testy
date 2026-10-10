@@ -2,11 +2,22 @@ const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const {loadUi}=require('./support/ui.cjs');
 
+/** @typedef {Record<string, any>} Recorded A recorded VS Code stub argument. */
+
+/** @param {{deferTask?: boolean}} [options] */
 function fixture({deferTask=false}={}) {
- const calls=[],reports=[],listeners=[];let task,finished=false,started=0;
- const token={onCancellationRequested:listener=>{listeners.push(listener);return{dispose(){}};}};
- const progress={report:value=>reports.push({...value})};
- const vscode={ProgressLocation:{Notification:15,Window:10},window:{withProgress:(options,callback)=>{
+ /** @type {Recorded[]} */
+ const calls=[];
+ /** @type {Recorded[]} */
+ const reports=[];
+ /** @type {(() => void)[]} */
+ const listeners=[];
+ /** @type {() => Promise<void>} */
+ let task;
+ let finished=false,started=0;
+ const token={onCancellationRequested:/** @param {() => void} listener */ listener=>{listeners.push(listener);return{dispose(){}};}};
+ const progress={report:/** @param {Recorded} value */ value=>reports.push({...value})};
+ const vscode={ProgressLocation:{Notification:15,Window:10},window:{withProgress:/** @param {Recorded} options @param {(progress: unknown, token: unknown) => Promise<void>} callback */ (options,callback)=>{
   started++;calls.push(options);task=()=>callback(progress,token).then(()=>{finished=true;});
   if(!deferTask)return task();
   return new Promise(()=>undefined);}}};
@@ -16,6 +27,7 @@ function fixture({deferTask=false}={}) {
  return{baseline,calls,reports,listeners,get finished(){return finished;},get started(){return started;},get cancelled(){return cancelled;},run:()=>task()};
 }
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
+/** @param {unknown} value */
 const plain=value=>JSON.parse(JSON.stringify(value));
 
 test('baseline progress uses window progress with an incrementing percentage and ends with the run',async()=>{
@@ -53,11 +65,12 @@ test('progress reported before VS Code starts the task is delivered when it star
  const f=fixture({deferTask:true});
  f.baseline.update({completed:2,total:4});
  assert.equal(f.reports.length,0);
- f.run();
+ void f.run(); // starts the deferred task; its completion is observed through `f.finished`
  assert.deepEqual(plain(f.reports),[{message:'50% · 2/4 files learned',increment:50}]);
  f.baseline.end();await tick();assert.equal(f.finished,true);
  const ended=fixture({deferTask:true});
- ended.baseline.update({completed:1,total:4});ended.baseline.end();ended.run();await tick();
+ ended.baseline.update({completed:1,total:4});ended.baseline.end();void ended.run(); // completion is observed through `ended.finished`
+ await tick();
  assert.equal(ended.finished,true,'a session that ended before the task started still completes');
 });
 
@@ -68,16 +81,18 @@ test('an unknown total reports zero percent',()=>{
 
 test('the controller shows baseline progress for automatic runs only, and ends it with the run',async()=>{
  const os=require('node:os');
- const disposable=()=>({dispose(){}}),started=[];
+ const disposable=()=>({dispose(){}});
+ /** @type {Recorded[]} */
+ const started=[];
  const output={...disposable(),append(){},appendLine(){},info(){},warn(){},error(){},show(){}};
  const vscode={tests:{createTestController:()=>({...disposable(),createRunProfile:()=>({}),items:{replace(){}}})},TestRunProfileKind:{Run:1,Coverage:3,Debug:2},StatusBarAlignment:{Left:1},
   ProgressLocation:{Window:10},languages:{createDiagnosticCollection:()=>({...disposable(),clear(){},set(){}})},ThemeColor:class{},Uri:{joinPath:()=>({})},
   commands:{registerCommand:disposable,executeCommand:async()=>undefined},
   window:{visibleTextEditors:[],createOutputChannel:()=>output,createStatusBarItem:()=>({...disposable(),show(){}}),createTextEditorDecorationType:disposable,onDidChangeVisibleTextEditors:disposable,
-   withProgress:(options,task)=>{started.push(options);return task({report(){}},{onCancellationRequested:()=>disposable()});}},
+   withProgress:/** @param {Recorded} options @param {(progress: unknown, token: unknown) => unknown} task */ (options,task)=>{started.push(options);return task({report(){}},{onCancellationRequested:()=>disposable()});}},
   workspace:{onDidSaveTextDocument:disposable,onDidDeleteFiles:disposable,onDidRenameFiles:disposable,onDidChangeConfiguration:disposable,onDidChangeWorkspaceFolders:disposable,onDidChangeTextDocument:disposable,
-   getConfiguration:()=>({get:(_key,fallback)=>fallback})}};
- const state=()=>{const values=new Map();return{get:key=>values.get(key),update:async(key,value)=>{values.set(key,value);}};};
+   getConfiguration:()=>({get:/** @param {string} _key @param {unknown} fallback */ (_key,fallback)=>fallback})}};
+ const state=()=>{/** @type {Map<string, unknown>} */ const values=new Map();return{get:/** @param {string} key */ key=>values.get(key),update:/** @param {string} key @param {unknown} value */ async(key,value)=>{values.set(key,value);}};};
  const {Testy}=loadUi({vscode,stubs:{configuration:{configuration:()=>({enabled:true,trigger:'save',showCoverage:false,debounce:100,pattern:'**/*.cs',excludes:[],folderConflicts:[],additionalConfigurations:[]})}}});
  const ui=new Testy({extensionUri:{},storageUri:{fsPath:os.tmpdir()},globalStorageUri:{fsPath:os.tmpdir()},extensionPath:process.cwd(),workspaceState:state(),globalState:state()},['/workspace']);
  const events=ui.engine.options.events;
@@ -96,7 +111,7 @@ test('the controller shows baseline progress for automatic runs only, and ends i
 
 test('the cancellation listener is disposed when the baseline ends',async()=>{
  let disposed=0;
- const vscode={ProgressLocation:{Window:10},window:{withProgress:(options,callback)=>callback({report(){}},{onCancellationRequested:()=>({dispose(){disposed++;}})})}};
+ const vscode={ProgressLocation:{Window:10},window:{withProgress:/** @param {unknown} options @param {(progress: unknown, token: unknown) => unknown} callback */ (options,callback)=>callback({report(){}},{onCancellationRequested:()=>({dispose(){disposed++;}})})}};
  const {BaselineProgress}=loadUi({vscode}).module('ui/baselineProgress');
  const baseline=new BaselineProgress(()=>undefined);
  baseline.update({completed:1,total:2});

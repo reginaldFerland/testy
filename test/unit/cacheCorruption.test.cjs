@@ -2,18 +2,25 @@ const test=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {CoverageCache}=require('../../out/services/cache'),{CoverageStore}=require('../../out/core/coverage');
 const {contentHash}=require('../../out/core/paths');
+/** @typedef {{id:string,file:string,hash:string,lines:number[]}} Source */
+/** @type {(index:number,hash?:string,lines?:number[])=>Source} */
 const source=(index,hash='v1',lines=[1,2])=>{const file=`/Source${index}.cs`;return{id:contentHash(`${file}\0${hash}`),file,hash,lines};};
+/** @type {(groupId:string,sources:Source[],timestamp?:number)=>any} */
 const trace=(groupId,sources,timestamp=1)=>({groupId,timestamp,reliable:true,stale:false,
  dependencies:sources.map(source=>source.file),inputs:Object.fromEntries(sources.map(source=>[source.file,source.hash])),
  sourceIds:sources.map(source=>source.id),coverage:sources.map(source=>({file:source.file,hash:source.hash,lines:[{line:1,hits:timestamp}]}))});
+/** @param {Source[]} sources @param {any[]} [traces] @param {string[]} [removedTraces] */
 const delta=(sources,traces=[],removedTraces=[])=>({sources,traces,removedSources:[],removedTraces});
+/** @param {import('node:test').TestContext} t @param {import('../../out/services/cacheFormat').CacheLimits} [limits] */
 async function fixture(t,limits){
- const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-cache-corruption-test-')),directory=path.join(root,'coverage-v2'),warnings=[];
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-cache-corruption-test-')),directory=path.join(root,'coverage-v2'),warnings=/** @type {string[]} */ ([]);
  t.after(()=>fs.rm(root,{recursive:true,force:true}));
  return{root,directory,warnings,cache:new CoverageCache(root,text=>warnings.push(text),limits),
-  sourceFile:source=>path.join(directory,'sources',`${source.id}.json`),traceFile:id=>path.join(directory,'traces',`${contentHash(id)}.json`),
+  sourceFile:(/** @type {Source} */ source)=>path.join(directory,'sources',`${source.id}.json`),traceFile:(/** @type {string} */ id)=>path.join(directory,'traces',`${contentHash(id)}.json`),
+  /** @param {string} id @param {number} seconds */
   async age(id,seconds){const time=new Date(Date.now()-seconds*1000);await fs.utimes(path.join(directory,'traces',`${contentHash(id)}.json`),time,time);}};
 }
+/** @param {string} file */
 const missing=file=>assert.rejects(fs.stat(file),{code:'ENOENT'});
 const unreadableTrace=`${'a'.repeat(64)}.json`;
 
@@ -78,7 +85,7 @@ test('maintenance bounds the cache that saves accumulate, evicting the least rec
 });
 
 test('records are flushed to disk before they are published',async t=>{
- const f=await fixture(t),a=source(0),events=[];
+ const f=await fixture(t),a=source(0),events=/** @type {string[]} */ ([]);
  const open=fs.open,rename=fs.rename;
  fs.open=async function(file,...args){const handle=await open.call(this,file,...args);
   if(String(file).endsWith('.tmp')){const sync=handle.sync;handle.sync=function(...a){events.push(`sync ${path.basename(path.dirname(String(file)))}`);return sync.apply(this,a);};}
@@ -92,7 +99,7 @@ test('records are flushed to disk before they are published',async t=>{
 });
 
 test('the writer epoch is replaced atomically without syncing, while records still sync before publication',async t=>{
- const f=await fixture(t),a=source(0),b=source(1),events=[];
+ const f=await fixture(t),a=source(0),b=source(1),events=/** @type {string[]} */ ([]);
  const open=fs.open;
  fs.open=async function(file,...args){const handle=await open.call(this,file,...args);
   if(String(file).endsWith('.tmp')){const sync=handle.sync;handle.sync=function(...a){events.push(`sync ${path.basename(path.dirname(String(file)))}`);return sync.apply(this,a);};}
@@ -102,7 +109,8 @@ test('the writer epoch is replaced atomically without syncing, while records sti
  assert.ok(!events.includes('sync coverage-v2'),'the epoch is not synced');
  assert.ok(!events.includes('directory coverage-v2'),'the cache root holds only the epoch and is not synced');
  assert.equal(events.filter(event=>event==='sync sources').length,2);assert.equal(events.filter(event=>event==='sync traces').length,2);
- assert.equal(JSON.parse(await fs.readFile(path.join(f.directory,'epoch.json'),'utf8')),f.cache.epoch);
+ // The epoch is private; the test compares it with the persisted value.
+ assert.equal(JSON.parse(await fs.readFile(path.join(f.directory,'epoch.json'),'utf8')),/** @type {any} */ (f.cache).epoch);
  const restored=new CoverageStore();await new CoverageCache(f.root,()=>undefined).restore(restored,t.signal);
  assert.deepEqual([...restored.traces.keys()].sort(),['one','two']);
 });

@@ -6,18 +6,19 @@ const os = require('node:os');
 const {TestEngine} = require('../../out/services/engine');
 const {normalizePath} = require('../../out/core/paths');
 
-const exists=async file=>fs.access(file).then(()=>true,()=>false);
+const exists=async(/** @type {string} */ file)=>fs.access(file).then(()=>true,()=>false);
 
 test('a manual run can build with another configuration without affecting automatic runs', {timeout:300000}, async(t)=>{
  const directory=await fs.mkdtemp(path.join(os.tmpdir(),'testy configuration '));
- let engine;
+ /** @type {TestEngine | undefined} */ let engine;
  t.after(async()=>{try{await engine?.dispose();}finally{await fs.rm(directory,{recursive:true,force:true});}});
  const root=path.join(directory,'workspace');
- await fs.cp(path.resolve('test/fixtures/ImpactDemo'),root,{recursive:true,filter:file=>!/(^|[/\\])(bin|obj|TestResults)([/\\]|$)/.test(file)});
- let selection;const output=[];
- const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:120000,coverageTool:process.env.TESTY_COVERAGE_TOOL};
+ await fs.cp(path.resolve('test/fixtures/ImpactDemo'),root,{recursive:true,filter:(/** @type {string} */ file)=>!/(^|[/\\])(bin|obj|TestResults)([/\\]|$)/.test(file)});
+ /** @type {Required<import('../../out/core/selection').Selection>} */ let selection=/** @type {any} */ (undefined); // assigned by the selected event
+ /** @type {string[]} */ const output=[];
+ /** @type {import('../../out/core/model').EngineConfiguration} */ const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:120000,coverageTool:process.env.TESTY_COVERAGE_TOOL};
  engine=new TestEngine({roots:[root],storage:path.join(directory,'state'),tools:path.join(directory,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,events:{
-  output:text=>output.push(text),phase:()=>{},discovered:()=>{},selected:value=>{selection=value;},result:()=>{},started:()=>{},coverage:()=>{},invalidated:()=>{}
+  output:(/** @type {string} */ text)=>output.push(text),phase:()=>{},discovered:()=>{},selected:(/** @type {import('../../out/core/selection').Selection} */ value)=>{selection=/** @type {typeof selection} */ (value);},result:()=>{},started:()=>{},coverage:()=>{},invalidated:()=>{}
  }});
  const tests=path.join(root,'ImpactDemo.Tests');
  const baseline=await engine.run({files:[],full:true},t.signal);

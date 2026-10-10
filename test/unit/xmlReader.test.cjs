@@ -1,11 +1,13 @@
 const test=require('node:test'),assert=require('node:assert/strict');
 const {readXml,XmlSyntaxError}=require('../../out/services/xml');
 
+/** @param {string} xml */
 const events=xml=>{
- const result=[];
+ /** @type {any[]} */ const result=[];
  readXml(xml,{open:(name,attributes)=>result.push(['open',name,Object.fromEntries(attributes)]),close:name=>result.push(['close',name]),text:value=>result.push(['text',value])});
  return result;
 };
+/** @param {string} xml */
 const rejects=xml=>assert.throws(()=>events(xml),error=>error instanceof XmlSyntaxError&&error.message==='The coverage report is not valid, safe XML.',xml.slice(0,60));
 
 test('elements, both quote styles, self-closing tags and whitespace inside tags',()=>{
@@ -44,10 +46,10 @@ test('unbalanced, mismatched, truncated and multi-root documents are rejected',(
 });
 
 test('attribute bags are not prototype-bearing objects',()=>{
- const [[,,attributes]]=[(()=>{let first;readXml('<a __proto__="1" constructor="2" toString="3"/>',{open:(name,bag)=>{first??=['open',name,bag];},close(){},text(){}});return first;})()];
+ const [[,,attributes]]=[(()=>{let first;readXml('<a __proto__="1" constructor="2" toString="3"/>',{open:(name,bag)=>{first??=['open',name,bag];},close(){},text(){}});return /** @type {any} */ (first);})()];
  assert.ok(attributes instanceof Map);
  assert.deepEqual([...attributes],[['__proto__','1'],['constructor','2'],['toString','3']]);
- assert.equal(({}).polluted,undefined);
+ assert.equal(/** @type {any} */ ({}).polluted,undefined);
 });
 
 test('huge values, long documents and deep nesting are handled without regex backtracking or recursion',()=>{

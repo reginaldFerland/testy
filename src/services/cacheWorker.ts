@@ -3,12 +3,15 @@ import * as path from 'node:path';
 import { parentPort, workerData } from 'node:worker_threads';
 import { CoverageSource, StoredTrace } from '../core/coverage';
 import { contentHash } from '../core/paths';
-import { CacheLimits, defaultCacheLimits, validSource, validTrace } from './cacheFormat';
+import { StoredOutcomes } from '../core/runPolicy';
+import { CacheLimits, defaultCacheLimits, validOutcomes, validSource, validTrace } from './cacheFormat';
 import { mapConcurrent } from '../core/concurrency';
 
 export interface CacheSnapshot {
     readonly sources: readonly (Omit<CoverageSource, 'lines'> & { lines: Float64Array })[];
     readonly traces: readonly (Omit<StoredTrace, 'coverage' | 'sourceIds'> & { sourceIds: Uint32Array; coverage: readonly { file: string; hash: string; values: Float64Array }[] })[];
+    /** The latest test outcomes by file, independent of the traces and limits. */
+    readonly outcomes: readonly StoredOutcomes[];
     /** File size and modification time per trace, in trace order. */
     readonly stats: readonly { readonly bytes: number; readonly mtimeMs: number }[];
     readonly warnings: readonly string[];
@@ -32,7 +35,7 @@ async function read(directory: string, limits: CacheLimits): Promise<CacheSnapsh
             return { kind, names: [], warning: (error as NodeJS.ErrnoException).code !== 'ENOENT' ? `Unable to read the coverage cache: ${String(error)}` : undefined };
         }
     };
-    const [sourceInventory, traceInventory] = await Promise.all([list('sources'), list('traces')]);
+    const [sourceInventory, traceInventory, outcomeInventory] = await Promise.all([list('sources'), list('traces'), list('outcomes')]);
     // Keep the newest traces within the limits. Order is otherwise inventory order.
     const aged = await mapConcurrent(traceInventory.names, 16, undefined, async name => {
         try {const stat = await fs.stat(path.join(directory, 'traces', name)); return { name, bytes: stat.size, mtimeMs: stat.mtimeMs };}
@@ -94,7 +97,23 @@ async function read(directory: string, limits: CacheLimits): Promise<CacheSnapsh
     else if (dangling.length) {warnings.push('Ignoring invalid coverage cache records; preserving source geometry until the cache is fully readable.');}
     if (evicted.length) {warnings.push(`Discarding the ${evicted.length} oldest coverage cache traces beyond the restore limit.`);}
     const traces = resolved.map(item => item.value as StoredTrace);
-    return { warnings, complete, corrupt, evicted, stats: resolved.map(({ name }) => stats.get(name)!),
+    // Outcomes reference nothing, so an unreadable one only goes missing; it never makes the snapshot incomplete.
+    if (outcomeInventory.warning) {warnings.push(outcomeInventory.warning);}
+    const outcomes: StoredOutcomes[] = [];
+    const outcomeRecords = await mapConcurrent(outcomeInventory.names, 4, undefined, async (name): Promise<Outcome> => {
+        let contents: string;
+        try {contents = await fs.readFile(path.join(directory, 'outcomes', name), 'utf8');}
+        catch {return { warning: `Ignoring an unreadable coverage cache entry: ${name}` };}
+        try {return { value: JSON.parse(contents) as unknown };}
+        catch {return { corrupt: true };}
+    });
+    outcomeInventory.names.forEach((name, index) => {
+        const record = outcomeRecords[index]!;
+        if ('warning' in record) {warnings.push(record.warning);}
+        else if ('value' in record && validOutcomes(record.value) && name === `${contentHash(record.value.groupId)}.json`) {outcomes.push(record.value);}
+        else {corrupt.push(`outcomes/${name}`); warnings.push(`Discarding a corrupt coverage cache entry: ${name}`);}
+    });
+    return { warnings, complete, corrupt, evicted, outcomes, stats: resolved.map(({ name }) => stats.get(name)!),
         sources: sources.map(({ value }) => ({ ...(value as CoverageSource), lines: Float64Array.from([...byId.get((value as CoverageSource).id)!].sort((a, b) => a - b)) })),
         traces: traces.map(trace => ({ ...trace, sourceIds: Uint32Array.from(trace.sourceIds.map(id => sourceIndex.get(id)!)), coverage: trace.coverage.map(file => {
             const values = new Float64Array(file.lines.length * 2);

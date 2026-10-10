@@ -20,7 +20,8 @@ const options = {
     target: 'node24',
     external: ['vscode'],
     minify: production,
-    sourcemap: !production,
+    // Production maps are external (no sourceMappingURL) and stay out of the VSIX; they symbolicate reported stack traces.
+    sourcemap: production ? 'external' : true,
     sourcesContent: false,
     logLevel: 'info'
 };

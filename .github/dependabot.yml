@@ -16,6 +16,23 @@ updates:
       nuget-minor-patch:
         update-types: [minor, patch]
 
+  # Test fixtures: MSTest.Sdk, xunit.v3.mtp-v2 and NUnit versions.
+  - package-ecosystem: nuget
+    directories:
+      - /test/fixtures/*
+      - /test/fixtures/*/*
+    schedule:
+      interval: weekly
+    groups:
+      nuget-fixtures:
+        patterns: ['*']
+
+  # The SDK pinned by the root global.json (the fixtures' global.json files pin no SDK).
+  - package-ecosystem: dotnet-sdk
+    directory: /
+    schedule:
+      interval: weekly
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

@@ -12,7 +12,7 @@ test('the corpus generator is still the one the fixture was captured from',()=>{
 });
 
 test('parseCobertura output matches the captured fast-xml-parser output for generated reports',()=>{
- const cwd=process.cwd(),rel=file=>path.relative(cwd,file);
+ const cwd=process.cwd(),rel=/** @param {string} file */ file=>path.relative(cwd,file);
  const outcomes=new Set();
  for(const {seed,xml,allowed,expected} of documents){
   const set=new Set(allowed.map(file=>normalizePath(path.resolve(cwd,file)))),declarations=new Map();
@@ -21,7 +21,7 @@ test('parseCobertura output matches the captured fast-xml-parser output for gene
    const lines=parseCobertura(xml,cwd,set,declarations);
    actual={lines:[...lines].map(([file,list])=>[rel(file),list]),declarations:[...declarations].map(([file,list])=>[rel(file),list])};
    assert.deepEqual([...parseCobertura(xml,cwd,set)],[...lines],'spans do not change class lines');
-  }catch(error){actual={error:error.message};}
+  }catch(error){actual={error:/** @type {Error} */ (error).message};}
   assert.deepEqual(actual,expected,`seed ${seed}`);
   outcomes.add(expected.error??(expected.declarations.length?'declarations':'lines'));
  }

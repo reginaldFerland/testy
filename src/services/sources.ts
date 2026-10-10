@@ -15,6 +15,8 @@ export class SourceTracker {
     private readonly dirty = new Set<string>();
     private current: ReadonlyMap<string, string> = new Map();
     private known = new Set<string>();
+    /** `known` as a list, built once per setFiles: every full sweep reads it. */
+    private knownList: readonly string[] | undefined;
     private tracked = new Set<string>();
     private readonly classifications = new Map<string, { generated: boolean; version: number }>();
     private classificationVersion = 0;
@@ -24,9 +26,12 @@ export class SourceTracker {
     revision = 0;
 
     get hashes(): ReadonlyMap<string, string> { return this.current; }
-    get files(): readonly string[] { return [...this.known]; }
+    get files(): readonly string[] { return this.knownList ??= [...this.known]; }
     isGenerated(file: string): boolean { return this.classifications.get(file)?.generated ?? this.states.get(file)?.generated ?? false; }
-    observeGenerated(file: string, generated: boolean): void { this.classifications.set(file, { generated, version: ++this.classificationVersion }); }
+    /** An editor or watcher classification. The file is read again by the next refresh, since a header change is also a content change
+     * that the watcher does not otherwise report for generated files. */
+    observeGenerated(file: string, generated: boolean): void { this.classify(file, generated); if (this.known.has(file)) {this.dirty.add(file);} }
+    private classify(file: string, generated: boolean): void { this.classifications.set(file, { generated, version: ++this.classificationVersion }); }
     // Rebuilt lazily after the states change; callers read these on every analysis.
     get analysisHashes(): ReadonlyMap<string, string> { return this.derive().analysisHashes; }
     get aliasSources(): ReadonlyMap<string, string> { return this.derive().aliasSources; }
@@ -49,7 +54,7 @@ export class SourceTracker {
             if (!next.has(file) && !classification.generated) {this.classifications.delete(file);}
         }
         for (const file of next) {if (!this.known.has(file) || tracked.has(file) !== this.tracked.has(file)) {this.dirty.add(file);}}
-        this.known = next;
+        this.known = next; this.knownList = undefined;
         this.tracked = tracked;
         if (changed) {this.current = hashes; this.revision++;}
     }
@@ -72,6 +77,14 @@ export class SourceTracker {
             signal.addEventListener('abort', abort, { once: true });
             result.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
         });
+    }
+
+    /** A full sweep of every known file, for background use. Cancellation stops it only before it applies anything: the changes
+     * it applies are always returned, never lost to a late abort, since no later refresh reports them again. */
+    sweep(signal: AbortSignal): Promise<readonly string[]> {
+        const result = this.refreshing.then(() => this.refreshNow(this.files, signal));
+        this.refreshing = result.catch(() => undefined);
+        return result;
     }
 
     private async refreshNow(files: readonly string[], signal?: AbortSignal): Promise<readonly string[]> {
@@ -127,7 +140,7 @@ export class SourceTracker {
             }
             if (state) {
                 this.states.set(file, state);
-                if ((this.classifications.get(file)?.version ?? 0) <= classificationVersion) {this.observeGenerated(file, state.generated);}
+                if ((this.classifications.get(file)?.version ?? 0) <= classificationVersion) {this.classify(file, state.generated);}
             }
             else if (this.states.get(file)?.generated) {this.states.set(file, { stamp: '', hash: undefined, analysisHash: undefined, generated: true, aliasSource: undefined });}
             else {this.states.delete(file);}

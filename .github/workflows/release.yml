@@ -19,18 +19,15 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
-    env:
-      VSCE_PAT: ${{ secrets.VSCE_PAT }}
-      OVSX_PAT: ${{ secrets.OVSX_PAT }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .nvmrc
           cache: npm
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         with:
           global-json-file: global.json
           cache: true
@@ -46,7 +43,12 @@ jobs:
             exit 1
           fi
 
-      - run: npx vsce package --no-dependencies --out testy.vsix
+      # Package once (vsce runs vscode:prepublish), verify that exact file, then publish it everywhere.
+      - name: Package VSIX
+        run: npx vsce package --no-dependencies --out testy.vsix
+
+      - name: Assert VSIX file list
+        run: npm run check:vsix -- --vsix testy.vsix
 
       - name: Create GitHub release
         env:
@@ -54,11 +56,15 @@ jobs:
         run: gh release create "${GITHUB_REF_NAME}" testy.vsix --title "${GITHUB_REF_NAME}" --generate-notes
 
       - name: Publish to Visual Studio Marketplace
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: |
           if [ -z "${VSCE_PAT}" ]; then echo "VSCE_PAT not set; skipping."; exit 0; fi
           npx vsce publish --no-dependencies --packagePath testy.vsix
 
       - name: Publish to Open VSX
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: |
           if [ -z "${OVSX_PAT}" ]; then echo "OVSX_PAT not set; skipping."; exit 0; fi
           # Pinned: this step runs with the publish token. ovsx reads OVSX_PAT from the environment.

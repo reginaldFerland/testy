@@ -7,14 +7,21 @@ const {normalizePath}=require('../../out/core/paths');
 const processes=require('../../out/services/process'),mtp=require('../../out/services/mtp');
 
 const workers=6;
-const alive=pid=>{try{process.kill(pid,0);return true;}catch(error){if(error.code==='ESRCH')return false;throw error;}};
+/** @param {number} pid */
+const alive=pid=>{try{process.kill(pid,0);return true;}catch(error){if(/** @type {NodeJS.ErrnoException} */ (error).code==='ESRCH')return false;throw error;}};
 
+/**
+ * @param {import('node:test').TestContext} t
+ * @param {{blocked?:boolean}} [options]
+ */
 async function fixture(t,{blocked=false}={}) {
  const temp=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy automatic workers ')));
  const root=path.join(temp,'workspace'),storage=path.join(temp,'state'),barrier=path.join(temp,'started'),blocker=path.join(temp,'blocked');
+ /** @param {string} relative */
  const file=relative=>normalizePath(path.join(root,relative));
  const control=new AbortController(),signal=AbortSignal.any([control.signal,t.signal]),running=new Set();
  const original={availableParallelism:os.availableParallelism,runProcess:processes.runProcess,requestTests:mtp.requestTests};
+ /** @type {import('../../out/services/engine').TestEngine} assigned below, before anything can dispose it; the `?.` in cleanup covers an early failure */
  let engine;
  t.after(async()=>{
   control.abort();
@@ -47,29 +54,34 @@ using System.Diagnostics;
  }
 }`);
  }
+ /** @type {import('../../out/core/model').EngineConfiguration} */
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:90000,
   coverageTool:process.env.TESTY_COVERAGE_TOOL,maxParallelProjects:0,maxParallelTestFiles:0};
- const output=[],probe={runs:[],instruments:[],activeRequests:0,activeCommands:0};
+ /** @type {string[]} */
+ const output=[];
+ /** @type {{runs:{assembly:string,session:string|undefined}[],instruments:{assembly:string,session:string}[],activeRequests:number,activeCommands:number}} */
+ const probe={runs:[],instruments:[],activeRequests:0,activeCommands:0};
  os.availableParallelism=()=>7;
- processes.runProcess=async(command,args,options)=>{
+ processes.runProcess=async(/** @type {string} */ command,/** @type {readonly string[]} */ args,/** @type {import('../../out/services/process').ProcessOptions} */ options)=>{
   probe.activeCommands++;
   if(args[0]==='instrument')probe.instruments.push({assembly:normalizePath(args[1]),session:args[args.indexOf('--session-id')+1]});
   try{return await original.runProcess(command,args,options);}finally{probe.activeCommands--;}
  };
- mtp.requestTests=async(options,operation,...args)=>{
+ mtp.requestTests=async(/** @type {import('../../out/services/mtp').MtpOptions} */ options,/** @type {'discover'|'run'} */ operation,/** @type {any[]} */ ...args)=>{
   if(operation==='run')probe.runs.push({assembly:normalizePath(options.assembly),session:options.wrapper?.args[options.wrapper.args.indexOf('--session-id')+1]});
   probe.activeRequests++;
   try{return await original.requestTests(options,operation,...args);}finally{probe.activeRequests--;}
  };
  engine=new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
   events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result(){},started(){},coverage(){},invalidated(){}}});
+ /** @param {AbortSignal} [abortSignal] */
  const run=(abortSignal=signal)=>{
   const operation=engine.run({files:[],full:true,generation:903},AbortSignal.any([signal,abortSignal]));
   running.add(operation);void operation.then(()=>running.delete(operation),()=>running.delete(operation));return operation;
  };
  const pids=async()=>{
   const markers=(await fs.readdir(barrier)).filter(name=>/^Feature\d+\.pid$/.test(name));
-  return Promise.all(markers.map(async name=>({index:Number(/^Feature(\d+)\.pid$/.exec(name)[1]),pid:Number(await fs.readFile(path.join(barrier,name),'utf8'))})));
+  return Promise.all(markers.map(async name=>({index:Number(/** @type {RegExpExecArray} */ (/^Feature(\d+)\.pid$/.exec(name))[1]),pid:Number(await fs.readFile(path.join(barrier,name),'utf8'))})));
  };
  const waitForHosts=async()=>{
   const deadline=Date.now()+60000;
@@ -79,22 +91,26 @@ using System.Diagnostics;
  return{temp,root,storage,file,barrier,blocker,engine,probe,output,signal,run,pids,waitForHosts};
 }
 
+/** @typedef {Awaited<ReturnType<typeof fixture>>} Fixture */
+
+/** @param {Fixture} f @param {Fixture['probe']['runs']} runs */
 function assertIdentities(f,runs) {
  assert.equal(runs.length,workers);assert.equal(new Set(runs.map(run=>run.assembly)).size,workers,'every concurrent host executes its own private copy');
  assert.equal(new Set(runs.map(run=>run.session)).size,workers,'collector sessions remain exclusive across all automatic workers');
  for(const run of runs) {
-  assert.match(run.session,/^[a-f\d-]{36}$/i);assert.ok(run.assembly.startsWith(normalizePath(f.storage)+'/'));
+  assert.match(/** @type {string} */ (run.session),/^[a-f\d-]{36}$/i);assert.ok(run.assembly.startsWith(normalizePath(f.storage)+'/'));
   const template=normalizePath(path.join(path.dirname(path.dirname(run.assembly)),'template','Tests.dll'));
   assert.ok(f.probe.instruments.some(instrument=>instrument.assembly===template&&instrument.session===run.session),'each collector uses the session embedded in its own template');
  }
 }
 
+/** @param {Fixture} f @param {import('../../out/services/engine').RunSummary} result */
 function assertCoverage(f,result) {
  assert.equal(result.files,workers);assert.equal(result.tests,workers);assert.equal(result.passed,workers,f.output.join(''));
  assert.equal(result.failed,0);assert.equal(result.coverageAvailable,true);
  assert.equal(f.engine.groups.length,workers);assert.equal(f.engine.coverage.traces.size,workers);
  for(const group of f.engine.groups) {
-  const index=Number(/^Feature(\d+)Tests\.cs$/i.exec(path.basename(group.file))[1]),expected=f.file(`Core/Feature${index}.cs`);
+  const index=Number(/** @type {RegExpExecArray} */ (/^Feature(\d+)Tests\.cs$/i.exec(path.basename(/** @type {string} */ (group.file))))[1]),expected=f.file(`Core/Feature${index}.cs`);
   const trace=f.engine.coverage.traces.get(group.id);assert.ok(trace?.reliable);assert.equal(!!trace.stale,false);
   assert.deepEqual(trace.dependencies.filter(file=>/\/Core\/Feature\d+\.cs$/i.test(file)),[expected],`Feature${index} retains only its own production dependency`);
   assert.deepEqual(trace.coverage.filter(source=>/\/Core\/Feature\d+\.cs$/i.test(source.file)&&source.lines.some(line=>line.hits>0)).map(source=>source.file),[expected]);

@@ -1,5 +1,6 @@
 import { CoverageSource, StoredTrace } from '../core/coverage';
 import { contentHash } from '../core/paths';
+import { StoredOutcomes } from '../core/runPolicy';
 
 const record = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every(item => typeof item === 'string');
@@ -32,6 +33,13 @@ export function validTrace(value: unknown): value is StoredTrace {
                     const line = record(value); return !!line && positive(line.line) && typeof line.hits === 'number' && Number.isFinite(line.hits) && line.hits > 0;
                 });
         });
+}
+
+/** A file's latest test outcomes; caches written before outcomes were saved have none. */
+export function validOutcomes(value: unknown): value is StoredOutcomes {
+    const outcomes = record(value);
+    return !!outcomes && typeof outcomes.groupId === 'string'
+        && Object.entries(outcomes).every(([key, ids]) => key === 'groupId' || ['passed', 'failed', 'errored', 'skipped'].includes(key) && strings(ids));
 }
 
 /** Bounds on what one restore loads; the oldest traces beyond them are discarded. */

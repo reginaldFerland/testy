@@ -2,24 +2,28 @@ const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const {createTesty}=require('./support/controller.cjs');
 
+/** @param {unknown} value */
 const plain=value=>JSON.parse(JSON.stringify(value));
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
 
-/** A controller whose startup only records baseline requests and prompts. */
+/**
+ * A controller whose startup only records baseline requests and prompts.
+ * @param {{answer?: (actions: string[]) => unknown, state?: Record<string, unknown>, traces?: number, configuration?: Record<string, unknown>}} [options]
+ */
 function fixture({answer,state={},traces=0,configuration={}}={}) {
- const prompts=[];
- const f=createTesty({configuration,api:{extensions:{getExtension:()=>undefined}},window:{showInformationMessage:async(message,...actions)=>{prompts.push({message,actions});return answer?.(actions);}}});
- const requested=[];
+ /** @type {{message: string, actions: string[]}[]} */ const prompts=[];
+ const f=createTesty({configuration,api:{extensions:{getExtension:()=>undefined}},window:{showInformationMessage:async(/** @type {string} */ message,/** @type {string[]} */ ...actions)=>{prompts.push({message,actions});return answer?.(actions);}}});
+ /** @type {unknown[][]} */ const requested=[];
  f.testy.engine.restore=async()=>undefined;
  if(traces)Object.defineProperty(f.testy.engine.coverage,'traces',{value:new Map(Array.from({length:traces},(_,i)=>[`g${i}`,{}]))});
- f.testy.scheduler.request=(...args)=>requested.push(args);
+ f.testy.scheduler.request=(/** @type {unknown[]} */ ...args)=>requested.push(args);
  const workspaceState=f.testy.context.workspaceState;
  for(const [key,value] of Object.entries(state))void workspaceState.update(key,value);
  return{...f,prompts,requested,workspaceState};
 }
 
 test('the first open of a workspace asks before building the baseline; Run Now starts it and is remembered',async()=>{
- const f=fixture({answer:actions=>actions[0]});
+ const f=fixture({answer:(/** @type {string[]} */ actions)=>actions[0]});
  await f.testy.start();await tick();await tick();
  assert.equal(f.prompts.length,1);
  assert.deepEqual([...f.prompts[0].actions],['Run Now','Not Now','Don\'t Ask Again']);
@@ -30,14 +34,14 @@ test('the first open of a workspace asks before building the baseline; Run Now s
 });
 
 test('Not Now waits for a save or a manual run and asks again next time; Don\'t Ask Again stops asking',async()=>{
- const later=fixture({answer:actions=>actions[1]});
+ const later=fixture({answer:(/** @type {string[]} */ actions)=>actions[1]});
  await later.testy.start();await tick();await tick();
  assert.deepEqual(later.requested,[]);
  assert.equal(later.workspaceState.get('testy.baselineConsent'),undefined);
  assert.equal(later.testy.snapshot().awaitingBaseline,true);
  await later.testy.dispose();
 
- const never=fixture({answer:actions=>actions[2]});
+ const never=fixture({answer:(/** @type {string[]} */ actions)=>actions[2]});
  await never.testy.start();await tick();await tick();
  assert.deepEqual(never.requested,[]);
  assert.equal(never.workspaceState.get('testy.baselineConsent'),'manual');
@@ -60,8 +64,9 @@ test('workspaces with retained coverage, earlier consent or a paused state start
 });
 
 test('a run that starts while the question is open settles it, so a late answer does not start a second baseline',async()=>{
+ /** @type {any} Resolves the open prompt; set when the prompt is shown. */
  let answer;
- const f=fixture({answer:actions=>new Promise(resolve=>{answer=()=>resolve(actions[0]);})});
+ const f=fixture({answer:(/** @type {string[]} */ actions)=>new Promise(resolve=>{answer=()=>resolve(actions[0]);})});
  f.testy.engine.run=async()=>({files:0,tests:0,passed:0,failed:0,skipped:0,duration:1,coverageAvailable:false});
  await f.testy.start();await tick();
  assert.equal(f.testy.snapshot().awaitingBaseline,true);
@@ -73,17 +78,41 @@ test('a run that starts while the question is open settles it, so a late answer 
 });
 
 test('setting changes do not start a baseline the user has not agreed to',async()=>{
+ /** @type {any} The configuration-change listener captured from the stub. */
  let changed;
  const f=createTesty({api:{extensions:{getExtension:()=>undefined}},window:{showInformationMessage:async()=>undefined},
-  workspace:{onDidChangeConfiguration:handler=>{changed=handler;return{dispose(){}};}}});
- const requested=[];
- f.testy.engine.restore=async()=>undefined;f.testy.scheduler.request=(...args)=>requested.push(args);
+  workspace:{onDidChangeConfiguration:(/** @type {unknown} */ handler)=>{changed=handler;return{dispose(){}};}}});
+ /** @type {unknown[][]} */ const requested=[];
+ f.testy.engine.restore=async()=>undefined;f.testy.scheduler.request=(/** @type {unknown[]} */ ...args)=>requested.push(args);
  await f.testy.start();await tick();
- changed({affectsConfiguration:key=>key==='testy'||key==='testy.solution'});
+ changed({affectsConfiguration:(/** @type {string} */ key)=>key==='testy'||key==='testy.solution'});
  assert.deepEqual(requested,[]);
  f.testy.engine.run=async()=>({files:0,tests:0,passed:0,failed:0,skipped:0,duration:1,coverageAvailable:false});
  await f.testy.execute({files:['/workspace/A.cs'],full:false},new AbortController().signal);
- changed({affectsConfiguration:key=>key==='testy'||key==='testy.solution'});
+ changed({affectsConfiguration:(/** @type {string} */ key)=>key==='testy'||key==='testy.solution'});
  assert.equal(requested.length,1,'after the first run, setting changes rerun as before');
+ await f.testy.dispose();
+});
+
+test('Test Explorer\'s refresh only rediscovers: the baseline question stays open, Run Now still starts it and settings changes still wait',async()=>{
+ /** @type {any} Resolves the open prompt; set when the prompt is shown. */
+ let answer;
+ /** @type {any} The configuration-change listener captured from the stub. */
+ let changed;
+ /** @type {string[][]} */ const prompts=[];
+ const f=createTesty({api:{extensions:{getExtension:()=>undefined}},window:{showInformationMessage:async(/** @type {string} */ _message,/** @type {string[]} */ ...actions)=>{prompts.push(actions);return new Promise(resolve=>{answer=()=>resolve(actions[0]);});}},
+  workspace:{onDidChangeConfiguration:(/** @type {unknown} */ handler)=>{changed=handler;return{dispose(){}};}},tests:{}});
+ /** @type {unknown[][]} */ const requested=[];
+ f.testy.engine.restore=async()=>undefined;f.testy.scheduler.request=(/** @type {unknown[]} */ ...args)=>requested.push(args);
+ f.testy.engine.run=async()=>({files:0,tests:0,passed:0,failed:0,skipped:0,duration:1,coverageAvailable:false});
+ await f.testy.start();await tick();
+ const token={isCancellationRequested:false,onCancellationRequested:()=>({dispose(){}})};
+ await f.testy.controller.refreshHandler(token);
+ assert.equal(f.runs.at(-1).name,'Testy · discover tests');
+ assert.equal(f.testy.snapshot().awaitingBaseline,true,'a discover-only run does not answer the question');
+ changed({affectsConfiguration:(/** @type {string} */ key)=>key==='testy'||key==='testy.solution'});
+ assert.deepEqual(requested,[],'a setting change still does not start the baseline');
+ answer();await tick();await tick();
+ assert.deepEqual(plain(requested),[[[],true]],'Run Now still starts the baseline');
  await f.testy.dispose();
 });

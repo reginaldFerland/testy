@@ -12,10 +12,11 @@ import { RunOutputLease } from '../runOutputs';
 import { mapConcurrent, Semaphore } from '../../core/concurrency';
 import { EnvironmentError } from '../../core/errors';
 import type { EngineHost } from './host';
-import type { BuildPlan, BuildResult, PreparedTests, RunContext } from './types';
+import type { AnalysisState, BuildPlan, BuildResult, PreparedTests, RunContext } from './types';
 
-/** Analyze sources, keeping only analyses whose parsed bytes match the current versions. */
-export async function analyzeSources(host: EngineHost, run: RunContext, analysisSlots: number): Promise<ReadonlyMap<string, string | null>> {
+/** Analyze sources, keeping only analyses whose parsed bytes match the current versions. The engine adopts the
+ * returned state as soon as analysis settles, even if discovery later fails. */
+export async function analyzeSources(host: EngineHost, run: RunContext, analysisSlots: number): Promise<{ readonly state: AnalysisState; readonly shapes: ReadonlyMap<string, string | null> }> {
     const { config, processOptions, signal } = run, events = host.options.events;
     const started = Date.now(), analysisHashes = host.sources.analysisHashes;
     const allFiles = [...analysisHashes.keys()];
@@ -27,6 +28,7 @@ export async function analyzeSources(host: EngineHost, run: RunContext, analysis
     let nextAnalyses: ReadonlyMap<string, SourceShape | null>;
     const nextHashes = new Map(contextChanged ? [] : host.analyzedHashes);
     let uncertain = aliasesChanged;
+    let { analysisContext, excludedAliases, aliasStamp } = host;
     try {
         const result = await sourceAnalysisBatch(config.dotnet, host.options.analyzer, shapeFiles, host.options.storage, processOptions,
             host.excludedAliases, analysisSlots, aliasesChanged ? { sources: candidates.map(([, content]) => content), allFiles } : undefined, true);
@@ -48,8 +50,8 @@ export async function analyzeSources(host: EngineHost, run: RunContext, analysis
             nextHashes.delete(file);
             if (context && shape) {nextHashes.set(file, result.sourceHashes.get(file)!);}
         }
-        host.analysisContext = context;
-        host.excludedAliases = result.aliases; host.aliasStamp = stamp;
+        analysisContext = context;
+        excludedAliases = result.aliases; aliasStamp = stamp;
         const reused = allFiles.length - nextAnalyses.size;
         if (reused > 0) {events.output(`Reused ${reused} unchanged source analyses.\n`);}
     }
@@ -61,11 +63,11 @@ export async function analyzeSources(host: EngineHost, run: RunContext, analysis
         const failedFiles = uncertain ? allFiles : shapeFiles;
         nextAnalyses = new Map(failedFiles.map(file => [file, null]));
         for (const file of failedFiles) {nextHashes.delete(file);}
-        if (uncertain) {host.analysisContext = undefined;}
+        if (uncertain) {analysisContext = undefined;}
     } finally {events.output(`Testy timing: Source analysis ${Date.now() - started}ms (overlaps test preparation)\n`);}
-    host.analyses = new Map([...host.analyses, ...nextAnalyses].filter(([file]) => analysisHashes.has(file)));
-    host.analyzedHashes = new Map([...nextHashes].filter(([file]) => analysisHashes.has(file)));
-    return resolveShapes(host.analyses, host.projects);
+    const analyses = new Map([...host.analyses, ...nextAnalyses].filter(([file]) => analysisHashes.has(file)));
+    const state: AnalysisState = { analyses, analyzedHashes: new Map([...nextHashes].filter(([file]) => analysisHashes.has(file))), analysisContext, aliasStamp, excludedAliases };
+    return { state, shapes: resolveShapes(analyses, host.projects) };
 }
 
 /** Overlap source analysis with coverage setup, runner preparation and discovery. */
@@ -83,7 +85,8 @@ export async function prepareTests(host: EngineHost, run: RunContext, plan: Buil
     // Other preparation work only borrows spare slots without waiting,
     // so these nested reservations cannot deadlock.
     const analyzeWithBudget = (slots: number): Promise<ReadonlyMap<string, string | null>> => slots
-        ? preparationBudget.run(signal, () => analyzeWithBudget(slots - 1)) : analyzeSources(host, run, analysisSlots);
+        ? preparationBudget.run(signal, () => analyzeWithBudget(slots - 1))
+        : analyzeSources(host, run, analysisSlots).then(({ state, shapes }) => {host.applyAnalysis(state); return shapes;});
     const analyzing = state.analyzing = analyzeWithBudget(analysisSlots);
     // Discovery may fail before the join; retain/drain the analysis rejection below.
     void analyzing.catch(() => undefined);
@@ -125,6 +128,7 @@ export async function prepareTests(host: EngineHost, run: RunContext, plan: Buil
             [...new Set(buildOrder(host.projects, new Set([project.file])).flatMap(input => [...input.inputs ?? []]))]])),
         onResult: (group, result, test) => {
             if (host.runtime.observe(group, result, test)) {prepared.runtimeTreeChanged = true;}
+            host.lastOutcomes.record(group.id, result);
             for (const observer of host.resultObservers) {observer(group, result);}
             events.result(group, result);
         }, onStarted: events.started, onPrepared: events.prepared,

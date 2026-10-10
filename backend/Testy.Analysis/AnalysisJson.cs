@@ -10,7 +10,9 @@ namespace Testy.Analysis;
 // resolves every one of its types when it first serializes anything, and
 // EvaluationInputs cannot be loaded without Microsoft.Build.
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
+[JsonSerializable(typeof(string))]
 [JsonSerializable(typeof(string[]))]
+[JsonSerializable(typeof(ErrorBody))]
 [JsonSerializable(typeof(Dictionary<string, SourceShape?>))]
 [JsonSerializable(typeof(CombinedAnalysis))]
 [JsonSerializable(typeof(SourceAnalysisProvenance))]
@@ -19,12 +21,15 @@ internal sealed partial class AnalysisJson : JsonSerializerContext;
 
 // What the project graph task, which MSBuild loads, writes and reads.
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
+[JsonSerializable(typeof(string[]))]
 [JsonSerializable(typeof(ProjectGraphOutput))]
 [JsonSerializable(typeof(ContextIdentity))]
 [JsonSerializable(typeof(EvaluationInputs.Snapshot))]
 [JsonSerializable(typeof(DigestStore.Contents))]
 internal sealed partial class GraphJson : JsonSerializerContext;
 
+// The "error" member of a failed server request: only the type and message reach the caller.
+sealed record ErrorBody(string? Type, string Message);
 sealed record CombinedAnalysis(string[] Aliases, Dictionary<string, SourceShape?> Analyses);
 sealed record SourceAnalysisProvenance(int Version, string RequestHash, string[] Aliases, Dictionary<string, SourceShape?> Analyses, Dictionary<string, string?> SourceHashes);
 

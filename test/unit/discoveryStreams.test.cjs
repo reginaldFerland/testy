@@ -18,15 +18,18 @@ test('discovery distinguishes successful empty projects from failed streams and 
 test('large discovery normalizes shared source paths once and yields for cancellation',async()=>{
  const {discover}=require('../../out/services/runner');
  const file=normalizePath(path.resolve('test/fixtures/ImpactDemo/ImpactDemo.Tests/CalculatorTests.cs'));
- const project={file:path.join(path.dirname(file),'ImpactDemo.Tests.csproj'),framework:'net10.0',assembly:'/unused/Tests.dll',sourceFiles:[file]};
+ // Partial Project and RunnerOptions (any casts): only the fields discovery reads.
+ /** @type {any} */ const project={file:path.join(path.dirname(file),'ImpactDemo.Tests.csproj'),framework:'net10.0',assembly:'/unused/Tests.dll',sourceFiles:[file]};
  const nodes=Array.from({length:20000},(_,i)=>({uid:`row${i}`,'location.file':file}));
- const original=fs.realpathSync.native,realpath=fs.promises.realpath,nativeFile=path.dirname(path.resolve(file));let calls=0,ticked=false;
- fs.realpathSync.native=(...args)=>{if(args[0]===nativeFile)calls++;return original(...args);};
- fs.promises.realpath=(...args)=>{if(args[0]===nativeFile)calls++;return realpath(...args);};
+ /** @type {any} */ const original=fs.realpathSync.native;
+ /** @type {any} */ const realpath=fs.promises.realpath; // any: reassigning overloaded fs functions with a pass-through wrapper
+ const nativeFile=path.dirname(path.resolve(file));let calls=0,ticked=false;
+ fs.realpathSync.native=(/** @type {any[]} */ ...args)=>{if(args[0]===nativeFile)calls++;return original(...args);};
+ fs.promises.realpath=(/** @type {any[]} */ ...args)=>{if(args[0]===nativeFile)calls++;return realpath(...args);};
  try{
-  setImmediate(()=>{ticked=true;});const groups=await discover(project,{},nodes);
+  setImmediate(()=>{ticked=true;});const groups=await discover(project,/** @type {any} */ ({}),nodes);
   assert.equal(groups[0].tests.length,nodes.length);assert.equal(calls,1);assert.equal(ticked,true);
   const abort=new AbortController();setImmediate(()=>abort.abort());
-  await assert.rejects(discover(project,{signal:abort.signal},nodes),{name:'AbortError'});
+  await assert.rejects(discover(project,/** @type {any} */ ({signal:abort.signal}),nodes),{name:'AbortError'});
  }finally{fs.realpathSync.native=original;fs.promises.realpath=realpath;}
 });

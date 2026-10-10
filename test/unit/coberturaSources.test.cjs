@@ -3,7 +3,9 @@ const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:
 const {parseCobertura}=require('../../out/services/reports');
 const {normalizePath}=require('../../out/core/paths');
 
+/** @param {string} value */
 const escape=value=>value.replaceAll('&','&amp;').replaceAll('"','&quot;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+/** @param {string} file @param {number} number @param {number} hits */
 const cls=(file,number,hits)=>`<class filename="${escape(file)}"><methods/><lines><line number="${number}" hits="${hits}"/></lines></class>`;
 
 test('relative class filenames resolve against the first existing report source',async t=>{
@@ -12,8 +14,12 @@ test('relative class filenames resolve against the first existing report source'
  for(const directory of [first,second,elsewhere]){await fs.mkdir(directory);}
  await fs.mkdir(path.join(second,'src'));await fs.writeFile(path.join(second,'src','Code.cs'),'// source');
  const file=normalizePath(path.join(second,'src','Code.cs')),fallback=normalizePath(path.join(elsewhere,relative));
+ /** @type {(sources:string[],filename?:string)=>string} */
  const report=(sources,filename=relative)=>`<coverage><sources>${sources.join('')}</sources><packages><package><classes>${cls(filename,4,1)}</classes></package></packages></coverage>`;
- const source=directory=>`<source>${escape(directory)}</source>`,expected=name=>[[name,[{line:4,hits:1}]]];
+ /** @type {(directory:string)=>string} */
+ const source=directory=>`<source>${escape(directory)}</source>`;
+ /** @type {(name:string)=>[string,{line:number,hits:number}[]][]} */
+ const expected=name=>[[name,[{line:4,hits:1}]]];
  assert.deepEqual([...parseCobertura(report([source(first),source(second)]),elsewhere,new Set([file]))],expected(file));
  assert.deepEqual([...parseCobertura(report([source(first)]),elsewhere,new Set([fallback]))],expected(fallback),'no existing candidate falls back to the working directory');
  assert.deepEqual([...parseCobertura(report([]),elsewhere,new Set([fallback]))],expected(fallback));

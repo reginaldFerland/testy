@@ -100,7 +100,8 @@ internal sealed partial class EvaluationInputs : MSBuildFileSystemBase
                 var hash = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
                 store?.Add(key.path, key.length, key.ticks, hash);
                 return hash;
-            })).Value;
+                // PublicationOnly does not cache a failure: a file locked for a moment is read again by the next caller.
+            }, LazyThreadSafetyMode.PublicationOnly)).Value;
         }
         internal (XDocument xml, string hash, bool valid) Parsed(ProjectRootElement root) => parsed.GetOrAdd(root, project => new(() =>
         {
@@ -116,17 +117,17 @@ internal sealed partial class EvaluationInputs : MSBuildFileSystemBase
             }
             Normalize(disk); Normalize(xml);
             return (xml, EvaluationInputs.Hash(saved), XNode.DeepEquals(xml.Root, disk.Root));
-        })).Value;
+        }, LazyThreadSafetyMode.PublicationOnly)).Value;
     }
-    // Serialized by AnalysisJson (camelCase), which the TypeScript side reads.
+    // Serialized by GraphJson (camelCase), which the TypeScript side reads.
     internal sealed record Query(string Kind, string Path, string? Pattern, bool Recursive, string[] Values);
     internal sealed record Snapshot(bool Reusable, string[] Files, IReadOnlyDictionary<string, string> Hashes, Query[] Queries, string[] ExcludedDirectories, string SdkDirectory, string? Reason);
     private readonly ConcurrentDictionary<string, Query> queries = new();
     private readonly ConcurrentDictionary<string, string> reads = new();
     private readonly Shared shared;
     internal EvaluationInputs(Shared shared) { this.shared = shared; }
-    private static string Hash(byte[] bytes) => Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
-    private void Read(string path, byte[] bytes)
+    private static string Hash(ReadOnlySpan<byte> bytes) => Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+    private void Read(string path, ReadOnlySpan<byte> bytes)
     {
         var hash = Hash(bytes);
         reads.AddOrUpdate(Path.GetFullPath(path), hash, (_, before) => before == hash ? before : "changed");
@@ -160,8 +161,13 @@ internal sealed partial class EvaluationInputs : MSBuildFileSystemBase
     public override Stream GetFileStream(string path, FileMode mode, FileAccess access, FileShare share)
     {
         if (mode != FileMode.Open || access != FileAccess.Read) { Add("changed", path, []); return base.GetFileStream(path, mode, access, share); }
+        // One copy: the same bytes are hashed and served, so what MSBuild parses is what was recorded.
         using var stream = base.GetFileStream(path, mode, access, share);
-        using var copy = new MemoryStream(); stream.CopyTo(copy); var bytes = copy.ToArray(); Read(path, bytes); return new MemoryStream(bytes, writable: false);
+        var copy = new MemoryStream(stream.CanSeek ? (int)Math.Min(stream.Length, int.MaxValue) : 0);
+        stream.CopyTo(copy);
+        copy.TryGetBuffer(out var buffer);
+        Read(path, buffer);
+        return new MemoryStream(buffer.Array!, buffer.Offset, buffer.Count, writable: false);
     }
     public override TextReader ReadFile(string path) => new StreamReader(GetFileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read));
     public override byte[] ReadFileAllBytes(string path) { var bytes = base.ReadFileAllBytes(path); Read(path, bytes); return bytes; }

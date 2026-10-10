@@ -1,12 +1,18 @@
 // Run after compilation. Measures the actual inventory/ownership paths, plus a
 // real 20,001-case MTP baseline. VS Code rendering is excluded from these timings.
+require('./artifacts.cjs');
 const fs=require('node:fs'),io=require('node:fs/promises'),path=require('node:path'),os=require('node:os'),vm=require('node:vm');
 const {createRequire}=require('node:module'),assert=require('node:assert/strict');
 const {discover}=require('../../out/services/runner'),{TestEngine}=require('../../out/services/engine');
 const {normalizePath}=require('../../out/core/paths');
+/**
+ * @template T
+ * @param {() => Promise<T>} callback
+ * @param {string} [source]
+ */
 async function measure(callback,source){
  const realpath=fs.realpathSync.native;let calls=0,last=performance.now(),gap=0;
- fs.realpathSync.native=(...args)=>{if(!source||args[0]===source)calls++;return realpath(...args);};
+ /** @type {any} Patched in place to count calls; the original is restored below. */ (fs.realpathSync).native=(/** @type {[string]} */ ...args)=>{if(!source||args[0]===source)calls++;return realpath(...args);};
  const timer=setInterval(()=>{const now=performance.now();gap=Math.max(gap,now-last);last=now;},1),start=performance.now();
  try{const value=await callback(),durationMs=performance.now()-start;await new Promise(resolve=>setTimeout(resolve,5));return{value,durationMs,realpathCalls:calls,maxTimerGapMs:gap};}
  finally{clearInterval(timer);fs.realpathSync.native=realpath;}
@@ -15,16 +21,17 @@ async function main(){
  const source=normalizePath(path.resolve('test/fixtures/ImpactDemo/ImpactDemo.Tests/CalculatorTests.cs'));
  for(const count of [20000,100000]){
   const nodes=Array.from({length:count},(_,i)=>({uid:`row${i}`,'display-name':`Case ${i}`,'location.file':source}));
-  const result=await measure(async()=>{const groups=await discover({file:path.join(path.dirname(source),'ImpactDemo.Tests.csproj'),framework:'net10.0',assembly:'/unused/Tests.dll',sourceFiles:[source]}, {},nodes);assert.equal(groups[0].tests.length,count);},source);
+  const result=await measure(async()=>{const groups=await discover(/** @type {any} */ ({file:path.join(path.dirname(source),'ImpactDemo.Tests.csproj'),framework:'net10.0',assembly:'/unused/Tests.dll',sourceFiles:[source]}), /** @type {any} */ ({}),nodes);assert.equal(groups[0].tests.length,count);},source);
   assert.equal(result.realpathCalls,1);console.log(JSON.stringify({kind:'discovery-inventory',count,...result}));
  }
  for(const located of [false,true]){
-  const file=path.resolve('out/services/runner.js'),realRequire=createRequire(file),exports={},mtp=realRequire('./mtp');
+  const file=path.resolve('out/services/runner.js'),realRequire=createRequire(file),mtp=realRequire('./mtp');
   const groups=Array.from({length:50},(_,i)=>({id:`g${i}`,project:'/workspace/Tests.csproj',framework:'net10.0',assembly:'/workspace/Tests.dll',file:`/workspace/Source${i}.cs`,
    tests:[mtp.discoveredTest({uid:`parent${i}`,'location.type':`Class${i}`,'location.method':'Theory'})]}));
+  /** @type {any} The compiled runner module, evaluated in a vm context below. */ const exports={};
   const rows=Array.from({length:1000},(_,i)=>({uid:`runtime${i}`,'location.type':`Class${i%50}`,'location.method':'Theory','execution-state':'passed',...(located?{'location.file':groups[i%50].file}:{})}));
-  vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:name=>name==='./mtp'?{...mtp,requestTests:async options=>{rows.forEach(options.onNode);return rows;}}:realRequire(name)});
-  let reported=0;const session=new exports.RunnerSession({dotnet:'dotnet',storage:'.',testArguments:[],onResult:(group,result)=>{assert.equal(group.id,`g${Number(result.id.slice(7))%50}`);reported++;}});
+  vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:(/** @type {string} */ name)=>name==='./mtp'?{...mtp,requestTests:async (/** @type {{onNode: (row: unknown) => void}} */ options)=>{rows.forEach(options.onNode);return rows;}}:realRequire(name)});
+  let reported=0;const session=new exports.RunnerSession({dotnet:'dotnet',storage:'.',testArguments:[],onResult:(/** @type {any} */ group,/** @type {any} */ result)=>{assert.equal(group.id,`g${Number(result.id.slice(7))%50}`);reported++;}});
   const nodes=groups.flatMap(group=>group.tests.map(test=>test.node));
   session.prepared.set('/workspace/Tests.csproj\0net10.0',{root:'.',output:{directory:'.',restore:async()=>{}},session:'fixture',coverage:false,nodes,nativeById:new Map(nodes.map(node=>[node.uid,node])),byKey:new Map(),groups,runs:0});
   try{const result=await measure(async()=>{await session.run(groups,new Map());});assert.equal(reported,rows.length);assert.ok(result.realpathCalls<300);console.log(JSON.stringify({kind:'runtime-ownership',located,groups:groups.length,count:rows.length,...result}));}

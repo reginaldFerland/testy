@@ -1,7 +1,7 @@
 {
   "displayName": "Testy",
   "description": "Automatic affected C# tests and live, retained code coverage for .NET 10+ and Microsoft.Testing.Platform.",
-  "command.refreshTests": "Refresh and Run All C# Tests",
+  "command.refreshTests": "Rebuild and Run All C# Tests",
   "command.runAffected": "Run Affected Tests Now",
   "command.toggleAutoRun": "Pause or Resume Automatic Testing",
   "command.pause": "Pause Automatic Testing",
@@ -15,6 +15,7 @@
   "command.explainSelection": "Why Was This Selected?",
   "command.excludeProject": "Exclude Project from Testy",
   "command.runFile": "Run Affected Tests for This File",
+  "command.runFolder": "Run Affected Tests for This Folder or Project",
   "command.runCoveringTests": "Run Tests Covering This Line",
   "config.autoRun": "Automatically run affected tests after changes. The first time a workspace opens, Testy asks before building and running the baseline. Pausing from the status bar or Test Explorer is remembered per workspace without changing this setting.",
   "config.runMode": "Choose affected test files or the entire C# suite.",
@@ -26,13 +27,17 @@
   "config.debounceTime": "Milliseconds to wait after the latest change before rebuilding and testing.",
   "config.runWithCoverage": "Collect and retain code coverage. Disabling coverage uses conservative project selection.",
   "config.showCoverage": "Also show covered, uncovered and stale markers in editor gutters. Coverage is always available in Test Explorer's coverage view; these markers additionally show **stale** coverage while affected tests rerun.",
+  "config.problems.publishBuildDiagnostics": "Whether Testy publishes the build errors and warnings of its builds to the Problems panel.",
+  "config.problems.publishBuildDiagnostics.auto": "Publish them unless the C# extension is active; it reports the same errors.",
+  "config.problems.publishBuildDiagnostics.always": "Always publish them, even if they can appear twice.",
+  "config.problems.publishBuildDiagnostics.never": "Never publish them; build errors stay in the Testy output and on the failing projects in Test Explorer.",
   "config.solution": "Optional `.sln`, `.slnx` or `.slnf` file whose projects limit the test and build entry points. Relative paths resolve against the workspace folder that sets the value (the first folder for workspace-level values); `${workspaceFolder}` is supported. In a multi-root workspace a folder-level value limits only that folder's projects. Leave empty to use every project in the workspace.",
   "config.projects.include": "Glob patterns for entry-point projects to include, for example `tests/**/*.csproj`. Empty includes every project. In a multi-root workspace a folder-level value applies only to that folder's projects.",
   "config.projects.exclude": "Glob patterns for entry-point projects to exclude. Exclusions win over inclusions. Folder-level patterns add to the workspace patterns and apply only to that folder.",
   "config.fileWatcherPattern": "Files whose changes can trigger tests.",
   "config.exclude": "Additional glob patterns to ignore. Generated files, `bin`, `obj`, `TestResults`, `node_modules` and `.git` are always excluded. Folder-level patterns add to the workspace patterns and apply only to that folder.",
   "config.buildConfiguration": "MSBuild configuration used for builds and test discovery. One value applies to every workspace folder; Testy warns when folder-level values differ and uses the workspace value.",
-  "config.additionalConfigurations": "Extra MSBuild configurations, for example `Release`. Each adds `Run (Release)` and `Run with coverage (Release)` profiles to Test Explorer that build, discover and run the selected tests with that configuration. Automatic runs always use `#testy.buildConfiguration#`.",
+  "config.additionalConfigurations": "Extra MSBuild configurations, for example `Release`. Each adds `Run (Release)`, `Run with coverage (Release)` and `Debug (Release)` profiles to Test Explorer that build, discover and run (or debug) the selected tests with that configuration. Automatic runs always use `#testy.buildConfiguration#`.",
   "config.maxParallelProjects": "Worker limit for initial project preparation, builds, source analysis and discovery. `0` automatically uses up to four workers while reserving one CPU; `1` runs sequentially. Applies on the next run.",
   "config.maxParallelTestFiles": "Worker limit for test-file execution and private runner preparation. Project-wide batches each use one worker. `0` uses available CPUs minus one, with at least one worker; `1` runs sequentially. Tests sharing external resources may need `1`. Applies on the next run.",
   "config.dotnetPath": "Path to the .NET 10+ CLI executable.",
@@ -53,5 +58,6 @@
   "walkthrough.pause.title": "Pause, resume and debug",
   "walkthrough.pause.description": "Save a file to run the affected tests. Pause automatic testing from the status bar or Test Explorer, and debug tests with the Debug profile (requires the C# extension).\n[Show Testy Actions](command:testy.showMenu)",
   "capabilities.untrusted": "Testy builds and executes workspace code, so in Restricted Mode it waits until the workspace is trusted.",
-  "capabilities.virtual": "Testy requires the .NET CLI and local workspace files."
+  "capabilities.virtual": "Testy requires the .NET CLI and local workspace files.",
+  "viewsWelcome.noTestProjects": "Testy found no C# test project it can run. Testy needs .NET 10 or later test projects that use Microsoft.Testing.Platform (MTP).\n[Show Output](command:testy.showOutput)\n[Get Started with Testy](command:workbench.action.openWalkthrough?%22reginaldFerland.testy%23testy.gettingStarted%22)"
 }

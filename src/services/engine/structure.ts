@@ -2,10 +2,11 @@ import * as path from 'node:path';
 import { isTestTarget, Project } from '../../core/model';
 import { environmentIdentity } from '../../core/environment';
 import { ProjectIndex } from '../../core/selection';
-import { contentHash, defaultExcludes, isConfigurationFile, isExcluded, testTargetKey } from '../../core/paths';
+import { contentHash, defaultExcludes, isExcluded, testTargetKey } from '../../core/paths';
+import { invalidatesRestore } from '../../core/runPolicy';
 import { mergeProjects, evaluateProjects, restoreProjects, filterEntryPoints, findProjects, refreshProjectSnapshotBatches, sdkContextGroups, sdkConfigurationFiles } from '../projects';
 import { Cancelled } from '../process';
-import { evaluationToolContext } from '../projectEvaluationCache';
+import { evaluationInputs, evaluationToolContext } from '../projectEvaluationCache';
 import { mapConcurrent } from '../../core/concurrency';
 import { EnvironmentError } from '../../core/errors';
 import type { EngineHost } from './host';
@@ -13,9 +14,9 @@ import type { RunContext } from './types';
 
 /** Find, restore and evaluate projects, then reconcile the test inventory. */
 export async function refreshStructure(host: EngineHost, run: RunContext): Promise<void> {
-    const { config, signal, manual, newBaseline, rootSnapshot, processOptions, projectLimit, changes, baseline } = run;
+    const { config, signal, manual, newBaseline, rootSnapshot, processOptions, projectLimit, changes, baseline, previousIndex } = run;
     const events = host.options.events;
-    if (newBaseline || changes.some(isConfigurationFile)) {host.sdk.forget(); host.restored.clear();}
+    if (newBaseline || changes.some(file => invalidatesRestore(file, previousIndex))) {host.sdk.forget(); host.restored.clear();}
     const selected = manual && !manual.all ? [...new Set([...manual.projects ?? [], ...host.displayGroups.filter(group => manual.groups.has(group.id)).map(group => group.project)])] : undefined;
     const filter = await filterEntryPoints(await findProjects(rootSnapshot, [...defaultExcludes, ...config.excludes], signal, 16,
         (directory, error) => events.output(`Skipping unreadable directory ${directory}: ${error.message}\n`)),
@@ -72,14 +73,13 @@ export async function refreshStructure(host: EngineHost, run: RunContext): Promi
         return new Map([...reused, ...evaluated]);
     });
     if (run.topology !== host.topology) {throw new Cancelled();}
-    host.projectSnapshots = snapshots;
     const evaluated = [...snapshots.values()].flat();
     // Exclusions control inventory and watching. MSBuild still writes
     // required excluded dependencies, so their conflicts stay in its plan.
-    host.buildGraph = mergeProjects(evaluated);
-    host.projects = mergeProjects(evaluated.filter(project => !isExcluded(project.file, config.excludes, rootSnapshot)));
-    reportUnsupported(host);
-    host.index = new ProjectIndex(host.projects); host.structureDirty = !!manual;
+    const projects = mergeProjects(evaluated.filter(project => !isExcluded(project.file, config.excludes, rootSnapshot)));
+    const unsupportedReport = reportUnsupported(host, projects);
+    host.applyStructure({ projectSnapshots: snapshots, buildGraph: mergeProjects(evaluated), projects,
+        index: new ProjectIndex(projects, evaluatedInputs(snapshots, projects)), structureDirty: !!manual }, unsupportedReport);
     host.sources.setFiles(host.projects.flatMap(project => [...project.sourceFiles, ...project.inputs ?? []])
         .filter(file => !isExcluded(file, [...defaultExcludes, ...config.excludes], rootSnapshot)),
     host.projects.flatMap(project => project.analysisFiles ?? project.sourceFiles));
@@ -96,15 +96,24 @@ export async function refreshStructure(host: EngineHost, run: RunContext): Promi
 }
 
 /** Unsupported test projects are skipped with a warning; a workspace with
- * nothing runnable reports why instead of silently showing no tests. */
-export function reportUnsupported(host: EngineHost): void {
-    const reasons = [...new Set(host.projects.flatMap(project => project.isTestProject && project.entryPoint !== false && project.unsupported ? [project.unsupported] : []))].sort();
+ * nothing runnable reports why instead of silently showing no tests. Returns the report to retain. */
+export function reportUnsupported(host: EngineHost, projects: readonly Project[]): string {
+    const reasons = [...new Set(projects.flatMap(project => project.isTestProject && project.entryPoint !== false && project.unsupported ? [project.unsupported] : []))].sort();
     const report = reasons.join('\n');
-    if (reasons.length && !host.projects.some(isTestTarget)) {
+    if (reasons.length && !projects.some(isTestTarget)) {
         throw new EnvironmentError('no-test-project', `No test project can run under Testy.\n${report}`);
     }
     if (report !== host.unsupportedReport && reasons.length) {
         host.options.events.output(`Skipping ${reasons.length} unsupported test target${reasons.length === 1 ? '' : 's'}:\n${report}\n`);
     }
-    host.unsupportedReport = report;
+    return report;
+}
+
+/** Owned inputs that evaluation itself read, such as imports with unusual extensions. MSBuild reports full paths
+ * built from the canonical project paths; a spelling that still differs is only missed by this refinement. */
+export function evaluatedInputs(snapshots: ReadonlyMap<string, readonly Project[]>, projects: readonly Project[]): ReadonlySet<string> {
+    const spelling = (file: string): string => process.platform === 'win32' ? file.replace(/\\/g, '/').toLowerCase() : file;
+    const read = new Set<string>();
+    for (const graph of snapshots.values()) {for (const input of evaluationInputs.get(graph) ?? []) {for (const file of input.files) {read.add(spelling(file));}}}
+    return new Set(projects.flatMap(project => project.inputs ?? []).filter(file => read.has(file)));
 }
