@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.3.0
+
 ### Added
 
 - **Debug profile:** debug tests from Test Explorer (requires the C# extension). Each selected project runs in one process without coverage, and the run timeout does not apply.
