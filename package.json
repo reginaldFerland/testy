@@ -145,6 +145,12 @@
         "command": "testy.runCoveringTests",
         "title": "%command.runCoveringTests%",
         "category": "Testy"
+      },
+      {
+        "command": "testy.showTest",
+        "title": "%command.showTest%",
+        "category": "Testy",
+        "icon": "$(go-to-file)"
       }
     ],
     "menus": {
@@ -249,6 +255,10 @@
         {
           "command": "testy.runCoveringTests",
           "when": "testy.active && editorLangId == csharp"
+        },
+        {
+          "command": "testy.showTest",
+          "when": "false"
         }
       ],
       "testing/item/context": [
@@ -307,6 +317,18 @@
         "key": "ctrl+; ctrl+t",
         "mac": "cmd+; cmd+t",
         "when": "testy.active && editorTextFocus && editorLangId == csharp"
+      },
+      {
+        "command": "testy.toggleAutoRun",
+        "key": "ctrl+; p",
+        "mac": "cmd+; p",
+        "when": "testy.active"
+      },
+      {
+        "command": "testy.cancelRun",
+        "key": "ctrl+; x",
+        "mac": "cmd+; x",
+        "when": "testy.active && testy.running"
       }
     ],
     "viewsWelcome": [
@@ -363,7 +385,10 @@
           "maximum": 60000,
           "markdownDescription": "%config.debounceTime%",
           "scope": "window",
-          "order": 3
+          "order": 3,
+          "tags": [
+            "advanced"
+          ]
         },
         "testy.runWithCoverage": {
           "type": "boolean",
@@ -379,56 +404,84 @@
           "scope": "window",
           "order": 5
         },
+        "testy.inlineResults": {
+          "type": "string",
+          "default": "gutterAndHover",
+          "enum": [
+            "off",
+            "gutter",
+            "gutterAndHover"
+          ],
+          "enumDescriptions": [
+            "%config.inlineResults.off%",
+            "%config.inlineResults.gutter%",
+            "%config.inlineResults.gutterAndHover%"
+          ],
+          "markdownDescription": "%config.inlineResults%",
+          "scope": "window",
+          "order": 6
+        },
         "testy.solution": {
           "type": "string",
           "default": "",
           "markdownDescription": "%config.solution%",
           "scope": "resource",
-          "order": 6
+          "order": 7
         },
         "testy.projects.include": {
           "type": "array",
           "default": [],
           "items": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           },
+          "uniqueItems": true,
           "markdownDescription": "%config.projects.include%",
           "scope": "resource",
-          "order": 7
+          "order": 8
         },
         "testy.projects.exclude": {
           "type": "array",
           "default": [],
           "items": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           },
+          "uniqueItems": true,
           "markdownDescription": "%config.projects.exclude%",
           "scope": "resource",
-          "order": 8
+          "order": 9
         },
         "testy.fileWatcherPattern": {
           "type": "string",
           "default": "**/*.{cs,csproj,sln,slnx,slnf,props,targets,runsettings,json,config,resx,editorconfig,globalconfig,ruleset,razor,cshtml,xaml,axaml,proto}",
+          "minLength": 1,
           "markdownDescription": "%config.fileWatcherPattern%",
           "scope": "window",
-          "order": 9
+          "order": 10,
+          "tags": [
+            "advanced"
+          ]
         },
         "testy.exclude": {
           "type": "array",
           "default": [],
           "items": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           },
+          "uniqueItems": true,
           "markdownDescription": "%config.exclude%",
           "scope": "resource",
-          "order": 10
+          "order": 11
         },
         "testy.buildConfiguration": {
           "type": "string",
           "default": "Debug",
+          "minLength": 1,
           "markdownDescription": "%config.buildConfiguration%",
           "scope": "window",
-          "order": 11
+          "order": 12
         },
         "testy.maxParallelProjects": {
           "type": "integer",
@@ -436,7 +489,10 @@
           "minimum": 0,
           "markdownDescription": "%config.maxParallelProjects%",
           "scope": "window",
-          "order": 12
+          "order": 13,
+          "tags": [
+            "advanced"
+          ]
         },
         "testy.maxParallelTestFiles": {
           "type": "integer",
@@ -444,14 +500,18 @@
           "minimum": 0,
           "markdownDescription": "%config.maxParallelTestFiles%",
           "scope": "window",
-          "order": 13
+          "order": 14,
+          "tags": [
+            "advanced"
+          ]
         },
         "testy.dotnetPath": {
           "type": "string",
           "default": "dotnet",
+          "minLength": 1,
           "markdownDescription": "%config.dotnetPath%",
           "scope": "machine-overridable",
-          "order": 14
+          "order": 15
         },
         "testy.testArguments": {
           "type": "array",
@@ -461,7 +521,7 @@
           },
           "markdownDescription": "%config.testArguments%",
           "scope": "window",
-          "order": 15
+          "order": 16
         },
         "testy.timeoutSeconds": {
           "type": "number",
@@ -470,31 +530,113 @@
           "maximum": 86400,
           "markdownDescription": "%config.timeoutSeconds%",
           "scope": "window",
-          "order": 16
+          "order": 17,
+          "tags": [
+            "advanced"
+          ]
         },
         "testy.coverageToolPath": {
           "type": "string",
           "default": "",
           "markdownDescription": "%config.coverageToolPath%",
           "scope": "machine-overridable",
-          "order": 17
+          "order": 18
         },
         "testy.additionalConfigurations": {
           "type": "array",
           "default": [],
           "items": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           },
+          "uniqueItems": true,
           "markdownDescription": "%config.additionalConfigurations%",
           "scope": "window",
-          "order": 18
+          "order": 19
         },
         "testy.debugConfiguration": {
           "type": "object",
           "default": {},
+          "properties": {
+            "type": {
+              "type": "string",
+              "default": "coreclr",
+              "markdownDescription": "%config.debugConfiguration.type%"
+            },
+            "justMyCode": {
+              "type": "boolean",
+              "default": true,
+              "markdownDescription": "%config.debugConfiguration.justMyCode%"
+            },
+            "requireExactSource": {
+              "type": "boolean",
+              "default": true,
+              "markdownDescription": "%config.debugConfiguration.requireExactSource%"
+            },
+            "enableStepFiltering": {
+              "type": "boolean",
+              "default": true,
+              "markdownDescription": "%config.debugConfiguration.enableStepFiltering%"
+            },
+            "suppressJITOptimizations": {
+              "type": "boolean",
+              "default": false,
+              "markdownDescription": "%config.debugConfiguration.suppressJITOptimizations%"
+            },
+            "sourceFileMap": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "markdownDescription": "%config.debugConfiguration.sourceFileMap%"
+            },
+            "symbolOptions": {
+              "type": "object",
+              "additionalProperties": true,
+              "markdownDescription": "%config.debugConfiguration.symbolOptions%",
+              "properties": {
+                "searchPaths": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "markdownDescription": "%config.debugConfiguration.symbolOptions.searchPaths%"
+                },
+                "searchMicrosoftSymbolServer": {
+                  "type": "boolean",
+                  "markdownDescription": "%config.debugConfiguration.symbolOptions.searchMicrosoftSymbolServer%"
+                },
+                "searchNuGetOrgSymbolServer": {
+                  "type": "boolean",
+                  "markdownDescription": "%config.debugConfiguration.symbolOptions.searchNuGetOrgSymbolServer%"
+                },
+                "cachePath": {
+                  "type": "string",
+                  "markdownDescription": "%config.debugConfiguration.symbolOptions.cachePath%"
+                }
+              }
+            },
+            "sourceLinkOptions": {
+              "type": "object",
+              "additionalProperties": true,
+              "markdownDescription": "%config.debugConfiguration.sourceLinkOptions%"
+            },
+            "logging": {
+              "type": "object",
+              "additionalProperties": true,
+              "markdownDescription": "%config.debugConfiguration.logging%"
+            },
+            "request": {
+              "markdownDescription": "%config.debugConfiguration.request%"
+            },
+            "processId": {
+              "markdownDescription": "%config.debugConfiguration.processId%"
+            }
+          },
+          "additionalProperties": true,
           "markdownDescription": "%config.debugConfiguration%",
           "scope": "resource",
-          "order": 19
+          "order": 20
         },
         "testy.problems.publishBuildDiagnostics": {
           "type": "string",
@@ -511,7 +653,7 @@
           ],
           "markdownDescription": "%config.problems.publishBuildDiagnostics%",
           "scope": "window",
-          "order": 20
+          "order": 21
         }
       }
     },
@@ -588,20 +730,24 @@
     "build:analyzer": "node -e \"require('fs').rmSync('dist/analyzer', { recursive: true, force: true })\" && dotnet build backend/Testy.Analysis/Testy.Analysis.csproj --configuration Release --output dist/analyzer --nologo",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint && npm run typecheck:tests",
-    "lint": "eslint src test scripts *.mjs",
+    "lint": "eslint --max-warnings 0 src test scripts *.mjs",
     "typecheck:tests": "tsc -p tsconfig.tests.json",
-    "test": "node --test test/unit/*.test.cjs",
-    "test:unit:only": "node --test test/unit/*.test.cjs",
+    "test": "npm run test:unit:only",
+    "test:unit:only": "node --test --import ./test/unit/support/fastFsync.mjs test/unit/*.test.cjs",
     "test:integration": "npm run compile && node --test test/integration/*.test.cjs",
     "test:integration:only": "node --test test/integration/*.test.cjs",
+    "test:windows": "node scripts/test-windows.mjs",
+    "test:windows:slow": "node scripts/test-windows.mjs --slow",
     "test:dotnet": "cd backend && dotnet test --project Testy.Backend.Tests",
     "pretest:extension": "npm run compile",
     "test:extension": "node test/extension/run.mjs",
     "test:extension:only": "node test/extension/run.mjs",
-    "coverage": "node --test --experimental-test-coverage --test-coverage-exclude=test/** --test-coverage-exclude=**/node_modules/** --test-coverage-lines=78 test/unit/*.test.cjs",
+    "coverage": "node --test --import ./test/unit/support/fastFsync.mjs --experimental-test-coverage --test-coverage-exclude=test/** --test-coverage-exclude=**/node_modules/** --test-coverage-lines=78 --test-coverage-branches=85 --test-coverage-functions=82 test/unit/*.test.cjs",
     "clean": "node scripts/clean.mjs",
     "package": "vsce package --no-dependencies",
+    "check:changelog": "node scripts/check-changelog.mjs",
     "check:vsix": "node scripts/check-vsix-files.mjs",
+    "verify": "node scripts/verify.mjs",
     "benchmark": "npm run compile && node test/performance/benchmark.cjs",
     "benchmark:responsiveness": "npm run compile && node test/performance/responsiveness.cjs",
     "l10n:export": "npx --yes @vscode/l10n-dev@0.0.35 export --outDir ./l10n ./src"

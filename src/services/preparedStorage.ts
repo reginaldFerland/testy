@@ -4,7 +4,9 @@ import { randomUUID } from 'node:crypto';
 import { LockTimeoutError, lockTiming, withLock } from './lock';
 import { removeOutput } from './output';
 import { uuidPattern as identityPattern } from '../core/paths';
-import { currentProcessStamp, isProcessAlive, isProcessStamp, ProcessStamp, unreadableOwnerExpired } from './processStamp';
+import { currentProcessStamp, isProcessAlive, isProcessStamp, ProcessStamp } from './processStamp';
+import { readOwnerRecord, scanOwnerRecords, tryRemoveOwned } from './ownerRecords';
+import type { OwnerRead } from './ownerRecords';
 const suffix = '.owner.json';
 const maximumMetadataBytes = 4 * 1024 * 1024;
 export interface Retention { readonly entries: number; readonly bytes: number; }
@@ -55,25 +57,16 @@ function parked(owner: Owner): owner is Parked {
         && Object.hasOwn(owner, 'snapshot');
 }
 
-/** 'unreadable' marks metadata that no version can parse (damaged or oversized). Unknown
- * versions and shapes may belong to another release, so they are never reclaimed. */
-async function readOwner(storage: string, identity: string): Promise<Owner | 'unreadable' | undefined> {
-    try {
-        const file = path.join(storage, identity + suffix);
-        const stat = await fs.lstat(file);
-        if (!stat.isFile() || stat.isSymbolicLink()) {return undefined;}
-        if (stat.size > maximumMetadataBytes) {return 'unreadable';}
-        const value = JSON.parse(await fs.readFile(file, 'utf8')) as { readonly [Key in keyof Owner]?: unknown } | null;
+/** Unknown versions and shapes may belong to another release, so they are never reclaimed. */
+function readOwner(storage: string, identity: string): Promise<OwnerRead<Owner>> {
+    return readOwnerRecord(path.join(storage, identity + suffix), maximumMetadataBytes, parsed => {
+        const value = parsed as { readonly [Key in keyof Owner]?: unknown } | null;
         if (!value || value.version !== 1 || value.identity !== identity || typeof value.token !== 'string' || !identityPattern.test(value.token)
             || !count(value.pid) || (value.state !== 'active' && value.state !== 'parked')
             || (value.state === 'active' ? value.pid === 0 : value.pid !== 0)
             || (value.process !== undefined && !isProcessStamp(value.process))) {return undefined;}
         return value as Owner;
-    } catch (error) {
-        if (error instanceof SyntaxError) {return 'unreadable';}
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {return undefined;}
-        throw error;
-    }
+    });
 }
 
 /** Every caller holds the storage lock; rename publishes the complete state at once. */
@@ -98,44 +91,26 @@ async function discard(storage: string, identity: string): Promise<void> {
     await fs.rm(path.join(storage, identity + suffix), { force: true });
 }
 
-/** Removal fails on Windows while antivirus or a lingering process holds a file. The
- * owner record outlives a failed removal, so the next storage operation retries it. */
-async function tryDiscard(storage: string, identity: string, log: Budget['log']): Promise<boolean> {
-    try {await discard(storage, identity); return true;}
-    catch (error) {log(`A retained prepared output could not be removed yet; it will be retried. ${String(error)}\n`); return false;}
-}
+const tryDiscard = (storage: string, identity: string, log: Budget['log']): Promise<boolean> =>
+    tryRemoveOwned(() => discard(storage, identity), log, 'A retained prepared output');
 
 /** Unknown formats and possibly live owners are never reclaimed. */
 async function inventory(storage: string, log: Budget['log'], signal?: AbortSignal): Promise<Parked[]> {
     const result: Parked[] = [];
-    for (const name of await fs.readdir(storage)) {
-        signal?.throwIfAborted();
-        const temporary = name.split('.'), [target, writer, kind] = temporary;
-        if (temporary.length === 3 && kind === 'tmp' && target && writer && identityPattern.test(target) && identityPattern.test(writer)) {
-            // All metadata writers hold this lock, so these are interrupted writes.
-            await fs.rm(path.join(storage, name), { force: true }).catch(() => undefined); continue;
-        }
-        const identity = name.slice(0, -suffix.length);
-        if (!name.endsWith(suffix) || !identityPattern.test(identity)) {continue;}
-        const owner = await readOwner(storage, identity);
-        if (owner === 'unreadable') {
-            // No process can be checked, so only age says the record was abandoned.
-            if (await unreadableOwnerExpired(path.join(storage, name))) {await tryDiscard(storage, identity, log);}
-            continue;
-        }
-        if (!owner) {continue;}
-        if (owner.state === 'active') {
-            if (!await isProcessAlive(owner.pid, owner.process)) {await tryDiscard(storage, identity, log);}
-            continue;
-        }
-        const stat = await fs.lstat(path.join(storage, identity)).catch((error: unknown) => {
-            if ((error as NodeJS.ErrnoException).code === 'ENOENT') {return undefined;} throw error;
-        });
-        if (!parked(owner) || !stat?.isDirectory() || stat.isSymbolicLink() || !owner.retention.entries) {
-            await tryDiscard(storage, identity, log); continue;
-        }
-        result.push(owner);
-    }
+    await scanOwnerRecords<Owner>(storage, { suffix, read: identity => readOwner(storage, identity), discard: identity => tryDiscard(storage, identity, log),
+        async visit(identity, owner) {
+            if (owner.state === 'active') {
+                if (!await isProcessAlive(owner.pid, owner.process)) {await tryDiscard(storage, identity, log);}
+                return;
+            }
+            const stat = await fs.lstat(path.join(storage, identity)).catch((error: unknown) => {
+                if ((error as NodeJS.ErrnoException).code === 'ENOENT') {return undefined;} throw error;
+            });
+            if (!parked(owner) || !stat?.isDirectory() || stat.isSymbolicLink() || !owner.retention.entries) {
+                await tryDiscard(storage, identity, log); return;
+            }
+            result.push(owner);
+        } }, signal);
     return result;
 }
 

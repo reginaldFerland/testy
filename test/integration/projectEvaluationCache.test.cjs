@@ -1,9 +1,10 @@
 const {test}=require('node:test');
+// Patch the defining modules: `projects` only re-exports them through read-only bindings.
+const projectGraph=require('../../out/services/projectGraph'),projectBuild=require('../../out/services/projectBuild');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {TestEngine}=require('../../out/services/engine');
 const {normalizePath}=require('../../out/core/paths');
-const projects=require('../../out/services/projects');
 
 /** @param {import('node:test').TestContext} t */
 async function fixture(t){
@@ -13,11 +14,11 @@ async function fixture(t){
  await fs.writeFile(source,'using Microsoft.VisualStudio.TestTools.UnitTesting; [TestClass] public class SmokeTests { [TestMethod] public void Pass() => Assert.IsTrue(true); }');
  /** @type {{-readonly [K in keyof import('../../out/core/model').EngineConfiguration]: import('../../out/core/model').EngineConfiguration[K]}} */
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:false,excludes:[],testArguments:[],timeout:60000,maxParallelProjects:2,maxParallelTestFiles:2};
- const output=/** @type {string[]} */ ([]);let evaluations=0;const evaluate=projects.evaluateProjects;
- projects.evaluateProjects=async(...args)=>{evaluations++;return evaluate(...args);};
+ const output=/** @type {string[]} */ ([]);let evaluations=0;const evaluate=projectGraph.evaluateProjects;
+ projectGraph.evaluateProjects=async(...args)=>{evaluations++;return evaluate(...args);};
  const engine=new TestEngine({roots:[root],storage:path.join(temp,'state'),tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
   events:{output:text=>output.push(text),phase:()=>{},discovered:()=>{},selected:()=>{},result:()=>{},started:()=>{},coverage:()=>{},invalidated:()=>{}}});
- t.after(async()=>{projects.evaluateProjects=evaluate;await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
+ t.after(async()=>{projectGraph.evaluateProjects=evaluate;await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
  return{temp,root,project,source,config,engine,output,evaluations:()=>evaluations,
   baseline:()=>engine.run({files:[],full:true},new AbortController().signal),
   manual:()=>engine.run({files:[],full:false},new AbortController().signal,{all:true,groups:new Set(),coverage:false})};
@@ -93,12 +94,12 @@ test('an SDK wildcard import appearing after evaluation cannot validate an older
  }} `);
  const {runProcess,requireSuccess}=require('../../out/services/process'),options={cwd:probe,timeoutMs:60000};
  requireSuccess(await runProcess('dotnet',['build',taskProject,'-o',taskOutput,'--nologo'],options),'Building evaluation race probe');
- await projects.restoreProjects('dotnet',[f.project],'Debug',{cwd:f.root},2);
+ await projectBuild.restoreProjects('dotnet',[f.project],'Debug',{cwd:f.root},2);
  const xml=(/** @type {string} */ value)=>value.replaceAll('&','&amp;').replaceAll('"','&quot;'),query=path.join(probe,'query.proj');
  await fs.writeFile(query,`<Project><UsingTask TaskName="Probe" AssemblyFile="${xml(path.join(taskOutput,'Probe.dll'))}"/><Target Name="Inspect"><Probe Analyzer="${xml(path.resolve('dist/analyzer/Testy.Analysis.dll'))}" Input="${xml(f.project)}" Output="${xml(result)}"/></Target></Project>`);
  requireSuccess(await runProcess('dotnet',['msbuild',query,'-target:Inspect','-nologo'],options),'Checking evaluation race');
  const {raced:snapshot,stable}=JSON.parse(await fs.readFile(result,'utf8'));
  assert.equal(stable,true,'the same ordinary MSTest graph is reusable when no concurrent import change occurs');
- assert.ok(snapshot.queries.some((/** @type {{kind:string,values:string[]}} */ query)=>query.kind==='imports'&&query.values.some(file=>file.endsWith('.late.props'))),'probe deterministically adds the matching file after Project.FromFile');
+ assert.ok(snapshot.queries.some((/** @type {{kind:string,pattern:string,values:string[]}} */ query)=>query.kind==='imports'&&query.pattern==='Tests.csproj.*.props'&&Number(query.values[0].split(':')[0])>=2),'probe deterministically adds the matching file after Project.FromFile (the listing counts the restore import and the late one)');
  assert.equal(snapshot.reusable,false,'current directory contents must not validate a graph that never imported the new file');
 });

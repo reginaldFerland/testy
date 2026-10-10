@@ -8,6 +8,7 @@ Testy runs your tests through **.NET 10+ and Microsoft.Testing.Platform (MTP)**,
 
 - **Affected tests on save.** Edits rerun every test file known to exercise the changed code, with a conservative project-wide fallback whenever impact is uncertain.
 - **Retained coverage.** Each test file keeps its own coverage contribution, so partial runs never erase coverage from other tests. Coverage appears in Test Explorer's native coverage view and can be filtered by test file or project.
+- **Inline results.** Covered lines of C# files show whether the test files that exercise them passed (green check), failed (red cross) or have not run since a change (grey dash). Hover a covered line to see those test files, jump to them in Test Explorer, or rerun them.
 - **Test Explorer integration.** Tests are grouped as project, file, class, test, with xUnit's namespace-qualified default names shortened to the method name. Run, debug, or continuously run individual tests, classes, files, and projects. Failures show expected/actual diffs when the framework reports them, plus clickable stack frames.
 - **Build problems in the Problems panel.** Compiler errors and warnings from Testy's builds are listed there and cleared after the next successful build.
 - **Parallel and cached.** Discovery, builds, and test files run concurrently, and prepared outputs and project evaluations are reused safely across runs and restarts.
@@ -31,16 +32,18 @@ Testy runs your tests through **.NET 10+ and Microsoft.Testing.Platform (MTP)**,
 
 Saves never cancel a run you started manually. Changes are accumulated across cancelled runs, and an interrupted baseline resumes where it stopped.
 
+Reopening a workspace reuses its saved coverage when the settings, Testy version, environment and coverage tools it was learned under still match: the startup run builds and rediscovers as usual, then reruns only the test files affected by changes made while VS Code was closed, including shared test data and other watched files outside every project, restored packages, and changes that no run consumed before closing. A different .NET SDK reruns everything. Changing a setting that starts a new baseline, such as `testy.buildConfiguration`, runs everything again.
+
 ## Commands
 
 Click the Testy status bar item to open its action menu. Every action is also available from the Command Palette:
 
 | Command | What it does |
 | --- | --- |
-| **Testy: Pause Automatic Testing** / **Resume Automatic Testing** | Stop or restart runs on save. Remembered per workspace without changing your settings. |
+| **Testy: Pause Automatic Testing** / **Resume Automatic Testing** | Stop or restart runs on save. Remembered per workspace without changing your settings. **Pause or Resume Automatic Testing** toggles it (`Ctrl+;` `P`, `Cmd+;` `P` on macOS). The status bar tooltip says whether testing is paused for this workspace or disabled by `testy.autoRun`. |
 | **Testy: Run Affected Tests Now** | Run the tests affected by pending changes immediately (`Ctrl+;` `T`, `Cmd+;` `T` on macOS). |
 | **Testy: Rebuild and Run All C# Tests** | Rebuild, rediscover, and run everything to replace the baseline. |
-| **Testy: Cancel Current Run** | Cancel the active run. |
+| **Testy: Cancel Current Run** | Cancel the active run (`Ctrl+;` `X`, `Cmd+;` `X` on macOS). |
 | **Testy: Clear Coverage** | Discard retained coverage. |
 | **Testy: Export Coverage…** | Write the current merged coverage as LCOV or Cobertura XML (default `coverage/testy.lcov` or `coverage/testy.cobertura.xml`), with paths relative to the workspace. In a multi-root workspace, choose one folder (only its files, relative to it) or all folders. Stale coverage is not exported. |
 | **Testy: Reset Caches and Baseline** | Delete learned coverage, saved project evaluations, and prepared test outputs, then establish a fresh baseline. |
@@ -48,7 +51,9 @@ Click the Testy status bar item to open its action menu. Every action is also av
 | **Testy: Show Actions** | Open the status bar menu. |
 | **Run Affected Tests for This File** | In the editor and Explorer context menus of a `.cs` file: run the tests affected by that file, as if it had been saved. |
 | **Run Affected Tests for This Folder or Project** | In the Explorer context menu of a folder or `.csproj`: run the tests affected by the C# source files Testy knows in it. |
-| **Run Tests Covering This Line** | In the editor context menu: run the test files whose retained coverage hits the cursor line (`Ctrl+;` `Ctrl+T`, `Cmd+;` `Cmd+T` on macOS). |
+| **Run Tests Covering This Line** | In the editor context menu: run the test files whose retained coverage hits the cursor line (`Ctrl+;` `Ctrl+T`, `Cmd+;` `Cmd+T` on macOS). The inline results hover offers the same for the hovered line. |
+
+The keyboard shortcuts use the `Ctrl+;` (`Cmd+;`) chord of VS Code's own testing shortcuts, with keys those leave free.
 
 Test Explorer items also have **Why Was This Selected?**, which explains whether and why the item ran in the latest run, and project items have **Exclude Project from Testy**, which adds the project to `testy.projects.exclude` (per folder in a multi-root workspace). A failure message's context menu has **Show Output**.
 
@@ -82,7 +87,19 @@ Optional gutter markers (`testy.showCoverage`, off by default) also show coverag
 - A **red ring** marks an uncovered line.
 - An **amber diamond** marks stale coverage, or coverage of an unsaved version of the file.
 
-On first use, Testy installs a pinned version of `dotnet-coverage` into its own storage; it never adds packages to your projects. If setup fails, tests continue with conservative selection and the status tooltip explains why coverage is unavailable.
+On first use, Testy installs a pinned version of Microsoft's `dotnet-coverage` from NuGet into its own storage (the first-baseline prompt mentions this); it never adds packages to your projects. If setup fails, for example offline or behind a proxy, tests continue with conservative selection and a notification offers to open `testy.coverageToolPath`, where you can point Testy to a `dotnet-coverage` you installed yourself.
+
+### Inline results
+
+With `testy.inlineResults` (on by default), every covered line of a C# file shows the latest outcome of the test files whose retained coverage hits it:
+
+- A **green check**: every covering test file passed.
+- A **red cross**: at least one covering test file has a failing test. Failures stay visible until the file reruns, and are also marked in the scroll bar.
+- A **grey dash**: a covering test file has not run since a change (its coverage is stale or it has no results yet), or the editor has unsaved changes.
+
+Results are per test file, the granularity of Testy's coverage: a red cross means a test file that exercises the line has a failure, not necessarily a test that reached that line. Hovering a covered line (`gutterAndHover`, the default) shows **Covered by N test files (X failing)**, the first ten files with their status and failing tests, links that reveal them in Test Explorer, and **Run covering tests**. Set `testy.inlineResults` to `gutter` for markers without the hover, or `off`.
+
+Only one marker is drawn per line. While inline results are on, they own covered lines, and `testy.showCoverage` adds only the red ring for uncovered lines and the amber diamond for stale uncovered lines. **Clear Coverage** hides both until the next run, **Reset Caches and Baseline** removes them with the coverage, and in Restricted Mode nothing is shown.
 
 ## How affected selection works
 
@@ -104,6 +121,7 @@ See [How Testy works](docs/how-it-works.md) for the full details: caching, evalu
 | `testy.debounceTime` | `500` | Delay after the latest change, in milliseconds. |
 | `testy.runWithCoverage` | `true` | Collect coverage. Disabling it uses project fallback. |
 | `testy.showCoverage` | `false` | Also show coverage and stale markers in editor gutters. |
+| `testy.inlineResults` | `gutterAndHover` | Pass/fail markers on covered lines (`gutter`), plus a hover listing the covering test files (`gutterAndHover`), or `off`. |
 | `testy.problems.publishBuildDiagnostics` | `auto` | Publish build errors to the Problems panel: `auto` skips them while the C# extension is active (it reports them too), or `always` / `never`. |
 | `testy.solution` | (empty) | Optional `.sln`, `.slnx`, or `.slnf` whose projects limit the entry points. Relative paths resolve against the folder that sets it. `${workspaceFolder}` is supported. *Per folder.* |
 | `testy.projects.include` | `[]` | Globs for entry-point projects to include, for example `tests/**/*.csproj`. *Per folder.* |
@@ -118,9 +136,9 @@ See [How Testy works](docs/how-it-works.md) for the full details: caching, evalu
 | `testy.testArguments` | `[]` | Additional MTP arguments, such as framework settings. |
 | `testy.timeoutSeconds` | `600` | Limit for each build, discovery, or test-file run. Debug runs are not limited. |
 | `testy.coverageToolPath` | Automatic | Absolute path to an existing `dotnet-coverage` executable. *Machine-overridable.* |
-| `testy.debugConfiguration` | `{}` | Extra properties for the `coreclr` attach configuration of Debug profiles. |
+| `testy.debugConfiguration` | `{}` | Extra properties for the `coreclr` attach configuration of Debug profiles, such as `justMyCode`, `symbolOptions` or `sourceFileMap`. |
 
-One engine serves every folder of a multi-root workspace. Settings marked *per folder* can be set in a folder's settings: they then apply to that folder's projects and resolve relative paths and globs against it (folder `exclude` patterns add to the workspace ones; a folder `solution` or `projects.include` replaces the inherited value for that folder). `testy.buildConfiguration` and `testy.testArguments` can be set per folder but apply to the whole run: when folders disagree, Testy warns and uses the workspace value. Other settings are window-scoped. With `0`, test-file workers use available CPUs minus one, and project workers use up to four while reserving one CPU.
+One engine serves every folder of a multi-root workspace. Settings marked *per folder* can be set in a folder's settings: they then apply to that folder's projects and resolve relative paths and globs against it (folder `exclude` patterns add to the workspace ones; a folder `solution` or `projects.include` replaces the inherited value for that folder). `testy.buildConfiguration` and `testy.testArguments` can be set per folder but apply to the whole run: when folders disagree, Testy warns and uses the workspace value. Other settings are window-scoped. Tuning settings (`debounceTime`, `fileWatcherPattern`, `maxParallel*`, `timeoutSeconds`) are tagged `advanced`; filter the Settings editor with `@tag:advanced`. With `0`, test-file workers use available CPUs minus one, and project workers use up to four while reserving one CPU.
 
 ## Remote, WSL, and dev containers
 

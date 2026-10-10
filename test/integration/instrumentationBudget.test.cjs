@@ -17,7 +17,7 @@ function deferred(){
  * @param {AbortSignal} [signal]
  */
 async function waitFor(gate,signal){
- signal?.throwIfAborted();if(!signal)return gate.promise;
+ signal?.throwIfAborted();if(!signal){await gate.promise;return;}
  /** @type {any} */ let abort;const cancelled=new Promise((_,reject)=>{abort=()=>reject(signal.reason);signal.addEventListener('abort',abort,{once:true});});
  try{await Promise.race([gate.promise,cancelled]);signal.throwIfAborted();}finally{signal.removeEventListener('abort',abort);}
 }

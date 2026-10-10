@@ -32,6 +32,7 @@ internal sealed partial class DigestStore
         var name = $"digests-{Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sdk)))[..16].ToLowerInvariant()}.json";
         var file = Path.Combine(directory, name);
         var entries = new Dictionary<string, Entry>();
+        StaleTemporaryFiles.Delete(directory, "digests-*.json.*.tmp");
         try
         {
             var contents = JsonSerializer.Deserialize(File.ReadAllBytes(file), GraphJson.Default.Contents);
@@ -73,5 +74,25 @@ internal sealed partial class DigestStore
         {
             try { File.Delete(temporary); } catch (Exception cleanup) when (cleanup is IOException or UnauthorizedAccessException) { }
         }
+    }
+}
+
+// Files written beside their destination and renamed into place are left behind when the process is
+// killed in between. Only old ones go: a recent one may belong to a process that is still running.
+internal static class StaleTemporaryFiles
+{
+    internal static readonly TimeSpan MinimumAge = TimeSpan.FromHours(1);
+
+    internal static void Delete(string directory, string pattern)
+    {
+        try
+        {
+            foreach (var file in Directory.EnumerateFiles(directory, pattern))
+            {
+                try { if (DateTime.UtcNow - File.GetLastWriteTimeUtc(file) > MinimumAge) { File.Delete(file); } }
+                catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+            }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
     }
 }

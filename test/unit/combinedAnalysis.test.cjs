@@ -74,3 +74,18 @@ test('process failure and cancellation clean up and never return a partial alias
  await assert.rejects(f.batch([],[],undefined,{signal:abort.signal}),{name:'AbortError'});assert.equal(f.calls.length,before);
  assert.deepEqual(await fs.readdir(f.directory),[]);
 });
+
+test('the Roslyn identity is shared by a burst of requests and recomputed for a different environment',async t=>{
+ const context=require('../../out/services/analysisContext');
+ const identity=context.roslynIdentity;let identities=0;
+ context.roslynIdentity=async()=>{identities++;await new Promise(done=>setImmediate(done));return 'roslyn';};
+ // Only requests served by an engine's analyzer pool need the Roslyn identity.
+ const analyzerServers=/** @type {any} */ ({request:async()=>'{}'});
+ t.after(()=>{context.roslynIdentity=identity;});
+ const options=(/** @type {string} */ path)=>({cwd:'/identity-test',env:{PATH:path},analyzerServers});
+ await Promise.all([1,2,3].map(()=>analysis.sourceLocations('dotnet-identity-test','analyzer.dll','App.dll','storage',options('/one'))));
+ await analysis.sourceLocations('dotnet-identity-test','analyzer.dll','App.dll','storage',options('/one'));
+ assert.equal(identities,1);
+ await analysis.sourceLocations('dotnet-identity-test','analyzer.dll','App.dll','storage',options('/two'));
+ assert.equal(identities,2);
+});

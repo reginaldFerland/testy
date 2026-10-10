@@ -1,0 +1,58 @@
+name: Performance
+
+# Manual only: the numbers are for trend-watching, so they run on demand only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TESTY_BENCH_DIR: ${{ github.workspace }}/.benchmarks
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: backend/**/packages.lock.json
+
+      - run: npm ci
+
+      - run: npm run compile
+
+      - name: Responsiveness probes
+        run: node test/performance/responsiveness.cjs
+
+      - name: Cache and result probes
+        run: |
+          node test/performance/cache-and-results.cjs
+          node test/performance/cache-membership.cjs
+          node test/performance/live-updates.cjs
+          node test/performance/discovery.cjs
+
+      - name: Deep dependency graph benchmark
+        run: node test/performance/benchmark.cjs
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: benchmarks
+          path: .benchmarks/
+          include-hidden-files: true
+          if-no-files-found: warn

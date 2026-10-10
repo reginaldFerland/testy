@@ -6,9 +6,7 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <!-- Everything is serialized through source-generated contexts (AnalysisJson), so nothing needs reflection-based System.Text.Json. -->
     <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
-    <!-- The server amortizes Tier-0 instrumentation over many requests. The one-shot
-         fallback (a short-lived process) turns it off with DOTNET_TieredPGO=0. -->
-    <TieredPGO>true</TieredPGO>
+    <!-- Tiered PGO is on by default. The one-shot fallback (a short-lived process) turns it off with DOTNET_TieredPGO=0. -->
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Testy.Backend.Tests" />

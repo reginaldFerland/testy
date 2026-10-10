@@ -61,3 +61,23 @@ test('a failing workspace-folder change is reported instead of escaping the even
  assert.equal(f.shown.length,1);
  await f.testy.dispose();
 });
+
+test('a failed collector setup warns once and opens testy.coverageToolPath, for offline or proxied machines',async()=>{
+ const f=fixture(/** @param {string[]} actions */ actions=>actions[1]);
+ const unavailable=/** @type {NonNullable<typeof f.events.coverageUnavailable>} */ (f.events.coverageUnavailable);
+ f.events.output('Coverage unavailable for Calc.Tests; test results are retained. boom\n');
+ f.events.output('Coverage unavailable; tests will continue with conservative selection. Error: Installing the coverage collector failed (exit 1).\n');
+ assert.equal(f.shown.length,0,'output text alone is not an event');
+ unavailable('Error: Installing the coverage collector failed (exit 1).');
+ unavailable('Error: Installing the coverage collector failed (exit 1).');
+ await tick();await tick();
+ assert.equal(f.shown.length,1,'one warning per session, and none for a single project\'s collector failure');
+ assert.equal(f.shown[0].severity,'warning');
+ assert.match(f.shown[0].message,/could not be installed from NuGet.*testy\.coverageToolPath/);
+ assert.deepEqual(f.commands,[['workbench.action.openSettings','@id:testy.coverageToolPath']]);
+ const custom=fixture();
+ custom.testy.config={...custom.testy.config,coverageTool:'/tools/dotnet-coverage'};
+ custom.events.coverageUnavailable?.('ENOENT');await tick();
+ assert.match(custom.shown[0].message,/set in testy\.coverageToolPath could not be used/);
+ await f.testy.dispose();await custom.testy.dispose();
+});

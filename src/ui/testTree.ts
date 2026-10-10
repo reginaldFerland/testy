@@ -11,6 +11,7 @@ import { Selection } from '../core/selection';
 import { RunScope, TestEngine } from '../services/engine';
 import { projectCoverageId } from '../core/coverage';
 import { explainSelection } from './selectionCause';
+import { countOutcome, FileOutcome } from './inlineStatus';
 
 // Call sites use l10n.t(...) literally so `npm run l10n:export` can extract them.
 const l10n = vscode.l10n;
@@ -91,6 +92,9 @@ export class TestTree {
     readonly items = new Map<string, vscode.TestItem>();
     readonly testIds = new Map<string, { group: string; test: string }>();
     readonly outcomes = new Map<string, string>();
+    /** Outcome counts per test file, kept current with `outcomes`; `outcomeRevision` changes with them. */
+    readonly fileOutcomes = new Map<string, FileOutcome>();
+    outcomeRevision = 0;
     passed = 0;
     failed = 0;
     /** Outcomes adopted from a previous session that this one has not reported again. */
@@ -129,6 +133,13 @@ export class TestTree {
         if (outcome) {this.outcomes.set(id, outcome);} else {this.outcomes.delete(id);}
         if (outcome === 'passed') {this.passed++;}
         if (outcome === 'failed' || outcome === 'errored') {this.failed++;}
+        if (countOutcome(this.fileOutcomes, id, previous, outcome)) {this.outcomeRevision++;}
+    }
+
+    /** The failing tests of a test file, by tree item. */
+    failingTests(groupId: string): vscode.TestItem[] {
+        return [...this.treeFiles.get(groupId)?.ids ?? []].filter(id => {const outcome = this.outcomes.get(id); return outcome === 'failed' || outcome === 'errored';})
+            .flatMap(id => this.items.get(id) ?? []);
     }
 
     /** Count the outcomes the engine restored, so the status matches the previous session before anything runs. */

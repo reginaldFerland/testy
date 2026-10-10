@@ -3,8 +3,9 @@ import * as vscode from 'vscode';
 import { escape } from 'minimatch';
 import { EngineConfiguration } from './core/model';
 import { additionalConfigurations } from './core/buildConfigurations';
-import { defaultExcludes, normalizePath } from './core/paths';
+import { defaultExcludes, defaultWatcherPattern, normalizePath } from './core/paths';
 import type { BuildDiagnosticsMode } from './diagnosticsPublisher';
+import type { InlineResultsMode } from './ui/inlineStatus';
 
 export interface Configuration extends EngineConfiguration {
     readonly enabled: boolean;
@@ -12,6 +13,8 @@ export interface Configuration extends EngineConfiguration {
     readonly debounce: number;
     readonly pattern: string;
     readonly showCoverage: boolean;
+    /** Pass/fail gutter markers and hovers on covered lines (`testy.inlineResults`). */
+    readonly inlineResults: InlineResultsMode;
     /** Whether build errors are published to the Problems panel (`testy.problems.publishBuildDiagnostics`). */
     readonly buildDiagnostics: BuildDiagnosticsMode;
     /** Extra build configurations offered as manual Run and Coverage profiles. */
@@ -20,7 +23,7 @@ export interface Configuration extends EngineConfiguration {
     readonly folderConflicts: readonly string[];
 }
 
-export const defaultWatcherPattern = '**/*.{cs,csproj,sln,slnx,slnf,props,targets,runsettings,json,config,resx,editorconfig,globalconfig,ruleset,razor,cshtml,xaml,axaml,proto}';
+export { defaultWatcherPattern };
 
 interface Folder { readonly root: string; readonly name: string; readonly settings: vscode.WorkspaceConfiguration }
 
@@ -70,7 +73,7 @@ export function configuration(): Configuration {
         enabled: settings.get('autoRun', true), trigger: settings.get('trigger', 'save'),
         debounce: Math.max(0, settings.get('debounceTime', 500)),
         pattern: settings.get('fileWatcherPattern', defaultWatcherPattern),
-        showCoverage: settings.get('showCoverage', false),
+        showCoverage: settings.get('showCoverage', false), inlineResults: settings.get<InlineResultsMode>('inlineResults', 'gutterAndHover'),
         buildDiagnostics: settings.get<BuildDiagnosticsMode>('problems.publishBuildDiagnostics', 'auto'),
         additionalConfigurations: additionalConfigurations(settings.get<string[]>('additionalConfigurations', []), buildConfiguration),
         dotnet: settings.get('dotnetPath', 'dotnet'), configuration: buildConfiguration,

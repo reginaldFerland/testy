@@ -53,6 +53,16 @@ export interface CoverageDelta {
     readonly removedSources: readonly string[];
     readonly removedTraces: readonly string[];
 }
+/** Running per-line maxima over a source version's contributions, kept while the version is displayed. Contribution
+ * changes since the last aggregation wait in `pending`; `unknown` lines lost their only maximum and are recomputed. */
+interface LineMaxima {
+    readonly max: Map<number, number>;
+    /** How many contribution entries hold each line's maximum. */
+    readonly holders: Map<number, number>;
+    readonly unknown: Set<number>;
+    readonly pending: [before: readonly CoveredLine[] | undefined, after: readonly CoveredLine[] | undefined][];
+    revision: number;
+}
 interface SourceRecord {
     source: CoverageSource;
     readonly groups: Set<string>;
@@ -60,6 +70,16 @@ interface SourceRecord {
     staleCount: number;
     aggregate?: { readonly lines: readonly CoveredLine[]; readonly covered: number } | undefined;
     aggregateVersion: number;
+    maxima?: LineMaxima | undefined;
+}
+/** A file's test-file owners across its source versions; the published sorted array is rebuilt lazily from the changes since. */
+interface Owners { readonly members: Set<string>; sorted: readonly string[]; readonly added: string[]; removed: boolean }
+/** Files whose version differs between two maps, without materializing their key sets. */
+function changedFiles(previous: ReadonlyMap<string, string>, next: ReadonlyMap<string, string>): string[] {
+    const files: string[] = [];
+    for (const [file, hash] of next) {if (previous.get(file) !== hash) {files.push(file);}}
+    for (const file of previous.keys()) {if (!next.has(file)) {files.push(file);}}
+    return files;
 }
 const moduleKey = (project: string): string => `\0module:${project}`;
 const dependencyKeys = (trace: Trace): readonly string[] => [...trace.dependencies, ...trace.moduleProjects?.map(moduleKey) ?? []];
@@ -74,13 +94,17 @@ export class CoverageStore {
     private dirtyFiles = new Set<string>();
     private dirtyGroups = new Set<string>();
     private appliedStale = new Map<string, boolean>();
-    private owners = new Map<string, readonly string[]>();
+    private owners = new Map<string, Owners>();
     private readonly staleOrigins = new Map<string, { trace: StoredTrace; dirty: boolean }>();
     private changedSources = new Set<string>();
     private changedTraces = new Set<string>();
     private removedSources = new Set<string>();
     private removedTraces = new Set<string>();
+    /** The versions summaries display, and the versions trace freshness was last checked against (see applyHashes). */
     private hashes: ReadonlyMap<string, string> = new Map();
+    private appliedHashes: ReadonlyMap<string, string> = new Map();
+    /** Restored traces were learned before this process knew any version: the next applyHashes checks all of them. */
+    private unchecked = false;
     private cached: readonly CoverageSummary[] | undefined;
     private version = 0;
     get revision(): number { return this.version; }
@@ -206,17 +230,20 @@ export class CoverageStore {
 
     restore(traces: readonly Trace[]): void { this.replace(traces, new Set(traces.map(trace => trace.groupId))); }
 
-    restorePacked(sources: readonly CoverageSource[], traces: readonly StoredTrace[], canonical = false): void {
+    /** Saved traces narrow selections again only when `trusted` vouches for them (see services/engine/identity); every other
+     * one is history: shown stale, never reliable. The next applyHashes checks every restored trace against its inputs. */
+    restorePacked(sources: readonly CoverageSource[], traces: readonly StoredTrace[], canonical = false, trusted?: (trace: StoredTrace) => boolean): void {
         for (const source of sources) {this.registerSource(source, canonical);}
         for (const trace of traces) {
-            if (trace.sourceIds.every(id => this.sources.has(id))) {this.install({ ...trace, reliable: false, stale: true });}
+            if (trace.sourceIds.every(id => this.sources.has(id))) {this.install(restoredTrace(trace, trusted));}
         }
         this.pruneSources();
-        this.clearDelta();
+        this.clearDelta(); this.unchecked = true;
     }
 
-    /** Stage the entire restored checkpoint before publishing any of its indexes. */
-    async restorePackedAsync(sources: readonly CoverageSource[], traces: readonly StoredTrace[], signal?: AbortSignal, version = this.version): Promise<void> {
+    /** Stage the entire restored checkpoint before publishing any of its indexes; `trusted` as for restorePacked. */
+    async restorePackedAsync(sources: readonly CoverageSource[], traces: readonly StoredTrace[], signal?: AbortSignal, version = this.version,
+        trusted?: (trace: StoredTrace) => boolean): Promise<void> {
         if (version !== this.version) {return;}
         const staged = new CoverageStore();
         function* prepare(): Generator<void, void> {
@@ -232,7 +259,7 @@ export class CoverageStore {
                     if (++count % 512 === 0) {yield;}
                 }
                 if (valid) {
-                    const restored = { ...trace, reliable: false, stale: true };
+                    const restored = restoredTrace(trace, trusted);
                     if (staged.records.has(trace.groupId)) {yield* staged.installation(restored);}
                     else {yield* staged.initialInstallation(restored);}
                 }
@@ -254,7 +281,7 @@ export class CoverageStore {
         this.appliedStale = staged.appliedStale; this.owners = staged.owners;
         this.changedSources = new Set(); this.changedTraces = new Set();
         this.removedSources = new Set(); this.removedTraces = new Set();
-        this.cached = undefined; this.version++;
+        this.cached = undefined; this.unchecked = true; this.version++;
     }
 
     private clearDelta(): void {
@@ -304,8 +331,9 @@ export class CoverageStore {
         this.version++;
     }
 
+    /** Reads only display `hashes`: trace freshness and the durable delta change only through applyHashes. */
     summarize(hashes: ReadonlyMap<string, string>): readonly CoverageSummary[] {
-        this.updateHashes(hashes);
+        this.display(hashes);
         finish(this.dirtySources());
         if (this.cached) {return this.cached;}
         for (const file of this.dirtyFiles) {
@@ -319,7 +347,7 @@ export class CoverageStore {
 
     async summarizeAsync(hashes: ReadonlyMap<string, string>, signal?: AbortSignal): Promise<readonly CoverageSummary[]> {
         signal?.throwIfAborted();
-        this.updateHashes(hashes);
+        this.display(hashes);
         while (!this.cached || this.dirtyGroups.size) {
             await finishAsync(this.dirtySources(), signal);
             if (this.dirtyGroups.size) {continue;}
@@ -350,7 +378,7 @@ export class CoverageStore {
     }
 
     summary(file: string, hashes: ReadonlyMap<string, string>): CoverageSummary | undefined {
-        this.updateHashes(hashes);
+        this.display(hashes);
         finish(this.dirtySources());
         if (this.dirtyFiles.delete(file)) {
             this.version++;
@@ -360,17 +388,32 @@ export class CoverageStore {
         return this.summaries.get(file);
     }
 
-    private updateHashes(hashes: ReadonlyMap<string, string>): void {
-        if (this.hashes === hashes) {return;}
-        const changed = new Set([...hashes.keys(), ...this.hashes.keys()].filter(file => hashes.get(file) !== this.hashes.get(file)));
-        if (!changed.size) {this.hashes = hashes; return;}
-        for (const file of changed) {this.dirty(file);}
+    /** The engine applies each new source version map: traces that depend on a changed file and no longer match it become stale
+     * (and are saved), and summaries display the new versions. Only traces that depend on a changed file are checked, except
+     * after a restore, which checks every trace. `changesSince` names the files that differ from the previously applied map
+     * when its owner knows them (see SourceTracker.changedSince); otherwise the two maps are compared. */
+    applyHashes(hashes: ReadonlyMap<string, string>, changesSince?: (applied: ReadonlyMap<string, string>) => readonly string[] | undefined): void {
+        if (this.appliedHashes === hashes && !this.unchecked) {this.display(hashes); return;}
+        const changed = this.appliedHashes === hashes ? [] : changesSince?.(this.appliedHashes) ?? changedFiles(this.appliedHashes, hashes);
+        const displayed = this.hashes === this.appliedHashes, unchecked = this.unchecked;
+        this.appliedHashes = hashes; this.unchecked = false;
+        if (!changed.length && !unchecked) {this.display(hashes); return;}
         const stale = new Set<string>();
-        for (const id of this.dependentGroups([...changed])) {
+        for (const id of unchecked ? this.records.keys() : this.dependentGroups(changed)) {
             const trace = this.records.get(id)!;
             if (Object.entries(trace.inputs ?? {}).some(([file, hash]) => sourceVersion(hashes, file) !== hash)) {stale.add(id);}
         }
-        this.hashes = hashes; this.markStale(stale); this.version++;
+        this.display(hashes, displayed ? changed : undefined); this.markStale(stale);
+    }
+
+    /** Display other versions; `changed` lists the files that differ from the displayed map, when known. */
+    private display(hashes: ReadonlyMap<string, string>, changed?: readonly string[]): void {
+        if (this.hashes === hashes) {return;}
+        const files = changed ?? changedFiles(this.hashes, hashes);
+        this.hashes = hashes;
+        if (!files.length) {return;}
+        for (const file of files) {this.dirty(file);}
+        this.version++;
     }
 
     /** Delay membership traversal until the scheduled, cancellable aggregation. */
@@ -415,13 +458,27 @@ export class CoverageStore {
         source.aggregate = undefined; source.aggregateVersion++; this.dirty(source.source.file);
     }
 
+    /** Every published contribution change passes through here, so running maxima see each transition. */
+    private changeHits(source: SourceRecord, id: string, lines: readonly CoveredLine[] | undefined): void {
+        const before = source.hits.get(id);
+        if (before === lines) {return;}
+        if (lines) {source.hits.set(id, lines);} else {source.hits.delete(id);}
+        const maxima = source.maxima;
+        if (maxima) {
+            maxima.pending.push([before, lines]); maxima.revision++;
+            // A long backlog costs more than one fresh pass over the contributions.
+            if (maxima.pending.length > source.hits.size + 64) {source.maxima = undefined;}
+        }
+        this.invalidateAggregate(source);
+    }
+
     private registerSource(source: CoverageSource, canonical = false, merged = false): void {
         const previous = this.sources.get(source.id);
         const lines = merged ? source.lines : previous ? finish(sortedUnion(previous.source.lines, source.lines)) : canonical ? source.lines : finish(sortedUnion([], source.lines));
         const declarations = mergeDeclarations(previous?.source.declarations, source.declarations);
         if (previous && lines.length === previous.source.lines.length && declarations === previous.source.declarations) {return;}
         this.sources.set(source.id, { source: { ...source, lines, ...declarations ? { declarations } : {} }, groups: previous?.groups ?? new Set(), hits: previous?.hits ?? new Map<string, readonly CoveredLine[]>(),
-            staleCount: previous?.staleCount ?? 0, aggregateVersion: (previous?.aggregateVersion ?? 0) + 1 });
+            staleCount: previous?.staleCount ?? 0, aggregateVersion: (previous?.aggregateVersion ?? 0) + 1, maxima: previous?.maxima });
         const versions = this.byFile.get(source.file) ?? new Set<string>(); versions.add(source.id); this.byFile.set(source.file, versions);
         this.changedSources.add(source.id); this.removedSources.delete(source.id); this.dirty(source.file); this.version++;
     }
@@ -473,7 +530,7 @@ export class CoverageStore {
             for (const id of previous.sourceIds) {
                 const source = this.sources.get(id)!;
                 if (!sourceIds.has(id)) {this.removeMembership(source, trace.groupId, wasStale);}
-                else if (!contributions.has(id) && source.hits.delete(trace.groupId)) {this.invalidateAggregate(source);}
+                else if (!contributions.has(id)) {this.changeHits(source, trace.groupId, undefined);}
                 if (++count % 512 === 0) {yield;}
             }
         }
@@ -493,9 +550,7 @@ export class CoverageStore {
         }
         for (const [id, lines] of contributions) {
             const source = this.sources.get(id);
-            if (source && source.hits.get(trace.groupId) !== lines) {
-                source.hits.set(trace.groupId, lines); this.invalidateAggregate(source);
-            }
+            if (source) {this.changeHits(source, trace.groupId, lines);}
             if (++count % 512 === 0) {yield;}
         }
         this.version++;
@@ -520,27 +575,36 @@ export class CoverageStore {
 
     private removeMembership(source: SourceRecord, id: string, stale: boolean): void {
         if (source.groups.delete(id)) {source.staleCount -= Number(stale); this.changeOwnership(source, id, false);}
-        if (source.hits.delete(id)) {this.invalidateAggregate(source);}
+        this.changeHits(source, id, undefined);
         this.dirty(source.source.file);
     }
 
-    /** Published ownership arrays stay immutable; insert only genuinely new owners. */
+    /** Record only genuinely new or departed owners; the next summary publishes a new array (see ownerList). */
     private changeOwnership(source: SourceRecord, id: string, add: boolean): void {
-        const file = source.source.file, previous = this.owners.get(file);
-        if (!previous) {return;}
+        const file = source.source.file, owners = this.owners.get(file);
+        if (!owners || owners.members.has(id) === add) {return;}
         if (!add) {for (const version of this.byFile.get(file) ?? []) {
             if (this.sources.get(version)?.groups.has(id)) {return;}
         }}
-        let low = 0, high = previous.length;
-        while (low < high) {
-            const middle = low + Math.floor((high - low) / 2);
-            if (previous[middle]! < id) {low = middle + 1;} else {high = middle;}
+        if (add) {owners.members.add(id); owners.added.push(id);} else {owners.members.delete(id); owners.removed = true;}
+        if (!owners.members.size) {this.owners.delete(file);}
+    }
+
+    /** Published ownership arrays stay immutable: merge the sorted additions into a copy that omits departed owners. */
+    private ownerList(owners: Owners): readonly string[] {
+        if (!owners.added.length && !owners.removed) {return owners.sorted;}
+        const previous = owners.sorted, members = owners.members;
+        const added = [...new Set(owners.added)].filter(id => members.has(id) && !sortedHas(previous, id)).sort();
+        const next: string[] = [];
+        let index = 0;
+        for (const id of previous) {
+            if (!members.has(id)) {continue;}
+            while (index < added.length && added[index]! < id) {next.push(added[index++]!);}
+            next.push(id);
         }
-        const exists = previous[low] === id;
-        if (exists === add) {return;}
-        const next = previous.slice();
-        if (add) {next.splice(low, 0, id);} else {next.splice(low, 1);}
-        if (next.length) {this.owners.set(file, next);} else {this.owners.delete(file);}
+        while (index < added.length) {next.push(added[index++]!);}
+        owners.sorted = next; owners.added.length = 0; owners.removed = false;
+        return next;
     }
 
     private pruneSources(): void {
@@ -555,21 +619,49 @@ export class CoverageStore {
         return finish(this.calculation(file));
     }
 
-    /** Membership-only updates retain the source's already aggregated line data. */
+    /** Membership-only updates retain the source's already aggregated line data. Contribution changes update the running
+     * maxima in proportion to their own lines; only lines whose sole maximum was removed or lowered are scanned again. */
     private *aggregate(source: SourceRecord): Generator<void, NonNullable<SourceRecord['aggregate']>> {
         if (source.aggregate) {return source.aggregate;}
-        const version = source.aggregateVersion, hits = new Map<number, number>();
-        let count = 0;
-        for (const contribution of source.hits.values()) {for (const line of contribution) {
-            hits.set(line.line, Math.max(hits.get(line.line) ?? 0, line.hits));
-            if (++count % 4096 === 0) {yield;}
-        }}
-        const lines: CoveredLine[] = [];
+        const version = source.aggregateVersion;
+        let count = 0, maxima = source.maxima;
+        if (!maxima) {
+            const built: LineMaxima = { max: new Map(), holders: new Map(), unknown: new Set(), pending: [], revision: 0 };
+            for (const contribution of source.hits.values()) {for (const line of contribution) {
+                raise(built, line);
+                if (++count % 4096 === 0) {yield;}
+            }}
+            // Counts built across a contribution change are used once and never retained.
+            maxima = version === source.aggregateVersion ? source.maxima ??= built : built;
+        }
+        // Applied without yielding: a paused pass can never observe half a transition.
+        for (const [before, after] of maxima.pending) {
+            for (const line of before ?? []) {lower(maxima, line);}
+            for (const line of after ?? []) {raise(maxima, line);}
+        }
+        maxima.pending.length = 0;
+        let recomputed: Map<number, [max: number, holders: number]> | undefined;
+        if (maxima.unknown.size) {
+            const revision = maxima.revision, unknown = maxima.unknown;
+            recomputed = new Map();
+            for (const contribution of source.hits.values()) {for (const { line, hits } of contribution) {
+                if (unknown.has(line)) {
+                    const value = recomputed.get(line);
+                    if (!value || hits > value[0]) {recomputed.set(line, [hits, 1]);} else if (hits === value[0]) {value[1]++;}
+                }
+                if (++count % 4096 === 0) {yield;}
+            }}
+            if (revision === maxima.revision && source.maxima === maxima) {
+                for (const [line, [max, holders]] of recomputed) {maxima.max.set(line, max); maxima.holders.set(line, holders);}
+                unknown.clear(); recomputed = undefined;
+            }
+        }
+        const max = maxima.max, covered = max.size + (recomputed?.size ?? 0), lines: CoveredLine[] = [];
         for (const line of source.source.lines) {
-            lines.push({ line, hits: hits.get(line) ?? 0 });
+            lines.push({ line, hits: recomputed?.get(line)?.[0] ?? max.get(line) ?? 0 });
             if (++count % 4096 === 0) {yield;}
         }
-        const aggregate = { lines, covered: hits.size };
+        const aggregate = { lines, covered };
         // A synchronous editor read or contribution replacement can run while
         // this calculation yields. Keep only a complete, still-current cache.
         if (version === source.aggregateVersion) {source.aggregate ??= aggregate; return source.aggregate;}
@@ -582,7 +674,8 @@ export class CoverageStore {
         const current = versions.find(version => version.source.hash === this.hashes.get(file));
         const displayed = current ?? versions.at(-1);
         if (!displayed) {return undefined;}
-        let groupIds = this.owners.get(file);
+        const owners = this.owners.get(file);
+        let groupIds = owners && this.ownerList(owners);
         const groups = groupIds ? undefined : new Set<string>();
         let stale = !current;
         let count = 0;
@@ -590,7 +683,7 @@ export class CoverageStore {
             if (version !== displayed) {
                 // Keep derived line objects for only the displayed source version.
                 // Invalidate paused calculations too; published arrays remain intact.
-                version.aggregate = undefined; version.aggregateVersion++;
+                version.aggregate = undefined; version.aggregateVersion++; version.maxima = undefined;
             }
             // Zero-hit reports still assert that these lines were uncovered.
             // That assertion becomes stale when the reporting test changes.
@@ -602,7 +695,7 @@ export class CoverageStore {
         }
         if (!groupIds) {
             groupIds = [...groups!].sort();
-            if (revision === this.version) {this.owners.set(file, groupIds);}
+            if (revision === this.version && groupIds.length) {this.owners.set(file, { members: groups!, sorted: groupIds, added: [], removed: false });}
         }
         const previous = this.summaries.get(file);
         const aggregate = yield* this.aggregate(displayed);
@@ -625,6 +718,32 @@ export class CoverageStore {
             && (previous.groupIds === groupIds || (previous.groupIds.length === groupIds.length && groupIds.every((id, index) => id === previous.groupIds[index])))) {return previous;}
         return { file, lines, ...declarations ? { declarations } : {}, stale, covered: aggregate.covered, total: lines.length, groupIds };
     }
+}
+
+function sortedHas(values: readonly string[], value: string): boolean {
+    let low = 0, high = values.length;
+    while (low < high) {const middle = (low + high) >>> 1; if (values[middle]! < value) {low = middle + 1;} else {high = middle;}}
+    return values[low] === value;
+}
+
+/** Running maxima: one more contribution entry for a line. A line awaiting recomputation reads the final contributions instead. */
+function raise(maxima: LineMaxima, { line, hits }: CoveredLine): void {
+    if (maxima.unknown.has(line)) {return;}
+    const max = maxima.max.get(line);
+    if (max === undefined || hits > max) {maxima.max.set(line, hits); maxima.holders.set(line, 1);}
+    else if (hits === max) {maxima.holders.set(line, maxima.holders.get(line)! + 1);}
+}
+
+/** Running maxima: one contribution entry fewer. Removing a line's last maximum leaves its value unknown. */
+function lower(maxima: LineMaxima, { line, hits }: CoveredLine): void {
+    if (maxima.unknown.has(line) || maxima.max.get(line) !== hits) {return;}
+    const holders = maxima.holders.get(line)! - 1;
+    if (holders) {maxima.holders.set(line, holders);} else {maxima.max.delete(line); maxima.holders.delete(line); maxima.unknown.add(line);}
+}
+
+/** A trace as restored from disk: as saved when `trusted` vouches for it, otherwise stale history that never narrows a selection. */
+function restoredTrace(trace: StoredTrace, trusted: ((trace: StoredTrace) => boolean) | undefined): StoredTrace {
+    return trusted?.(trace) ? { ...trace, stale: trace.stale ?? false } : { ...trace, reliable: false, stale: true };
 }
 
 export function projectCoverageId(group: TestFile): string { return `project:${testFileId(group.project, group.framework)}`; }

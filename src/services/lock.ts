@@ -10,8 +10,9 @@ import { currentProcessStamp, isProcessAlive, isProcessStamp } from './processSt
  * laptop, blocked event loop) is slow, not gone. Windows stamps never carry a
  * start time, so there the silence must last `windowsStaleMs` while the contender
  * itself keeps running. `cleanupWaitMs` bounds waits on shutdown paths, where a
- * hung live holder must not block disposal. */
-export const lockTiming = { heartbeatMs: 5_000, staleMs: 60_000, windowsStaleMs: 600_000, cleanupWaitMs: 10_000 };
+ * hung live holder must not block disposal. A lock directory without an owner file
+ * for `ownerlessMs` belongs to a process that died before publishing its PID. */
+export const lockTiming = { heartbeatMs: 5_000, staleMs: 60_000, windowsStaleMs: 600_000, cleanupWaitMs: 10_000, ownerlessMs: 10_000 };
 
 export class LockTimeoutError extends Error {
     constructor(directory: string) {super(`Timed out waiting for the lock ${directory}.`); this.name = 'LockTimeoutError';}
@@ -54,14 +55,50 @@ async function abandoned(directory: string, name: string, silence: Silence): Pro
     return now - watched.since > lockTiming.windowsStaleMs;
 }
 
+/** In-process waiters per lock directory, in arrival order. Each holds a turn until its work ends,
+ * so one waiter per process polls the disk and the next takes over without a polling delay. */
+const turns = new Map<string, Promise<void>>();
+
+async function takeTurn(directory: string, signal: AbortSignal | undefined, deadline: number): Promise<() => void> {
+    const previous = turns.get(directory) ?? Promise.resolve();
+    let release = (): void => undefined;
+    const mine = new Promise<void>(resolve => {release = resolve;});
+    // The turn passes on only after the predecessor and this waiter have both finished with it.
+    const gate = previous.then(() => mine);
+    turns.set(directory, gate);
+    const leave = (): void => {release(); void gate.then(() => {if (turns.get(directory) === gate) {turns.delete(directory);}});};
+    const stop = new AbortController();
+    try {
+        const interruptions: Promise<void>[] = [];
+        if (deadline !== Infinity) {
+            interruptions.push(delay(Math.max(0, deadline - Date.now()), undefined, { signal: stop.signal }).then(() => {throw new LockTimeoutError(directory);}));
+        }
+        if (signal) {
+            interruptions.push(new Promise<never>((_, reject) => {
+                if (signal.aborted) {reject(signal.reason);}
+                else {signal.addEventListener('abort', () => reject(signal.reason), { once: true, signal: stop.signal });}
+            }));
+        }
+        await Promise.race([previous, ...interruptions]);
+    } catch (error) {leave(); throw error;}
+    finally {stop.abort();}
+    return leave;
+}
+
 /** A process-owned directory serializes shared storage without blocking the host.
  * The work receives a signal that aborts if the lock is taken over meanwhile, and
  * the call then fails instead of reporting success for work another writer may have raced. */
 export async function withLock<T>(directory: string, signal: AbortSignal | undefined, work: (signal?: AbortSignal) => Promise<T>,
     options: LockOptions = {}): Promise<T> {
+    const deadline = options.timeoutMs === undefined ? Infinity : Date.now() + options.timeoutMs;
+    const leave = await takeTurn(directory, signal, deadline);
+    try {return await withDiskLock(directory, signal, work, deadline);}
+    finally {leave();}
+}
+
+async function withDiskLock<T>(directory: string, signal: AbortSignal | undefined, work: (signal?: AbortSignal) => Promise<T>, deadline: number): Promise<T> {
     await fs.mkdir(path.dirname(directory), { recursive: true });
-    const owner = `${process.pid}-${randomUUID()}`;
-    const deadline = options.timeoutMs === undefined ? Infinity : Date.now() + options.timeoutMs, silence: Silence = new Map();
+    const owner = `${process.pid}-${randomUUID()}`, silence: Silence = new Map();
     for (;;) {
         signal?.throwIfAborted();
         try {await fs.mkdir(directory); break;}
@@ -75,7 +112,7 @@ export async function withLock<T>(directory: string, signal: AbortSignal | undef
                 await fs.unlink(path.join(directory, name)); await fs.rmdir(directory);
             }
             // Recover a process that died between mkdir and publishing its PID.
-            if (!names.length && Date.now() - (await fs.stat(directory)).mtimeMs > 10_000) {await fs.rmdir(directory);}
+            if (!names.length && Date.now() - (await fs.stat(directory)).mtimeMs > lockTiming.ownerlessMs) {await fs.rmdir(directory);}
         } catch (error) {if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes((error as NodeJS.ErrnoException).code ?? '')) {throw error;}}
         const remaining = deadline - Date.now();
         if (remaining <= 0) {throw new LockTimeoutError(directory);}

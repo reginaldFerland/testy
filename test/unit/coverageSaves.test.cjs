@@ -15,14 +15,15 @@ async function fixture(t){
  const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-saves-')));
  t.after(()=>fs.rm(root,{recursive:true,force:true}));
  /** @type {string[]} */ const outputs=[];
+ const cache=new CoverageCache(path.join(root,'state'),()=>{});
+ /** @type {string[][]} */ const writes=[],save=cache.save.bind(cache);
+ cache.save=async(/** @type {import('../../out/core/coverage').CoverageDelta} */ delta,/** @type {AbortSignal | undefined} */ signal)=>{writes.push(delta.traces.map(trace=>trace.groupId));return save(delta,signal);};
  const engine=new TestEngine({roots:[root],storage:path.join(root,'state'),tools:root,analyzer:'',configuration:()=>/** @type {any} */ ({}) /* partial mock: unused by these scenarios */,events:{
-  output:text=>outputs.push(text),phase(){},selected(){},discovered(){},coverage(){},invalidated(){},started(){},result(){}}}),
-  /** @type {any} */ internals=engine; // private members: cache, saveDelay, options
- /** @type {string[][]} */ const writes=[],save=internals.cache.save.bind(internals.cache);
- internals.cache.save=async(/** @type {import('../../out/core/coverage').CoverageDelta} */ delta,/** @type {AbortSignal | undefined} */ signal)=>{writes.push(delta.traces.map(trace=>trace.groupId));return save(delta,signal);};
+  output:text=>outputs.push(text),phase(){},selected(){},discovered(){},coverage(){},invalidated(){},started(){},result(){}}},{coverageCache:cache}),
+  /** @type {any} */ internals=engine; // private members: saveDelay, options
  internals.saveDelay=40;
  const persisted=async()=>{const store=new CoverageStore();await new CoverageCache(path.join(root,'state'),()=>{}).restore(store);return [...store.traces.keys()].sort();};
- return {root,engine,internals,writes,save,outputs,persisted};
+ return {root,engine,internals,cache,writes,save,outputs,persisted};
 }
 const trace=(/** @type {string} */ groupId,/** @type {string} */ file=`/w/${groupId}.cs`)=>({groupId,dependencies:[file],coverage:[{file,hash:'h',lines:[{line:1,hits:1}]}],reliable:true,timestamp:1,inputs:{}});
 const live=new Set(['a','b','c','d','e']);
@@ -42,7 +43,7 @@ test('contributions completing close together share one locked write',async t=>{
 
 test('a cancelled caller stops waiting for a blocked save, and its changes stay pending in order',async t=>{
  const f=await fixture(t);/** @type {() => void} */ let release=()=>{};const gate=new Promise(resolve=>{release=()=>resolve(undefined);});
- f.internals.cache.save=async(/** @type {import('../../out/core/coverage').CoverageDelta} */ delta,/** @type {AbortSignal | undefined} */ signal)=>{f.writes.push(delta.traces.map(trace=>trace.groupId));await gate;return f.save(delta,signal);};
+ f.cache.save=async(/** @type {import('../../out/core/coverage').CoverageDelta} */ delta,/** @type {AbortSignal | undefined} */ signal)=>{f.writes.push(delta.traces.map(trace=>trace.groupId));await gate;return f.save(delta,signal);};
  f.engine.coverage.replace([trace('a')],live);
  const first=f.engine.save();
  await delay(10);
@@ -65,7 +66,7 @@ test('cancelling a run mid-batch keeps committed files published and flushes the
  f.internals.options.events.coverage=()=>coverage.push([...engine.coverage.traces.keys()]);
  const sessions={canRunParallel:()=>true,run:async(/** @type {import('../../out/core/model').TestFile[]} */ groups,/** @type {unknown} */ _before,/** @type {unknown} */ _worker)=>{
   if(groups[0].id==='a'){return {results:[{id:'a1',name:'a',fullyQualifiedName:'a',outcome:'passed',duration:1}],coverageAvailable:true,executedGroups:groups,trace:trace('a')};}
-  await new Promise((_,reject)=>controller.signal.addEventListener('abort',()=>reject(Object.assign(new Error('cancelled'),{name:'AbortError'})),{once:true}));
+  await new Promise((_,reject)=>controller.signal.addEventListener('abort',()=>reject(Object.assign(new Error('cancelled'),{name:'AbortError'})),{once:true}));return undefined;
  }};
  const baseline=new Baseline('generation',new Map());
  const run=/** @type {any} */ ({controller,signal:controller.signal,config:{mode:'affected',configuration:'Debug'},configured:{coverage:true,configuration:'Debug'},manualOperation:false,changes:[],testLimit:2,topology:engine.topology,baseline}); // partial RunContext: only the fields executeSelection reads here

@@ -1,0 +1,66 @@
+// Regression scenarios: generated files, compiler configuration and SDK candidates changing around runs. Fixtures are shared through support/regressions.cjs.
+const {test}=require('node:test');
+const assert=require('node:assert/strict');
+const fs=require('node:fs/promises');
+const path=require('node:path');
+const {normalizePath}=require('../../out/core/paths');
+const {defined,fixture}=require('./support/regressions.cjs');
+
+test('build-generated header rewrites do not cancel baselines and generator data stays tracked',{timeout:90000},async t=>{
+ const f=await fixture(t);f.config.coverage=false;
+ const generated=f.file('ImpactDemo/Stamped.cs'),project=f.file('ImpactDemo/ImpactDemo.csproj'),input=f.file('ImpactDemo/generator.data');
+ await fs.writeFile(generated,'// Placeholder: the build adds the generated header');await fs.writeFile(input,'initial generator input');
+ const target='<ItemGroup><AdditionalFiles Include="generator.data"/></ItemGroup><Target Name="GeneratedStamp" BeforeTargets="CoreCompile"><PropertyGroup><GeneratedStamp>$([System.DateTime]::UtcNow.Ticks)</GeneratedStamp></PropertyGroup><WriteLinesToFile File="$(MSBuildProjectDirectory)/Stamped.cs" Lines="// &lt;auto-generated/&gt; $(GeneratedStamp)" Overwrite="true" /></Target>';
+ await fs.writeFile(project,(await fs.readFile(project,'utf8')).replace('</Project>',target+'</Project>'));
+ /** @type {string[]} */ const invalidated=[];f.internal.options.events.invalidated=(/** @type {string[]} */ files)=>invalidated.push(...files);
+ assert.equal((await f.run([],true)).passed,3);assert.equal((await f.run([],true)).passed,3);
+ assert.deepEqual(invalidated,[]);assert.equal(f.engine.hashes.has(generated),false);assert.equal(f.engine.hashes.has(input),true);
+ await fs.writeFile(input,'changed generator input');assert.equal((await f.run([input])).passed,3);
+});
+
+test('missing observer reports keep coverage visible and selection conservative',{timeout:90000},async t=>{
+ const f=await fixture(t),{RuntimeObservation}=require('../../out/services/runtimeObservation'),original=RuntimeObservation.prototype.dependencies;
+ RuntimeObservation.prototype.dependencies=async()=>{throw new Error('controlled missing observation');};
+ try {
+  const result=await f.run([],true);assert.equal(result.passed,3);assert.equal(result.coverageAvailable,true);
+  assert.ok([...f.engine.coverage.traces.values()].every(trace=>!trace.reliable));
+  assert.ok(f.engine.coverage.summarize(f.engine.hashes).some(source=>source.covered>0));
+  assert.equal(f.engine.select([f.file('ImpactDemo/Calculator.cs')]).groups.length,2);
+ }finally{RuntimeObservation.prototype.dependencies=original;}
+});
+
+test('creating and deleting compiler configuration during tests prevents obsolete checkpoints',{timeout:90000},async t=>{
+ const f=await fixture(t),config=f.file('.editorconfig');
+ await f.run([],true);assert.ok(f.engine.knownFiles.includes(config));
+ for(const action of ['create','delete']){
+  const before=new Map(f.engine.coverage.traces);let changed=false;
+  f.state.started=()=>{if(changed)return;changed=true;if(action==='create')require('node:fs').writeFileSync(config,'root = true\n[*.cs]\ndotnet_diagnostic.CS0168.severity = none\n');else require('node:fs').unlinkSync(config);};
+  await assert.rejects(f.run([],true),{name:'AbortError'});assert.equal(changed,true);
+  for(const [id,trace] of before){assert.equal(defined(f.engine.coverage.traces.get(id)).timestamp,trace.timestamp,'obsolete contribution did not replace the checkpoint');}
+  f.state.started=()=>{};assert.equal((await f.run([],true)).passed,3);
+ }
+});
+
+test('SDK candidate creation and deletion during execution discard obsolete checkpoints',{timeout:90000},async t=>{
+ const f=await fixture(t);await fs.rm(f.file('global.json'));const global=normalizePath(path.join(f.temp,'global.json'));
+ await f.run([],true);assert.ok(f.engine.knownFiles.includes(global));
+ for(const action of ['create','delete']){
+  const before=new Map(f.engine.coverage.traces);let changed=false;
+  f.state.started=()=>{if(changed)return;changed=true;if(action==='create')require('node:fs').writeFileSync(global,'{}');else require('node:fs').unlinkSync(global);};
+  await assert.rejects(f.run([],true),{name:'AbortError'});assert.equal(changed,true);
+  for(const [id,trace] of before)assert.equal(defined(f.engine.coverage.traces.get(id)).timestamp,trace.timestamp);
+  f.state.started=()=>{};assert.equal((await f.run([],true)).passed,3);assert.equal(f.engine.hashes.has(global),action==='create');
+ }
+});
+
+test('UTF-16 generated build outputs do not invalidate the initial baseline',{timeout:90000},async t=>{
+ const f=await fixture(t);f.config.coverage=false;const project=f.file('ImpactDemo/ImpactDemo.csproj'),original=await fs.readFile(project,'utf8');
+ const generated=f.file('ImpactDemo/UnicodeOutput.cs');
+ for(const [encoding,bom] of /** @type {[string, number[]][]} */ ([['Unicode',[0xff,0xfe]],['unicodeFFFE',[0xfe,0xff]]])){
+  const content=Buffer.from('// <auto-generated/> initial\n','utf16le');if(encoding==='unicodeFFFE')content.swap16();
+  await fs.writeFile(generated,Buffer.concat([Buffer.from(bom),content]));
+  await fs.writeFile(project,original.replace('</Project>',`<Target Name="EmitUnicode" BeforeTargets="CoreCompile"><PropertyGroup><GeneratedStamp>$([System.DateTime]::UtcNow.Ticks)</GeneratedStamp></PropertyGroup><WriteLinesToFile File="$(MSBuildProjectDirectory)/UnicodeOutput.cs" Lines="// &lt;auto-generated/&gt; $(GeneratedStamp)" Encoding="${encoding}" Overwrite="true" /></Target></Project>`));
+  for(let attempt=0;attempt<2;attempt++)assert.equal((await f.run([],true)).passed,3,encoding);
+  assert.equal(f.engine.hashes.has(generated),false);assert.equal(f.engine.sources.isGenerated(generated),true);
+ }
+});

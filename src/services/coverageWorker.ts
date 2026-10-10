@@ -21,11 +21,16 @@ export interface CoverageResponse {
     readonly files?: readonly { readonly file: string; readonly values: Float64Array; readonly declarations?: readonly Declaration[] | undefined }[];
 }
 
+/** A Cobertura report this large is not parsed whole into one string; the run reports coverage as unavailable. */
+export const maxReportBytes = 256 * 1024 * 1024;
+
 let allowed: { readonly version: number; readonly files: ReadonlySet<string> } = { version: 0, files: new Set() };
 
 async function handle(request: CoverageRequest, list: typeof allowed): Promise<void> {
     try {
         if (list.version !== request.filesVersion) {throw new Error('The coverage parser received an outdated file list.');}
+        const size = (await fs.stat(request.report)).size;
+        if (size > maxReportBytes) {throw new Error(`The coverage report is ${size} bytes; the limit is ${maxReportBytes}.`);}
         const xml = await fs.readFile(request.report, 'utf8');
         const declarations = new Map<string, readonly Declaration[]>();
         const parsed = parseCobertura(xml, request.cwd, list.files, declarations);

@@ -179,10 +179,11 @@ test('retain before lazy loading and clean disposal cannot resurrect removed ent
 });
 
 test('failed and cancelled snapshot publication leaves the prior complete epoch readable and removes own temporaries',async t=>{
- const f=await fixture(t),original=await fs.readFile(f.snapshot,'utf8'),write=patchable.writeFile,rename=patchable.rename,abort=new AbortController();
+ const f=await fixture(t),original=await fs.readFile(f.snapshot,'utf8'),open=patchable.open,rename=patchable.rename,abort=new AbortController();
  const graph=f.graph.map(project=>({...project,assemblyName:'Updated'}));evaluationInputs.set(graph,f.inputs);
- patchable.writeFile=async function(/** @type {any} */ file,/** @type {any[]} */ ...args){const result=await write.call(this,file,...args);if(String(file).startsWith(f.snapshot+'.')&&String(file).endsWith('.tmp'))abort.abort();return result;};
- try{await assert.rejects(f.cache.put(new Map([[f.file,graph]]),'context',abort.signal),{name:'AbortError'});}finally{patchable.writeFile=write;}
+ // Cancellation arrives once the temporary exists, before its bytes are written.
+ patchable.open=async function(/** @type {any} */ file,/** @type {any[]} */ ...args){const result=await open.call(this,file,...args);if(String(file).startsWith(f.snapshot+'.')&&String(file).endsWith('.tmp'))abort.abort();return result;};
+ try{await assert.rejects(f.cache.put(new Map([[f.file,graph]]),'context',abort.signal),{name:'AbortError'});}finally{patchable.open=open;}
  assert.equal(await fs.readFile(f.snapshot,'utf8'),original);assert.ok((await fs.readdir(f.storage)).every(file=>!file.endsWith('.tmp')));
  patchable.rename=async function(/** @type {any} */ from,/** @type {any} */ to){if(String(to)===f.snapshot)throw Object.assign(new Error('controlled rename failure'),{code:'EACCES'});return rename.call(this,from,to);};
  try{await f.cache.put(new Map([[f.file,graph]]),'context',t.signal);}finally{patchable.rename=rename;}
@@ -276,4 +277,23 @@ test('cancellation after an atomic snapshot rename still reaches the admission c
  const after=JSON.parse(await fs.readFile(f.snapshot,'utf8'));assert.notEqual(after.epoch,before.epoch,'a complete durable candidate may remain after the commit boundary');
  assert.deepEqual((await f.get()).get(f.file),graph,'the committed candidate still requires normal validation on a new instance');
  assert.ok((await fs.readdir(f.storage)).every(file=>!file.endsWith('.tmp')));
+});
+
+test('a fresh install without a snapshot is an empty one: no log line and no repeated reads',async t=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-evaluation-fresh-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));
+ const storage=path.join(root,'state'),logs=/** @type {string[]} */ ([]),lstat=patchable.lstat;let reads=0;
+ patchable.lstat=async function(/** @type {any} */ file,/** @type {any[]} */ ...args){if(String(file)===path.join(storage,fileName))reads++;return lstat.call(this,file,...args);};
+ try{
+  const cache=new ProjectEvaluationCache(storage,{},text=>logs.push(text));
+  assert.equal((await cache.get(['/workspace/A.csproj'],'context',t.signal)).size,0);assert.equal((await cache.get(['/workspace/A.csproj'],'context',t.signal)).size,0);
+  assert.deepEqual(logs,[]);assert.equal(reads,1,'the missing snapshot is read once');
+ }finally{patchable.lstat=lstat;}
+});
+
+test('an entry the snapshot limits leave out is reported with its size and node counts',async t=>{
+ const f=await fixture(t),entries=/** @type {Snapshot} */ (await readEvaluationSnapshot(f.storage)).entries,logs=/** @type {string[]} */ ([]);
+ const {writeEvaluationSnapshot}=require('../../out/services/projectEvaluationStorage');
+ await writeEvaluationSnapshot(f.storage,entries,{maxBytes:256},t.signal,text=>logs.push(text));
+ assert.equal(logs.length,1);assert.match(logs[0],/P0\.csproj is not saved.*limit 256.*project nodes.*limit 4096/);
+ assert.equal(/** @type {Snapshot} */ (await readEvaluationSnapshot(f.storage)).entries.size,0);
 });

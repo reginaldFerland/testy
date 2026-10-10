@@ -12,17 +12,16 @@ const trace=(/** @type {number} */ index,/** @type {Source[]} */ sources)=>({gro
  sourceIds:sources.map((/** @type {Source} */ source)=>source.id),coverage:[{file:sources[0].file,hash:'v1',lines:[{line:1,hits:0.5}]}]});
 
 /**
+ * Records are written by the production cache, so they reference its table.
  * @param {import('node:test').TestContext} t
- * @param {Record<string, any>[]} sources
- * @param {Record<string, any>[]} traces
+ * @param {Source[]} sources
+ * @param {ReturnType<typeof trace>[]} traces
  */
 async function fixture(t,sources,traces){
- const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-parallel-cache-read-')),directory=path.join(root,'coverage-v2');
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-parallel-cache-read-')),directory=path.join(root,'coverage-v3');
  t.after(()=>fs.rm(root,{recursive:true,force:true}));
- for(const [kind,records]of /** @type {[string, Record<string, any>[]][]} */ ([['sources',sources],['traces',traces]])){
-  await fs.mkdir(path.join(directory,kind),{recursive:true});
-  for(const record of records)await fs.writeFile(path.join(directory,kind,`${kind==='sources'?record.id:contentHash(record.groupId)}.json`),JSON.stringify(record));
- }
+ await new CoverageCache(root,()=>{}).save({sources,traces,removedSources:[],removedTraces:[]});
+ for(const kind of ['sources','traces'])await fs.mkdir(path.join(directory,kind),{recursive:true});
  return{root,directory};
 }
 
@@ -71,9 +70,18 @@ function observe(worker,t){
   release(/** @type {string} */ key){worker.postMessage({release:key});},releaseAll(){worker.postMessage({all:true});}};
 }
 
-// File times are environmental; the snapshot reports one entry per trace.
+// File times are environmental; the snapshot reports one entry per trace. Table references are resolved for comparison.
 /** @param {{result: Promise<any>}} probe */
-async function settled(probe){const {stats,...rest}=await probe.result;assert.equal(stats.length,rest.traces.length);return rest;}
+async function settled(probe){
+ const {stats,tables,generation:_generation,compact:_compact,checkpoint:_checkpoint,...rest}=await probe.result;assert.equal(stats.length,rest.traces.length);
+ return{...rest,traces:rest.traces.map((/** @type {any} */ trace)=>{
+  const entries=tables[trace.table];
+  return{groupId:trace.groupId,timestamp:trace.timestamp,reliable:trace.reliable,stale:trace.stale,
+   dependencies:[...trace.dependencies].map(index=>entries[index]),...trace.moduleProjects?{moduleProjects:[...trace.moduleProjects].map(index=>entries[index])}:{},
+   inputs:Object.fromEntries([...trace.inputs].map(index=>[entries[entries[index][0]],entries[index][1]])),sourceIds:trace.sourceIds,coverage:trace.coverage.map((/** @type {any} */ file)=>({
+    file:rest.sources[file.source].file,hash:rest.sources[file.source].hash,values:file.values}))};
+ })};
+}
 /**
  * @param {Source[]} sources
  * @param {ReturnType<typeof trace>[]} traces
@@ -100,16 +108,19 @@ test('one four-read pool spans both cache tables and preserves exact inventory o
  await probe.wait(()=>probe.events.filter(event=>event.event==='admitted').length===5);
  assert.equal(probe.events.find(event=>event.event==='completed').key,initial[3].key);
  probe.releaseAll();const snapshot=await probe.result;
- assert.equal(probe.active,0);assert.equal(probe.peak,4);assert.equal(probe.events.filter(event=>event.event==='admitted').length,8);
+ assert.equal(probe.active,0);assert.equal(probe.peak,4);
+ assert.equal(probe.events.filter(event=>event.event==='admitted'&&/^(sources|traces)/.test(event.key)).length,8,'each record is read once; the table follows');
  assert.deepEqual(await settled({result:Promise.resolve(snapshot)}),expected([...sources].reverse(),[...traces].reverse()));
 });
 
 test('out-of-order corrupt and missing records retain warning order, valid records and incomplete-cache pruning protection',{timeout:10000},async t=>{
- const sources=[source(0),source(1)],traces=[trace(0,sources.slice(0,1))],{root,directory}=await fixture(t,sources,traces);
+ const sources=[source(0),source(1)],traces=[trace(0,sources.slice(0,1))],{root,directory}=await fixture(t,sources,[...traces,trace(1,sources)]);
  const brokenSource=`${'a'.repeat(64)}.json`,missingSource=`${'b'.repeat(64)}.json`,brokenTrace=`${'c'.repeat(64)}.json`,invalidTrace=`${contentHash('group1')}.json`;
  await fs.writeFile(path.join(directory,'sources',brokenSource),'{broken');
  await fs.writeFile(path.join(directory,'traces',brokenTrace),'{broken');
- await fs.writeFile(path.join(directory,'traces',invalidTrace),JSON.stringify({...trace(1,sources),coverage:[{file:sources[0].file,hash:'v1',lines:[{line:999,hits:1}]}]}));
+ // A well-formed record whose coverage names a line its source does not have.
+ const invalid=JSON.parse(await fs.readFile(path.join(directory,'traces',invalidTrace),'utf8'));invalid.coverage[0][1]=999;
+ await fs.writeFile(path.join(directory,'traces',invalidTrace),JSON.stringify(invalid));
  await fs.writeFile(path.join(directory,'sources','ignored.tmp'),'{broken');
  const order={sources:[brokenSource,`${sources[0].id}.json`,missingSource,`${sources[1].id}.json`],traces:[brokenTrace,invalidTrace,`${contentHash(traces[0].groupId)}.json`]};
  const worker=new threads.Worker(bootstrap({directory,order,gate:true}),{eval:true,workerData:directory}),probe=observe(worker,t);

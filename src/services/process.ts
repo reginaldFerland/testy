@@ -19,6 +19,9 @@ export class Shutdown extends Cancelled {}
  * waits this long for it to close before reporting the error anyway. */
 export const processTiming = { errorCloseMs: 5_000 };
 
+/** The tail of each stream kept in a ProcessResult. */
+const capturedOutputChars = 1024 * 1024;
+
 export interface ProcessResult {
     readonly code: number;
     readonly stdout: string;
@@ -76,8 +79,9 @@ export function startProcess(command: string, args: readonly string[], options: 
     let killTimer: NodeJS.Timeout | undefined;
     let failure: Error | undefined;
     let failureTimer: NodeJS.Timeout | undefined;
-    const stdout = new OutputTail(8 * 1024 * 1024);
-    const stderr = new OutputTail(8 * 1024 * 1024);
+    // Callers use the captured text only for diagnostics and short answers; streaming goes through options.output.
+    const stdout = new OutputTail(capturedOutputChars);
+    const stderr = new OutputTail(capturedOutputChars);
     const teardowns: Promise<void>[] = [];
     let posixCleanup: Promise<void> | undefined;
     const cleanPosix = (): void => {

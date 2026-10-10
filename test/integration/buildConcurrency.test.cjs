@@ -1,9 +1,10 @@
 // @ts-check
 const {test}=require('node:test');
+// Patch the defining modules: `projects` only re-exports them through read-only bindings.
+const projectBuild=require('../../out/services/projectBuild');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {TestEngine}=require('../../out/services/engine');
-const projects=require('../../out/services/projects');
 const {normalizePath}=require('../../out/core/paths');
 
 test('excluded production dependencies still serialize conflicting reference contexts',{timeout:120000},async t=>{
@@ -23,8 +24,8 @@ test('excluded production dependencies still serialize conflicting reference con
  const engine=new TestEngine({roots:[root],storage:path.join(temp,'state'),tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),
   configuration:()=>({dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:false,excludes:['**/Excluded/**'],testArguments:[],timeout:60000,maxParallelProjects:2,maxParallelTestFiles:2}),
   events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result:(group,result)=>results.push({project:group.project,...result}),started(){},coverage(){},invalidated(){}}});
- const build=projects.buildProjects,batches=/** @type {string[][]} */([]);let active=0,peak=0;
- projects.buildProjects=async(...args)=>{
+ const build=projectBuild.buildProjects,batches=/** @type {string[][]} */([]);let active=0,peak=0;
+ projectBuild.buildProjects=async(...args)=>{
   const roots=args[1];batches.push(roots.map(project=>project.file));
   assert.equal(roots.length,1,'the excluded Core contexts share outputs and must build in separate waves');
   peak=Math.max(peak,++active);try{return await build(...args);}finally{active--;}
@@ -40,5 +41,5 @@ test('excluded production dependencies still serialize conflicting reference con
   const manual=await engine.run({files:[],full:false},new AbortController().signal,{groups:new Set([first.id]),coverage:false});
   assert.equal(manual.tests,1);assert.equal(manual.passed,1,output.join(''));assert.deepEqual(batches,[[targets[0]]]);
   assert.deepEqual(await fs.readdir(path.join(temp,'state','runs')),[],'all isolated test outputs are cleaned up');
- }finally{projects.buildProjects=build;}
+ }finally{projectBuild.buildProjects=build;}
 });

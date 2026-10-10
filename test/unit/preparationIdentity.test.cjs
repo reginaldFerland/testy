@@ -25,7 +25,7 @@ async function identityFixture(config={}){
   },resolveOwnedCommand:async (/** @type {string} */ command)=>{
    const found=resolved.get(command)??(path.win32.isAbsolute(command)?command:undefined);
    if(!found)throw new Error(`Cannot find ${command} on PATH`);return found;
-  }}:name==='./preparedOutputCache'?{preparationToolIdentity:async(/** @type {string} */ file,/** @type {unknown} */ env,/** @type {AbortSignal | undefined} */ signal,/** @type {string} */ cwd,/** @type {unknown} */ identities)=>{
+  }}:name==='./preparationTools'?{preparationToolIdentity:async(/** @type {string} */ file,/** @type {unknown} */ env,/** @type {AbortSignal | undefined} */ signal,/** @type {string} */ cwd,/** @type {unknown} */ identities)=>{
    signal?.throwIfAborted();assert.equal(path.win32.isAbsolute(file),true,'only explicitly resolved file paths reach asset hashing');
    hashes.push({file,env,cwd,identities});await config.hash?.(file);signal?.throwIfAborted();
    return `${file}:${versions.get(file)??'v1'}`;
@@ -109,7 +109,7 @@ async function runnerFixture(t,config={}){
  const state={instruments:[],discoveries:[],runs:[],messages:[],legacy:[]};
  const modules={
   './preparationIdentity':platform==='win32'?identity:{windowsPreparationTools:()=>{throw new Error('POSIX must retain its existing identity path');}},
-  './preparedOutputCache':{...cacheTools,preparationToolIdentity:async (/** @type {string | undefined} */ command)=>{state.legacy.push(command);return command===undefined?undefined:`legacy:${command}`;}},
+  './preparationTools':{preparationToolIdentity:async (/** @type {string | undefined} */ command)=>{state.legacy.push(command);return command===undefined?undefined:`legacy:${command}`;}},
   './process':{...processTools,runProcess:async(/** @type {string} */ command,/** @type {string[]} */ args,/** @type {any} */ options)=>{
    assert.equal(args[0],'instrument');state.instruments.push({command,session:args[3],cleanupDescendants:options.cleanupDescendants});
    await fs.appendFile(args[1],`:instrumented:${args[3]}`);return{code:0,stdout:'',stderr:''};

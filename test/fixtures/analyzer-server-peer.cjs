@@ -13,8 +13,8 @@ const readline = require('node:readline');
         return;
     }
     if (process.env.PEER_START === 'exit') {process.stderr.write('refusing to start'); process.exit(7);}
-    if (process.env.PEER_START === 'noise') {process.stdout.write('not the protocol\n'); return setTimeout(() => undefined, 60_000);}
-    if (process.env.PEER_START === 'silent') {return setTimeout(() => undefined, 60_000);}
+    if (process.env.PEER_START === 'noise') {process.stdout.write('not the protocol\n'); setTimeout(() => undefined, 60_000); return;}
+    if (process.env.PEER_START === 'silent') {setTimeout(() => undefined, 60_000); return;}
     /** @param {string} line */
     const out = line => process.stdout.write(line + '\n');
     const waiting = new Map();
@@ -31,6 +31,7 @@ const readline = require('node:readline');
         switch (request.mode ?? request.aliasSources?.[0]) {
             case 'echo': return out(`{"id":${id},"result":${JSON.stringify({ pid: process.pid, cwd, env: process.env.PEER_MARK ?? null, request })}}`);
             case 'fail': return out(`{"id":${id},"error":${JSON.stringify('boom\nwith lines')}}`);
+            case 'busy': return out(`{"id":${id},"error":{"type":"Testy.Analysis.ServerBusy","message":"too many requests waiting"}}`);
             case 'crash': return process.exit(3);
             case 'garbage': return out('nonsense');
             // A response line that never ends.

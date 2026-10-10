@@ -17,6 +17,12 @@ dist/processhost/Testy.ProcessHost.runtimeconfig.json
 l10n/bundle.l10n.json
 media/covered-dark.svg
 media/covered-light.svg
+media/failed-dark.svg
+media/failed-light.svg
+media/passed-dark.svg
+media/passed-light.svg
+media/pending-dark.svg
+media/pending-light.svg
 media/stale-dark.svg
 media/stale-light.svg
 media/uncovered-dark.svg

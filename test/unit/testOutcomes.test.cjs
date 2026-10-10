@@ -21,31 +21,33 @@ async function storage(t){
 /**
  * @param {string} state
  * @param {string[]} [outputs]
+ * @param {Partial<import('../../out/services/engine').EngineServices>} [services]
  */
-function engine(state,outputs=[]){
- return new TestEngine({roots:[],storage:state,tools:state,analyzer:'',configuration:()=>/** @type {any} */ ({}) /* partial mock: unused by these scenarios */,events:{output:(/** @type {string} */ text)=>outputs.push(text),phase(){},selected(){},discovered(){},coverage(){},invalidated(){},started(){},result(){}}});
+function engine(state,outputs=[],services={}){
+ return new TestEngine({roots:[],storage:state,tools:state,analyzer:'',configuration:()=>/** @type {any} */ ({}) /* partial mock: unused by these scenarios */,events:{output:(/** @type {string} */ text)=>outputs.push(text),phase(){},selected(){},discovered(){},coverage(){},invalidated(){},started(){},result(){}}},services);
 }
 /**
  * @param {string} state
  * @param {string[]} [outputs]
+ * @param {Partial<import('../../out/services/engine').EngineServices>} [services]
  */
-async function restored(state,outputs){const next=engine(state,outputs);await next.restore();return next;}
+async function restored(state,outputs,services){const next=engine(state,outputs,services);await next.restore();return next;}
 // `lastOutcomes` is a private member of the engine.
 const record=(/** @type {any} */ target,/** @type {string} */ group,/** @type {Record<string, import('../../out/core/runPolicy').TestOutcome>} */ outcomes)=>{for(const [id,outcome] of Object.entries(outcomes))target.lastOutcomes.record(group,{id,outcome});};
 const outcomes=(/** @type {TestEngine} */ target)=>Object.fromEntries([...target.outcomes].sort(([a],[b])=>a.localeCompare(b)));
-const saved=(/** @type {string} */ state,/** @type {string} */ group)=>fs.readFile(path.join(state,'coverage-v2','outcomes',`${contentHash(group)}.json`),'utf8').then(JSON.parse,()=>undefined);
+const saved=(/** @type {string} */ state,/** @type {string} */ group)=>fs.readFile(path.join(state,'coverage-v3','outcomes',`${contentHash(group)}.json`),'utf8').then(JSON.parse,()=>undefined);
 
 test('test outcomes round-trip through the coverage cache as one compact record per file',async t=>{
  const state=await storage(t),first=engine(state);
  record(first,'/w/A.cs',{a1:'passed',a2:'failed',a3:'skipped'});record(first,'/w/B.cs',{b1:'errored',b2:'passed'});
  await first.save();
- assert.deepEqual(await saved(state,'/w/A.cs'),{groupId:'/w/A.cs',passed:['a1'],failed:['a2'],skipped:['a3']},'ids are listed under their outcome; empty lists are omitted');
- const second=await restored(state);
+ assert.deepEqual(await saved(state,'/w/A.cs'),{format:3,groupId:'/w/A.cs',passed:['a1'],failed:['a2'],skipped:['a3']},'ids are listed under their outcome; empty lists are omitted');
+ /** @type {SavedDelta[]} */ const writes=[],coverageCache=new CoverageCache(state,()=>{}),save=coverageCache.save.bind(coverageCache);
+ coverageCache.save=async(/** @type {SavedDelta} */ delta,/** @type {AbortSignal | undefined} */ signal)=>{writes.push(delta);return save(delta,signal);};
+ const second=await restored(state,[],{coverageCache});
  assert.deepEqual(outcomes(second),{'/w/A.cs:a1':'passed','/w/A.cs:a2':'failed','/w/A.cs:a3':'skipped','/w/B.cs:b1':'errored','/w/B.cs:b2':'passed'});
  assert.equal(second.failing.has('/w/A.cs'),true);assert.equal(second.failing.has('/w/B.cs'),true);
- /** @type {any} */ const internals=second; // private member: cache
- /** @type {SavedDelta[]} */ const writes=[],save=internals.cache.save.bind(internals.cache);internals.cache.save=async(/** @type {SavedDelta} */ delta,/** @type {AbortSignal | undefined} */ signal)=>{writes.push(delta);return save(delta,signal);};
- await second.save();assert.deepEqual(writes.filter(delta=>delta.outcomes.saved.length||delta.outcomes.removed.length),[],'restored outcomes are not written back');
+ writes.length=0;await second.save();assert.deepEqual(writes.filter(delta=>delta.outcomes.saved.length||delta.outcomes.removed.length),[],'restored outcomes are not written back');
  record(second,'/w/A.cs',{a2:'passed'});await second.save();
  assert.deepEqual(writes.filter(delta=>delta.outcomes.saved.length).map(delta=>delta.outcomes.saved.map((/** @type {import('../../out/core/runPolicy').StoredOutcomes} */ stored)=>stored.groupId)),[['/w/A.cs']],'only a changed file is rewritten');
  const third=await restored(state);assert.equal(third.outcomes.get('/w/A.cs:a2'),'passed');assert.equal(third.failing.has('/w/A.cs'),false);
@@ -55,13 +57,13 @@ test('a cache written before outcomes were saved still restores its coverage, wi
  const state=await storage(t);
  /** @type {string[]} */ const outputs=[];
  await new CoverageCache(state,()=>{}).save({sources:[],traces:[{groupId:'/w/A.cs',sourceIds:[],dependencies:['/w/A.cs'],coverage:[],reliable:false,timestamp:1,inputs:{}}],removedSources:[],removedTraces:[]});
- await assert.rejects(fs.access(path.join(state,'coverage-v2','outcomes')),'the old layout has no outcome records');
+ await assert.rejects(fs.access(path.join(state,'coverage-v3','outcomes')),'the old layout has no outcome records');
  const loaded=await restored(state,outputs);
  assert.deepEqual([...loaded.coverage.traces.keys()],['/w/A.cs']);assert.equal(loaded.outcomes.size,0);assert.equal(loaded.failing.has('/w/A.cs'),false);
  assert.deepEqual(outputs.filter(text=>/unavailable/.test(text)),[]);
  // A corrupt record is discarded on its own; valid outcomes and the coverage are kept.
  record(loaded,'/w/A.cs',{a1:'failed'});await loaded.save();
- const corrupt=path.join(state,'coverage-v2','outcomes',`${contentHash('/w/B.cs')}.json`);
+ const corrupt=path.join(state,'coverage-v3','outcomes',`${contentHash('/w/B.cs')}.json`);
  await fs.writeFile(corrupt,'{"groupId":"/w/B.cs","failed":[1]}');
  const again=await restored(state,outputs);
  assert.deepEqual(outcomes(again),{'/w/A.cs:a1':'failed'});assert.equal(again.coverage.traces.size,1);
@@ -85,7 +87,7 @@ test('outcomes of tests and files that no longer exist are dropped and deleted f
  // Reset forgets every outcome, on disk too.
  const second=await restored(state);await second.reset();
  assert.equal(second.outcomes.size,0);assert.equal((await restored(state)).outcomes.size,0);
- assert.deepEqual(await fs.readdir(path.join(state,'coverage-v2','outcomes')),[]);
+ assert.deepEqual(await fs.readdir(path.join(state,'coverage-v3','outcomes')),[]);
 });
 
 test('a failed save keeps changed outcomes pending for the next one',()=>{

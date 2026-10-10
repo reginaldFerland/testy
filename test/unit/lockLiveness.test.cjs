@@ -46,7 +46,8 @@ test('a live holder whose heartbeat pauses past the stale limit keeps its lock',
 test('a holder that loses its lock aborts its work and fails instead of reporting success',async t=>{
  const root=await temporary(t,'lock-lost'),lock=path.join(root,'state.lock');
  const takeOver=async()=>{const [name]=await fs.readdir(lock);await fs.unlink(path.join(lock,name));};
- timing(t,{heartbeatMs:20});keepAlive(t);
+ // The takeover leaves an ownerless directory, which the next holder reclaims after ownerlessMs.
+ timing(t,{heartbeatMs:20,ownerlessMs:200});keepAlive(t);
  /** @type {any} */ let reason;
  await assert.rejects(withLock(lock,undefined,async signal=>{
   const lockSignal=/** @type {AbortSignal} */ (signal);
@@ -56,7 +57,7 @@ test('a holder that loses its lock aborts its work and fails instead of reportin
  }),LockLostError);
  assert.ok(reason instanceof LockLostError,'the work is told through its signal');
  // A takeover between heartbeats is still caught before success is reported.
- timing(t,{heartbeatMs:60_000});
+ timing(t,{heartbeatMs:60_000,ownerlessMs:200});
  await assert.rejects(withLock(lock,undefined,async()=>{await takeOver();return 'finished';}),LockLostError);
  assert.equal(await withLock(lock,undefined,async()=>'ordinary locks still work'),'ordinary locks still work');
 });
@@ -143,4 +144,18 @@ test('Windows restarts its watch when the contender itself was suspended or the 
  const refresh=setInterval(()=>{const now=new Date();void fs.utimes(owner,now,now).catch(()=>undefined);},20);t.after(()=>clearInterval(refresh));
  await assert.rejects(withLock(lock,AbortSignal.timeout(500),async()=>assert.fail('a beating holder keeps its lock')),{name:/^(AbortError|TimeoutError)$/});
  clearInterval(refresh);await fs.access(owner);
+});
+
+test('in-process contenders for one lock run in arrival order and a queued waiter honours its timeout and signal',async t=>{
+ const root=await temporary(t,'lock-queue'),directory=path.join(root,'lock');
+ const first=gate(),order=/** @type {string[]} */ ([]);
+ const holder=withLock(directory,undefined,async()=>{order.push('first');await first.closed;});
+ const second=withLock(directory,undefined,async()=>{order.push('second');});
+ const third=withLock(directory,undefined,async()=>{order.push('third');});
+ await assert.rejects(withLock(directory,undefined,async()=>undefined,{timeoutMs:20}),LockTimeoutError);
+ const abort=new AbortController(),aborted=withLock(directory,abort.signal,async()=>undefined);abort.abort();
+ await assert.rejects(aborted,{name:'AbortError'});
+ first.open();await Promise.all([holder,second,third]);
+ assert.deepEqual(order,['first','second','third']);
+ assert.equal(await withLock(directory,undefined,async()=>'free'),'free');
 });

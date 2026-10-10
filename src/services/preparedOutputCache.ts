@@ -1,5 +1,5 @@
 import * as fs from 'node:fs/promises';
-import { constants, Stats } from 'node:fs';
+import { Stats } from 'node:fs';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { Semaphore, walkTree } from '../core/concurrency';
@@ -28,17 +28,19 @@ async function memoizedHash(file: string, stat: Stats, memo: HashMemo | undefine
 export async function outputManifest(directory: string, signal?: AbortSignal, followLinks = true, memo?: HashMemo): Promise<Manifest> {
     const records: string[] = [];
     let bytes = 0;
-    interface Job { readonly file: string; readonly relative: string; readonly ancestors: ReadonlySet<string>; }
-    const visit = async ({ file, relative, ancestors }: Job): Promise<Job[]> => {
+    /** `link` is known for listed entries, whose parent is a real path; only links and the root need resolving. */
+    interface Job { readonly file: string; readonly relative: string; readonly ancestors: ReadonlySet<string>; readonly link?: boolean; }
+    const visit = async ({ file, relative, ancestors, link }: Job): Promise<Job[]> => {
         signal?.throwIfAborted();
-        if (!followLinks && (await fs.lstat(file)).isSymbolicLink()) {throw new Error('A retained preparation contains a symbolic link.');}
-        const real = await fs.realpath(file), stat = await fs.stat(real);
+        link ??= (await fs.lstat(file)).isSymbolicLink();
+        if (!followLinks && link) {throw new Error('A retained preparation contains a symbolic link.');}
+        const real = link || !relative ? await fs.realpath(file) : file, stat = await fs.stat(real);
         if (stat.isDirectory()) {
             if (ancestors.has(real)) {throw new Error(`A cycle in the build output prevents safe test isolation: ${file}`);}
             records.push(JSON.stringify([relative, 'directory', stat.mode]));
             const next = new Set([...ancestors, real]);
-            return (await fs.readdir(real)).filter(name => name !== 'TestResults')
-                .map(name => ({ file: path.join(real, name), relative: path.join(relative, name), ancestors: next }));
+            return (await fs.readdir(real, { withFileTypes: true })).filter(entry => entry.name !== 'TestResults')
+                .map(entry => ({ file: path.join(real, entry.name), relative: path.join(relative, entry.name), ancestors: next, link: entry.isSymbolicLink() }));
         } else if (stat.isFile()) {
             const hash = await memoizedHash(real, stat, memo, signal);
             bytes += stat.size;
@@ -50,93 +52,6 @@ export async function outputManifest(directory: string, signal?: AbortSignal, fo
     await walkTree([{ file: directory, relative: '', ancestors: new Set<string>() }], visit, readers, signal);
     records.sort();
     return { hash: createHash('sha256').update(records.join('\n')).digest('hex'), bytes };
-}
-
-/** Hash commands by their resolved bytes, and tool-store dependencies when present. */
-export async function preparationToolIdentity(command: string | undefined, env: NodeJS.ProcessEnv, signal?: AbortSignal, cwd = process.cwd(),
-    identities?: Map<string, Promise<string>>): Promise<string | undefined> {
-    if (!command) {return undefined;}
-    const hasDirectory = command.includes(path.sep) || command.includes('/');
-    const searchPath = !path.isAbsolute(command) && !hasDirectory;
-    // POSIX '..' traverses symlinks before its parent; lexical normalization
-    // could fingerprint a different file from the process launcher.
-    const fromCwd = (file: string): string => path.isAbsolute(file) ? file : `${cwd}/${file}`;
-    const candidates = path.isAbsolute(command) ? [command] : hasDirectory
-        ? [process.platform === 'win32' ? path.resolve(cwd, command) : fromCwd(command)]
-        : process.platform === 'win32'
-            ? (env.PATH ?? '').split(path.delimiter).flatMap(directory => ['', ...(env.PATHEXT ?? '.EXE;.CMD;.BAT').split(';')]
-                .map(extension => path.resolve(cwd, directory, command + extension)))
-            // Missing PATH uses platform-specific launch defaults; do not guess cwd.
-            : env.PATH === undefined ? [] : env.PATH.split(path.delimiter).map(directory => `${fromCwd(directory)}/${command}`);
-    for (const candidate of candidates) {
-        try {
-            const resolved = await fs.realpath(candidate);
-            if (!(await fs.stat(resolved)).isFile()) {continue;}
-            if (searchPath && process.platform !== 'win32') {
-                try {await fs.access(resolved, constants.X_OK);} catch {continue;}
-            }
-            // Resolve each command in its actual working directory before sharing bytes.
-            // Relative PATH entries can name different tools in different projects.
-            // The cache can outlive a run, so a metadata stamp detects reinstalls.
-            const key = identities ? `${resolved}\0${await toolStamp(resolved)}` : resolved;
-            let identity = identities?.get(key);
-            if (!identity) {
-                identity = hashPreparationTool(resolved, signal);
-                identities?.set(key, identity);
-                const pending = identity, cache = identities;
-                if (cache) {void pending.catch(() => {if (cache.get(key) === pending) {cache.delete(key);}});}
-            }
-            return await identity;
-        } catch (error) {
-            signal?.throwIfAborted();
-            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {throw error;}
-        }
-    }
-    // A command without a verifiable executable must not produce a reusable entry.
-    throw new Error(`Cannot identify preparation tool: ${command}`);
-}
-
-/** Cheap metadata covering the files hashPreparationTool reads: the command,
- * its managed siblings, and each tool-store package directory. */
-async function toolStamp(resolved: string): Promise<string> {
-    const stat = async (file: string): Promise<string> => fs.stat(file, { bigint: true })
-        .then(value => `${value.size}:${value.mtimeNs}:${value.ctimeNs}:${value.ino}`, () => 'missing');
-    const directory = path.dirname(resolved), base = path.basename(resolved, path.extname(resolved));
-    const parts = [await stat(resolved), ...await Promise.all(['.dll', '.deps.json', '.runtimeconfig.json'].map(extension => stat(path.join(directory, base + extension))))];
-    const store = path.join(directory, '.store');
-    const packages = await fs.readdir(store).catch(() => [] as string[]);
-    parts.push(await stat(store), ...await Promise.all(packages.sort().map(async name => `${name}=${await stat(path.join(store, name))}`)));
-    return parts.join('|');
-}
-
-async function hashPreparationTool(resolved: string, signal?: AbortSignal): Promise<string> {
-    const parts = [resolved, await fileHash(resolved, signal)];
-    // A .NET tool shim can stay unchanged when its managed payload changes.
-    const store = path.join(path.dirname(resolved), '.store');
-    if (await fs.stat(store).then(stat => stat.isDirectory(), () => false)) {parts.push((await outputManifest(store, signal)).hash);}
-    // Custom managed collectors may keep their runtime assets beside the executable.
-    for (const extension of ['.dll', '.deps.json', '.runtimeconfig.json']) {
-        const sibling = path.join(path.dirname(resolved), path.basename(resolved, path.extname(resolved)) + extension);
-        if (sibling !== resolved && await fs.stat(sibling).then(stat => stat.isFile(), () => false)) {parts.push(sibling, await fileHash(sibling, signal));}
-    }
-    const deps = path.join(path.dirname(resolved), path.basename(resolved, path.extname(resolved)) + '.deps.json');
-    if (await fs.stat(deps).then(stat => stat.isFile(), () => false)) {
-        const assets = JSON.parse(await fs.readFile(deps, 'utf8')) as { targets?: Record<string, Record<string, Record<string, unknown>>> };
-        const files = new Set<string>();
-        for (const target of Object.values(assets.targets ?? {})) {for (const library of Object.values(target)) {
-            for (const kind of ['runtime', 'native', 'resources', 'runtimeTargets']) {
-                const references = library[kind];
-                if (references && typeof references === 'object') {for (const name of Object.keys(references)) {
-                    for (const relative of [name, path.basename(name)]) {
-                        const file = path.resolve(path.dirname(resolved), relative);
-                        if (file.startsWith(path.dirname(resolved) + path.sep) && await fs.stat(file).then(stat => stat.isFile(), () => false)) {files.add(file);}
-                    }
-                }}
-            }
-        }}
-        for (const file of [...files].sort()) {parts.push(file, await fileHash(file, signal));}
-    }
-    return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
 }
 
 export interface PreparedArtifact {
@@ -238,6 +153,9 @@ export class PreparedOutputCache {
     private readonly entries = new Set<Entry>();
     private readonly claimedSlots = new Set<string>();
     private readonly hashes = new HashMemo(50_000);
+    /** Source walks in flight, so the lanes of one target share a walk; `sequence` orders their starts. */
+    private readonly walks = new Map<string, { readonly started: number; readonly manifest: Promise<Manifest> }>();
+    private sequence = 0;
     private readonly pending = new Set<Promise<unknown>>();
     private owner: Promise<RunOutputLease | PreparedStorageLease> | undefined;
     private closed = false;
@@ -266,9 +184,13 @@ export class PreparedOutputCache {
         })());
     }
 
-    async acquire(source: string, context: string, create: (root: string) => Promise<PreparedArtifact>, signal?: AbortSignal, slot?: string): Promise<PreparedArtifactLease | undefined> {
+    /** A sequence mark: a source walk started after it reads every build output written before it was taken. */
+    mark(): number { return this.sequence; }
+
+    /** `after`: a mark taken once the build of `source` completed (see mark), so a walk of an older build is never joined. */
+    async acquire(source: string, context: string, create: (root: string) => Promise<PreparedArtifact>, signal?: AbortSignal, slot?: string, after = -1): Promise<PreparedArtifactLease | undefined> {
         if (this.closed) {throw new Error('The prepared output cache has been disposed.');}
-        const pending = this.acquireArtifact(source, context, create, signal, slot);
+        const pending = this.acquireArtifact(source, context, create, signal, slot, after);
         return this.track(pending);
     }
 
@@ -278,22 +200,43 @@ export class PreparedOutputCache {
         return pending;
     }
 
-    private async acquireArtifact(source: string, context: string, create: (root: string) => Promise<PreparedArtifact>, signal?: AbortSignal, slot?: string): Promise<PreparedArtifactLease | undefined> {
+    private async acquireArtifact(source: string, context: string, create: (root: string) => Promise<PreparedArtifact>, signal?: AbortSignal, slot?: string, after = -1): Promise<PreparedArtifactLease | undefined> {
         let sourceManifest: Manifest | undefined, root: string;
-        try {
-            this.owner ??= this.claimOwner(signal).catch((error: unknown) => {this.owner = undefined; throw error;});
-            root = (await this.owner).directory;
-        } catch (error) {signal?.throwIfAborted(); this.log(`Prepared output storage unavailable; preparing without the cache. ${String(error)}\n`); return undefined;}
-        try {sourceManifest = await outputManifest(source, signal, true, this.hashes);}
-        catch (error) {signal?.throwIfAborted(); this.log(`Build output could not be fingerprinted; its preparation will not be reused. ${String(error)}\n`);}
+        // A claimed slot is refused before any directory is read.
         if (slot && this.claimedSlots.has(slot)) {return undefined;}
         if (slot) {this.claimedSlots.add(slot);}
+        let held = false;
         try {
+            try {
+                this.owner ??= this.claimOwner(signal).catch((error: unknown) => {this.owner = undefined; throw error;});
+                root = (await this.owner).directory;
+            } catch (error) {signal?.throwIfAborted(); this.log(`Prepared output storage unavailable; preparing without the cache. ${String(error)}\n`); return undefined;}
+            try {sourceManifest = await this.sourceManifest(source, signal, after);}
+            catch (error) {signal?.throwIfAborted(); this.log(`Build output could not be fingerprinted; its preparation will not be reused. ${String(error)}\n`);}
             const lease = await this.acquireOwnedArtifact(source, context, sourceManifest, root, create, signal, slot);
-            if (!lease && slot) {this.claimedSlots.delete(slot);}
+            held = !!lease;
             return lease;
+        } finally {if (slot && !held) {this.claimedSlots.delete(slot);}}
+    }
+    /** Walk a build output, joining a walk another lane started. Only walks that began after `after`
+     * (a sequence mark) qualify, since earlier ones may predate changes the caller must observe. */
+    private async sourceManifest(source: string, signal?: AbortSignal, after = -1): Promise<Manifest> {
+        let walk = this.walks.get(source);
+        if (!walk || walk.started <= after) {
+            const manifest = outputManifest(source, signal, true, this.hashes);
+            const own = walk = { started: ++this.sequence, manifest };
+            this.walks.set(source, own);
+            const forget = (): void => {if (this.walks.get(source) === own) {this.walks.delete(source);}};
+            manifest.then(forget, forget);
+            return manifest;
         }
-        catch (error) {if (slot) {this.claimedSlots.delete(slot);} throw error;}
+        try {return await walk.manifest;}
+        catch {
+            // The shared walk may have been cut short by another lane's signal.
+            signal?.throwIfAborted();
+            if (this.walks.get(source) === walk) {this.walks.delete(source);}
+            return outputManifest(source, signal, true, this.hashes);
+        }
     }
 
     private async claimOwner(signal?: AbortSignal): Promise<RunOutputLease | PreparedStorageLease> {
@@ -349,7 +292,8 @@ export class PreparedOutputCache {
                 } else {await entry.artifact.output.restore(signal);}
                 return this.lease(entry, true);
             } catch (error) {
-                signal?.throwIfAborted();
+                // An interrupted validation leaves the entry as it was found; the next acquire revalidates it.
+                if (signal?.aborted) {entry.active = false; entry.finish(); signal.throwIfAborted();}
                 this.log(`Discarding a retained preparation: ${String(error)}\n`);
                 if (!await this.tryRemove(entry, signal) && slot) {return undefined;}
             }
@@ -360,10 +304,11 @@ export class PreparedOutputCache {
         let artifact: PreparedArtifact;
         try {artifact = await create(directory);} catch (error) {await removeOutput(directory); throw error;}
         let template: Manifest, unchanged = false;
+        const mark = this.sequence;
         try {
             template = await outputManifest(artifact.output.template, signal, true, this.hashes);
             // Files the first manifest hashed are not read again unless they changed since.
-            unchanged = !!sourceManifest && (await outputManifest(source, signal, true, this.hashes)).hash === sourceManifest.hash;
+            unchanged = !!sourceManifest && (await this.sourceManifest(source, signal, mark)).hash === sourceManifest.hash;
         } catch (error) {
             if (signal?.aborted) {await removeOutput(directory); throw error;}
             return this.temporary(artifact, slot);

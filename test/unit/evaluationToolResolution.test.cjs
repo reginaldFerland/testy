@@ -60,7 +60,7 @@ test('evaluation identity preserves literal POSIX backslashes and declines missi
  assert.deepEqual(await f.read(installation.host,[project]),expected,'an explicit host does not need PATH');
 });
 
-test('Windows evaluation identity uses mixed-case Path, cwd precedence and selected COM refusal',
+test('[windows] Windows evaluation identity uses mixed-case Path, cwd precedence and selected COM refusal',
  {skip:process.platform!=='win32'},async t=>{
  const f=await fixture(t),left=await f.install('left','01'),right=await f.install('right','02');
  environment(t,right.directory);process.env.Pathext='.BAT;.EXE';

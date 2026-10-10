@@ -138,13 +138,13 @@ test('a cancel message interrupts the running request by id and the server keeps
  assert.equal(await next(),'{"id":3,"result":["A"]}');
 });
 
-test('the server exits when its input closes and keeps TieredPGO on for long-lived work',{timeout:60000},async t=>{
+test('the server exits when its input closes and leaves TieredPGO on (the default) for long-lived work',{timeout:60000},async t=>{
  const runtime=JSON.parse(await fs.readFile(analyzer.replace(/\.dll$/,'.runtimeconfig.json'),'utf8'));
- assert.equal(runtime.runtimeOptions.configProperties['System.Runtime.TieredPGO'],true);
+ assert.notEqual(runtime.runtimeOptions.configProperties['System.Runtime.TieredPGO'],false);
  const child=spawn('dotnet',[analyzer,'--server'],{stdio:['pipe','pipe','pipe']});
  t.after(()=>{child.kill();});
  const ready=await new Promise((resolve,reject)=>{child.once('error',reject);child.stdout.once('data',data=>resolve(String(data)));});
- assert.match(ready,/^\{"ready":1,"roslyn":"5\.\d+\.\d+\.\d+ from [^"]+"\}\n$/);
+ assert.match(ready,/^\{"ready":1,"roslyn":"5\.\d+\.\d+\.\d+ from [^"]+","version":"\d+\.\d+\.\d+[^"]*"\}\n$/);
  const exited=new Promise(resolve=>child.once('exit',(code,signal)=>resolve([code,signal])));
  child.stdin.end();
  assert.deepEqual(await exited,[0,null]);

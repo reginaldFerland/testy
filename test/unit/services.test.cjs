@@ -33,6 +33,18 @@ async function temporary(t) {
  const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy services '));
  t.after(()=>fs.rm(root,{recursive:true,force:true})); return root;
 }
+/**
+ * Polls until the condition holds (no fixed sleeps); a generous deadline absorbs slow CI hosts, such as the Windows process owner starting dotnet.
+ * @param {() => boolean | Promise<boolean>} condition
+ */
+async function until(condition,timeoutMs=20000) {
+ const deadline=Date.now()+timeoutMs;
+ while(!(await condition())){if(Date.now()>deadline)throw new Error('Timed out waiting for the condition');await delay(10);}
+}
+/** @param {number} pid */
+function alive(pid) {try{process.kill(pid,0);return true;}catch{return false;}}
+/** @param {string} file */
+async function readJson(file) {try{return JSON.parse(await fs.readFile(file,'utf8'));}catch{return undefined;}}
 function trace(groupId='one',hash='v1') {
  return {groupId,dependencies:['/code.cs','/tests.cs'],inputs:{'/code.cs':hash,'/tests.cs':'test1'},timestamp:1,reliable:true,
   coverage:[{file:'/code.cs',hash,lines:[{line:1,hits:1},{line:2,hits:0}]}]};
@@ -40,7 +52,8 @@ function trace(groupId='one',hash='v1') {
 
 test('cache membership restoration yields, publishes atomically and respects concurrent changes',async t=>{
  const {contentHash}=require('../../out/core/paths'),{setImmediate:turn}=require('node:timers/promises');
- const sources=Array.from({length:1000},(_,i)=>({file:`/Source${i}.cs`,hash:'v1',id:contentHash(`/Source${i}.cs\0v1`),lines:[1,2]}));
+ // 300 sources in each of 200 traces keep restore well past its 512-item yield interval.
+ const sources=Array.from({length:300},(_,i)=>({file:`/Source${i}.cs`,hash:'v1',id:contentHash(`/Source${i}.cs\0v1`),lines:[1,2]}));
  const sourceIds=sources.map(source=>source.id);
  const traces=Array.from({length:200},(_,i)=>({groupId:`group${i}`,sourceIds,dependencies:[`/Source${i}.cs`],inputs:{[`/Source${i}.cs`]:'v1'},reliable:true,stale:false,timestamp:1,
   coverage:[{file:`/Source${i}.cs`,hash:'v1',lines:[{line:1,hits:1}]}]}));
@@ -55,7 +68,7 @@ test('cache membership restoration yields, publishes atomically and respects con
  try {await new CoverageCache(root,()=>{}).restore(store);}finally{clearInterval(timer);}
  assert.ok(beats>1);assert.equal(store.traces.size,200);assert.equal(store.traces.has('live'),false);
  assert.deepEqual([...store.dependentGroups(['/Source199.cs'])],['group199']);
- const summary=/** @type {CoverageSummary} */ (store.summary('/Source999.cs',new Map([['/Source999.cs','v1']])));
+ const summary=/** @type {CoverageSummary} */ (store.summary('/Source299.cs',new Map([['/Source299.cs','v1']])));
  assert.equal(summary.groupIds.length,200);assert.equal(summary.total,2);assert.equal(summary.covered,0);assert.equal(summary.stale,true);
  assert.deepEqual(store.takeDelta(),{sources:[],traces:[],removedSources:[],removedTraces:[]});
  /** @type {any} Assigned by the promise executors below. */
@@ -63,7 +76,7 @@ test('cache membership restoration yields, publishes atomically and respects con
  /** @type {any} */
  let acquired;
  const gate=new Promise(resolve=>release=resolve),ready=new Promise(resolve=>acquired=resolve);
- const lock=withLock(path.join(root,'coverage-v2.lock'),undefined,async()=>{acquired();await gate;});await ready;
+ const lock=withLock(path.join(root,'coverage-v3.lock'),undefined,async()=>{acquired();await gate;});await ready;
  const waiting=new CoverageCache(root,()=>{}).restore(store);
  try {store.replace([trace('newer')],new Set(['newer']));}finally{release();await lock;}
  await waiting;assert.deepEqual([...store.traces.keys()],['newer'],'changes during disk I/O or lock waits also take precedence');
@@ -94,7 +107,8 @@ test('coverage caches summaries and shares zero-hit geometry; changed test input
  const delta=store.takeDelta(); assert.equal(delta.sources.length,1);assert.equal(delta.traces[0].coverage[0].lines.length,1);
  assert.equal(summary[0].stale,false);
  const changedHashes=new Map(hashes);changedHashes.set('/tests.cs','test2');
- const changed=store.summarize(changedHashes);
+ assert.equal(store.summarize(changedHashes)[0].stale,false,'a read alone does not change trace freshness');assert.equal(store.takeDelta().traces.length,0);
+ store.applyHashes(changedHashes);const changed=store.summarize(changedHashes);
  assert.equal(changed[0].stale,true);assert.equal(/** @type {StoredTrace} */ (store.traces.get('one')).reliable,true);
  assert.equal(/** @type {CoverageSummary} */ (store.summary('/code.cs',changedHashes)).stale,true);
 });
@@ -104,7 +118,7 @@ test('zero-hit coverage becomes stale with its test and recovers without losing 
  const zero={...trace(),dependencies:['/tests.cs'],inputs:{'/tests.cs':'test1'},coverage:[{file:'/code.cs',hash:'v1',lines:[{line:1,hits:0}]}]};
  store.replace([zero],new Set(['one']));
  assert.equal(/** @type {CoverageSummary} */ (store.summary('/code.cs',hashes)).stale,false);
- const changed=new Map(hashes);changed.set('/tests.cs','test2');
+ const changed=new Map(hashes);changed.set('/tests.cs','test2');store.applyHashes(changed);
  assert.equal(/** @type {CoverageSummary} */ (store.summary('/code.cs',changed)).stale,true);
  store.replace([{...zero,inputs:{'/tests.cs':'test2'}}],new Set(['one']));
  assert.equal(/** @type {CoverageSummary} */ (store.summary('/code.cs',changed)).stale,false);
@@ -119,8 +133,8 @@ test('cache tolerates corruption, concurrent writers and orphaned geometry',asyn
  first.replace([trace()],new Set(['one']));second.replace([trace('two')],new Set(['two']));
  const a=new CoverageCache(root,()=>{}), b=new CoverageCache(root,()=>{});
  await Promise.all([a.save(first.takeDelta()),b.save(second.takeDelta())]);
- await fs.writeFile(path.join(root,'coverage-v2/traces',`${'a'.repeat(64)}.json`),'{broken');
- await fs.writeFile(path.join(root,'coverage-v2/traces',`${'b'.repeat(64)}.json`),JSON.stringify({groupId:'bad',sourceIds:[],inputs:[],coverage:[]}));
+ await fs.writeFile(path.join(root,'coverage-v3/traces',`${'a'.repeat(64)}.json`),'{broken');
+ await fs.writeFile(path.join(root,'coverage-v3/traces',`${'b'.repeat(64)}.json`),JSON.stringify({groupId:'bad',sourceIds:[],inputs:[],coverage:[]}));
  const restored=new CoverageStore();await a.restore(restored);
  assert.equal(restored.traces.size,2);
  assert.ok([...restored.traces.values()].every(trace=>trace.stale && !trace.reliable));
@@ -136,15 +150,13 @@ test('cache lock cancellation returns before another writer releases ownership',
  let release;
  /** @type {any} */
  let acquired;const gate=new Promise(resolve=>release=resolve), ready=new Promise(resolve=>acquired=resolve);
- const held=withLock(path.join(root,'coverage-v2.lock'),undefined,async()=>{acquired();await gate;});await ready;
+ const held=withLock(path.join(root,'coverage-v3.lock'),undefined,async()=>{acquired();await gate;});await ready;
  const abort=new AbortController();
  try{
-  // Abort once the save is contending for the lock, not after a guessed delay.
-  const lock=path.join(root,'coverage-v2.lock'),mkdir=/** @type {any} */ (fs).mkdir;
-  /** @type {any} */
-  let contending;const waiting=new Promise(resolve=>contending=resolve);
-  /** @type {any} */ (fs).mkdir=async function(/** @type {import('node:fs').PathLike} */ target,/** @type {any[]} */ ...args){if(String(target)===lock)contending();return mkdir.call(this,target,...args);};
-  let saving;try{saving=cache.save(delta,abort.signal);await waiting;}finally{fs.mkdir=mkdir;}
+  // The save queues behind the in-process holder without polling the disk, so there is no
+  // lock attempt to observe; let it reach the queue by yielding to the event loop first.
+  const saving=cache.save(delta,abort.signal);
+  for(let turn=0;turn<5;turn++)await new Promise(resolve=>setImmediate(resolve));
   abort.abort();
   await assert.rejects(Promise.race([saving,delay(2000).then(()=>{throw new Error('cancellation waited on cache ownership');})]),{name:'AbortError'});
  }finally{release();await held;}
@@ -265,7 +277,7 @@ test('collector installation is atomic, cancelable and serialized across windows
  });
 });
 
-test('process cancellation terminates its own descendants before completion',async t=>{
+test('[windows] process cancellation terminates its own descendants before completion',async t=>{
  const root=await temporary(t), pidFile=path.join(root,'pid');
  const script=`const {spawn}=require('node:child_process');const fs=require('node:fs');const child=spawn(process.execPath,['-e','process.on("SIGTERM",()=>{});setInterval(()=>{},1000)'],{stdio:'ignore'});fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid));setInterval(()=>{},1000);`;
  const abort=new AbortController(), processRun=startProcess(process.execPath,['-e',script],{cwd:root,signal:abort.signal});
@@ -277,7 +289,7 @@ test('process cancellation terminates its own descendants before completion',asy
  assert.equal(alive,false);
 });
 
-test('normal process completion terminates descendants with ignored or inherited output',async t=>{
+test('[windows] normal process completion terminates descendants with ignored or inherited output',async t=>{
  const root=await temporary(t);
  for(const stdio of ['ignore','inherit']){
   const script=`const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:${JSON.stringify(stdio)}});process.stdout.write(String(child.pid));child.unref();`;
@@ -291,7 +303,7 @@ test('normal process completion terminates descendants with ignored or inherited
  }
 });
 
-test('owned process arguments preserve whitespace, quoting, Unicode and shell characters',async t=>{
+test('[windows] owned process arguments preserve whitespace, quoting, Unicode and shell characters',async t=>{
  const root=await temporary(t), args=['','space value','double"quote','trailing\\','日本語 😀','$(echo nope) & %PATH%'];
  const result=await startProcess(process.execPath,['-e','console.log(JSON.stringify(process.argv.slice(1)))','--',...args],{cwd:root}).done;
  assert.equal(result.code,0);assert.deepEqual(JSON.parse(result.stdout),args);
@@ -334,17 +346,18 @@ test('manual containers include newly discovered children while leaf selections 
 });
 
 test('dense caches larger than 16 MiB restore without losing geometry, yield host time and cancel atomically',async t=>{
- const root=await temporary(t), count=1000000, lines=Array.from({length:10000},(_,i)=>({line:i+1,hits:1}));
+ // Large hit counts keep the record above 16 MiB now that each line is stored as two numbers.
+ const root=await temporary(t), count=1000000, lines=Array.from({length:10000},(_,i)=>({line:i+1,hits:1e12+i}));
  const store=new CoverageStore();store.replace([{groupId:'dense',dependencies:[],inputs:{},timestamp:1,reliable:true,
   coverage:Array.from({length:100},(_,i)=>({file:`/source/File${i}.cs`,hash:'v1',lines}))}],new Set(['dense']));
  /** @type {string[]} */ const warnings=[];
  const cache=new CoverageCache(root,text=>warnings.push(text));await cache.save(store.takeDelta());
- const names=await fs.readdir(path.join(root,'coverage-v2/traces'));
- assert.ok((await fs.stat(path.join(root,'coverage-v2/traces',names[0]))).size>16*1024*1024);
+ const names=await fs.readdir(path.join(root,'coverage-v3/traces'));
+ assert.ok((await fs.stat(path.join(root,'coverage-v3/traces',names[0]))).size>16*1024*1024);
  let beats=0;const timer=setInterval(()=>beats++,5),restored=new CoverageStore();
  try{await cache.restore(restored);}finally{clearInterval(timer);}
  assert.equal(/** @type {StoredTrace} */ (restored.traces.get('dense')).coverage.reduce((sum,file)=>sum+file.lines.length,0),count);
- assert.equal((await fs.readdir(path.join(root,'coverage-v2/sources'))).length,100);assert.deepEqual(warnings,[]);assert.ok(beats>=3);
+ assert.equal((await fs.readdir(path.join(root,'coverage-v3/sources'))).length,100);assert.deepEqual(warnings,[]);assert.ok(beats>=3);
  // Cancel after the snapshot was read, as its records are applied: the target must stay untouched.
  const target=new CoverageStore(),abort=new AbortController(),apply=target.restorePackedAsync.bind(target);
  target.restorePackedAsync=(...args)=>{abort.abort();return apply(...args);};
@@ -384,13 +397,13 @@ test('cache restoration failure allows startup baseline and cancellation still s
  const {TestEngine}=require('../../out/services/engine');
  const root=await temporary(t);
  /** @type {string[]} */ const warnings=[];
- await fs.mkdir(path.join(root,'coverage-v2','epoch.json'),{recursive:true});
+ await fs.mkdir(path.join(root,'coverage-v3','epoch.json'),{recursive:true});
  /** @type {any} Partial options: only the storage root and output event matter for cache restoration. */
  const options={roots:[],storage:root,events:{output:(/** @type {string} */ text)=>warnings.push(text)}};
  const engine=new TestEngine(options);
  await engine.restore();assert.match(warnings.join(''),/fresh baseline/);assert.equal(engine.coverage.traces.size,0);
  // Optional cache failure leaves both the damaged path and recoverable data alone.
- assert.equal((await fs.stat(path.join(root,'coverage-v2','epoch.json'))).isDirectory(),true);
+ assert.equal((await fs.stat(path.join(root,'coverage-v3','epoch.json'))).isDirectory(),true);
  const abort=new AbortController();abort.abort();await assert.rejects(engine.restore(abort.signal),{name:'AbortError'});
 });
 
@@ -414,7 +427,8 @@ test('dense checkpoint preparation, aggregation and serialization yield, and abo
  }finally{clearInterval(timer);}
 });
 
-test('detached children are cleaned on normal completion and cancellation without touching unrelated processes',{skip:process.platform==='win32'},async t=>{
+test('[windows] detached children are cleaned on normal completion and cancellation without touching unrelated processes',async t=>{
+ // Windows: the ProcessHost job object (KILL_ON_JOB_CLOSE) plays the role of the POSIX owner; detached children stay in the job.
  const {spawn}=require('node:child_process');
  const root=await temporary(t),background=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore',detached:true});
  t.after(()=>{try{process.kill(/** @type {number} */ (background.pid),'SIGKILL');}catch{}});
@@ -422,11 +436,11 @@ test('detached children are cleaned on normal completion and cancellation withou
   const pidFile=path.join(root,`child-${cancel}`),abort=new AbortController();
   const script=`const child=require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});child.unref();require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(child.pid));${cancel?'setInterval(()=>{},1000);':''}`;
   const owned=startProcess(process.execPath,['-e',script],{cwd:root,signal:abort.signal,cleanupDescendants:true});
-  let pid;for(let i=0;i<100;i++){try{pid=Number(await fs.readFile(pidFile,'utf8'));break;}catch{await delay(10);}}
-  assert.ok(pid);t.after(()=>{try{process.kill(pid,'SIGKILL');}catch{}});
+  /** @type {number | undefined} */ let pid;await until(async()=>{pid=Number(await fs.readFile(pidFile,'utf8').catch(()=>''))||undefined;return pid!==undefined;});
+  const childPid=/** @type {number} */ (pid);t.after(()=>{try{process.kill(childPid,'SIGKILL');}catch{}});
   if(cancel){abort.abort();await assert.rejects(owned.done,{name:'AbortError'});}else{assert.equal((await owned.done).code,0);}
-  let alive=true;for(let i=0;i<100&&alive;i++){try{process.kill(pid,0);await delay(10);}catch{alive=false;}}
-  assert.equal(alive,false);assert.doesNotThrow(()=>process.kill(/** @type {number} */ (background.pid),0));
+  await until(()=>!alive(childPid));
+  assert.equal(alive(childPid),false);assert.doesNotThrow(()=>process.kill(/** @type {number} */ (background.pid),0));
  }
 });
 
@@ -447,7 +461,7 @@ test('cancelling streamed cache writes preserves the previous atomic trace and c
  try{await assert.rejects(cache.save(store.takeDelta(),abort.signal),{name:'AbortError'});}finally{fs.open=open;}
  assert.equal(interrupted,true,'cancel while writing the trace, after its first chunk');
  const restored=new CoverageStore();await cache.restore(restored);assert.equal(/** @type {StoredTrace} */ (restored.traces.get('one')).timestamp,1);
- assert.equal((await fs.readdir(path.join(root,'coverage-v2/traces'))).some(file=>file.endsWith('.tmp')),false);
+ assert.equal((await fs.readdir(path.join(root,'coverage-v3/traces'))).some(file=>file.endsWith('.tmp')),false);
 });
 
 test('asynchronous summaries retain concurrent editor reads and stale invalidations',async()=>{
@@ -500,7 +514,7 @@ test('build planning preserves conditional context edges without losing merged s
  assert.throws(()=>buildOrder(mergeProjects([...graph.slice(0,3),node('A','leaf',['a'])]),new Set(['Tests'])),/cycle/);
 });
 
-test('POSIX owner handles host death and kills detached descendants without touching other processes',{skip:process.platform==='win32',timeout:15000},async t=>{
+test('[windows] owner handles host death and kills detached descendants without touching other processes',{timeout:60000},async t=>{
  const {spawn}=require('node:child_process'),root=await temporary(t),pidFile=path.join(root,'pids'),ownerFile=path.join(root,'owner');
  const background=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
  /** @type {number[]} */
@@ -508,21 +522,27 @@ test('POSIX owner handles host death and kills detached descendants without touc
  const child=`const child=require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});child.unref();require('node:fs').writeFileSync(${JSON.stringify(pidFile)},JSON.stringify([process.pid,child.pid]));setInterval(()=>{},1000);`;
  const hostScript=`const owned=require(${JSON.stringify(path.resolve('out/services/process'))}).startProcess(process.execPath,['-e',${JSON.stringify(child)}],{cwd:${JSON.stringify(root)},cleanupDescendants:true});require('node:fs').writeFileSync(${JSON.stringify(ownerFile)},String(owned.child.pid));`;
  const host=spawn(process.execPath,['-e',hostScript],{stdio:'ignore'});pids.push(/** @type {number} */ (host.pid));
- let children;for(let i=0;i<300;i++){try{children=JSON.parse(await fs.readFile(pidFile,'utf8'));break;}catch{await delay(10);}}
- assert.ok(children);pids.push(...children,Number(await fs.readFile(ownerFile,'utf8')));
+ /** @type {number[] | undefined} */ let found;await until(async()=>(found=await readJson(pidFile))!==undefined);
+ const children=/** @type {number[]} */ (found);
+ await until(()=>fs.access(ownerFile).then(()=>true,()=>false));pids.push(...children,Number(await fs.readFile(ownerFile,'utf8')));
+ // Windows: the host's death closes the ProcessHost stdin, which terminates its job object.
  host.kill('SIGKILL');
- const alive=(/** @type {number} */ pid)=>{try{process.kill(pid,0);return true;}catch{return false;}};
- for(let i=0;i<500&&children.some(alive);i++){await delay(10);}
+ await until(()=>!children.some(alive));
  assert.deepEqual(children.filter(alive),[]);assert.equal(alive(/** @type {number} */ (background.pid)),true);
 });
 
-test('POSIX supervision handles launch failure, timeout and original Electron environment',{skip:process.platform==='win32'},async t=>{
+test('[windows] supervision enforces the time limit on a process that ignores termination',async t=>{
+ const root=await temporary(t);
+ await assert.rejects(startProcess(process.execPath,['-e','process.on("SIGTERM",()=>{});setInterval(()=>{},1000)'],{cwd:root,timeoutMs:200}).done,/time limit/);
+});
+
+// POSIX only: the exit code 127 launch-failure contract and the ELECTRON_RUN_AS_NODE restoration belong to posixOwner.ts; the Windows owner is Testy.ProcessHost.
+test('POSIX supervision handles launch failure and original Electron environment',{skip:process.platform==='win32'},async t=>{
  const root=await temporary(t);
  const missing=await startProcess(path.join(root,'does not exist'),[],{cwd:root}).done;
  assert.equal(missing.code,127);assert.match(missing.stderr,/ENOENT/);
  const result=await startProcess(process.execPath,['-e','console.log(process.env.ELECTRON_RUN_AS_NODE || "unset")'],{cwd:root,env:{ELECTRON_RUN_AS_NODE:undefined}}).done;
  assert.equal(result.stdout.trim(),'unset');
- await assert.rejects(startProcess(process.execPath,['-e','process.on("SIGTERM",()=>{});setInterval(()=>{},1000)'],{cwd:root,timeoutMs:200}).done,/time limit/);
 });
 
 test('build roots avoid redundant default contexts ahead of alternate binary consumers',()=>{

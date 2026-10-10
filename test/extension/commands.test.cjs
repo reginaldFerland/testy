@@ -71,6 +71,26 @@ suite('Testy commands in VS Code', () => {
         });
     }
 
+    test('hovering a covered line shows its covering test files with run and show links', async () => {
+        const greeting = snapshot().coverage.find((/** @type {{file: string}} */file) => file.file.endsWith('/Greeting.cs'));
+        assert.ok(greeting, 'retained coverage of Greeting.cs');
+        const line = greeting.lines.find((/** @type {{line: number, hits: number}} */entry) => entry.hits > 0);
+        assert.ok(line, 'a covered line');
+        const document = await vscode.workspace.openTextDocument(vscode.Uri.file(greeting.file));
+        await vscode.window.showTextDocument(document);
+        /** @type {string} */
+        let text = '';
+        // The hover reads coverage asynchronously; poll the providers until it answers.
+        for (let attempt = 0; attempt < 50 && !/Covered by/.test(text); attempt++) {
+            if (attempt) {await new Promise(resolve => setTimeout(resolve, 100));}
+            const hovers = /** @type {vscode.Hover[]} */ (await vscode.commands.executeCommand('vscode.executeHoverProvider', document.uri, new vscode.Position(line.line - 1, 0)));
+            text = hovers.flatMap(hover => hover.contents).map(content => typeof content === 'string' ? content : content.value).join('\n');
+        }
+        assert.match(text, /Covered by/);
+        assert.match(text, /command:testy\.runCoveringTests\?/);
+        assert.match(text, /command:testy\.showTest\?/);
+    });
+
     test('exportCoverage writes nothing when the save dialog is dismissed', async () => {
         let asked = false;
         await withWindow({

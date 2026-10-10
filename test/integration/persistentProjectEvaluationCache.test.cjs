@@ -1,13 +1,15 @@
+// Patch the defining modules: `projects` only re-exports them through read-only bindings.
+const projectGraph=require('../../out/services/projectGraph'),projectBuild=require('../../out/services/projectBuild');
 const {test}=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {TestEngine}=require('../../out/services/engine'),{normalizePath}=require('../../out/core/paths');
-const projects=require('../../out/services/projects'),processes=require('../../out/services/process');
+const processes=require('../../out/services/process');
 const xml=(/** @type {string} */ value)=>value.replaceAll('&','&amp;').replaceAll('"','&quot;').replaceAll('<','&lt;');
 const source=(/** @type {string} */ name)=>`using Microsoft.VisualStudio.TestTools.UnitTesting; [TestClass] public class ${name} { [TestMethod] public void Pass() => Assert.AreEqual(1, Core.Feature.Value); }`;
 /** @returns {{promise: Promise<void>, resolve: () => void}} */
 function deferred(){let resolve=()=>{}; // replaced synchronously by the promise executor
  /** @type {Promise<void>} */ const promise=new Promise(done=>{resolve=done;});return{promise,resolve};}
-/** @typedef {(...args: Parameters<typeof import('../../out/services/projects').restoreProjects>) => Promise<void>} RestoreHook */
+/** @typedef {(...args: Parameters<typeof import('../../out/services/projectBuild').restoreProjects>) => Promise<void>} RestoreHook */
 
 /**
  * @param {import('node:test').TestContext} t
@@ -38,14 +40,14 @@ async function fixture(t,{privateAnalyzer=false}={}){
  /** @type {string[]} */ const output=[];
  /** @type {import('../../out/services/engine').TestEngine} */ let engine;
  /** @type {RestoreHook | undefined} */ let afterRestore;
- const evaluate=projects.evaluateProjects,restoreProjects=projects.restoreProjects,runProcess=processes.runProcess;
- projects.evaluateProjects=async(...args)=>{inspect++;return evaluate(...args);};
- projects.restoreProjects=async(...args)=>{restore++;await restoreProjects(...args);await afterRestore?.(...args);};
+ const evaluate=projectGraph.evaluateProjects,restoreProjects=projectBuild.restoreProjects,runProcess=processes.runProcess;
+ projectGraph.evaluateProjects=async(...args)=>{inspect++;return evaluate(...args);};
+ projectBuild.restoreProjects=async(...args)=>{restore++;await restoreProjects(...args);await afterRestore?.(...args);};
  processes.runProcess=(command,args,...options)=>{if(args.length===1&&args[0]==='--version')sdk++;return runProcess(command,args,...options);};
  const create=()=>new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer,configuration:()=>config,
   events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result:(group,result)=>results.set(`${group.id}:${result.id}`,result),started(){},coverage(){},invalidated(){}}});
  engine=create();
- t.after(async()=>{control.abort();projects.evaluateProjects=evaluate;projects.restoreProjects=restoreProjects;processes.runProcess=runProcess;await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
+ t.after(async()=>{control.abort();projectGraph.evaluateProjects=evaluate;projectBuild.restoreProjects=restoreProjects;processes.runProcess=runProcess;await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
  return{temp,root,tests,project,coreProject,testFile,storage,payload,imported,marker,failure,analyzer,config,output,signal,
   get engine(){return engine;},counts:()=>({inspect,restore,sdk}),afterRestore:(/** @type {RestoreHook | undefined} */ hook)=>{afterRestore=hook;},
   async restart(){await engine.dispose();engine=create();await engine.restore(signal);},

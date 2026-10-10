@@ -21,7 +21,8 @@ export async function selectRun(host: EngineHost, run: RunContext, built: BuildR
     const impactChanges = baseline ? changes.filter(file => !baseline.inputs.has(file) || baseline.inputs.get(file) !== checkpointInputs.get(file)) : changes;
     const impactFrom = (index: ProjectIndex): Selection => selectTests(host.groups, host.projects, host.coverage.traces, impactChanges, config.mode, false, conservative, index,
         file => host.coverage.dependentGroups([file]), project => host.coverage.dependentProjects([project]));
-    const impact = mergeImpact(impactFrom(previousIndex), impactFrom(host.index));
+    // The indexes differ only after a structural refresh.
+    const impact = previousIndex === host.index ? impactFrom(host.index) : mergeImpact(impactFrom(previousIndex), impactFrom(host.index));
     const affected = new Set(impact.groups.map(group => group.id));
     let selection: Selection;
     if (manual?.discoverOnly) {
@@ -34,7 +35,9 @@ export async function selectRun(host: EngineHost, run: RunContext, built: BuildR
         // Affected files are learned again once the engine applies the checkpoint below.
         const pending = baselineOrder(host.groups.filter(group => affected.has(group.id) || !baseline.completed.has(group.id)), affected);
         const completed = host.groups.filter(group => baseline.completed.has(group.id) && !affected.has(group.id)).length;
-        selection = { groups: pending, reason: `Baseline (${completed}/${host.groups.length} files complete)`, fallback: false, causes: uniformCauses(pending, 'baseline') };
+        // A resumed baseline vouches for the files saved coverage still describes; the rest is what changed or was never learned.
+        const reason = baseline.resumed ? `Changes since the saved coverage (${completed}/${host.groups.length} files current)` : `Baseline (${completed}/${host.groups.length} files complete)`;
+        selection = { groups: pending, reason, fallback: false, causes: uniformCauses(pending, 'baseline') };
     } else {selection = { ...impact, groups: failingFirst(impact.groups, id => host.failing.has(id)) };}
     if (run.scope && !baseline) {
         const scoped = selectManual(selection.groups, run.scope, group => host.knownTests(group));

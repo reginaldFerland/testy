@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
+using System.Text;
 using System.Xml.Linq;
 using Microsoft.Build.Evaluation;
 using Microsoft.Build.FileSystem;
@@ -119,9 +120,19 @@ internal sealed partial class EvaluationInputs : MSBuildFileSystemBase
             return (xml, EvaluationInputs.Hash(saved), XNode.DeepEquals(xml.Root, disk.Root));
         }, LazyThreadSafetyMode.PublicationOnly)).Value;
     }
-    // Serialized by GraphJson (camelCase), which the TypeScript side reads.
+    // Serialized by GraphJson (camelCase), which the TypeScript side reads. In a snapshot the Values of a
+    // listing ("files", "directories", "entries", "imports") are the one string Listing returns; the
+    // TypeScript side only ever compares them with a fresh listing, so the names themselves are not kept.
     internal sealed record Query(string Kind, string Path, string? Pattern, bool Recursive, string[] Values);
     internal sealed record Snapshot(bool Reusable, string[] Files, IReadOnlyDictionary<string, string> Hashes, Query[] Queries, string[] ExcludedDirectories, string SdkDirectory, string? Reason);
+    // "<count>:<SHA-256 of the names>", the names as the TypeScript side spells them (lowercase on Windows), sorted, one per line.
+    // Keep in sync with listingDigest in src/services/projectEvaluationCache.ts.
+    internal static string Listing(IEnumerable<string> values)
+    {
+        var names = values.Select(value => OperatingSystem.IsWindows() ? value.ToLowerInvariant() : value).Order(StringComparer.Ordinal).ToArray();
+        return $"{names.Length}:{Hash(Encoding.UTF8.GetBytes(string.Join('\n', names)))}";
+    }
+    private static Query Digested(Query query) => query.Kind is "files" or "directories" or "entries" or "imports" ? query with { Values = [Listing(query.Values)] } : query;
     private readonly ConcurrentDictionary<string, Query> queries = new();
     private readonly ConcurrentDictionary<string, string> reads = new();
     private readonly Shared shared;
@@ -238,7 +249,7 @@ internal sealed partial class EvaluationInputs : MSBuildFileSystemBase
         // Sorted so equal evaluations serialize identically regardless of read order.
         return new Snapshot(reusable, imports.Concat(reads.Keys).Distinct().Order(StringComparer.Ordinal).ToArray(),
             reads.OrderBy(pair => pair.Key, StringComparer.Ordinal).ToDictionary(pair => pair.Key, pair => pair.Value),
-            recorded.Concat(shared.ResolverQueries).OrderBy(query => query.Kind, StringComparer.Ordinal).ThenBy(query => query.Path, StringComparer.Ordinal)
+            recorded.Concat(shared.ResolverQueries).Select(Digested).OrderBy(query => query.Kind, StringComparer.Ordinal).ThenBy(query => query.Path, StringComparer.Ordinal)
                 .ThenBy(query => query.Pattern, StringComparer.Ordinal).ThenBy(query => query.Recursive).ToArray(), outputs, sdk, reason);
     }
 

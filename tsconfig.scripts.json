@@ -1,0 +1,13 @@
+{
+	// Type information for the type-aware ESLint rules on the root and script ES modules (not a compile step).
+	"compilerOptions": {
+		"module": "Node16",
+		"target": "ES2024",
+		"lib": ["ES2024"],
+		"allowJs": true,
+		"checkJs": false,
+		"noEmit": true,
+		"types": ["node"]
+	},
+	"include": ["*.mjs", "scripts/**/*.mjs", "test/**/*.mjs"]
+}

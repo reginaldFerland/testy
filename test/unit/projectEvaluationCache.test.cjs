@@ -77,12 +77,13 @@ test('SDK output import globs observe new matching imports while ordinary output
  await fs.writeFile(path.join(obj,'App.csproj.new.props'),'<Project/>');assert.equal((await f.get()).size,0);
 });
 
-test('symbolic directory changes cannot reuse canonical source ownership from an earlier target',{skip:process.platform==='win32'},async t=>{
+test('symbolic directory changes cannot reuse canonical source ownership from an earlier target',async t=>{
+ // 'junction' is ignored on POSIX and avoids the symlink privilege requirement on Windows.
  const f=await fixture(t),a=path.join(f.root,'a'),b=path.join(f.root,'b'),link=path.join(f.root,'link');
- await fs.mkdir(a);await fs.mkdir(b);await fs.writeFile(path.join(a,'Same.cs'),'class Same {}');await fs.writeFile(path.join(b,'Same.cs'),'class Same {}');await fs.symlink(a,link);
+ await fs.mkdir(a);await fs.mkdir(b);await fs.writeFile(path.join(a,'Same.cs'),'class Same {}');await fs.writeFile(path.join(b,'Same.cs'),'class Same {}');await fs.symlink(a,link,'junction');
  f.inputs[0].queries.push({kind:'files',path:link,pattern:'*.cs',recursive:false,values:[path.join(link,'Same.cs')]});
  await f.cache.put(new Map([[f.file,f.graph]]),'context');assert.equal((await f.get()).size,1);
- await fs.rm(link);await fs.symlink(b,link);assert.equal((await f.get()).size,0);
+ await fs.rm(link);await fs.symlink(b,link,'junction');assert.equal((await f.get()).size,0);
 });
 
 test('evaluation tool identity validates native host layout, executable bytes and analyzer bytes',async(/** @type {import('node:test').TestContext} */ t)=>{
@@ -105,4 +106,13 @@ test('captured SDK resolver binaries and adjacent dependencies invalidate same-p
  const time=await fs.stat(resolver);await fs.writeFile(resolver,'resolver-v2');await fs.utimes(resolver,time.atime,time.mtime);assert.equal((await f.get()).size,0);
  await f.cache.put(new Map([[f.file,f.graph]]),'context');assert.equal((await f.get()).size,0,'changed bytes cannot be attached to the graph evaluated before replacement');
  f.inputs[0].hashes=await hashes();await f.cache.put(new Map([[f.file,f.graph]]),'context');await fs.writeFile(dependency,'dependency-v2');assert.equal((await f.get()).size,0);
+});
+
+test('a listing query stored as a digest (count and SHA-256 of the sorted names) validates like the names',async(/** @type {import('node:test').TestContext} */ t)=>{
+ const f=await fixture(t),{createHash}=require('node:crypto');
+ const names=process.platform==='win32'?[f.source.toLowerCase()]:[f.source];
+ f.inputs[0].queries[0]={...f.inputs[0].queries[0],values:[`${names.length}:${createHash('sha256').update(names.join('\n')).digest('hex')}`]};
+ await f.cache.put(new Map([[f.file,f.graph]]),'context');assert.equal((await f.get()).size,1);
+ const added=path.join(f.directory,'New.cs');await fs.writeFile(added,'class New {}');assert.equal((await f.get()).size,0);
+ await fs.rm(added);assert.equal((await f.get()).size,1);
 });

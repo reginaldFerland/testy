@@ -5,21 +5,44 @@ import { contentHash, preparePathNormalizer } from '../core/paths';
 import { Project } from '../core/model';
 import { EnvironmentError } from '../core/errors';
 import { ProcessOptions, requireSuccess, runProcess } from './process';
-import { analyzerServers, AnalyzerRequestFailed, AnalyzerServerUnavailable } from './analyzerServer';
+import { AnalyzerRequestFailed, AnalyzerServers, AnalyzerServerUnavailable } from './analyzerServer';
 import { roslynIdentity } from './analysisContext';
+import { untilAborted } from '../core/concurrency';
 
-export { disposeAnalyzerServers } from './analyzerServer';
+export interface AnalysisOptions extends ProcessOptions {
+    /** The long-lived analyzer processes of the caller (the engine owns and disposes them); without them, every request runs a one-shot process. */
+    readonly analyzerServers?: AnalyzerServers | undefined;
+}
+
+/** roslynIdentity resolves the host and stats every installed SDK, which is too much for each request of a
+ * burst. Concurrent and near-simultaneous requests share one answer; an SDK change is noticed within the window. */
+const identityWindowMs = 5_000;
+const identities = new Map<string, { readonly at: number; readonly identity: Promise<string> }>();
+function cachedRoslynIdentity(dotnet: string, options: ProcessOptions): Promise<string> {
+    const env = { ...process.env, ...options.env };
+    const key = JSON.stringify([dotnet, options.cwd, env.PATH ?? env.Path ?? null, env.PATHEXT ?? null, env.TESTY_ROSLYN_DIR ?? null]);
+    const now = Date.now(), known = identities.get(key);
+    if (known && now - known.at < identityWindowMs) {return options.signal ? untilAborted(known.identity, options.signal) : known.identity;}
+    // Shared work must not die with its first caller's cancellation; each caller stops waiting on its own.
+    const identity = roslynIdentity(dotnet, { ...options, signal: undefined });
+    if (identities.size >= 16) {identities.delete(identities.keys().next().value!);}
+    identities.set(key, { at: now, identity });
+    return options.signal ? untilAborted(identity, options.signal) : identity;
+}
 
 /** Run one analyzer request. A long-lived server answers it when one can be used; otherwise
- * (it could not start, crashed, or the protocol broke) a one-shot process does. One-shot
+ * (none was given, it could not start, crashed, or the protocol broke) a one-shot process does. One-shot
  * responses are written to a file: stdout is a bounded diagnostic tail and cannot carry
  * arbitrarily large results. */
-async function analyze(dotnet: string, analyzer: string, storage: string, prefix: string, request: string, operation: string, options: ProcessOptions): Promise<string> {
-    try {return await analyzerServers.request(dotnet, analyzer, request, options, await roslynIdentity(dotnet, options));}
-    catch (error) {
-        if (error instanceof AnalyzerRequestFailed) {throw new EnvironmentError('analyzer', `${operation} failed.\n${error.message}`);}
-        if (!(error instanceof AnalyzerServerUnavailable)) {throw error;}
-        options.signal?.throwIfAborted();
+async function analyze(dotnet: string, analyzer: string, storage: string, prefix: string, request: string, operation: string, options: AnalysisOptions): Promise<string> {
+    const { analyzerServers, ...processOptions } = options;
+    if (analyzerServers) {
+        try {return await analyzerServers.request(dotnet, analyzer, request, processOptions, await cachedRoslynIdentity(dotnet, processOptions));}
+        catch (error) {
+            if (error instanceof AnalyzerRequestFailed) {throw new EnvironmentError('analyzer', `${operation} failed.\n${error.message}`);}
+            if (!(error instanceof AnalyzerServerUnavailable)) {throw error;}
+            options.signal?.throwIfAborted();
+        }
     }
     await fs.mkdir(storage, { recursive: true });
     const directory = await fs.mkdtemp(path.join(storage, prefix));
@@ -27,12 +50,12 @@ async function analyze(dotnet: string, analyzer: string, storage: string, prefix
         const input = path.join(directory, 'request.json'), output = path.join(directory, 'response.json');
         await fs.writeFile(input, request);
         // A process that serves one request never recoups the cost of Tier-0 instrumentation.
-        requireSuccess(await runProcess(dotnet, [analyzer, input, output], { ...options, output: undefined, env: { ...options.env, DOTNET_TieredPGO: '0' } }), operation);
+        requireSuccess(await runProcess(dotnet, [analyzer, input, output], { ...processOptions, output: undefined, env: { ...options.env, DOTNET_TieredPGO: '0' } }), operation);
         return await fs.readFile(output, 'utf8');
     } finally {await fs.rm(directory, { recursive: true, force: true });}
 }
 
-export async function sourceLocations(dotnet: string, analyzer: string, assembly: string, storage: string, options: ProcessOptions): Promise<ReadonlyMap<string, { file: string; line: number }>> {
+export async function sourceLocations(dotnet: string, analyzer: string, assembly: string, storage: string, options: AnalysisOptions): Promise<ReadonlyMap<string, { file: string; line: number }>> {
     const output = await analyze(dotnet, analyzer, storage, 'symbols-', JSON.stringify({ assembly }), 'Reading portable symbols', options);
     const values = JSON.parse(output) as Record<string, { file?: string; line?: number } | null>;
     const entries = Object.entries(values).filter((entry): entry is [string, { file: string; line: number }] =>
@@ -73,7 +96,7 @@ export interface SourceAliasUpdate {
 
 /** Resolve changed aliases and analyze their affected files in one process.
  * A complete response is required before callers may publish the alias state. */
-export async function sourceAnalysisBatch(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: ProcessOptions,
+export async function sourceAnalysisBatch(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: AnalysisOptions,
     excludedAliases: readonly string[] = [], concurrency = 1, aliasUpdate?: SourceAliasUpdate, provenance = false): Promise<SourceAnalysisBatch> {
     options.signal?.throwIfAborted();
     if (!aliasUpdate || !aliasUpdate.sources.length) {
@@ -122,7 +145,7 @@ export async function sourceAnalysisBatch(dotnet: string, analyzer: string, file
 }
 
 /** Parse global aliases with the same C# syntax rules as declaration analysis. */
-export async function sourceAliases(dotnet: string, analyzer: string, contents: readonly string[], storage: string, options: ProcessOptions): Promise<readonly string[]> {
+export async function sourceAliases(dotnet: string, analyzer: string, contents: readonly string[], storage: string, options: AnalysisOptions): Promise<readonly string[]> {
     if (!contents.length) {return [];}
     const aliases: unknown = JSON.parse(await analyze(dotnet, analyzer, storage, 'aliases-', JSON.stringify({ aliasSources: contents }), 'Analyzing global C# aliases', options));
     if (!names(aliases)) {throw new Error('Invalid C# alias response.');}
@@ -143,7 +166,7 @@ export function resolveShapes(analyses: ReadonlyMap<string, SourceShape | null>,
 }
 
 /** Declaration fingerprints catch dependencies that runtime coverage cannot see. */
-export async function sourceAnalyses(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: ProcessOptions, excludedAliases: readonly string[] = [], concurrency = 1): Promise<ReadonlyMap<string, SourceShape | null>> {
+export async function sourceAnalyses(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: AnalysisOptions, excludedAliases: readonly string[] = [], concurrency = 1): Promise<ReadonlyMap<string, SourceShape | null>> {
     if (!files.length) {return new Map();}
     const output = await analyze(dotnet, analyzer, storage, 'analysis-', JSON.stringify({ files, excludedAliases, concurrency: workers(concurrency) }), 'Analyzing C# declarations', options);
     const parsed: unknown = JSON.parse(output);
@@ -158,6 +181,6 @@ export async function sourceAnalyses(dotnet: string, analyzer: string, files: re
     return result;
 }
 
-export async function sourceShapes(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: ProcessOptions, excludedAliases: readonly string[] = [], concurrency = 1): Promise<ReadonlyMap<string, string | null>> {
+export async function sourceShapes(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: AnalysisOptions, excludedAliases: readonly string[] = [], concurrency = 1): Promise<ReadonlyMap<string, string | null>> {
     return resolveShapes(await sourceAnalyses(dotnet, analyzer, files, storage, options, excludedAliases, concurrency));
 }

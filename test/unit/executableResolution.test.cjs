@@ -150,7 +150,7 @@ test('POSIX identity preserves symlink-sensitive parent traversal in commands an
  await io.writeFile(actual,'#!/bin/sh\nprintf actual',{mode:0o755});
  await io.writeFile(path.join(root,'tool'),'#!/bin/sh\nprintf wrong',{mode:0o755});
  const execute=require('node:util').promisify(require('node:child_process').execFile);
- const {preparationToolIdentity}=require('../../out/services/preparedOutputCache');
+ const {preparationToolIdentity}=require('../../out/services/preparationTools');
  const expectedIdentity=await preparationToolIdentity(actual,{});
  for(const [command,env] of /** @type {[string, Record<string, string>][]} */ ([[`${root}/link/../tool`,{}],['./link/../tool',{}],['tool',{PATH:'link/..'}]])){
   assert.equal(await resolveNodeExecutable(command,env,root),actual);
@@ -160,7 +160,7 @@ test('POSIX identity preserves symlink-sensitive parent traversal in commands an
  await assert.rejects(preparationToolIdentity('tool',{},undefined,root),/Cannot identify preparation tool/,'missing PATH cannot prove a cwd executable identity');
 });
 
-test('Windows source analysis uses direct Path lookup and declines ambiguous owned commands',{skip:process.platform!=='win32'},async t=>{
+test('[windows] Windows source analysis uses direct Path lookup and declines ambiguous owned commands',{skip:process.platform!=='win32'},async t=>{
  const {sourceAnalysisContext}=require('../../out/services/analysisContext');
  const root=await io.realpath(await io.mkdtemp(path.join(os.tmpdir(),'testy-analysis-resolution-'))),cwd=path.join(root,'project'),host=path.join(root,'dotnet.exe'),analyzer=path.join(root,'Testy.Analysis.dll');
  t.after(()=>io.rm(root,{recursive:true,force:true}));
@@ -188,7 +188,7 @@ test('Windows source analysis uses direct Path lookup and declines ambiguous own
  assert.equal(await sourceAnalysisContext('dotnet',analyzer,options),undefined,'the selected COM candidate is not skipped in favor of a later eligible EXE');
 });
 
-test('Windows resolver agrees with actual shell:false launch for cwd and COM/EXE precedence',{skip:process.platform!=='win32',timeout:15000},async t=>{
+test('[windows] Windows resolver agrees with actual shell:false launch for cwd and COM/EXE precedence',{skip:process.platform!=='win32',timeout:15000},async t=>{
  const {resolveNodeExecutable}=require('../../out/services/executable');
  const root=await io.realpath(await io.mkdtemp(path.join(os.tmpdir(),'testy-executable-'))),bin=path.join(root,'bin');
  const children=new Set();

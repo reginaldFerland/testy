@@ -72,6 +72,46 @@ public sealed class ApplicationResolutionTests : IDisposable
     }
 
     [Fact]
+    public void AQuotedPathEntryIsUnquoted()
+    {
+        var tool = Tool("Program Files", "tool.exe");
+        SetPath("\"" + Path.GetDirectoryName(tool) + "\"");
+        Assert.Equal(tool, ProcessOwner.ResolveApplication("tool"));
+    }
+
+    [Fact]
+    public void WhitespaceAroundAPathEntryIsIgnored()
+    {
+        var tool = Tool("bin", "tool.exe");
+        SetPath("  \"" + Path.GetDirectoryName(tool) + "\" ");
+        Assert.Equal(tool, ProcessOwner.ResolveApplication("tool"));
+    }
+
+    [Fact]
+    public void ASemicolonInsideQuotesDoesNotSplitAnEntry()
+    {
+        Assert.Equal(["C:\\a;b", "C:\\c", "D:\\d"], ProcessOwner.PathEntries("\"C:\\a;b\";C:\\c;;  D:\\d  ;"));
+    }
+
+    [Fact]
+    public void AnUnmatchedQuoteEndsAtTheNextSemicolon()
+    {
+        Assert.Equal(["C:\\a", "C:\\b", "D:\\d"], ProcessOwner.PathEntries("\"C:\\a;C:\\b;D:\\d"));
+    }
+
+    [Fact]
+    public void EmbeddedQuotesAreRemoved()
+    {
+        Assert.Equal(["C:\\Program Files\\x", "D:\\a;b"], ProcessOwner.PathEntries("C:\\Program\" \"Files\\x;D:\\\"a;b\""));
+    }
+
+    [Fact]
+    public void QuotedEntriesWithSemicolonsAndEmptyEntriesAreHandled()
+    {
+        Assert.Equal(["C:\\a;b;c"], ProcessOwner.PathEntries(";;\"C:\\a;b;c\";\"\";  ;"));
+    }
+
+    [Fact]
     public void IgnoresEmptyPathSegments()
     {
         var tool = Tool("bin", "tool.exe");

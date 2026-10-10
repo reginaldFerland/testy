@@ -171,3 +171,14 @@ test('while coverage is hidden and nothing is drawn, edits neither queue nor res
  f.host.config.showCoverage=false;f.context.queue([editor]);assert.equal(f.context.pendingEditors.size,1,'a drawn editor is still cleared');
  clearTimeout(f.context.renderTimer);await f.render(editor);assert.equal(f.context.drawn,false);
 });
+
+test('with inline results on, coverage markers leave covered lines to them and keep uncovered and stale ones',async()=>{
+ const f=fixture(),editor=f.editor();f.set([f.summary()]);
+ /** @type {any} Partial configuration: only the settings decorate reads. */ const config=f.host.config;
+ config.inlineResults='gutter';await f.render(editor);
+ assert.deepEqual(f.last(editor),{covered:[],uncovered:[1],stale:[]});
+ f.set([f.summary(undefined,{stale:true})]);await f.render(editor);
+ assert.deepEqual(f.last(editor),{covered:[],uncovered:[],stale:[1]},'stale covered lines show their pending inline marker instead');
+ config.inlineResults='off';await f.render(editor);
+ assert.deepEqual(f.last(editor),{covered:[],uncovered:[],stale:[0,1,4]},'turning inline results off redraws every line');
+});

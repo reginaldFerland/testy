@@ -38,6 +38,8 @@ interface Pending {
 interface Refable { ref?(): unknown; unref?(): unknown }
 
 const protocol = 1;
+/** The error type of a request the server refused because too many were already waiting (AnalyzerServer.BusyErrorType); the one-shot fallback serves it. */
+const busyType = 'Testy.Analysis.ServerBusy';
 const responseHead = /^\{"id":(\d+),"(result|error)":/;
 
 /** One analyzer process speaking the line protocol of backend/Testy.Analysis/AnalyzerServer.cs.
@@ -134,13 +136,13 @@ class AnalyzerServer {
         entry.settle();
         if (head[2] === 'result') {entry.resolve(body);}
         else {
-            let message = body;
+            let message = body, busy = false;
             try {
                 const parsed = JSON.parse(body) as string | { type?: unknown; message?: unknown } | null;
                 if (typeof parsed === 'string') {message = parsed;}
-                else if (parsed && typeof parsed.message === 'string') {message = typeof parsed.type === 'string' ? `${parsed.type}: ${parsed.message}` : parsed.message;}
+                else if (parsed && typeof parsed.message === 'string') {message = typeof parsed.type === 'string' ? `${parsed.type}: ${parsed.message}` : parsed.message; busy = parsed.type === busyType;}
             } catch {/* keep the raw text */}
-            entry.reject(new AnalyzerRequestFailed(message));
+            entry.reject(busy ? new AnalyzerServerUnavailable(message) : new AnalyzerRequestFailed(message));
         }
     }
 
@@ -249,7 +251,8 @@ export interface AnalyzerServerOptions {
 }
 
 /** Servers keyed by everything that can change an analysis: the host, the helper
- * (including a rebuilt file), the working directory and the environment. */
+ * (including a rebuilt file), the working directory and the environment. Each engine
+ * owns its pool and stops it on disposal; there is no shared instance. */
 export class AnalyzerServers {
     private readonly servers = new Map<string, AnalyzerServer>();
     private readonly failedUntil = new Map<string, number>();
@@ -319,8 +322,3 @@ export class AnalyzerServers {
         await Promise.allSettled(servers.map(server => server.close(new AnalyzerServerUnavailable('The analyzer server was stopped.', true))));
     }
 }
-
-export const analyzerServers = new AnalyzerServers();
-
-/** Stop the shared analyzer servers (engine disposal). */
-export function disposeAnalyzerServers(): Promise<void> { return analyzerServers.dispose(); }

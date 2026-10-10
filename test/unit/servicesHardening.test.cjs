@@ -89,6 +89,7 @@ test('an active prepared-storage owner from another boot is discarded',async t=>
  await lease.dispose();
 });
 
+// POSIX only: chmod 0 does not make a directory unreadable on Windows (ACLs ignore the mode bits), and root bypasses it.
 test('project discovery skips unreadable directories but not unreadable roots',{skip:process.platform==='win32'||process.getuid?.()===0},async t=>{
  const root=await temporary(t,'find-projects');
  await fs.mkdir(path.join(root,'App'));await fs.writeFile(path.join(root,'App','App.csproj'),'<Project/>');

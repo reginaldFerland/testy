@@ -25,6 +25,14 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task, ICancelab
     // MSBuild values keep the backslashes of the project's authoring platform.
     private static string FullPath(string value, string directory) => Path.GetFullPath(value.Replace('\\', Path.DirectorySeparatorChar), directory);
 
+    // The hint, or else an Include that names a file ("libs\x.dll"; a bare "System.Xml" or a strong name is not one).
+    private static string BinaryReference(string hint, string include)
+    {
+        if (hint.Length > 0) { return hint; }
+        var file = include.Trim();
+        return !file.Contains(',') && (file.IndexOfAny(['\\', '/']) >= 0 || file.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) ? file : "";
+    }
+
     public void Cancel() => cancellation.Cancel();
 
     public override bool Execute()
@@ -86,11 +94,14 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task, ICancelab
                 {
                     var project = node.ProjectInstance;
                     string[] Items(string name) => project.GetItems(name).Select(item => item.GetMetadataValue("FullPath")).Where(value => value.Length > 0).Distinct().ToArray();
+                    var compile = Items("Compile");
+                    var toolsPath = project.GetPropertyValue("MSBuildToolsPath");
+                    var sdkPrefix = toolsPath + Path.DirectorySeparatorChar;
                     // The compiler discovers inherited editorconfig files after
                     // evaluation. Include absent candidates so creation and
                     // deletion are watched and versioned, including linked code.
                     var compilerConfigs = new HashSet<string>(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
-                    foreach (var file in Items("Compile").Append(project.FullPath))
+                    foreach (var file in compile.Append(project.FullPath))
                     {
                         for (var directory = Path.GetDirectoryName(file); directory is not null; directory = Path.GetDirectoryName(directory))
                         {
@@ -100,6 +111,20 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task, ICancelab
                     compilerConfigs.Add(Path.Combine(project.Directory, ".globalconfig"));
                     var ruleSet = project.GetPropertyValue("CodeAnalysisRuleSet");
                     if (!string.IsNullOrWhiteSpace(ruleSet)) { compilerConfigs.Add(FullPath(ruleSet, project.Directory)); }
+                    // Analyzers and generators listed in the project run inside the compiler, so changing one changes the build.
+                    // Those the SDK, its packs or the NuGet cache supply are versioned by the SDK or by restore (project.assets.json).
+                    var packageRoot = project.GetPropertyValue("NuGetPackageRoot");
+                    var shipped = new List<string> { sdkPrefix };
+                    if (toolsPath.Length > 0 && Path.GetDirectoryName(Path.GetDirectoryName(toolsPath)) is { } dotnetRoot) { shipped.Add(Path.Combine(dotnetRoot, "packs") + Path.DirectorySeparatorChar); }
+                    if (!string.IsNullOrWhiteSpace(packageRoot)) { shipped.Add(Path.TrimEndingDirectorySeparator(FullPath(packageRoot, project.Directory)) + Path.DirectorySeparatorChar); }
+                    var analyzers = Items("Analyzer").Where(analyzer => !shipped.Any(prefix => analyzer.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))).ToArray();
+                    var inputFiles = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var group in new IEnumerable<string>[] { inputs[project], Items("Content"), Items("None"), Items("EmbeddedResource"), Items("AdditionalFiles"),
+                        Items("EditorConfigFiles"), Items("GlobalAnalyzerConfigFiles"), Items("AnalyzerConfigFiles"), compilerConfigs })
+                    {
+                        inputFiles.UnionWith(group.Where(input => !input.StartsWith(sdkPrefix, StringComparison.OrdinalIgnoreCase)));
+                    }
+                    inputFiles.UnionWith(analyzers);
                     return new ProjectRecord(
                         File: project.FullPath,
                         Framework: project.GetPropertyValue("TargetFramework"),
@@ -115,14 +140,10 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task, ICancelab
                         Properties: project.GlobalProperties,
                         ContextId: identities[node],
                         ContextReferences: node.ProjectReferences.SelectMany(Targets).Select(reference => identities[reference]).Distinct().Order(StringComparer.Ordinal).ToArray(),
-                        SourceFiles: Items("Compile"),
-                        Inputs: inputs[project].Concat(Items("Content")).Concat(Items("None")).Concat(Items("EmbeddedResource"))
-                            .Concat(Items("AdditionalFiles")).Concat(Items("EditorConfigFiles")).Concat(Items("GlobalAnalyzerConfigFiles"))
-                            .Concat(Items("AnalyzerConfigFiles")).Concat(compilerConfigs)
-                            .Where(input => !input.StartsWith(project.GetPropertyValue("MSBuildToolsPath") + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
-                            .Distinct().Order(StringComparer.Ordinal).ToArray(),
+                        SourceFiles: compile,
+                        Inputs: [.. inputFiles.Order(StringComparer.Ordinal)],
                         References: node.ProjectReferences.Select(reference => reference.ProjectInstance.FullPath).Where(reference => reference != project.FullPath).Distinct().Order(StringComparer.Ordinal).ToArray(),
-                        BinaryReferences: project.GetItems("Reference").Select(item => item.GetMetadataValue("HintPath"))
+                        BinaryReferences: project.GetItems("Reference").Select(item => BinaryReference(item.GetMetadataValue("HintPath"), item.EvaluatedInclude))
                             .Where(value => value.Length > 0).Select(value => FullPath(value, project.Directory)).Distinct().Order(StringComparer.Ordinal).ToArray()
                     );
                 }).OrderBy(project => project.ContextId, StringComparer.Ordinal).ToArray();
@@ -148,6 +169,8 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task, ICancelab
             var evaluations = graph.ProjectNodes.OrderBy(node => identities[node], StringComparer.Ordinal)
                 .ToDictionary(node => identities[node], node => evaluationInputs[node.ProjectInstance]);
             // Written beside the output and renamed into place, so a reader never sees a partial graph.
+            // A process killed between the write and the rename leaves its file behind; clear the old ones.
+            StaleTemporaryFiles.Delete(Path.GetDirectoryName(Path.GetFullPath(OutputFile))!, Path.GetFileName(OutputFile) + ".*.tmp");
             var temporary = $"{OutputFile}.{Guid.NewGuid():N}.tmp";
             try
             {

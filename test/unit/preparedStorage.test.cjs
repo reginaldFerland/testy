@@ -75,7 +75,7 @@ test('dead active owners are discarded even with a previous snapshot, while live
  await Promise.all([live.dispose(),next.dispose()]);
 });
 
-test('malformed owned parked metadata is discarded without following root or owner symlinks',async t=>{
+test('[windows] malformed owned parked metadata is discarded without following root or owner symlinks',async t=>{
  const {root,storage}=await fixture(t),bad=await seed(storage,{retention:{entries:-1,bytes:1}}),missingSnapshot=await seed(storage,{snapshot:undefined});
  const external=path.join(root,'external');await fs.mkdir(external);await fs.writeFile(path.join(external,'asset'),'keep');
  const linked=await seed(storage);await fs.rmdir(linked);await fs.symlink(external,linked,process.platform==='win32'?'junction':'dir');
@@ -154,4 +154,13 @@ test('cancelling a blocked claim cannot consume a parked container',async t=>{
  const abort=new AbortController(),claim=claimPreparedStorage(storage,abort.signal);abort.abort();
  try {await assert.rejects(claim,{name:'AbortError'});}finally{unlock();await locked;}
  const next=await claimPreparedStorage(storage);assert.equal(next.directory,first.directory);assert.deepEqual(next.snapshot,{ready:true});await next.dispose();
+});
+
+test('claiming run outputs removes temporary owner files from interrupted claims',async t=>{
+ const {claimRunOutputs}=require('../../out/services/runOutputs');
+ const root=await fs.mkdtemp(path.join(require('node:os').tmpdir(),'testy-run-tmp-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));
+ const storage=path.join(root,'runs'),stale=`${randomUUID()}.${randomUUID()}.tmp`,other='notes.tmp';
+ await fs.mkdir(storage);await fs.writeFile(path.join(storage,stale),'{');await fs.writeFile(path.join(storage,other),'keep');
+ const lease=await claimRunOutputs(storage);t.after(()=>lease.dispose());
+ const names=await fs.readdir(storage);assert.ok(!names.includes(stale));assert.ok(names.includes(other));
 });

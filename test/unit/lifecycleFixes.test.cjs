@@ -105,11 +105,11 @@ test('input directories merge into one watcher per root, keep outside directorie
 });
 
 test('disposal aborts runs with a shutdown reason so owned processes skip the graceful phase', async()=>{
- // Partial engine options and private members (any): only what disposal and run touch.
- const engine=/** @type {any} */ (new TestEngine(/** @type {any} */ ({roots:[],storage:'/unused/testy-state',events:{output(){}},configuration:()=>({})})));
+ // Partial engine options and services (any): only what disposal and run touch; runBatch is replaced to hold a run open.
+ const engine=/** @type {any} */ (new TestEngine(/** @type {any} */ ({roots:[],storage:'/unused/testy-state',events:{output(){}},configuration:()=>({})}),
+  /** @type {any} */ ({preparedOutputs:{async dispose(){}}})));
  /** @type {any} */ let reason;
  /** @type {PromiseWithResolvers<void>} */ const entered=Promise.withResolvers();
- engine.preparedOutputs={async dispose(){}};
  engine.runBatch=async(/** @type {unknown} */ _batch,/** @type {AbortController} */ controller)=>{
   entered.resolve();
   await new Promise((/** @type {(value?: any) => void} */ resolve)=>controller.signal.addEventListener('abort',()=>{reason=controller.signal.reason;resolve();}));
@@ -138,8 +138,13 @@ test('a shutdown abort kills an owned process without waiting out the graceful p
 test('deactivate returns promptly even when disposal never finishes',async()=>{
  const vscode={ExtensionMode:{Test:3},workspace:{isTrusted:true,workspaceFolders:[{uri:{fsPath:'/workspace'}}]}};
  class Testy{start(){return Promise.resolve();}dispose(){return new Promise(()=>undefined);}}
- const extension=loadUi({vscode,stubs:{controller:{Testy}}}).module('extension');
+ // The shutdown bound is a timer the test fires, rather than three seconds of waiting.
+ /** @type {{fire:()=>void,ms:number}[]} */ const timers=[];
+ const globals={setTimeout:(/** @type {()=>void} */ fire,/** @type {number} */ ms)=>timers.push({fire,ms}),clearTimeout:()=>undefined};
+ const extension=loadUi({vscode,stubs:{controller:{Testy}},globals}).module('extension');
  extension.activate({subscriptions:[],extensionMode:1});
- const began=Date.now();await extension.deactivate();
- assert.ok(Date.now()-began<4500);
+ let finished=false;const pending=extension.deactivate().then(()=>{finished=true;});
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(finished,false,'deactivation waits for disposal until the bound');assert.deepEqual(timers.map(timer=>timer.ms),[3000]);
+ timers[0]?.fire();await pending;assert.equal(finished,true);
 });

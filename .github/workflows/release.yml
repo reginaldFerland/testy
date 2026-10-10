@@ -3,24 +3,70 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # A dry run builds, verifies and attests everything but publishes nothing. A run
+  # with dry-run off is only accepted on a tag ref (the same path as a tag push).
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Build and verify only; skip marketplace publishing and the GitHub release
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
-jobs:
-  ci:
-    name: CI gate
-    uses: ./.github/workflows/ci.yml
+env:
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
 
-  release:
-    name: Package and publish
-    needs: ci
+jobs:
+  # No CI gate: tests are run locally before pushing (CONTRIBUTING.md).
+  build:
+    name: Package and attest
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write
+      contents: read
+      id-token: write      # sign the build provenance
+      attestations: write  # store it
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Check the ref is a release tag on main
+        run: |
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            if [ "${DRY_RUN}" = "true" ]; then echo "Dry run on ${GITHUB_REF}; skipping the tag checks."; exit 0; fi
+            echo "A real release must run from a v* tag, not ${GITHUB_REF}" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "Tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not on main" >&2
+            exit 1
+          fi
+
+      - name: Check publish tokens
+        if: env.DRY_RUN != 'true'
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          missing=0
+          if [ -z "${VSCE_PAT}" ]; then echo "VSCE_PAT is not set" >&2; missing=1; fi
+          if [ -z "${OVSX_PAT}" ]; then echo "OVSX_PAT is not set" >&2; missing=1; fi
+          exit "${missing}"
+
+      # Before npm ci, so the SBOM lists what the lock files pin (npm and NuGet), not the installed dev tree.
+      - name: Generate SBOM
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          path: .
+          format: spdx-json
+          output-file: testy.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+          dependency-snapshot: false
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -35,13 +81,14 @@ jobs:
 
       - run: npm ci
 
-      - name: Check tag matches package version
+      - name: Check tag and package version agree, and the changelog has the version
         run: |
           version="$(node -p "require('./package.json').version")"
-          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
             echo "Tag ${GITHUB_REF_NAME} does not match package.json version ${version}" >&2
             exit 1
           fi
+          node scripts/check-changelog.mjs
 
       # Package once (vsce runs vscode:prepublish), verify that exact file, then publish it everywhere.
       - name: Package VSIX
@@ -50,22 +97,69 @@ jobs:
       - name: Assert VSIX file list
         run: npm run check:vsix -- --vsix testy.vsix
 
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" testy.vsix --title "${GITHUB_REF_NAME}" --generate-notes
+      # The production bundle writes external source maps to dist/*.map; .vscodeignore keeps them out of the VSIX.
+      - name: Collect source maps
+        run: |
+          ls dist/*.map
+          tar -czf testy-sourcemaps.tar.gz dist/*.map
 
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            testy.vsix
+            testy-sourcemaps.tar.gz
+            testy.spdx.json
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-files
+          path: |
+            testy.vsix
+            testy-sourcemaps.tar.gz
+            testy.spdx.json
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: build
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry-run) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # vsce comes from the locked dev dependencies; lifecycle scripts stay off while tokens are in reach.
+      - run: npm ci --ignore-scripts
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-files
+
+      # Marketplaces first, the GitHub release last: a failed publish never leaves a release
+      # without a marketplace package. --skip-duplicate lets a re-run continue after a partial publish.
       - name: Publish to Visual Studio Marketplace
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: |
-          if [ -z "${VSCE_PAT}" ]; then echo "VSCE_PAT not set; skipping."; exit 0; fi
-          npx vsce publish --no-dependencies --packagePath testy.vsix
+          if [ -z "${VSCE_PAT}" ]; then echo "VSCE_PAT is not set" >&2; exit 1; fi
+          npx vsce publish --no-dependencies --skip-duplicate --packagePath testy.vsix
 
       - name: Publish to Open VSX
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: |
-          if [ -z "${OVSX_PAT}" ]; then echo "OVSX_PAT not set; skipping."; exit 0; fi
+          if [ -z "${OVSX_PAT}" ]; then echo "OVSX_PAT is not set" >&2; exit 1; fi
           # Pinned: this step runs with the publish token. ovsx reads OVSX_PAT from the environment.
-          npx --yes ovsx@1.2.0 publish testy.vsix
+          npx --yes ovsx@1.2.0 publish testy.vsix --skip-duplicate
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" testy.vsix testy-sourcemaps.tar.gz testy.spdx.json --title "${GITHUB_REF_NAME}" --generate-notes

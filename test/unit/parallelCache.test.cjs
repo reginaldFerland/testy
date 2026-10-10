@@ -24,7 +24,7 @@ const delta=(sources,groupId='one',timestamp=1)=>({sources,removedSources:[],rem
 async function fixture(t){
  const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-parallel-cache-'));
  t.after(()=>fs.rm(root,{recursive:true,force:true}));
- return{root,cache:new CoverageCache(root,()=>{}),directory:path.join(root,'coverage-v2')};
+ return{root,cache:new CoverageCache(root,()=>{}),directory:path.join(root,'coverage-v3')};
 }
 
 test('independent geometry writes overlap within four slots, merge duplicate IDs and finish before traces publish',{timeout:10000},async t=>{
@@ -107,7 +107,7 @@ for(const failure of [false,true])test(`${failure?'failed':'cancelled'} geometry
   await turn();
   assert.equal(settled,false,'a failed/cancelled save still owns its in-flight sibling writes');
   assert.equal(active,failure?3:4);assert.ok(workerSignals.every(signal=>signal.aborted));
-  await fs.access(path.join(root,'coverage-v2.lock'));
+  await fs.access(path.join(root,'coverage-v3.lock'));
   assert.equal(JSON.parse(await fs.readFile(traceFile,'utf8')).timestamp,1);assert.equal(traceWrites,0);
   competitor=new CoverageCache(root,()=>{}).save(delta([source(99)],'competing')).then(()=>{competitorFinished=true;});
   await turn();assert.equal(competitorFinished,false,'another cache cannot publish while cancelled siblings still own the lock');

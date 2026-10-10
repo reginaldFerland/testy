@@ -152,7 +152,7 @@ async function runTrial(directory,template,coverageTool,layout,projectCount,tria
   let cacheBytes=0;
   /** @param {string} directory @returns {Promise<void>} */
   async function size(directory){for(const entry of await fs.readdir(directory,{withFileTypes:true})){const file=path.join(directory,entry.name);if(entry.isDirectory())await size(file);else cacheBytes+=(await fs.stat(file)).size;}}
-  await size(path.join(directory,'state','coverage-v2'));
+  await size(path.join(directory,'state','coverage-v3'));
   const shared=normalizePath(path.join(workspace,'Core','Shared.cs'));await fs.writeFile(shared,(await fs.readFile(shared,'utf8')).replace('value + 1','value + 2'));
   await engine.markChanged([shared]);const sharedCore=engine.select([shared]),sharedCoreSelectedCases=sharedCore.groups.reduce((count,group)=>count+group.tests.length,0);
   assert.equal(sharedCore.groups.length,fileCount,'a shared Core edit selects callers through all four production layers');

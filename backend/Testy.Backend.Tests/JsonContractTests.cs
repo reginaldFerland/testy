@@ -146,7 +146,8 @@ public sealed class JsonContractTests : IDisposable
         Assert.Equal(0, await server.WaitAsync(TimeSpan.FromSeconds(60), TestContext.Current.CancellationToken));
         using (ready)
         {
-            Assert.Equal(["ready", "roslyn"], Names(ready.RootElement));
+            Assert.Equal(["ready", "roslyn", "version"], Names(ready.RootElement));
+            Assert.Equal(JsonValueKind.String, ready.RootElement.GetProperty("version").ValueKind);
             Assert.Equal(1, ready.RootElement.GetProperty("ready").GetInt32());
             Assert.Equal(JsonValueKind.String, ready.RootElement.GetProperty("roslyn").ValueKind);
         }

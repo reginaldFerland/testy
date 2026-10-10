@@ -52,8 +52,13 @@ async function makeAccessible(directory: string, signal?: AbortSignal): Promise<
 }
 
 export async function removeOutput(directory: string): Promise<void> {
-    await makeAccessible(directory);
-    await fs.rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    const remove = (): Promise<void> => fs.rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    // Tests can leave unwritable directories behind; repair them only when removal says so.
+    try {await remove();}
+    catch (error) {
+        if (!['EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) {throw error;}
+        await makeAccessible(directory); await remove();
+    }
 }
 
 function stampValue(stat: BigIntStats): string {
@@ -136,27 +141,29 @@ export class PreparedOutput {
                 await fs.rm(path.join(this.directory, file), { recursive: true, force: true }); current.delete(file);
             }
         }
+        const files: [string, string][] = [];
         for (const [file, previous] of this.stamps) {
             signal?.throwIfAborted();
-            if (previous.startsWith('dir:')) {
-                if (!current.has(file)) {await fs.mkdir(path.join(this.directory, file), { recursive: true });}
-                continue;
-            }
+            if (!previous.startsWith('dir:')) {files.push([file, previous]);}
+            else if (!current.has(file)) {await fs.mkdir(path.join(this.directory, file), { recursive: true });}
+        }
+        // Directories exist before any file is repaired; the files are independent of each other.
+        await mapConcurrent(files, 8, signal, async ([file, previous], _index, workerSignal) => {
             let changed = current.get(file) !== previous;
             // Earlier timestamps prove the filesystem clock advanced before
             // tests started. Only the newest timestamp cohort can hide a write
             // in the same tick; compare its bytes when metadata is unchanged.
             if (!changed && stampTime(previous) === this.collisionTime) {
                 let expected = this.templateHashes.get(file);
-                if (!expected) {expected = await fileHash(path.join(this.template, file), signal); this.templateHashes.set(file, expected);}
-                changed = expected !== await fileHash(path.join(this.directory, file), signal);
+                if (!expected) {expected = await fileHash(path.join(this.template, file), workerSignal); this.templateHashes.set(file, expected);}
+                changed = expected !== await fileHash(path.join(this.directory, file), workerSignal);
             }
             if (changed) {
                 await fs.rm(path.join(this.directory, file), { force: true });
-                await copyFile(path.join(this.template, file), path.join(this.directory, file), signal);
-                restored.set(file, await stamp(path.join(this.directory, file), signal));
+                await copyFile(path.join(this.template, file), path.join(this.directory, file), workerSignal);
+                restored.set(file, await stamp(path.join(this.directory, file), workerSignal));
             }
-        }
+        });
         // Apply directory modes last, after all children have been repaired.
         for (const [file, previous] of [...this.stamps].reverse()) {
             if (previous.startsWith('dir:') && previous.split(':').at(-1) !== current.get(file)?.split(':').at(-1)) {

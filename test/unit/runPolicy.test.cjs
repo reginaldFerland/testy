@@ -94,8 +94,9 @@ test('commit freshness requires the build, topology, revision and every recorded
  assert.equal(policy.commitIsCurrent(run,{...current,revision:3},{},versions),false);
  assert.equal(policy.commitIsCurrent(run,{...current,topology:2},{},versions),false);
  assert.equal(policy.commitIsCurrent({...run,obsoleteBuild:true},current,{},versions),false);
- const stored=/** @type {Map<string, Trace>} */ (/** @type {unknown} */ (new Map([['x',{inputs:{'/w/A.cs':'1'}}],['y',{inputs:{'/w/A.cs':'0'}}],['z',{inputs:{}}]]))); // traces reduced to their recorded inputs
- assert.deepEqual([...policy.freshTraces(stored,new Set(['z']),versions)],['x'],'selected traces are not refreshed');
+ const stored=/** @type {Map<string, Trace>} */ (/** @type {unknown} */ (new Map([['x',{inputs:{'/w/A.cs':'1'},stale:true}],['y',{inputs:{'/w/A.cs':'0'},stale:true}],['z',{inputs:{},stale:true}],
+  ['fresh',{inputs:{}}],['historical',{inputs:{},stale:true,historical:true}]]))); // traces reduced to their recorded inputs and freshness
+ assert.deepEqual([...policy.freshTraces(stored,new Set(['z']),versions)],['x'],'selected, already fresh and historical traces are not refreshed');
 });
 
 test('selection rules for shapes, merged impact, completeness and checkpoints',()=>{

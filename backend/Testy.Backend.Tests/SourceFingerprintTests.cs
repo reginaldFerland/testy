@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using Testy.Analysis;
 using Xunit;
 
@@ -18,7 +19,14 @@ public class SourceFingerprintTests
             public int F = 5;
             public int Q { get; set; } = 7;
             [Obsolete] public void A() { }
-            public D() { F = 1; }
+            public D() : base() { F = 1; }
+            static D() { }
+            public D(int a) => F = a;
+            ~D() { F = 0; }
+            public static D operator +(D l, D r) { return l; }
+            public static implicit operator int(D d) => d.F;
+            /// <summary>Docs.</summary>
+            // ordinary comment
             public int M(int x) { return x; }
             public int P => 1;
             public int this[int i] { get { return i; } }
@@ -39,6 +47,10 @@ public class SourceFingerprintTests
     [InlineData("public int Expr(int x) => x;", "public int Expr(int x) => x * x;")]
     [InlineData("public int Accessors { get => 1; set { F = value; } }", "public int Accessors { get => 2; set { F = value + 1; } }")]
     [InlineData("int Twice(int y) => y * 2;", "int Twice(int y) => y * 3;")]
+    [InlineData("public D() : base() { F = 1; }", "public D() : base() { F = 2; }")]
+    [InlineData("public D(int a) => F = a;", "public D(int a) => F = a + 1;")]
+    [InlineData("operator +(D l, D r) { return l; }", "operator +(D l, D r) { return r; }")]
+    [InlineData("implicit operator int(D d) => d.F;", "implicit operator int(D d) => 0;")]
     public async Task AnExecutableBodyEditKeepsTheSignatureButChangesTheBody(string before, string after)
     {
         Assert.Contains(before, Baseline, StringComparison.Ordinal);
@@ -73,8 +85,19 @@ public class SourceFingerprintTests
     [InlineData("public class D", "public class D : System.IDisposable")]
     [InlineData("namespace N;", "namespace M;")]
     [InlineData("using System;", "using System;\nusing System.IO;")]
-    // Constructors run no caller-visible declaration but stay in the signature.
-    [InlineData("public D() { F = 1; }", "public D() { F = 2; }")]
+    // The initializer and the static constructor's body run before any test's own code does.
+    [InlineData("public D() : base() { F = 1; }", "public D() : this(2) { F = 1; }")]
+    [InlineData("public D(int a) => F = a;", "public D(long a) => F = (int)a;")]
+    [InlineData("static D() { }", "static D() { F = 9; }")]
+    [InlineData("static D() { }", "")]
+    // A finalizer runs at no test's bidding.
+    [InlineData("~D() { F = 0; }", "~D() { F = 3; }")]
+    [InlineData("~D() { F = 0; }", "")]
+    // Source generators can copy documentation into generated code.
+    [InlineData("/// <summary>Docs.</summary>", "/// <summary>Other <b>docs</b>.</summary>")]
+    [InlineData("/// <summary>Docs.</summary>", "")]
+    [InlineData("public static D operator +(D l, D r) { return l; }", "public static D operator -(D l, D r) { return l; }")]
+    [InlineData("public static implicit operator int(D d) => d.F;", "public static explicit operator int(D d) => d.F;")]
     public async Task ADeclarationEditChangesTheSignature(string before, string after)
     {
         Assert.Contains(before, Baseline, StringComparison.Ordinal);
@@ -82,6 +105,37 @@ public class SourceFingerprintTests
         var edited = await Shape(Baseline.Replace(before, after, StringComparison.Ordinal));
         Assert.NotEqual(original.Signature, edited.Signature);
         Assert.NotEqual(original.Body, edited.Body);
+    }
+
+    [Theory]
+    [InlineData("// ordinary comment", "// edited comment")]
+    [InlineData("// ordinary comment", "/* block */ // ordinary comment")]
+    [InlineData("public int P => 1;", "public int P => 1; // trailing")]
+    [InlineData("public int P => 1;", "public int P => 1; /* trailing */")]
+    public async Task CommentsChangeTheBodyButNotTheSignature(string before, string after)
+    {
+        Assert.Contains(before, Baseline, StringComparison.Ordinal);
+        var original = await Shape(Baseline);
+        var edited = await Shape(Baseline.Replace(before, after, StringComparison.Ordinal));
+        Assert.Equal(original.Signature, edited.Signature);
+        Assert.NotEqual(original.Body, edited.Body);
+    }
+
+    [Fact]
+    public async Task DisabledTextStaysInTheSignature()
+    {
+        var original = await Shape("class D {\n#if NEVER\n int a;\n#endif\n}");
+        var edited = await Shape("class D {\n#if NEVER\n int b;\n#endif\n}");
+        Assert.NotEqual(original.Signature, edited.Signature);
+    }
+
+    [Fact]
+    public async Task ACommentIsPartOfTheSignatureOfACoverageBlindFile()
+    {
+        var original = await Shape("[DebuggerHidden] class D { int M() { return 1; } // a\n}");
+        var edited = await Shape("[DebuggerHidden] class D { int M() { return 1; } // b\n}");
+        Assert.NotEqual(original.Signature, edited.Signature);
+        Assert.Equal(original.Signature, original.Body);
     }
 
     [Fact]
@@ -165,6 +219,34 @@ public class SourceFingerprintTests
     public void FindsGlobalExcludingAliases(string content, string[] expected)
     {
         Assert.Equal(expected, SourceAnalysis.GlobalAliases(content, TestContext.Current.CancellationToken).Order(StringComparer.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("[System . Diagnostics . /* c */ DebuggerHidden] class D { }")]
+    [InlineData("[@DebuggerHidden] class D { }")]
+    [InlineData("[global::System.Diagnostics.DebuggerHiddenAttribute] class D { }")]
+    [InlineData("[System.Diagnostics.Debugger\\u0048iddenAttribute] class D { }")]
+    public async Task ExcludingAttributesAreRecognizedWhateverTheirSpelling(string source)
+    {
+        Assert.Equal([":D`0"], (await Shape(source)).ExcludedTypes);
+    }
+
+    [Fact]
+    public async Task AliasResultsAreKeptByTheTextTheyCameFromAndStayRight()
+    {
+        const string Hidden = "global using Hidden = System.Diagnostics.DebuggerHiddenAttribute;";
+        static async Task<string[]> Aliases(params string[] sources)
+        {
+            using var request = JsonDocument.Parse(JsonSerializer.Serialize(new { aliasSources = sources }));
+            return JsonSerializer.Deserialize<string[]>(await SourceAnalysis.HandleAsync(request.RootElement, [], ".", CancellationToken.None))!;
+        }
+        Assert.Equal(["Hidden"], await Aliases(Hidden));
+        Assert.Equal(["Hidden"], await Aliases(Hidden));
+        Assert.Equal(["Hidden", "Other"], await Aliases(Hidden, Hidden.Replace("Hidden =", "Other =", StringComparison.Ordinal).Replace("DebuggerHiddenAttribute", "DebuggerNonUserCode", StringComparison.Ordinal)));
+        Assert.Empty(await Aliases(Hidden.Replace("DebuggerHiddenAttribute", "ObsoleteAttribute", StringComparison.Ordinal)));
+        // More distinct sources than the cache holds: the oldest are dropped and parsed again, with the same answer.
+        for (var index = 0; index < 600; index++) { Assert.Equal([$"A{index}"], await Aliases($"global using A{index} = System.Diagnostics.DebuggerHiddenAttribute;")); }
+        Assert.Equal(["Hidden"], await Aliases(Hidden));
     }
 
     [Fact]

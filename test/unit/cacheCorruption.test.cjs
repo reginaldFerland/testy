@@ -1,7 +1,9 @@
 const test=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {CoverageCache}=require('../../out/services/cache'),{CoverageStore}=require('../../out/core/coverage');
-const {contentHash}=require('../../out/core/paths');
+const {contentHash}=require('../../out/core/paths'),{defaultCacheLimits}=require('../../out/services/cacheFormat');
+// Saves between maintenance sweeps; production sweeps every 128, which only makes these tests slower.
+const every=16;
 /** @typedef {{id:string,file:string,hash:string,lines:number[]}} Source */
 /** @type {(index:number,hash?:string,lines?:number[])=>Source} */
 const source=(index,hash='v1',lines=[1,2])=>{const file=`/Source${index}.cs`;return{id:contentHash(`${file}\0${hash}`),file,hash,lines};};
@@ -11,11 +13,11 @@ const trace=(groupId,sources,timestamp=1)=>({groupId,timestamp,reliable:true,sta
  sourceIds:sources.map(source=>source.id),coverage:sources.map(source=>({file:source.file,hash:source.hash,lines:[{line:1,hits:timestamp}]}))});
 /** @param {Source[]} sources @param {any[]} [traces] @param {string[]} [removedTraces] */
 const delta=(sources,traces=[],removedTraces=[])=>({sources,traces,removedSources:[],removedTraces});
-/** @param {import('node:test').TestContext} t @param {import('../../out/services/cacheFormat').CacheLimits} [limits] */
+/** @param {import('node:test').TestContext} t @param {Partial<import('../../out/services/cacheFormat').CacheLimits>} [limits] */
 async function fixture(t,limits){
- const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-cache-corruption-test-')),directory=path.join(root,'coverage-v2'),warnings=/** @type {string[]} */ ([]);
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-cache-corruption-test-')),directory=path.join(root,'coverage-v3'),warnings=/** @type {string[]} */ ([]);
  t.after(()=>fs.rm(root,{recursive:true,force:true}));
- return{root,directory,warnings,cache:new CoverageCache(root,text=>warnings.push(text),limits),
+ return{root,directory,warnings,cache:new CoverageCache(root,text=>warnings.push(text),{...defaultCacheLimits,maintenanceSaves:every,...limits}),
   sourceFile:(/** @type {Source} */ source)=>path.join(directory,'sources',`${source.id}.json`),traceFile:(/** @type {string} */ id)=>path.join(directory,'traces',`${contentHash(id)}.json`),
   /** @param {string} id @param {number} seconds */
   async age(id,seconds){const time=new Date(Date.now()-seconds*1000);await fs.utimes(path.join(directory,'traces',`${contentHash(id)}.json`),time,time);}};
@@ -44,7 +46,7 @@ test('corrupt records found by periodic maintenance no longer stop pruning',asyn
  const f=await fixture(t),a=source(0),orphan=source(1);
  await f.cache.save(delta([a],[trace('good',[a])]),t.signal);await f.cache.save(delta([orphan]),t.signal);
  await fs.writeFile(path.join(f.directory,'traces',unreadableTrace),'{broken');
- for(let index=0;index<128;index++)await f.cache.save(delta([],[trace('tick',[])]),t.signal);
+ for(let index=0;index<every;index++)await f.cache.save(delta([],[trace('tick',[])]),t.signal);
  await missing(path.join(f.directory,'traces',unreadableTrace));await missing(f.sourceFile(orphan));await fs.access(f.sourceFile(a));
  assert.ok(f.warnings.some(text=>text.includes('corrupt')));
 });
@@ -77,7 +79,7 @@ test('maintenance bounds the cache that saves accumulate, evicting the least rec
  for(const [index,value] of sources.entries())await f.cache.save(delta([value],[trace(`t${index}`,[value],index+1)]),t.signal);
  // Saving t0 again makes it the most recent.
  await f.cache.save(delta([],[trace('t0',[sources[0]],9)]),t.signal);
- for(let index=0;index<128;index++)await f.cache.save(delta([],[trace('t0',[sources[0]],9)]),t.signal);
+ for(let index=0;index<every;index++)await f.cache.save(delta([],[trace('t0',[sources[0]],9)]),t.signal);
  const names=(await fs.readdir(path.join(f.directory,'traces'))).sort();
  assert.deepEqual(names,['t0','t3','t4'].map(id=>`${contentHash(id)}.json`).sort());
  for(const index of [1,2]){await missing(f.sourceFile(sources[index]));}
@@ -106,8 +108,8 @@ test('the writer epoch is replaced atomically without syncing, while records sti
   else if(args[0]==='r'){events.push(`directory ${path.basename(String(file))}`);}
   return handle;};
  try{await f.cache.save(delta([a,b],[trace('one',[a]),trace('two',[b])]),t.signal);}finally{fs.open=open;}
- assert.ok(!events.includes('sync coverage-v2'),'the epoch is not synced');
- assert.ok(!events.includes('directory coverage-v2'),'the cache root holds only the epoch and is not synced');
+ assert.ok(!events.includes('sync coverage-v3'),'the epoch is not synced');
+ assert.ok(!events.includes('directory coverage-v3'),'the cache root holds only the epoch and is not synced');
  assert.equal(events.filter(event=>event==='sync sources').length,2);assert.equal(events.filter(event=>event==='sync traces').length,2);
  // The epoch is private; the test compares it with the persisted value.
  assert.equal(JSON.parse(await fs.readFile(path.join(f.directory,'epoch.json'),'utf8')),/** @type {any} */ (f.cache).epoch);

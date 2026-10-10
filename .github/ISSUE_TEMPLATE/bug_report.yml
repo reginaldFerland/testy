@@ -27,7 +27,7 @@ body:
     id: vscode-version
     attributes:
       label: VS Code version
-      description: From **Help > About**.
+      description: From **Help > About** (Testy needs VS Code 1.140 or later).
     validations:
       required: true
   - type: input
@@ -42,6 +42,14 @@ body:
     attributes:
       label: Output of `dotnet --info`
       description: Run it from the workspace folder so `global.json` is applied.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: mtp
+    attributes:
+      label: Microsoft.Testing.Platform and test framework versions
+      description: The target framework and the test SDK or framework package versions of the failing test project (for example `net10.0`, `MSTest.Sdk 4.x`, `xunit.v3.mtp-v2 3.x`, `NUnit3TestAdapter 5.x`), and `OutputType`/`UseMicrosoftTestingPlatformRunner` if set explicitly.
       render: text
     validations:
       required: true

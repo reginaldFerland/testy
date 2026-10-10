@@ -33,7 +33,7 @@ test('method content with comments, CDATA and nested method tags cannot hide fol
  assert.deepEqual([...parseCobertura(report(cls('Code.cs',line(8,0)+line(9,2),methods)),process.cwd(),new Set([file]))],[[file,[{line:8,hits:0},{line:9,hits:2}]]]);
 });
 
-test('Unicode, escaped paths and symlink aliases resolve to the same allowed source file',async t=>{
+test('[windows] Unicode, escaped paths and symlink aliases resolve to the same allowed source file',async t=>{
  const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-cobertura-paths-'))),directory=path.join(root,'sources');
  await fs.mkdir(directory);const file=path.join(directory,'Déjà & 中文.cs');await fs.writeFile(file,'// source');
  t.after(()=>fs.rm(root,{recursive:true,force:true}));

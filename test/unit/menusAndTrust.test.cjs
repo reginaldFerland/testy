@@ -128,3 +128,65 @@ test('before Testy can start, its commands explain the trust requirement or the 
   assert.equal(registry.live.size,0);
  }
 });
+
+test('registered, declared and referenced commands agree: menus and keybindings use only declared commands',()=>{
+ const registry=commandRegistry();
+ const {registerCommands,commandIds}=loadUi({vscode:{commands:registry.commands}}).module('commands');
+ /** @type {any} Every handler is a no-op; only the registrations matter. */ const handlers=new Proxy({},{get:()=>()=>undefined});
+ registerCommands(handlers);
+ assert.deepEqual([...registry.registered].sort(),[...commandIds].sort(),'registerCommands registers every ID in commandIds once');
+ const declared=new Set(manifest.contributes.commands.map(command=>command.command));
+ /** @type {{command: string}[]} */ const keybindings=/** @type {any} */ (manifest.contributes).keybindings;
+ for(const [where,entries] of [...Object.entries(manifest.contributes.menus),['keybindings',keybindings]])
+  for(const entry of /** @type {{command: string}[]} */ (entries))assert.ok(declared.has(entry.command),`${where} references the declared command ${entry.command}`);
+ for(const command of manifest.contributes.commands)assert.ok(nls[command.title.slice(1,-1)],`${command.command} has a localized title`);
+ assert.ok(manifest.contributes.menus.commandPalette.some(item=>item.command==='testy.showTest'&&item.when==='false'),'Show Test takes an item ID, so it is hidden from the palette');
+});
+
+test('settings schema: unique non-empty patterns, non-empty names, advanced tuning tags and a described debug configuration',()=>{
+ /** @type {Record<string, any>} */ const properties=manifest.contributes.configuration.properties;
+ for(const key of ['projects.include','projects.exclude','exclude','additionalConfigurations']) {
+  const setting=properties[`testy.${key}`];assert.equal(setting.uniqueItems,true,key);assert.equal(setting.items.minLength,1,key);
+ }
+ assert.equal(properties['testy.testArguments'].uniqueItems,undefined,'arguments such as --filter may repeat');
+ for(const key of ['buildConfiguration','dotnetPath','fileWatcherPattern'])assert.equal(properties[`testy.${key}`].minLength,1,key);
+ for(const key of ['debounceTime','fileWatcherPattern','maxParallelProjects','maxParallelTestFiles','timeoutSeconds'])assert.deepEqual(properties[`testy.${key}`].tags,['advanced'],key);
+ const debug=properties['testy.debugConfiguration'];
+ assert.equal(debug.additionalProperties,true);
+ for(const key of ['type','justMyCode','requireExactSource','symbolOptions','sourceFileMap'])assert.ok(nls[debug.properties[key].markdownDescription.slice(1,-1)],key);
+ const inline=properties['testy.inlineResults'];
+ assert.deepEqual(inline.enum,['off','gutter','gutterAndHover']);assert.equal(inline.default,'gutterAndHover');
+ for(const description of [inline.markdownDescription,...inline.enumDescriptions])assert.ok(nls[description.slice(1,-1)],description);
+ const orders=Object.values(properties).map(setting=>setting.order);assert.deepEqual(orders,orders.map((_,index)=>index),'settings keep a contiguous order');
+});
+
+test('the status bar and its menu say whether the workspace or testy.autoRun paused testing, and the menu opens Testy settings',async()=>{
+ /** @type {any} The stub status bar item the extension created. */
+ let item;
+ /** @type {any[]} */ let picked=[];
+ const vscode={StatusBarAlignment:{Left:1},ThemeColor:class{},commands:{executeCommand:async()=>undefined},
+  window:{createStatusBarItem:()=>(item={show(){},dispose(){}}),showQuickPick:async(/** @type {any[]} */ items)=>{picked=items;return items.at(-1);}}};
+ const {StatusBar,showMenu,pauseReason}=loadUi({vscode}).module('ui/statusBar');
+ const bar=new StatusBar(),model={paused:true,running:false,scheduling:'idle',phase:undefined,lastError:'',lastSummary:undefined,passed:0,failed:0,hasTests:true,coverageSuffix:'',continuousOverride:false};
+ bar.update({...model,pauseSource:'workspace',autoRunSetting:true});assert.match(item.tooltip,/Paused for this workspace\./);
+ bar.update({...model,pauseSource:'setting',autoRunSetting:false});assert.match(item.tooltip,/Disabled by testy\.autoRun\./);
+ bar.update({...model,paused:false,pauseSource:'workspace',autoRunSetting:false});assert.match(item.tooltip,/Resumed for this workspace although testy\.autoRun is off\./);
+ bar.update({...model,paused:false,pauseSource:'setting',autoRunSetting:true});assert.doesNotMatch(item.tooltip,/autoRun|workspace/);
+ assert.equal(pauseReason(false,'workspace',true),'','a resume matching the setting needs no explanation');
+ let opened=0;
+ await showMenu({paused:true,running:false,lastError:'',placeHolder:undefined,pauseSource:'setting'},{setPaused(){},runAffected(){},refreshAll(){},cancel(){},clearCoverage(){},exportCoverage(){},resetCaches(){},showOutput(){},openSettings(){opened++;}});
+ assert.equal(picked[0].description,'Disabled by testy.autoRun.');
+ assert.match(picked.at(-1).label,/Open Testy Settings/);assert.equal(opened,1);
+});
+
+test('the controller opens settings filtered to the extension and reports the pause source from workspace state',async()=>{
+ const f=createTesty({settings:{}});
+ /** @type {unknown[][]} */ const commands=[];
+ f.vscode.commands.executeCommand=async(/** @type {unknown[]} */ ...args)=>{commands.push(args);};
+ f.vscode.window.showQuickPick=async(/** @type {any[]} */ items)=>items.find(item=>/Open Testy Settings/.test(item.label));
+ await f.testy.showMenu(async()=>undefined);
+ assert.deepEqual(commands,[['workbench.action.openSettings','@ext:reginaldFerland.testy']]);
+ assert.equal(f.testy.pauseSource,'setting');f.testy.setPaused(true);assert.equal(f.testy.pauseSource,'workspace');
+ f.testy.setPaused(false);assert.equal(f.testy.pauseSource,'setting','resuming to the setting\'s value clears the workspace override');
+ await f.testy.dispose();
+});

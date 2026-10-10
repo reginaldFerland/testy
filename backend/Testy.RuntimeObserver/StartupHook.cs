@@ -42,7 +42,8 @@ internal static class StartupHook
             // so unlisted loads (nearly all of them) are dismissed without taking the gate.
             bool Listed(Assembly assembly)
             {
-                try { return names.Contains(assembly.GetName().Name ?? ""); }
+                // The simple name is the full name up to its first comma; AssemblyName would allocate for every load.
+                try { var full = assembly.FullName ?? ""; var comma = full.IndexOf(','); return names.Contains(comma < 0 ? full : full[..comma]); }
                 catch { failed = true; return false; }
             }
             void Loaded(Assembly assembly)

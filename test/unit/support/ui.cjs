@@ -2,7 +2,7 @@ const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),{cre
 
 const out=path.resolve('out');
 // Modules that import `vscode` are evaluated against the stub; everything else loads normally.
-const stubbed=new Set(['extension','controller','changeWatcher','commands','diagnosticsPublisher','configuration','ui/coverage','ui/statusBar','ui/testTree','ui/exportCoverage','ui/selectionCause','ui/baselineProgress']);
+const stubbed=new Set(['extension','controller','changeWatcher','commands','diagnosticsPublisher','configuration','ui/coverage','ui/statusBar','ui/testTree','ui/exportCoverage','ui/selectionCause','ui/baselineProgress','ui/inlineResults']);
 
 /**
  * Loads the compiled extension-host modules from out/ into one sandbox with a stub `vscode`.

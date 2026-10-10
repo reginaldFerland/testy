@@ -43,6 +43,18 @@ export interface StatusModel {
     readonly coverageSuffix: string;
     /** A continuous run keeps automatic testing on although the user paused it. */
     readonly continuousOverride: boolean;
+    /** Whether this workspace's pause or resume, or the `testy.autoRun` setting, decides automatic testing. */
+    readonly pauseSource?: PauseSource;
+    /** The `testy.autoRun` setting. */
+    readonly autoRunSetting?: boolean;
+}
+
+export type PauseSource = 'workspace' | 'setting';
+
+/** Which source paused or resumed automatic testing, when that is not simply the setting's default; nothing otherwise. */
+export function pauseReason(paused: boolean, source: PauseSource | undefined, autoRunSetting = true): string {
+    if (paused) {return source === 'setting' ? l10n.t('Disabled by testy.autoRun.') : source === 'workspace' ? l10n.t('Paused for this workspace.') : '';}
+    return source === 'workspace' && !autoRunSetting ? l10n.t('Resumed for this workspace although testy.autoRun is off.') : '';
 }
 
 /** Status text without `$(icon)` references. */
@@ -78,6 +90,7 @@ export class StatusBar {
             lastSummary ? l10n.t('Last run: {0} test files in {1}s', lastSummary.files, (lastSummary.duration / 1000).toFixed(1)) : '',
             failedBatches ? l10n.t('{0} test batches could not run; see Output.', failedBatches) : '',
             lastSummary && !lastSummary.coverageAvailable ? l10n.t('Coverage unavailable or disabled; selection uses project fallback.') : '',
+            pauseReason(model.paused, model.pauseSource, model.autoRunSetting),
             model.continuousOverride ? l10n.t('A continuous run keeps automatic testing on.') : '',
             l10n.t('Click for Testy actions.')].filter(Boolean);
         this.item.tooltip = details.join('\n');
@@ -111,13 +124,14 @@ export interface MenuActions {
     exportCoverage(): unknown;
     resetCaches(): unknown;
     showOutput(): unknown;
+    openSettings(): unknown;
 }
 
-export async function showMenu(state: { readonly paused: boolean; readonly running: boolean; readonly lastError: string; readonly placeHolder: string | undefined }, actions: MenuActions): Promise<void> {
+export async function showMenu(state: { readonly paused: boolean; readonly running: boolean; readonly lastError: string; readonly placeHolder: string | undefined; readonly pauseSource?: PauseSource }, actions: MenuActions): Promise<void> {
     type Action = vscode.QuickPickItem & { readonly run: () => unknown };
     const items: Action[] = [
         ...state.lastError ? [{ label: `$(warning) ${l10n.t('Show Error Details')}`, detail: state.lastError, run: () => actions.showOutput() }] : [],
-        state.paused ? { label: `$(debug-start) ${l10n.t('Resume Automatic Testing')}`, run: () => actions.setPaused(false) }
+        state.paused ? { label: `$(debug-start) ${l10n.t('Resume Automatic Testing')}`, description: pauseReason(true, state.pauseSource), run: () => actions.setPaused(false) }
             : { label: `$(debug-pause) ${l10n.t('Pause Automatic Testing')}`, run: () => actions.setPaused(true) },
         { label: `$(play) ${l10n.t('Run Affected Tests Now')}`, run: () => actions.runAffected() },
         { label: `$(run-all) ${l10n.t('Rebuild and Run All C# Tests')}`, run: () => actions.refreshAll() },
@@ -125,7 +139,8 @@ export async function showMenu(state: { readonly paused: boolean; readonly runni
         { label: `$(clear-all) ${l10n.t('Clear Coverage')}`, run: () => actions.clearCoverage() },
         { label: `$(export) ${l10n.t('Export Coverage…')}`, run: () => actions.exportCoverage() },
         { label: `$(trash) ${l10n.t('Reset Caches and Baseline')}`, run: () => actions.resetCaches() },
-        { label: `$(output) ${l10n.t('Show Output')}`, run: () => actions.showOutput() }
+        { label: `$(output) ${l10n.t('Show Output')}`, run: () => actions.showOutput() },
+        { label: `$(settings-gear) ${l10n.t('Open Testy Settings')}`, run: () => actions.openSettings() }
     ];
     const choice = await vscode.window.showQuickPick(items, { title: 'Testy', ...state.placeHolder ? { placeHolder: state.placeHolder } : {} });
     await choice?.run();

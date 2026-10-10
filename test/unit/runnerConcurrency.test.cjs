@@ -84,7 +84,7 @@ async function fixture(t,config={}){
    await config.instrument?.(args,state,control.signal);
    await fs.appendFile(args[1],args[3]);return{code:0,stdout:'',stderr:''};
   }},
-  './preparedOutputCache':{...cacheTools,preparationToolIdentity:async(/** @type {string} */ command,/** @type {any[]} */ ...rest)=>config.toolIdentity?config.toolIdentity(command,...rest):command},
+  './preparationTools':{preparationToolIdentity:async(/** @type {string} */ command,/** @type {any[]} */ ...rest)=>config.toolIdentity?config.toolIdentity(command,...rest):command},
   './preparationIdentity':{windowsPreparationTools:async(/** @type {any} */ options)=>({dotnet:options.dotnet,collector:options.coverageTool,analyzer:options.analyzer,instrumentationLaunch:'node'})},
   './output':{...output,removeOutput:async(/** @type {string} */ directory)=>{
    for(const assembly of state.activeAssemblies)assert.equal(assembly.startsWith(directory+path.sep),false,'cleanup must await the owning run');

@@ -13,6 +13,7 @@ import { excludeProject, registerCommands } from './commands';
 import { DiagnosticsPublisher } from './diagnosticsPublisher';
 import { BaselineProgress } from './ui/baselineProgress';
 import { CoverageView } from './ui/coverage';
+import { InlineResults } from './ui/inlineResults';
 import { exportCoverageFile } from './ui/exportCoverage';
 import { EnvironmentErrorCode, errorMessage, isAbortError, isEnvironmentError } from './core/errors';
 import { explainItem } from './ui/selectionCause';
@@ -26,6 +27,8 @@ const pausedKey = 'testy.paused';
 const devKitNoticeKey = 'testy.devKitNotice.dismissed';
 /** Whether opening this workspace may build and run the baseline: `always`, `manual` (only after a save or manual run), or unset (ask). */
 const baselineConsentKey = 'testy.baselineConsent';
+/** The Settings editor filtered to Testy's settings. */
+const extensionSettings = '@ext:reginaldFerland.testy';
 // Call sites use l10n.t(...) literally so `npm run l10n:export` can extract them.
 const l10n = vscode.l10n;
 
@@ -91,6 +94,7 @@ export class Testy implements vscode.Disposable {
     readonly engine: TestEngine;
     private readonly tree: TestTree;
     private readonly coverage: CoverageView;
+    private readonly inline: InlineResults;
     private readonly baselineProgress = new BaselineProgress(() => this.scheduler.cancel());
     /** Whether the current run advances the baseline; manual runs do not. */
     private baselineRun = false;
@@ -151,7 +155,7 @@ export class Testy implements vscode.Disposable {
                     this.updateStatus();
                 },
                 inputsChanged: () => this.changes.watch(),
-                restored: () => {this.tree.restore(this.engine.outcomes); this.updateStatus();},
+                restored: () => {this.tree.restore(this.engine.outcomes); this.updateStatus(); this.inline.refresh();},
                 discovered: groups => {if (groups.length) {setContext('testy.noTestProjects', false);} return this.updateTree(groups);},
                 selected: selection => {
                     this.lastSelection = selection;
@@ -160,9 +164,11 @@ export class Testy implements vscode.Disposable {
                     for (const line of this.tree.explain(selection)) {this.output.info(line);}
                 },
                 started: (group, id) => this.tree.started(group, id),
-                result: (group, result) => this.tree.publishResult(group, result),
-                coverage: () => this.coverage.publish(),
+                result: (group, result) => {this.tree.publishResult(group, result); this.inline.refresh();},
+                coverage: () => {this.coverage.publish(); this.inline.refresh();},
                 invalidated: files => this.scheduler.request(files),
+                // The engine continues without coverage when the collector cannot be installed or started.
+                coverageUnavailable: () => {if (!this.disposed) {this.coverageUnavailable();}},
                 debug: processId => this.attachDebugger(processId)
             }
         });
@@ -186,6 +192,7 @@ export class Testy implements vscode.Disposable {
             (request, token) => this.debug(request, token), true), profileSettings.debug);
         this.tree = new TestTree(this.controller, this.engine, this);
         this.coverage = new CoverageView(context.extensionUri, this.controller, this.coverageProfile, this.engine, this.tree.items, this);
+        this.inline = new InlineResults(context.extensionUri, this.engine, this.coverage, this.tree, this);
         this.syncConfigurationProfiles();
         // Test Explorer's refresh rediscovers; it does not run the suite.
         this.controller.refreshHandler = async token => {
@@ -200,8 +207,8 @@ export class Testy implements vscode.Disposable {
                 refreshTests: () => this.refreshAll(), toggleAutoRun: () => this.setPaused(!this.userPaused), pause: () => this.setPaused(true), resume: () => this.setPaused(false),
                 runAffected: () => this.runAffected(), cancelRun: () => this.scheduler.cancel(), clearCoverage: () => this.clearCoverage(), exportCoverage: () => this.exportCoverage(),
                 resetCaches: () => this.resetCaches(), showOutput: () => this.output.show(), showMenu: () => this.showMenu(() => this.refreshAll()),
-                explainSelection: item => this.explain(item), excludeProject: item => this.excludeProject(item), runCoveringTests: () => this.runCoveringTests(),
-                runFile: uris => this.runFiles(uris)
+                explainSelection: item => this.explain(item), excludeProject: item => this.excludeProject(item), runCoveringTests: target => this.runCoveringTests(target),
+                showTest: id => this.showTest(id), runFile: uris => this.runFiles(uris)
             }),
             vscode.workspace.onDidSaveTextDocument(document => {
                 if (this.config.trigger === 'save') {void this.changes.changed(document.uri).catch((error: unknown) => this.reportError(error));}
@@ -218,9 +225,13 @@ export class Testy implements vscode.Disposable {
                     // Changing the setting is an explicit choice that replaces a local pause or resume.
                     if (event.affectsConfiguration('testy.autoRun')) {this.storePause(undefined);}
                     this.applyPause();
-                    this.changes.watch(); this.coverage.queue(vscode.window.visibleTextEditors);
+                    this.changes.watch(); this.coverage.queue(vscode.window.visibleTextEditors); this.inline.refresh();
                     if (event.affectsConfiguration('testy.problems') && !this.scheduler.isRunning) {this.diagnostics.publish();}
-                    if (['runMode', 'runWithCoverage', 'buildConfiguration', 'dotnetPath', 'testArguments', 'exclude', 'coverageToolPath', 'solution', 'projects'].some(key => event.affectsConfiguration(`testy.${key}`)) && !this.awaitingBaseline) {this.scheduler.request([], true);}
+                    // Settings that choose what runs refresh discovery at once; the engine decides at run start whether
+                    // learned coverage still applies or a new baseline starts.
+                    const structural = ['runMode', 'runWithCoverage', 'buildConfiguration', 'dotnetPath', 'testArguments', 'exclude', 'coverageToolPath', 'solution', 'projects']
+                        .some(key => event.affectsConfiguration(`testy.${key}`));
+                    if ((structural || this.engine.configurationChanged()) && !this.awaitingBaseline) {this.scheduler.request([], true);}
                 } catch (error) { this.reportError(error, true); }
             }),
             vscode.workspace.onDidChangeWorkspaceFolders(() => {
@@ -231,9 +242,11 @@ export class Testy implements vscode.Disposable {
                     this.engine.setRoots(this.roots); this.changes.watch(); if (!this.awaitingBaseline) {this.scheduler.request([], true);}
                 } catch (error) { this.reportError(error, true); }
             }),
-            vscode.window.onDidChangeVisibleTextEditors(() => this.coverage.queue(vscode.window.visibleTextEditors)),
+            vscode.window.onDidChangeVisibleTextEditors(() => {this.coverage.queue(vscode.window.visibleTextEditors); this.inline.refresh();}),
             vscode.workspace.onDidChangeTextDocument(event => {
-                if (event.contentChanges.length) {this.coverage.queue(vscode.window.visibleTextEditors.filter(editor => editor.document === event.document));}
+                if (!event.contentChanges.length) {return;}
+                const editors = vscode.window.visibleTextEditors.filter(editor => editor.document === event.document);
+                this.coverage.queue(editors); this.inline.queue(editors);
             })
         );
         setContext('testy.active', true);
@@ -261,8 +274,11 @@ export class Testy implements vscode.Disposable {
         this.awaitingBaseline = true;
         this.output.info('Waiting for permission to establish the baseline; a save or a manual run also starts it.');
         const run = l10n.t('Run Now'), later = l10n.t('Not Now'), never = l10n.t('Don\'t Ask Again');
-        void Promise.resolve(vscode.window.showInformationMessage(
-            l10n.t('Testy can build this workspace and run every C# test once to learn which tests cover which code. Start the baseline now?'), run, later, never))
+        // The first coverage run downloads the collector, so say so before the user agrees.
+        const message = this.config.coverage && !this.config.coverageTool
+            ? l10n.t('Testy can build this workspace and run every C# test once to learn which tests cover which code. Coverage uses Microsoft\'s dotnet-coverage tool, downloaded from NuGet on first use. Start the baseline now?')
+            : l10n.t('Testy can build this workspace and run every C# test once to learn which tests cover which code. Start the baseline now?');
+        void Promise.resolve(vscode.window.showInformationMessage(message, run, later, never))
             .then(async choice => {
                 if (!this.awaitingBaseline || this.disposed) {return;}
                 if (choice === run) {
@@ -296,6 +312,9 @@ export class Testy implements vscode.Disposable {
 
     /** The user's pause choice, before continuous runs override it. */
     private get userPaused(): boolean { return this.pauseOverride ?? !this.config.enabled; }
+
+    /** Which of the two sources decides whether automatic testing is on: this workspace's pause or resume, or `testy.autoRun`. */
+    private get pauseSource(): 'workspace' | 'setting' { return this.pauseOverride === undefined ? 'setting' : 'workspace'; }
 
     /** Whether automatic runs are paused; startup's hold is not shown as a pause. */
     private get paused(): boolean { return this.started && this.scheduler.isPaused; }
@@ -364,14 +383,21 @@ export class Testy implements vscode.Disposable {
         return [...new Set(projects.flatMap(project => project.sourceFiles.filter(source => source !== file && isInside(source, file))))];
     }
 
-    /** Run the test files whose retained coverage hits the cursor line. */
-    private async runCoveringTests(): Promise<void> {
+    /** Run the test files whose retained coverage hits a line (1-based): the given one, or the cursor line. */
+    private async runCoveringTests(target?: { readonly uri: vscode.Uri; readonly line: number }): Promise<void> {
         const editor = vscode.window.activeTextEditor;
-        if (!editor || editor.document.uri.scheme !== 'file') {return;}
-        const groups = this.coverage.covering(await normalizePathAsync(editor.document.uri.fsPath), editor.selection.active.line + 1);
+        const { uri, line } = target ?? (editor ? { uri: editor.document.uri, line: editor.selection.active.line + 1 } : { uri: undefined, line: 0 });
+        if (uri?.scheme !== 'file') {return;}
+        const groups = this.coverage.covering(await normalizePathAsync(uri.fsPath), line);
         if (!groups.length) {void Promise.resolve(vscode.window.showInformationMessage(l10n.t('No retained test coverage hits this line.'))).catch(() => undefined); return;}
-        try { await this.scheduler.runManual(signal => this.execute({ files: [], full: false }, signal, { manual: { groups: new Set(groups) }, label: l10n.t('Testy · run tests covering {0}:{1}', path.basename(editor.document.uri.fsPath), editor.selection.active.line + 1) })); }
+        try { await this.scheduler.runManual(signal => this.execute({ files: [], full: false }, signal, { manual: { groups: new Set(groups) }, label: l10n.t('Testy · run tests covering {0}:{1}', path.basename(uri.fsPath), line) })); }
         catch (error) { this.reportError(error); }
+    }
+
+    /** Reveal a test, file or project in Test Explorer. */
+    private async showTest(id: string): Promise<void> {
+        const item = this.tree.items.get(id);
+        if (item) {await vscode.commands.executeCommand('vscode.revealTestInExplorer', item);}
     }
 
     /** "Why was this selected?" for a Test Explorer item. */
@@ -385,7 +411,7 @@ export class Testy implements vscode.Disposable {
     }
 
     private clearCoverage(): void {
-        this.coverage.hide(); this.updateStatus();
+        this.coverage.hide(); this.inline.refresh(); this.updateStatus();
         void Promise.resolve(vscode.commands.executeCommand('testing.coverage.close')).catch(() => undefined);
         this.output.info('Coverage display cleared; the next run shows coverage again.');
     }
@@ -406,14 +432,16 @@ export class Testy implements vscode.Disposable {
                 this.diagnostics.clear(); this.tree.clearBuildFailures();
                 await this.engine.reset(signal);
             });
+            this.inline.refresh();
             this.scheduler.request([], true);
         } catch (error) { this.reportError(error); }
     }
 
     private showMenu(refreshAll: () => Promise<void>): Promise<void> {
-        return showMenu({ paused: this.paused, running: this.scheduler.isRunning, lastError: this.lastError, placeHolder: this.statusBar.tooltip }, {
+        return showMenu({ paused: this.paused, running: this.scheduler.isRunning, lastError: this.lastError, placeHolder: this.statusBar.tooltip, pauseSource: this.pauseSource }, {
             setPaused: paused => this.setPaused(paused), runAffected: () => this.runAffected(), refreshAll, cancel: () => this.scheduler.cancel(),
-            clearCoverage: () => this.clearCoverage(), exportCoverage: () => this.exportCoverage(), resetCaches: () => this.resetCaches(), showOutput: () => this.output.show()
+            clearCoverage: () => this.clearCoverage(), exportCoverage: () => this.exportCoverage(), resetCaches: () => this.resetCaches(), showOutput: () => this.output.show(),
+            openSettings: () => vscode.commands.executeCommand('workbench.action.openSettings', extensionSettings)
         });
     }
 
@@ -576,7 +604,8 @@ export class Testy implements vscode.Disposable {
         this.statusBar.update({
             paused: this.paused, running: this.scheduler.isRunning, scheduling: this.scheduling, phase: this.phase,
             lastError: this.lastError, lastSummary: this.lastSummary, passed: this.tree.passed, failed: this.tree.failed,
-            hasTests: !!this.engine.groups.length, coverageSuffix: this.coverage.suffix, continuousOverride: !!this.continuous.size && this.userPaused
+            hasTests: !!this.engine.groups.length, coverageSuffix: this.coverage.suffix, continuousOverride: !!this.continuous.size && this.userPaused,
+            pauseSource: this.pauseSource, autoRunSetting: this.config.enabled
         });
     }
 
@@ -590,8 +619,16 @@ export class Testy implements vscode.Disposable {
         if (notify || environmentError(error)) {this.notify(this.lastError, 'error', isEnvironmentError(error) ? environmentSummary(error.code) : undefined);}
     }
 
-    /** Shows the first line of `message` once per session, or `shown` (localized) in its place. */
-    private notify(message: string, severity: 'error' | 'warning', shown?: string): void {
+    /** Coverage setup failed: usually NuGet is unreachable (offline, or a proxy) or testy.coverageToolPath is wrong. */
+    private coverageUnavailable(): void {
+        const message = this.config.coverageTool
+            ? l10n.t('Coverage is unavailable: the dotnet-coverage tool set in testy.coverageToolPath could not be used. Tests run with project-wide selection. See the output for details.')
+            : l10n.t('Coverage is unavailable: Microsoft\'s dotnet-coverage tool could not be installed from NuGet. Offline or behind a proxy? Install dotnet-coverage and set testy.coverageToolPath to it. Tests run with project-wide selection meanwhile.');
+        this.notify(message, 'warning', undefined, '@id:testy.coverageToolPath');
+    }
+
+    /** Shows the first line of `message` once per session, or `shown` (localized) in its place; Open Settings opens `settings`. */
+    private notify(message: string, severity: 'error' | 'warning', shown?: string, settingsQuery = extensionSettings): void {
         const summary = (message.split(/\r?\n/, 1)[0] ?? '').trim();
         if (this.notified.has(summary)) {return;}
         this.notified.add(summary);
@@ -599,7 +636,7 @@ export class Testy implements vscode.Disposable {
         const text = l10n.t('Testy: {0}', shown ?? summary);
         void Promise.resolve(severity === 'error' ? vscode.window.showErrorMessage(text, output, settings) : vscode.window.showWarningMessage(text, output, settings)).then(async choice => {
             if (choice === output) {this.output.show();}
-            else if (choice === settings) {await vscode.commands.executeCommand('workbench.action.openSettings', '@ext:reginaldFerland.testy');}
+            else if (choice === settings) {await vscode.commands.executeCommand('workbench.action.openSettings', settingsQuery);}
         }).catch(() => undefined);
     }
 
@@ -619,7 +656,7 @@ export class Testy implements vscode.Disposable {
         // Subscription disposal is synchronous; deactivate also awaits this work.
         void this.disposal.catch((error: unknown) => console.error('Testy prepared-output cleanup failed.', error));
         this.disposables.forEach(disposable => {disposable.dispose();});
-        this.coverage.dispose();
+        this.coverage.dispose(); this.inline.dispose();
         this.activeRun?.end(); this.controller.dispose(); this.statusBar.dispose();
         for (const key of ['testy.active', 'testy.paused', 'testy.running', 'testy.noTestProjects']) {setContext(key, false);}
         return this.disposal;

@@ -84,6 +84,8 @@ test('setting changes do not start a baseline the user has not agreed to',async(
   workspace:{onDidChangeConfiguration:(/** @type {unknown} */ handler)=>{changed=handler;return{dispose(){}};}}});
  /** @type {unknown[][]} */ const requested=[];
  f.testy.engine.restore=async()=>undefined;f.testy.scheduler.request=(/** @type {unknown[]} */ ...args)=>requested.push(args);
+ // The engine judges whether the settings invalidate learned coverage; here they always do.
+ f.testy.engine.configurationChanged=()=>true;
  await f.testy.start();await tick();
  changed({affectsConfiguration:(/** @type {string} */ key)=>key==='testy'||key==='testy.solution'});
  assert.deepEqual(requested,[]);
@@ -115,4 +117,13 @@ test('Test Explorer\'s refresh only rediscovers: the baseline question stays ope
  answer();await tick();await tick();
  assert.deepEqual(plain(requested),[[[],true]],'Run Now still starts the baseline');
  await f.testy.dispose();
+});
+
+test('the baseline prompt mentions the dotnet-coverage download only when coverage needs it',async()=>{
+ for(const [configuration,mentioned] of /** @type {[Record<string, unknown>, boolean][]} */ ([[{coverage:true},true],[{coverage:true,coverageTool:'/tools/dotnet-coverage'},false],[{coverage:false},false]])) {
+  const f=fixture({configuration});
+  await f.testy.start();await tick();
+  assert.equal(/dotnet-coverage tool, downloaded from NuGet/.test(f.prompts[0].message),mentioned,JSON.stringify(configuration));
+  await f.testy.dispose();
+ }
 });

@@ -43,10 +43,11 @@ export function commitIsCurrent(run: { readonly topology: number; readonly revis
     return run.topology === current.topology && !run.obsoleteBuild && run.revision === current.revision && traceIsCurrent(trace, hashes);
 }
 
-/** Unselected traces whose inputs match the build's source versions are fresh again. */
+/** Unselected stale traces whose inputs match the build's source versions are fresh again. Fresh and
+ * historical traces cannot change, so only stale traces' inputs are compared. */
 export function freshTraces(traces: ReadonlyMap<string, Trace>, selected: ReadonlySet<string>, before: ReadonlyMap<string, string>): Set<string> {
     const fresh = new Set<string>();
-    for (const [id, trace] of traces) {if (!selected.has(id) && traceIsCurrent(trace, before)) {fresh.add(id);}}
+    for (const [id, trace] of traces) {if (trace.stale && !trace.historical && !selected.has(id) && traceIsCurrent(trace, before)) {fresh.add(id);}}
     return fresh;
 }
 

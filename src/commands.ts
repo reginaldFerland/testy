@@ -20,7 +20,10 @@ export interface CommandHandlers {
     showMenu(): Promise<void>;
     explainSelection(item?: vscode.TestItem): void;
     excludeProject(item?: vscode.TestItem): Promise<void>;
-    runCoveringTests(): Promise<void>;
+    /** Lines are 1-based; without a line, the cursor line of the active editor. */
+    runCoveringTests(target?: { readonly uri: vscode.Uri; readonly line: number }): Promise<void>;
+    /** Reveal a Test Explorer item by its id. */
+    showTest(id: string): Promise<void>;
     runFile(uris: readonly vscode.Uri[]): Promise<void>;
 }
 
@@ -39,7 +42,10 @@ export function registerCommands(handlers: CommandHandlers): vscode.Disposable[]
         vscode.commands.registerCommand('testy.showMenu', () => handlers.showMenu()),
         vscode.commands.registerCommand('testy.explainSelection', (item?: vscode.TestItem) => handlers.explainSelection(item)),
         vscode.commands.registerCommand('testy.excludeProject', (item?: vscode.TestItem) => handlers.excludeProject(item)),
-        vscode.commands.registerCommand('testy.runCoveringTests', () => handlers.runCoveringTests()),
+        // The editor context menu passes the document's URI; hover links pass a URI string and a 1-based line.
+        vscode.commands.registerCommand('testy.runCoveringTests', (uri?: vscode.Uri | string, line?: unknown) => handlers.runCoveringTests(
+            uri !== undefined && typeof line === 'number' && Number.isInteger(line) && line > 0 ? { uri: typeof uri === 'string' ? vscode.Uri.parse(uri, true) : uri, line } : undefined)),
+        vscode.commands.registerCommand('testy.showTest', (id?: unknown) => typeof id === 'string' ? handlers.showTest(id) : undefined),
         vscode.commands.registerCommand('testy.runFile', (uri?: vscode.Uri, uris?: readonly vscode.Uri[]) => handlers.runFile(uris?.length ? uris : uri ? [uri] : [])),
         vscode.commands.registerCommand('testy.runFolder', (uri?: vscode.Uri, uris?: readonly vscode.Uri[]) => handlers.runFile(uris?.length ? uris : uri ? [uri] : []))
     ];
@@ -47,7 +53,7 @@ export function registerCommands(handlers: CommandHandlers): vscode.Disposable[]
 
 /** Every contributed command; `registerCommands` registers the same set. */
 export const commandIds = ['testy.refreshTests', 'testy.toggleAutoRun', 'testy.pause', 'testy.resume', 'testy.runAffected', 'testy.cancelRun', 'testy.clearCoverage', 'testy.exportCoverage',
-    'testy.resetCaches', 'testy.showOutput', 'testy.showMenu', 'testy.explainSelection', 'testy.excludeProject', 'testy.runCoveringTests', 'testy.runFile', 'testy.runFolder'] as const;
+    'testy.resetCaches', 'testy.showOutput', 'testy.showMenu', 'testy.explainSelection', 'testy.excludeProject', 'testy.runCoveringTests', 'testy.showTest', 'testy.runFile', 'testy.runFolder'] as const;
 
 /**
  * Before Testy can start (Restricted Mode, or no folder open), its commands only explain why:

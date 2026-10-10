@@ -9,8 +9,9 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 namespace Testy.Analysis;
 
 // Source analysis requests, shared by the one-shot and server modes. Every
-// request reads its files afresh and keeps no state, so a long-lived process
-// cannot serve results for bytes that have since changed.
+// request reads its files afresh, so a long-lived process cannot serve results
+// for bytes that have since changed. The only state kept is a small cache of global
+// alias results, keyed by the hash of the very text they were computed from.
 static class SourceAnalysis
 {
     // The extension can keep several servers, each serving requests concurrently with several
@@ -34,11 +35,20 @@ static class SourceAnalysis
             throw new InvalidOperationException("The installed Roslyn did not analyze the self-test source as expected.");
         }
         // The contract that selection relies on: executable edits keep the declaration signature, declaration edits change it.
-        var original = await AnalyzeAsync("class D { int M(int x) { return x; } int P => 1; int this[int i] { get { return i; } } }");
-        var edited = await AnalyzeAsync("class D { int M(int x) { return x + 1; } int P => 2; int this[int i] { get { return i + 1; } } }");
-        var redeclared = await AnalyzeAsync("class D { int M(long x) { return x; } int P => 1; int this[int i] { get { return i; } } }");
-        if (original is null || edited is null || redeclared is null || original.Signature == original.Body
-            || original.Signature != edited.Signature || original.Body == edited.Body || original.Signature == redeclared.Signature)
+        const string declarations = "class D { int f; /* c */ D(int a) : base() { f = a; } static D() { } ~D() { } public static D operator +(D l, D r) { return l; }"
+            + " public static implicit operator int(D d) { return d.f; } int M(int x) { return x; } int P => 1; int this[int i] { get { return i; } } }";
+        var original = await AnalyzeAsync(declarations);
+        var edited = await AnalyzeAsync(declarations.Replace("f = a;", "f = a + 1;").Replace("return l;", "return r;").Replace("return d.f;", "return 0;")
+            .Replace("return x;", "return x + 1;").Replace("=> 1", "=> 2").Replace("return i;", "return i + 1;").Replace("/* c */", "// changed comment\n"));
+        var redeclared = await AnalyzeAsync(declarations.Replace("int M(int x)", "int M(long x)"));
+        var initializer = await AnalyzeAsync(declarations.Replace(": base()", ": this(1)"));
+        var staticBody = await AnalyzeAsync(declarations.Replace("static D() { }", "static D() { Init(); }"));
+        var finalizer = await AnalyzeAsync(declarations.Replace("~D() { }", "~D() { f = 0; }"));
+        var documented = await AnalyzeAsync(declarations.Replace("/* c */", "/// <summary>doc</summary>\n"));
+        if (original is null || edited is null || redeclared is null || initializer is null || staticBody is null || finalizer is null || documented is null || original.Signature == original.Body
+            || original.Signature != edited.Signature || original.Body == edited.Body || original.Signature == redeclared.Signature
+            || original.Signature == initializer.Signature || original.Signature == staticBody.Signature
+            || original.Signature == finalizer.Signature || original.Signature == documented.Signature)
         {
             throw new InvalidOperationException("The installed Roslyn did not fingerprint the self-test declarations as expected.");
         }
@@ -50,10 +60,13 @@ static class SourceAnalysis
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static string Describe() => $"{typeof(SyntaxNode).Assembly.GetName().Version} from {RoslynLoader.Location}";
 
+    public static Task<string> HandleAsync(JsonElement request, byte[] requestBytes, string cwd, CancellationToken cancellationToken) =>
+        HandleAsync(request, () => requestBytes, cwd, cancellationToken);
+
     // Relative paths in a request mean what they mean to the caller's working directory.
-    // requestBytes are the exact serialized request, bound into provenance responses.
+    // requestBytes yields the exact serialized request, bound into provenance responses; only provenance asks for it.
     [MethodImpl(MethodImplOptions.NoInlining)]
-    public static async Task<string> HandleAsync(JsonElement request, byte[] requestBytes, string cwd, CancellationToken cancellationToken)
+    public static async Task<string> HandleAsync(JsonElement request, Func<byte[]> requestBytes, string cwd, CancellationToken cancellationToken)
     {
         var provenance = request.TryGetProperty("provenance", out var requestedProvenance) && requestedProvenance.GetBoolean();
         var combined = request.TryGetProperty("allFiles", out var allFiles);
@@ -94,7 +107,7 @@ static class SourceAnalysis
         {
             var sourceHashes = new Dictionary<string, string?>();
             for (var index = 0; index < files.Length; index++) { sourceHashes[files[index]] = analyses[index].SourceHash; }
-            return JsonSerializer.Serialize(new SourceAnalysisProvenance(1, Convert.ToHexString(SHA256.HashData(requestBytes)), aliases, result, sourceHashes), AnalysisJson.Default.SourceAnalysisProvenance);
+            return JsonSerializer.Serialize(new SourceAnalysisProvenance(1, Convert.ToHexString(SHA256.HashData(requestBytes())), aliases, result, sourceHashes), AnalysisJson.Default.SourceAnalysisProvenance);
         }
         return combined ? JsonSerializer.Serialize(new CombinedAnalysis(aliases, result), AnalysisJson.Default.CombinedAnalysis) : JsonSerializer.Serialize(result, AnalysisJson.Default.DictionaryStringSourceShape);
     }
@@ -140,7 +153,7 @@ static class SourceAnalysis
         var localAliases = usings.Where(directive => directive.Alias is not null && IsExcluded(Name(directive.Name)))
             .SelectMany(directive => AliasNames(directive.Alias!.Name.Identifier.ValueText)).ToArray();
         var excludedAliases = aliases.Concat(localAliases).ToHashSet(StringComparer.Ordinal);
-        bool Excluded(AttributeSyntax attribute) => IsExcluded(Name(attribute.Name)) || excludedAliases.Contains(Name(attribute.Name));
+        bool Excluded(AttributeSyntax attribute) { var name = Name(attribute.Name); return IsExcluded(name) || excludedAliases.Contains(name); }
         var attributes = allAttributes.Where(Excluded).ToArray();
         // Compilation symbols are project-specific. An exclusion in disabled
         // text cannot safely be ruled out by this syntax-only analysis.
@@ -190,11 +203,22 @@ static class SourceAnalysis
     }
 
     static readonly string[] ExcludingAttributes = ["ExcludeFromCodeCoverage", "DebuggerHidden", "DebuggerNonUserCode", "GeneratedCode", "CompilerGenerated"];
+    static readonly string[] ExcludingSuffixes = [.. ExcludingAttributes, .. ExcludingAttributes.Select(attribute => attribute + "Attribute")];
 
-    static bool IsExcluded(string name) => ExcludingAttributes
-        .Any(attribute => name.EndsWith(attribute, StringComparison.Ordinal) || name.EndsWith(attribute + "Attribute", StringComparison.Ordinal));
+    static bool IsExcluded(string name)
+    {
+        foreach (var suffix in ExcludingSuffixes) { if (name.EndsWith(suffix, StringComparison.Ordinal)) { return true; } }
+        return false;
+    }
 
-    static string Name(SyntaxNode? node) => node is null ? "" : string.Concat(node.DescendantTokens().Select(token => token.ValueText));
+    // The value text of every token of the name. Simple and qualified names, nearly all of them, need no token walk.
+    static string Name(SyntaxNode? node) => node switch
+    {
+        null => "",
+        IdentifierNameSyntax identifier => identifier.Identifier.ValueText,
+        QualifiedNameSyntax qualified => string.Concat(Name(qualified.Left), qualified.DotToken.ValueText, Name(qualified.Right)),
+        _ => string.Concat(node.DescendantTokens().Select(token => token.ValueText))
+    };
 
     static IEnumerable<string> AliasNames(string name) => name.EndsWith("Attribute", StringComparison.Ordinal) ? [name, name[..^9]] : [name];
 
@@ -204,11 +228,38 @@ static class SourceAnalysis
         var names = new HashSet<string>(StringComparer.Ordinal);
         foreach (var source in sources)
         {
+            var key = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(source)));
+            if (AliasCache.TryGet(key, out var known)) { names.UnionWith(known); continue; }
             await Cpu.WaitAsync(cancellationToken);
-            try { names.UnionWith(GlobalAliases(source, cancellationToken)); }
+            try
+            {
+                var found = GlobalAliases(source, cancellationToken).ToArray();
+                AliasCache.Add(key, found); names.UnionWith(found);
+            }
             finally { Cpu.Release(); }
         }
         return [.. names.Order(StringComparer.Ordinal)];
+    }
+
+    // Global alias sources rarely change between requests, yet each request lists all of them. The result is a
+    // pure function of the text, so it is kept by the text's hash; the oldest entries go first.
+    static class AliasCache
+    {
+        private const int Capacity = 512;
+        private static readonly Dictionary<string, string[]> entries = new(StringComparer.Ordinal);
+        private static readonly Queue<string> order = new();
+
+        public static bool TryGet(string key, out string[] aliases) { lock (entries) { return entries.TryGetValue(key, out aliases!); } }
+
+        public static void Add(string key, string[] aliases)
+        {
+            lock (entries)
+            {
+                if (!entries.TryAdd(key, aliases)) { return; }
+                order.Enqueue(key);
+                while (entries.Count > Capacity) { entries.Remove(order.Dequeue()); }
+            }
+        }
     }
 
     internal static IEnumerable<string> GlobalAliases(string content, CancellationToken cancellationToken = default)
@@ -229,7 +280,7 @@ static class SourceAnalysis
     static string TypeKey(TypeDeclarationSyntax type)
     {
         var ns = string.Join(".", type.Ancestors().OfType<BaseNamespaceDeclarationSyntax>().Reverse()
-            .Select(declaration => string.Concat(declaration.Name.DescendantTokens().Select(token => token.ValueText))));
+            .Select(declaration => Name(declaration.Name)));
         var name = string.Join("+", type.AncestorsAndSelf().OfType<TypeDeclarationSyntax>().Reverse()
             .Select(declaration => declaration.Identifier.ValueText + "`" + (declaration.TypeParameterList?.Parameters.Count ?? 0)));
         return ns + ":" + name;

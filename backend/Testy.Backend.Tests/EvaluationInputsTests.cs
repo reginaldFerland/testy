@@ -185,6 +185,18 @@ public class EvaluationInputsTests
     }
 
     [Fact]
+    public void AListingDigestIgnoresOrderAndNamesTheCount()
+    {
+        // The TypeScript side computes the same string (listingDigest in projectEvaluationCache.ts).
+        Assert.Equal("0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", EvaluationInputs.Listing([]));
+        var names = new[] { "/p/b.cs", "/p/a.cs", "/p/c.cs" };
+        Assert.Equal(EvaluationInputs.Listing(names), EvaluationInputs.Listing(names.Reverse()));
+        Assert.Equal("3:" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData("/p/a.cs\n/p/b.cs\n/p/c.cs"u8)).ToLowerInvariant(), EvaluationInputs.Listing(names));
+        Assert.NotEqual(EvaluationInputs.Listing(names), EvaluationInputs.Listing(["/p/a.cs", "/p/b.cs"]));
+        Assert.NotEqual(EvaluationInputs.Listing(["/p/a.cs\n/p/b.cs"]), EvaluationInputs.Listing(["/p/a.cs", "/p/b.cs"]));
+    }
+
+    [Fact]
     public void ReportsEvaluationInputsWithLowerCaseFields()
     {
         var snapshot = new EvaluationInputs.Snapshot(true, ["a"], new Dictionary<string, string> { ["a"] = "h" },

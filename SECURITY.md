@@ -12,6 +12,10 @@ Vulnerabilities we do want to hear about include, for example, code execution or
 
 Security fixes are made in the latest released version.
 
+## Verifying a release
+
+The VSIX attached to each GitHub release has a build provenance attestation: `gh attestation verify testy.vsix --repo reginaldFerland/testy`. The release also carries an SPDX SBOM of the locked dependencies and the production source maps.
+
 ## Reporting a vulnerability
 
 Please do not open a public issue. Report privately through [GitHub security advisories](https://github.com/reginaldFerland/testy/security/advisories/new) ("Report a vulnerability" on the repository's Security tab). Include the Testy and VS Code versions, your OS, and steps to reproduce.

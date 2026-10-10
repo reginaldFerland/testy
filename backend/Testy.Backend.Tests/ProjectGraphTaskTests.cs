@@ -33,7 +33,7 @@ public sealed class ProjectGraphTaskTests : IDisposable
         Assert.Equal(Path.Combine(directory, "a.proj"), graph.RootElement.GetProperty("projects")[0].GetProperty("file").GetString());
         // The TypeScript reader rejects any other version, and the members it reads keep their names.
         Assert.Equal(["version", "projects", "roots", "evaluations"], graph.RootElement.EnumerateObject().Select(property => property.Name));
-        Assert.Equal(1, graph.RootElement.GetProperty("version").GetInt32());
+        Assert.Equal(2, graph.RootElement.GetProperty("version").GetInt32());
         Assert.Equal(["file", "framework", "assembly", "assemblyName", "outputDirectories", "isTestProject", "isMtp", "properties", "contextId", "contextReferences",
             "sourceFiles", "inputs", "references", "binaryReferences"], graph.RootElement.GetProperty("projects")[0].EnumerateObject().Select(property => property.Name));
         Assert.Equal(["file", "contexts", "entryPoints", "evaluation"], graph.RootElement.GetProperty("roots")[0].EnumerateObject().Select(property => property.Name));
@@ -178,6 +178,67 @@ public sealed class ProjectGraphTaskTests : IDisposable
         // Backslashes are the project's authoring platform, not the current one; no hint means nothing to watch.
         Assert.Equal(Sorted([Path.Combine(directory, "libs", "relative.dll"), Path.Combine(directory, "app", "absolute.dll")]),
             Strings(ProjectOf(graph, project).GetProperty("binaryReferences")));
+    }
+
+    [Fact]
+    public void AReferenceNamingAFileCountsEvenWithoutAHintPath()
+    {
+        var project = Project("app/app.proj", SingleTarget() + """
+            <ItemGroup>
+              <Reference Include="..\libs\plain.dll" />
+              <Reference Include="$(MSBuildThisFileDirectory)tool.exe" />
+              <Reference Include="Local.dll" />
+              <Reference Include="Hinted"><HintPath>..\libs\hinted.dll</HintPath></Reference>
+              <Reference Include="..\libs\hinted.dll" />
+              <Reference Include="System.Xml" />
+              <Reference Include="Strong.Name, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null" />
+            </ItemGroup>
+            """);
+        using var graph = Graph(project);
+        Assert.Equal(Sorted([Path.Combine(directory, "libs", "plain.dll"), Path.Combine(directory, "app", "tool.exe"), Path.Combine(directory, "app", "Local.dll"),
+            Path.Combine(directory, "libs", "hinted.dll")]), Strings(ProjectOf(graph, project).GetProperty("binaryReferences")));
+    }
+
+    [Fact]
+    public void BinaryAnalyzersAreInputsExceptThoseOfThePackageCache()
+    {
+        var project = Project("app/app.proj", SingleTarget() + """
+            <PropertyGroup><NuGetPackageRoot>$(MSBuildThisFileDirectory)..\packages\</NuGetPackageRoot></PropertyGroup>
+            <ItemGroup>
+              <Analyzer Include="..\gen\Generator.dll" />
+              <Analyzer Include="local\Other.dll" />
+              <Analyzer Include="..\packages\some.pkg\1.0.0\analyzers\dotnet\cs\Cached.dll" />
+            </ItemGroup>
+            """);
+        using var graph = Graph(project);
+        var inputs = Strings(ProjectOf(graph, project).GetProperty("inputs"));
+        Assert.Contains(Path.Combine(directory, "gen", "Generator.dll"), inputs);
+        Assert.Contains(Path.Combine(directory, "app", "local", "Other.dll"), inputs);
+        Assert.DoesNotContain(inputs, input => input.Contains("Cached.dll", StringComparison.Ordinal));
+        Assert.Equal(inputs, Sorted(inputs.Distinct()));
+    }
+
+    [Fact]
+    public void ListingQueriesOfAnEvaluationCarryADigestNotTheNames()
+    {
+        var project = Project("app/app.proj", SingleTarget());
+        using var graph = Graph(project);
+        var queries = graph.RootElement.GetProperty("evaluations").EnumerateObject().SelectMany(evaluation => evaluation.Value.GetProperty("queries").EnumerateArray())
+            .Where(query => query.GetProperty("kind").GetString() is "files" or "directories" or "entries" or "imports").ToArray();
+        Assert.All(queries, query => Assert.Matches("^[0-9]+:[0-9a-f]{64}$", Assert.Single(query.GetProperty("values").EnumerateArray()).GetString()!));
+    }
+
+    [Fact]
+    public void StaleTemporaryGraphsAreClearedAndRecentOnesLeftAlone()
+    {
+        var (task, engine) = Task();
+        var stale = task.OutputFile + ".aaaa.tmp";
+        var recent = task.OutputFile + ".bbbb.tmp";
+        File.WriteAllText(stale, "x"); File.WriteAllText(recent, "x");
+        File.SetLastWriteTimeUtc(stale, DateTime.UtcNow.AddHours(-2));
+        Assert.True(task.Execute(), string.Join("\n", engine.Errors));
+        Assert.False(File.Exists(stale));
+        Assert.True(File.Exists(recent));
     }
 
     [Fact]

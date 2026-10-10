@@ -5,9 +5,10 @@ import * as path from 'node:path';
 import { Project } from '../core/model';
 import { mapConcurrent } from '../core/concurrency';
 import { EnvironmentError } from '../core/errors';
-import { EvaluationStorageLimits, readEvaluationSnapshot, writeEvaluationSnapshot } from './projectEvaluationStorage';
+import { EvaluationStorageLimits, listingDigestPattern, readEvaluationSnapshot, writeEvaluationSnapshot } from './projectEvaluationStorage';
 import { isNativeExecutable, resolveNodeExecutable } from './executable';
 import { HashMemo } from './hashMemo';
+import { fileIdentity } from './preparationTools';
 
 export interface EvaluationQuery {
     readonly kind: 'file' | 'directory' | 'exists' | 'files' | 'directories' | 'entries' | 'mtime' | 'imports';
@@ -35,21 +36,24 @@ export interface EvaluationEntry {
 }
 const missing = (error: unknown): boolean => ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '');
 const lexical = (value: string): string => process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value);
-const within = (file: string, directory: string): boolean => lexical(file) === lexical(directory) || lexical(file).startsWith(`${lexical(directory)}${path.sep}`);
+/** `within` for operands already passed through lexical. */
+const underLexical = (file: string, directory: string): boolean => file === directory || file.startsWith(`${directory}${path.sep}`);
+const within = (file: string, directory: string): boolean => underLexical(lexical(file), lexical(directory));
 const digest = (value: string | Buffer): string => createHash('sha256').update(value).digest('hex');
+/** The digest of a listing's names, as EvaluationInputs.Listing in the helper computes it. */
+const listingDigest = (names: readonly string[]): string => { const sorted = [...names].sort(); return `${sorted.length}:${digest(sorted.join('\n'))}`; };
 
 /** Resolve the actual CLI in every possible inspection cwd. A relative PATH
- * selecting different hosts cannot share an evaluation cache context. */
-export async function evaluationToolContext(dotnet: string, analyzer: string, directories: readonly string[], signal?: AbortSignal): Promise<{ readonly key: string; readonly root: string } | undefined> {
+ * selecting different hosts cannot share an evaluation cache context. `identities`
+ * (the engine's tool hashes) reuses the host and analyzer hashes while their metadata is unchanged. */
+export async function evaluationToolContext(dotnet: string, analyzer: string, directories: readonly string[], signal?: AbortSignal,
+    identities?: Map<string, Promise<string>>): Promise<{ readonly key: string; readonly root: string } | undefined> {
     signal?.throwIfAborted();
     const fingerprints = new Map<string, Promise<string>>();
     const fingerprint = (file: string): Promise<string> => {
         const previous = fingerprints.get(file);
         if (previous) {return previous;}
-        const pending = (async () => {
-            const actual = await fs.realpath(file), bytes = await fs.readFile(actual, { signal });
-            return `${actual}\0${digest(bytes)}`;
-        })();
+        const pending = fileIdentity(file, signal, identities);
         fingerprints.set(file, pending); return pending;
     };
     try {
@@ -65,13 +69,20 @@ export async function evaluationToolContext(dotnet: string, analyzer: string, di
         if (unique.length !== 1 || !host) {return undefined;}
         const [executable] = host.split('\0');
         if (!executable) {return undefined;}
-        const root = path.dirname(executable), bytes = await fs.readFile(executable, { signal });
-        if (!['dotnet', 'dotnet.exe'].includes(path.basename(executable).toLowerCase()) || !isNativeExecutable(bytes)
+        const root = path.dirname(executable);
+        if (!['dotnet', 'dotnet.exe'].includes(path.basename(executable).toLowerCase()) || !isNativeExecutable(await fileHeader(executable))
             || !(await fs.stat(path.join(root, 'sdk'))).isDirectory() || !(await fs.stat(path.join(root, 'host', 'fxr'))).isDirectory()) {return undefined;}
         const analyzerIdentity = await fingerprint(analyzer);
         signal?.throwIfAborted();
         return { key: digest(JSON.stringify([host, analyzerIdentity])), root };
     } catch {signal?.throwIfAborted(); return undefined;}
+}
+
+/** The leading bytes that identify an executable format. */
+async function fileHeader(file: string): Promise<Buffer> {
+    const handle = await fs.open(file, 'r');
+    try {const { buffer, bytesRead } = await handle.read(Buffer.alloc(4), 0, 4, 0); return buffer.subarray(0, bytesRead);}
+    finally {await handle.close();}
 }
 
 function configurationCandidates(file: string): string[] {
@@ -142,7 +153,7 @@ class Validation {
                 return JSON.stringify([query.kind === 'mtime' ? String(stat.mtimeNs / 100n + 621355968000000000n) : String(query.kind === 'file' ? stat.isFile() : query.kind === 'directory' ? stat.isDirectory() : true)]);
             } catch (error) {if (missing(error)) {return JSON.stringify(query.kind === 'mtime' ? ['504911232000000000'] : ['false']);} throw error;}
         }
-        const values: string[] = [], pending = [query.path];
+        const values: string[] = [], pending = [query.path], excludedPaths = excluded.map(lexical);
         const suffix = query.pattern === '*' || !query.pattern ? undefined : query.pattern.slice(1);
         const importPattern = query.kind === 'imports' ? new RegExp(`^${(query.pattern ?? '*').split('*').map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`, process.platform === 'win32' ? 'i' : '') : undefined;
         while (pending.length) {
@@ -153,17 +164,18 @@ class Validation {
             for (const entry of entries) {
                 this.signal?.throwIfAborted();
                 const file = path.join(directory, entry.name);
-                if (query.kind !== 'imports' && excluded.some(output => within(file, output))) {continue;}
+                const lexicalFile = lexical(file);
+                if (query.kind !== 'imports' && excludedPaths.some(output => underLexical(lexicalFile, output))) {continue;}
                 // MSBuild follows linked source directories; decline cached
                 // validation for links instead of assuming a Dirent is a file.
                 const stat = entry.isSymbolicLink() ? await fs.stat(file) : entry;
                 if (entry.isSymbolicLink() && stat.isDirectory()) {throw new Error('Directory links require fresh project evaluation.');}
                 if (query.recursive && stat.isDirectory()) {pending.push(file);}
                 if (importPattern ? !importPattern.test(entry.name) : suffix && !(process.platform === 'win32' ? entry.name.toLowerCase().endsWith(suffix.toLowerCase()) : entry.name.endsWith(suffix))) {continue;}
-                if (query.kind === 'entries' || ((query.kind === 'files' || query.kind === 'imports') && stat.isFile()) || (query.kind === 'directories' && stat.isDirectory())) {values.push(lexical(file));}
+                if (query.kind === 'entries' || ((query.kind === 'files' || query.kind === 'imports') && stat.isFile()) || (query.kind === 'directories' && stat.isDirectory())) {values.push(lexicalFile);}
             }
         }
-        return JSON.stringify(values.sort());
+        return JSON.stringify([listingDigest(values)]);
     }
     async projectInputs(graph: readonly Project[], inputs: readonly EvaluationInputs[], signal?: AbortSignal): Promise<Readonly<Record<string, string>> | undefined> {
         const captured = new Map<string, string>();
@@ -192,7 +204,7 @@ class Validation {
         const queries = inputs.flatMap(input => input.queries.map(query => ({ query, excluded: input.excludedDirectories })));
         const checked = await mapConcurrent(queries, 16, signal, async ({ query, excluded }) => {
             const expected = query.kind === 'files' || query.kind === 'directories' || query.kind === 'entries' || query.kind === 'imports'
-                ? JSON.stringify(query.values.map(lexical).sort()) : JSON.stringify(query.values);
+                ? JSON.stringify(query.values.length === 1 && listingDigestPattern.test(query.values[0]!) ? query.values : [listingDigest(query.values.map(lexical))]) : JSON.stringify(query.values);
             return await this.query(query, excluded) === expected;
         });
         if (checked.some(valid => !valid)) {return undefined;}
@@ -246,6 +258,8 @@ export class ProjectEvaluationCache {
             this.loaded = true;
         } catch (error) {
             signal?.throwIfAborted();
+            // A fresh install has no snapshot yet: that is an empty one, not a failure.
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') {this.loaded = true; return;}
             // An absent, corrupt or unreadable snapshot is a retryable miss.
             this.log(`Saved project evaluations unavailable; evaluating projects. ${String(error)}\n`);
         }
@@ -303,7 +317,7 @@ export class ProjectEvaluationCache {
             signal?.throwIfAborted(); if (!this.dirty) {return;}
             const revision = this.revision;
             try {
-                await writeEvaluationSnapshot(this.storage!, new Map(this.entries), this.limits, signal);
+                await writeEvaluationSnapshot(this.storage!, new Map(this.entries), this.limits, signal, this.log);
                 this.loaded = true;
                 if (this.revision === revision) {this.dirty = false;}
             } catch (error) {

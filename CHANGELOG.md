@@ -38,6 +38,9 @@
 - Class items in Test Explorer have a range, so classes get Run/Debug gutter actions and **Go to Test**.
 - In affected runs, test files that failed last time run first.
 - Test results survive a VS Code reload: each test's last outcome is saved with the cache, so the status bar shows the previous pass/fail counts and previously failing files still run first. **Reset Caches and Baseline** clears them.
+- **Inline results:** covered lines in C# editors show whether the test files covering them passed, failed or are pending, and failing lines are marked in the scroll bar. Hovering a covered line lists the covering test files with their status, with **Run covering tests** and **Show in Test Explorer** links. `testy.inlineResults` (`off`, `gutter`, `gutterAndHover`) controls it; while it is on, `testy.showCoverage` marks only uncovered lines.
+- **Keybindings:** `Ctrl+; P` (`Cmd+; P`) pauses or resumes automatic testing and `Ctrl+; X` (`Cmd+; X`) cancels the current run.
+- **Open Testy Settings** in the status bar menu.
 
 ### Changed
 
@@ -84,6 +87,14 @@
 - Large workspaces block the editor less while loading project graphs, reading saved project evaluations and validating analysis results.
 - Startup and environment notifications are localized; the English detail stays in the output.
 - Production builds ship external source maps alongside the bundle for readable error reports.
+- **Reopening a workspace no longer reruns the whole suite.** Saved coverage is trusted again when the settings, Testy version, environment variables and coverage tools it was learned under still match: the startup run checks every tracked file, the watched files outside every project (such as shared test data, `nuget.config` or a root `.runsettings`) and each project's restored packages, and reruns only test files affected by changes made while VS Code was closed, along with changes no run consumed before closing (for example while automatic testing was paused) and test files whose coverage was stale when saved. Changing a setting that starts a new baseline, or a different .NET SDK or evaluation tools, still runs everything. A baseline interrupted by closing VS Code resumes.
+- Editing a constructor, operator or conversion body, or an ordinary comment, no longer reruns the whole project and its dependents; only test files covering the change run.
+- The first-baseline prompt mentions the one-time download of the coverage collector, and a failed collector setup shows a warning that opens `testy.coverageToolPath`.
+- The status bar tooltip and menu say whether automatic testing is paused for this workspace or turned off by `testy.autoRun`.
+- The settings schema rejects empty and duplicate entries, documents the `testy.debugConfiguration` properties, and marks tuning settings as advanced.
+- Coverage updates and affected-test selection are much faster in large workspaces: merging coverage no longer gets quadratically slower as a baseline grows, coverage refreshes at most every 250 ms during a baseline, and selection groups test files by project.
+- The coverage cache stores each path once, so large solutions no longer exceed its size limit and lose older coverage.
+- Less disk work per run: tool fingerprints, the Roslyn identity and source manifests are reused, committed files are rechecked only once per run, and output directories are removed and repaired faster.
 
 ### Fixed
 
@@ -139,6 +150,13 @@
 - On Windows, another window no longer takes over the storage lock from a live window after sleep/resume or a stall of up to 10 minutes.
 - The analyzer server bounds request line length and queues requests beyond a concurrency limit, and alias analysis honours cancellation and the shared CPU limit.
 - The runtime observer no longer serializes unrelated assembly loads in the test process, and never throws into it.
+- Disposing Testy no longer hangs after a run was cancelled while reusing a prepared output, and every shutdown step runs even if an earlier one fails.
+- A test host that exits right after its last result no longer turns a complete run into a failure.
+- Binary references without a `HintPath` and analyzer or source-generator DLLs are tracked as project inputs, so rebuilding one selects the projects that use it.
+- Quoted `PATH` entries are resolved on Windows and an over-long Windows command line gets a clear error.
+- A missing evaluation snapshot on a fresh install is no longer logged as a failure; evaluations skipped for size are logged.
+- Oversized coverage reports and cache records are rejected instead of exhausting memory, and the analyzer server bounds its request queue.
+- Interrupted output claims and helper temporary files are cleaned up, and captured process output is capped at 1 MiB per stream.
 
 ### Internal
 
@@ -161,6 +179,13 @@
 - New backend tests cover the Windows process host job, project graph edge cases, PDB source locations, startup hook concurrency and analyzer server limits.
 - CI compiles once per OS, gates TypeScript line coverage, checks l10n drift and runs the extension tests on the minimum VS Code version. Release secrets are scoped to the publish steps, actions are pinned to commit SHAs, and the published VSIX is the one that was checked.
 - Timing-based unit tests use explicit synchronization instead of sleeps. `npm run clean` removes build and benchmark output; benchmarks write results to `.benchmarks/`.
+- The engine takes injectable services, owns its analyzer server pool, and its run stages change engine state only through named host methods. Reading coverage no longer marks traces stale or schedules saves.
+- `projects.ts` is split into discovery, graph and build modules; owner-record handling is shared by run outputs and prepared storage; preparation tool identity moved to `preparationTools.ts`.
+- The coverage cache moved to `coverage-v3` with versioned records and a shared path table; the old directory is removed. Saved project graphs store listing digests instead of full file lists.
+- The analyzer server reuses parsed alias sources, avoids per-line copies, answers cancellations of queued requests at once, and reports its version. Helper assemblies are stamped with the extension version; NuGet uses package source mapping.
+- CI runs the minimum VS Code on Windows too, tests the latest .NET 10 SDK, audits npm signatures, reviews dependency changes and runs benchmarks weekly. Releases check the changelog and that the tag is on `main`, fail when a marketplace token is missing, publish before creating the GitHub release, and attach provenance attestations, an SBOM and source maps.
+- Lint fails on warnings and covers scripts; tests use `noImplicitReturns`, coverage gates include branches and functions, and Windows runs the process-teardown and junction tests.
+
 
 ## 1.2.0
 

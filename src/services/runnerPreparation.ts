@@ -8,7 +8,8 @@ import { stableEnvironment } from '../core/environment';
 import { requestTests, TestNode } from './mtp';
 import { requireSuccess, runProcess } from './process';
 import { copyOutput, fileHash, PreparedOutput, removeOutput } from './output';
-import { PreparedArtifact, PreparedArtifactLease, preparationToolIdentity } from './preparedOutputCache';
+import { PreparedArtifact, PreparedArtifactLease } from './preparedOutputCache';
+import { preparationToolIdentity } from './preparationTools';
 import { windowsPreparationTools } from './preparationIdentity';
 import { discover, nodeKey } from './runnerDiscovery';
 import { assemblyName, instrumentWithSpareCapacity, workspaceOutputs } from './runnerInstrumentation';
@@ -80,7 +81,7 @@ export class RunnerPreparations {
             lease = await options.preparedOutputCache.acquire(source, context ?? randomUUID(), async root => {
                 const artifact = await this.createArtifact(group, source, root);
                 return context ? artifact : { ...artifact, reusable: false };
-            }, options.signal, JSON.stringify([key, options.preparationLane ?? 0]));
+            }, options.signal, JSON.stringify([key, options.preparationLane ?? 0]), options.preparedAfter);
             options.output?.(`Prepared output cache ${lease?.hit ? 'hit' : 'miss'} for ${path.basename(group.project)} (${group.framework}).\n`);
         }
         let artifact: PreparedArtifact;
@@ -221,7 +222,7 @@ export class RunnerPreparations {
                     for (const assembly of files) {const result = await instrument(assembly, options.signal); if (result) {instrumented.push(result);}}
                 }
             } catch (error) {
-                options.signal?.throwIfAborted(); coverage = false;
+                options.signal?.throwIfAborted(); coverage = false; instrumented.length = 0;
                 options.output?.(`Coverage preparation failed; running tests without collection. ${String(error)}\n`);
                 // All sibling commands have drained before restoring the pristine template.
                 await removeOutput(template);

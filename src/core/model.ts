@@ -87,6 +87,9 @@ export interface Trace {
     readonly stale?: boolean;
     /** An aggregate partially superseded by file runs cannot become fresh again. */
     readonly historical?: boolean;
+    /** What the trace was learned under (settings, collector, Testy; see services/engine/identity). A saved trace narrows
+     * selections after a restart only while this still matches. */
+    readonly identity?: string;
 }
 
 export interface TestResult {
@@ -128,4 +131,6 @@ export interface EngineConfiguration {
     readonly projects?: { readonly include: readonly string[]; readonly exclude: readonly string[] };
     /** `fileSystem`: watcher events cover every input, so incremental runs read only the files they report. */
     readonly trigger?: 'save' | 'fileSystem';
+    /** `testy.fileWatcherPattern`; the default when unset. Matching files outside every project are compared across restarts. */
+    readonly pattern?: string;
 }

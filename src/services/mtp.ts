@@ -1,7 +1,7 @@
 import * as net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { createMessageConnection, MessageConnection, StreamMessageReader, StreamMessageWriter } from 'vscode-jsonrpc/node';
+import { ConnectionError, ConnectionErrors, createMessageConnection, MessageConnection, StreamMessageReader, StreamMessageWriter } from 'vscode-jsonrpc/node';
 import { DiscoveredTest, TestResult } from '../core/model';
 import { normalizePath, pathNormalizer } from '../core/paths';
 import { nodeTraits } from '../core/traits';
@@ -80,6 +80,12 @@ function attachWhenWaiting(owned: OwnedProcess, attach: (processId: number) => P
     });
 }
 
+/** The host may close the socket after its final update, before Testy says goodbye. */
+export function connectionClosed(error: unknown): boolean {
+    if (error instanceof ConnectionError) {return error.code === ConnectionErrors.Closed || error.code === ConnectionErrors.Disposed;}
+    return ['EPIPE', 'ECONNRESET', 'ERR_STREAM_DESTROYED', 'ERR_STREAM_WRITE_AFTER_END'].includes((error as NodeJS.ErrnoException | undefined)?.code ?? '');
+}
+
 /** MTP's IDE protocol, transported over a loopback socket using Content-Length framing. */
 export async function requestTests(options: MtpOptions, operation: 'discover' | 'run', tests?: readonly TestNode[]): Promise<readonly TestNode[]> {
     options.signal?.throwIfAborted();
@@ -104,13 +110,9 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
         let rejectIntrusion: (error: Error) => void = () => undefined;
         const intrusion = new Promise<never>((_resolve, reject) => {rejectIntrusion = reject;});
         void intrusion.catch(() => undefined);
+        let rejectConnection: (error: Error) => void = () => undefined;
         const connected = new Promise<net.Socket>((resolve, reject) => {
-            // A debugged host connects only after the debugger attaches. A coverage
-            // collector's cold start is slower, but nothing outlives the process timeout.
-            if (!debugging) {
-                const limit = Math.min(options.wrapper ? mtpTiming.wrappedConnectMs : mtpTiming.connectMs, options.timeoutMs ?? 600_000);
-                connectionTimer = setTimeout(() => reject(new EnvironmentError('not-mtp', 'The test application did not connect to Testy. Use a .NET 10+ Microsoft.Testing.Platform project.')), limit);
-            }
+            rejectConnection = reject;
             server.on('connection', candidate => {
                 if (socket) {
                     candidate.destroy();
@@ -126,9 +128,18 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
         const args = [options.assembly, '--server', '--client-port', String(port), ...options.args ?? []];
         const ownedOptions = { ...options, cleanupDescendants: true, env: debugging ? { ...options.env, TESTINGPLATFORM_WAIT_ATTACH_DEBUGGER: '1' } : options.env };
         // The Windows owner must not search the workspace for a bare command name.
-        const dotnet = await resolveOwnedCommand(options.dotnet, ownedOptions.env, options.cwd);
-        const wrapper = options.wrapper && await resolveOwnedCommand(options.wrapper.command, ownedOptions.env, options.cwd);
-        const hostOptions = { ...ownedOptions, dotnetHost: await resolveOwnedCommand(options.dotnetHost ?? 'dotnet', ownedOptions.env, options.cwd) };
+        // The CLI and the host are usually the same command: resolve each distinct one once, in parallel.
+        const commands = [...new Set([options.dotnet, options.dotnetHost ?? 'dotnet', ...options.wrapper ? [options.wrapper.command] : []])];
+        const resolved = new Map(await Promise.all(commands.map(async command => [command, await resolveOwnedCommand(command, ownedOptions.env, options.cwd)] as const)));
+        const dotnet = resolved.get(options.dotnet)!;
+        const wrapper = options.wrapper && resolved.get(options.wrapper.command)!;
+        const hostOptions = { ...ownedOptions, dotnetHost: resolved.get(options.dotnetHost ?? 'dotnet')! };
+        // A debugged host connects only after the debugger attaches. A coverage
+        // collector's cold start is slower, but nothing outlives the process timeout.
+        if (!debugging) {
+            const limit = Math.min(options.wrapper ? mtpTiming.wrappedConnectMs : mtpTiming.connectMs, options.timeoutMs ?? 600_000);
+            connectionTimer = setTimeout(() => rejectConnection(new EnvironmentError('not-mtp', 'The test application did not connect to Testy. Use a .NET 10+ Microsoft.Testing.Platform project.')), limit);
+        }
         process = wrapper
             ? startProcess(wrapper, [...options.wrapper.args, dotnet, ...args], hostOptions)
             : startProcess(dotnet, args, hostOptions);
@@ -206,7 +217,9 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
         if (!initialized.capabilities?.testing?.supportsDiscovery && operation === 'discover') {throw new Error('This MTP test framework does not support discovery.');}
         await request(operation === 'discover' ? 'testing/discoverTests' : 'testing/runTests', { runId, ...(tests ? { tests } : {}) });
         if (!completed) {throw new Error('The test runner ended without a complete test update stream.');}
-        await rpc.sendNotification('exit', {});
+        // A host that already closed the connection after its final update still produced a complete run.
+        try {await rpc.sendNotification('exit', {});}
+        catch (error) {if (!connectionClosed(error)) {throw error;}}
         // Every result has arrived. A host kept alive by a lingering foreground
         // thread must not hold the batch until the run timeout and lose them.
         const result = await Promise.race([exitWithin(process, options.wrapper ? mtpTiming.wrappedExitGraceMs : mtpTiming.exitGraceMs), intrusion]);

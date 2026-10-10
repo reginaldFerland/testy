@@ -111,7 +111,7 @@ test('keybindings avoid VS Code\'s Testing chords; the rebuild command does not 
  // VS Code binds Ctrl/Cmd+; followed by A, C, E, F, L and their Ctrl/Shift variants, plus Ctrl+I/M/O/R/X.
  const builtIn=new Set(['a','c','e','f','l','ctrl+a','ctrl+c','ctrl+e','ctrl+f','ctrl+l','ctrl+i','ctrl+m','ctrl+o','ctrl+r','ctrl+x','ctrl+shift+a','ctrl+shift+c','ctrl+shift+f','ctrl+shift+i','ctrl+shift+l']);
  const {keybindings,commands,menus}=manifest.contributes;
- assert.deepEqual(keybindings.map(binding=>binding.command).sort(),['testy.runAffected','testy.runCoveringTests']);
+ assert.deepEqual(keybindings.map(binding=>binding.command).sort(),['testy.cancelRun','testy.runAffected','testy.runCoveringTests','testy.toggleAutoRun']);
  for(const binding of keybindings) {
   const [first,second]=binding.key.split(' ');
   assert.equal(first,'ctrl+;');assert.equal(binding.mac,binding.key.replace(/ctrl/g,'cmd'));

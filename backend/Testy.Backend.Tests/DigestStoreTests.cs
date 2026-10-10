@@ -92,4 +92,19 @@ public sealed class DigestStoreTests : IDisposable
         Assert.Single(Directory.GetFiles(directory));
         Assert.Contains(Enumerable.Range(0, 8), index => survivor.TryGet($"/sdk/{index}-19.dll", index, 19) is not null);
     }
+
+    [Fact]
+    public void OpeningClearsOldTemporaryFilesOfThisStoreOnly()
+    {
+        var stale = Path.Combine(directory, "digests-0123456789abcdef.json.aaaa.tmp");
+        var recent = Path.Combine(directory, "digests-0123456789abcdef.json.bbbb.tmp");
+        var unrelated = Path.Combine(directory, "other.tmp");
+        foreach (var file in new[] { stale, recent, unrelated }) { File.WriteAllText(file, "x"); }
+        File.SetLastWriteTimeUtc(stale, DateTime.UtcNow.AddHours(-2));
+        File.SetLastWriteTimeUtc(unrelated, DateTime.UtcNow.AddHours(-2));
+        DigestStore.Open(directory, "/sdk");
+        Assert.False(File.Exists(stale));
+        Assert.True(File.Exists(recent));
+        Assert.True(File.Exists(unrelated));
+    }
 }

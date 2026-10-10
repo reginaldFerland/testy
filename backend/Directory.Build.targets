@@ -4,5 +4,7 @@
     <!-- Bundled tools run on whichever .NET 10+ runtime the user has. Test projects (xunit.v3 needs an app host) are not bundled. -->
     <RollForward>Major</RollForward>
     <UseAppHost>false</UseAppHost>
+    <!-- Short-lived processes gain nothing from EventSource (diagnostic tracing) starting up. Error messages are untouched. -->
+    <EventSourceSupport>false</EventSourceSupport>
   </PropertyGroup>
 </Project>

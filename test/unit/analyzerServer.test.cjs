@@ -5,7 +5,7 @@ const fs=require('node:fs/promises');
 const os=require('node:os');
 const path=require('node:path');
 const {AnalyzerServers,AnalyzerServerUnavailable,AnalyzerRequestFailed}=require('../../out/services/analyzerServer');
-const {sourceAliases,disposeAnalyzerServers}=require('../../out/services/analysis');
+const {sourceAliases}=require('../../out/services/analysis');
 
 const peer=path.resolve('test/fixtures/analyzer-server-peer.cjs'),node=process.execPath;
 const alive=(/** @type {number} */pid)=>{try{process.kill(pid,0);return true;}catch{return false;}};
@@ -101,6 +101,13 @@ test('errors reported by the analyzer keep the server and its message',async t=>
  assert.equal((await send(servers,'echo')).pid,pid);
 });
 
+test('a request the server refuses as busy is reported unavailable, so the one-shot fallback serves it, and the server stays',async t=>{
+ const servers=new AnalyzerServers();t.after(()=>servers.dispose());
+ const {pid}=await send(servers,'echo');
+ await assert.rejects(send(servers,'busy'),error=>error instanceof AnalyzerServerUnavailable&&!error.retryable&&/too many requests/.test(error.message));
+ assert.equal((await send(servers,'echo')).pid,pid);
+});
+
 test('protocol violations stop the server and report it unavailable',async t=>{
  const servers=new AnalyzerServers();t.after(()=>servers.dispose());
  const {pid}=await send(servers,'echo');
@@ -186,8 +193,9 @@ test('the number of servers is bounded and the least recently used idle one is s
 
 test('analysis falls back to a one-shot process when the server cannot start or breaks, and surfaces its failures',async t=>{
  const directory=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-server-fallback-')));
- t.after(async()=>{await disposeAnalyzerServers();await fs.rm(directory,{recursive:true,force:true});});
- const options={cwd:directory};
+ const servers=new AnalyzerServers();
+ t.after(async()=>{await servers.dispose();await fs.rm(directory,{recursive:true,force:true});});
+ const options={cwd:directory,analyzerServers:servers};
  // The server path answers first.
  assert.deepEqual(await sourceAliases(node,peer,['x'],directory,options),['server']);
  // A host that cannot serve falls back, and a short-lived process turns TieredPGO off.
@@ -202,4 +210,6 @@ test('analysis falls back to a one-shot process when the server cannot start or 
  assert.deepEqual((await fs.readdir(directory)),[]);
  const abort=new AbortController();abort.abort();
  await assert.rejects(sourceAliases(node,peer,['x'],directory,{...options,signal:abort.signal}),{name:'AbortError'});
+ // Without the caller's servers every request is a one-shot process: no pool is shared behind the caller's back.
+ assert.deepEqual(await sourceAliases(node,peer,['x'],directory,{cwd:directory}),['one-shot','0']);
 });

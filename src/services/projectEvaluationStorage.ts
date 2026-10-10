@@ -20,6 +20,8 @@ const fingerprint = (value: unknown): value is string => typeof value === 'strin
 const array = <T>(value: unknown, valid: (item: unknown) => item is T, limit = maximumItems): value is T[] => Array.isArray(value) && value.length <= limit && value.every(item => valid(item));
 const fields = (value: Record<string, unknown>, names: readonly string[]): boolean => Object.keys(value).every(key => names.includes(key));
 const optional = (value: unknown, valid: (item: unknown) => boolean): boolean => value === undefined || valid(value);
+/** What the helper stores for the names of a listing query: "<count>:<SHA-256 of the sorted names>" (EvaluationInputs.Listing). */
+export const listingDigestPattern = /^\d{1,9}:[0-9a-f]{64}$/;
 const strings = (value: unknown): value is Record<string, string> => record(value) && Object.keys(value).length <= maximumItems && Object.entries(value).every(([key, item]) => text(key) && text(item));
 
 function limits(options: EvaluationStorageLimits): { maxEntries: number; maxBytes: number } {
@@ -51,7 +53,9 @@ function validQuery(value: unknown): value is EvaluationQuery {
         return value.pattern === null && !value.recursive && array(value.values, text, 1) && value.values.length === 1
             && value.values.every(item => value.kind === 'mtime' ? /^\d{1,20}$/.test(item) : ['true', 'false'].includes(item));
     }
-    if (!['files', 'directories', 'entries', 'imports'].includes(value.kind as string) || !array(value.values, absolute)) {return false;}
+    // The names themselves, or a digest of them (saved snapshots of earlier versions hold the names).
+    if (!['files', 'directories', 'entries', 'imports'].includes(value.kind as string)
+        || !(array(value.values, absolute) || (array(value.values, text, 1) && value.values.length === 1 && listingDigestPattern.test(value.values[0]!)))) {return false;}
     return value.pattern === null || value.pattern === '*' || (value.kind === 'imports'
         ? /^[^/\\?\0]+$/.test(value.pattern) : /^\*\.[a-z0-9]+$/i.test(value.pattern));
 }
@@ -164,7 +168,7 @@ export async function readEvaluationSnapshot(storage: string, options: Evaluatio
     signal?.throwIfAborted(); return { epoch: header[1]!, entries };
 }
 
-async function encode(entries: ReadonlyMap<string, EvaluationEntry>, options: EvaluationStorageLimits, signal?: AbortSignal): Promise<string> {
+async function encode(entries: ReadonlyMap<string, EvaluationEntry>, options: EvaluationStorageLimits, signal?: AbortSignal, log?: (text: string) => void): Promise<string> {
     const { maxEntries, maxBytes } = limits(options), projects: Project[] = [], inputs: EvaluationInputs[] = [], kept: StoredEntry[] = [];
     const projectIds = new Map<string, number>(), inputIds = new Map<string, number>();
     const projectValid = memoized(validProject), inputValid = memoized(validInputs), identities = new WeakMap<object, { id: string; bytes: number }>();
@@ -185,7 +189,11 @@ async function encode(entries: ReadonlyMap<string, EvaluationEntry>, options: Ev
         const added = [...pendingProjects.values(), ...pendingInputs.values()].reduce((total, item) => total + item.bytes, 0);
         // At most four digits per table index, plus the entry's field framing.
         const entryBytes = Buffer.byteLength(JSON.stringify([file, entry.context, entry.stamp, entry.projectInputs])) + (graphIds.length + evaluationIds.length) * 5 + 128;
-        if (bytes + added + entryBytes > maxBytes || projects.length + pendingProjects.size > maximumNodes || inputs.length + pendingInputs.size > maximumNodes) {continue;}
+        if (bytes + added + entryBytes > maxBytes || projects.length + pendingProjects.size > maximumNodes || inputs.length + pendingInputs.size > maximumNodes) {
+            log?.(`Project evaluation for ${path.basename(file)} is not saved: it would bring the snapshot to ${bytes + added + entryBytes} bytes (limit ${maxBytes}), `
+                + `${projects.length + pendingProjects.size} project nodes and ${inputs.length + pendingInputs.size} input sets (limit ${maximumNodes} each). It is evaluated again after a restart.\n`);
+            continue;
+        }
         for (const [id, item] of pendingProjects) {projectIds.set(id, projects.length); projects.push(item.value);}
         for (const [id, item] of pendingInputs) {inputIds.set(id, inputs.length); inputs.push(item.value);}
         kept.push({ file, graph: graphIds.map(id => projectIds.get(id)!), inputs: evaluationIds.map(id => inputIds.get(id)!), context: entry.context, stamp: entry.stamp, projectInputs: entry.projectInputs! });
@@ -199,8 +207,8 @@ async function encode(entries: ReadonlyMap<string, EvaluationEntry>, options: Ev
 
 /** Last-writer-wins candidates are safe across windows: no saved epoch or
  * checksum skips validation of current evaluation inputs at the point of use. */
-export async function writeEvaluationSnapshot(storage: string, entries: ReadonlyMap<string, EvaluationEntry>, options: EvaluationStorageLimits = {}, signal?: AbortSignal): Promise<void> {
-    const contents = await encode(entries, options, signal);
+export async function writeEvaluationSnapshot(storage: string, entries: ReadonlyMap<string, EvaluationEntry>, options: EvaluationStorageLimits = {}, signal?: AbortSignal, log?: (text: string) => void): Promise<void> {
+    const contents = await encode(entries, options, signal, log);
     const file = path.join(storage, filename), temporary = `${file}.${randomUUID()}.tmp`;
     await withLock(`${file}.lock`, signal, async () => {
         // Only this format's abandoned temporaries are ours to reclaim. Every
@@ -211,10 +219,9 @@ export async function writeEvaluationSnapshot(storage: string, entries: Readonly
             if (name.startsWith(`${filename}.`) && name.endsWith('.tmp') && uuid.test(identity)) {await fs.unlink(path.join(storage, name)).catch(() => undefined);}
         }
         try {
-            await fs.writeFile(temporary, contents, { flag: 'wx', mode: 0o600, signal });
+            const handle = await fs.open(temporary, 'wx', 0o600);
             // The bytes must be durable before the rename can make them the snapshot.
-            const handle = await fs.open(temporary, 'r+');
-            try {await handle.sync();} finally {await handle.close();}
+            try {await handle.writeFile(contents, { signal }); await handle.sync();} finally {await handle.close();}
             signal?.throwIfAborted(); await fs.rename(temporary, file);
             await syncDirectory(storage);
         } finally {await fs.unlink(temporary).catch(() => undefined);}

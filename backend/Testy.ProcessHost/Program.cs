@@ -47,7 +47,8 @@ static partial class ProcessOwner
             var command = new StringBuilder(string.Join(" ", arguments.Select(Quote)));
             if (command.Length > MaxCommandLine)
             {
-                throw new ArgumentException($"The command line is {command.Length} characters; Windows allows at most {MaxCommandLine}. Run fewer tests at once or shorten testy.testArguments.");
+                throw new ArgumentException($"The command line for '{Path.GetFileName(arguments[0])}' is {command.Length} characters long, but Windows allows at most {MaxCommandLine}. "
+                    + "Select fewer tests to run at once, shorten the workspace path, or remove long entries from the 'testy.testArguments' setting.");
             }
             using var input = File.OpenHandle("NUL", FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             using var discard = File.OpenHandle("NUL", FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
@@ -141,6 +142,27 @@ static partial class ProcessOwner
         }
     }
 
+    /// <summary>The directories of a PATH value, as Windows reads it: ';' separates entries except inside quotes, which
+    /// are removed wherever they occur ("C:\Program Files\x" is not a path until they are). An unmatched quote ends at the next ';'.</summary>
+    internal static IEnumerable<string> PathEntries(string path)
+    {
+        var entry = new StringBuilder();
+        var quoted = false;
+        for (var index = 0; index <= path.Length; index++)
+        {
+            var character = index < path.Length ? path[index] : ';';
+            if (character == ';' && quoted && path.IndexOf('"', index) < 0) { quoted = false; }
+            if (character == ';' && !quoted)
+            {
+                var directory = entry.ToString().Trim();
+                entry.Clear();
+                if (directory.Length > 0) { yield return directory; }
+            }
+            else if (character == '"') { quoted = !quoted; }
+            else { entry.Append(character); }
+        }
+    }
+
     /// <summary>Explicit paths are used as given; a bare name is looked up on PATH alone, never in the current directory.</summary>
     internal static string ResolveApplication(string command)
     {
@@ -148,7 +170,7 @@ static partial class ProcessOwner
         if (command.IndexOfAny(['\\', '/', ':']) >= 0) { return Path.GetFullPath(command); }
         var dot = command.IndexOf('.', 1);
         string[] names = dot >= 0 && dot < command.Length - 1 ? [command] : [command + ".com", command + ".exe"];
-        foreach (var directory in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries))
+        foreach (var directory in PathEntries(Environment.GetEnvironmentVariable("PATH") ?? ""))
         {
             if (!Path.IsPathFullyQualified(directory)) { continue; }
             foreach (var name in names)

@@ -95,7 +95,8 @@ test('seventeen test targets retain every instrumented preparation through warm 
  const run=async(/** @type {Instance} */ instance,/** @type {string} */ label)=>{
   stage=label;phase=undefined;
   instance.state.results=[];instance.state.output=[];
-  const summary=await track(instance.engine.run({files:[],full:true},signal));
+  // An explicit rebuild-and-run-all: a restart would otherwise trust the saved coverage and run nothing.
+  const summary=await track(instance.engine.run({files:[],full:true},signal,undefined,true));
   assert.equal(summary.passed,count,instance.state.output.join(''));assert.equal(summary.failed,0);assert.equal(summary.tests,count);assert.equal(summary.coverageAvailable,true);
   assert.equal(probe.discoveries.length,count,'every project performs fresh discovery');assert.equal(probe.runs.length,count,'every baseline executes all seventeen tests');
   assert.equal(probe.peakRuns,1,'test execution is deliberately sequential');

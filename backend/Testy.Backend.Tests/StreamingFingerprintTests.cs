@@ -24,10 +24,27 @@ public class StreamingFingerprintTests
 
     [Theory]
     [InlineData("public int F = 5;", "/* why */ public int F = 5;")]
-    [InlineData("<summary>Doc</summary>", "<summary>Docs</summary>")]
     [InlineData("// end", "// the end")]
+    public async Task ACommentOutsideBodiesChangesTheBodyButNotTheSignature(string before, string after)
+    {
+        var original = await Shape(Baseline);
+        var edited = await Shape(Baseline.Replace(before, after, StringComparison.Ordinal));
+        Assert.Equal(original.Signature, edited.Signature);
+        Assert.NotEqual(original.Body, edited.Body);
+    }
+
+    [Fact]
+    public async Task ADocumentationCommentChangesBothFingerprints()
+    {
+        var original = await Shape(Baseline);
+        var edited = await Shape(Baseline.Replace("<summary>Doc</summary>", "<summary>Docs</summary>", StringComparison.Ordinal));
+        Assert.NotEqual(original.Signature, edited.Signature);
+        Assert.NotEqual(original.Body, edited.Body);
+    }
+
+    [Theory]
     [InlineData("#region R", "#region S")]
-    public async Task ACommentOrDirectiveOutsideBodiesChangesBoth(string before, string after)
+    public async Task ADirectiveOutsideBodiesChangesBoth(string before, string after)
     {
         var original = await Shape(Baseline);
         var edited = await Shape(Baseline.Replace(before, after, StringComparison.Ordinal));

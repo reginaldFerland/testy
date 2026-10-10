@@ -4,7 +4,7 @@ const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:
 const {constants}=require('node:fs');
 const {createHash}=require('node:crypto');
 const analysis=require('../../out/services/analysis'),processes=require('../../out/services/process');
-const {analyzerServers}=require('../../out/services/analyzerServer');
+const {AnalyzerServers}=require('../../out/services/analyzerServer');
 const {sourceAnalysisContext}=require('../../out/services/analysisContext');
 const {TestEngine}=require('../../out/services/engine');
 const {normalizePath}=require('../../out/core/paths');
@@ -93,8 +93,11 @@ async function fixture(t,{copyAnalyzer=false}={}){
  /** @type {unknown[][]} */ const results=[];
  /** @type {{files: string[]}[]} */ const requests=[];
  /** @type {(() => unknown)[]} */ const cleanups=[];
+ // Requests are served by the engine's long-lived analyzer unless it cannot start.
+ const servers=new AnalyzerServers(),serve=servers.request.bind(servers);
+ servers.request=async(/** @type {Parameters<typeof serve>} */ ...args)=>{const value=JSON.parse(args[2]);if(value.files)requests.push(value);return serve(...args);};
  const engine=new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer,configuration:()=>config,
-  events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result:(group,result)=>results.push([group.id,result.id,result.outcome]),started(){},coverage(){},invalidated(){}}});
+  events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result:(group,result)=>results.push([group.id,result.id,result.outcome]),started(){},coverage(){},invalidated(){}}},{analyzerServers:servers});
  const run=processes.runProcess,batch=analysis.sourceAnalysisBatch;
  processes.runProcess=async(command,args,options)=>{
   if(args[0]===analyzer&&args[1]){
@@ -102,10 +105,7 @@ async function fixture(t,{copyAnalyzer=false}={}){
   }
   return run(command,args,options);
  };
- // Requests are served by the long-lived analyzer unless it cannot start.
- const servers=analyzerServers,serve=servers.request;
- servers.request=async(dotnet_,helper,request,...rest)=>{const value=JSON.parse(request);if(value.files)requests.push(value);return serve.call(servers,dotnet_,helper,request,...rest);};
- t.after(async()=>{control.abort();analysis.sourceAnalysisBatch=batch;processes.runProcess=run;servers.request=serve;for(const cleanup of cleanups)await cleanup();await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
+ t.after(async()=>{control.abort();analysis.sourceAnalysisBatch=batch;processes.runProcess=run;for(const cleanup of cleanups)await cleanup();await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
  assert.ok(await sourceAnalysisContext(dotnet,analyzer,{cwd:root,signal}),'real reuse fixture requires ordinary installed dotnet and bundled analyzer assets');
  return{temp,root,storage,analyzer,engine,config,signal,output,results,requests,batch,cleanup:(/** @type {() => unknown} */ fn)=>cleanups.push(fn),
   file:(/** @type {string} */ relative)=>normalizePath(path.join(root,relative)),
@@ -117,7 +117,7 @@ function rawSnapshot(engine){return new Map([...engine.analyses].map(([file,shap
 /** @param {Engine} engine */
 function assertNoReusableShapes(engine){for(const [file,shape]of engine.analyses){assert.equal(shape,null,file);assert.equal(engine.analyzedHashes.has(file),false,file);}}
 
-test('Windows default dotnet with a mixed-case Path reuses real syntax while rediscovering and running tests',
+test('[windows-slow] Windows default dotnet with a mixed-case Path reuses real syntax while rediscovering and running tests',
  {skip:process.platform!=='win32',timeout:120000},async t=>{
  const f=await fixture(t),keys=Object.keys(process.env).filter(key=>key.toUpperCase()==='PATH');
  const prior=new Map(keys.map(key=>[key,process.env[key]]));

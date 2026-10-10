@@ -326,11 +326,12 @@ test('editor coverage refresh yields during shared-file aggregation and never fa
  const {CoverageStore}=require('../../out/core/coverage'),{normalizePath}=require('../../out/core/paths');
  const store=new CoverageStore(),file=normalizePath('/Common.cs'),hashes=new Map([[file,'v1']]);
  const lines=Array.from({length:1000},(_,i)=>({line:i+1,hits:1}));
- const traces=Array.from({length:1000},(_,i)=>({groupId:`g${i}`,dependencies:[file],inputs:{[file]:'v1'},timestamp:1,reliable:true,coverage:[{file,hash:'v1',lines}]}));
+ // g0 alone holds every line's maximum, so lowering it forces a rescan of all owners.
+ const traces=Array.from({length:1000},(_,i)=>({groupId:`g${i}`,dependencies:[file],inputs:{[file]:'v1'},timestamp:1,reliable:true,coverage:[{file,hash:'v1',lines:i?lines:lines.map(line=>({...line,hits:2}))}]}));
  const live=new Set(traces.map(trace=>trace.groupId));await store.replaceAsync(traces,live);await store.summarizeAsync(hashes);store.markStale(live);
- // A changed positive contribution requires real aggregation work; freshness
- // changes alone can now reuse the warmed line cache. Other owners remain stale.
- await store.replaceAsync([{...traces[0],timestamp:2,coverage:[{file,hash:'v1',lines:[{line:1,hits:2},...lines.slice(1)]}]}],live);
+ // Lowering the sole maximum requires real aggregation work; freshness
+ // changes alone can reuse the warmed line cache. Other owners remain stale.
+ await store.replaceAsync([{...traces[0],timestamp:2,coverage:[{file,hash:'v1',lines}]}],live);
  store.summary=()=>assert.fail('editor must not calculate synchronously');
  const proto=prototypes({Range:class{}}).coverage;
  /** @type {[string, number][]} */ const calls=[];

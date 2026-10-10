@@ -20,7 +20,7 @@ export async function analyzeSources(host: EngineHost, run: RunContext, analysis
     const { config, processOptions, signal } = run, events = host.options.events;
     const started = Date.now(), analysisHashes = host.sources.analysisHashes;
     const allFiles = [...analysisHashes.keys()];
-    const context = await sourceAnalysisContext(config.dotnet, host.options.analyzer, processOptions);
+    const context = await sourceAnalysisContext(config.dotnet, host.options.analyzer, processOptions, host.toolIdentities);
     const contextChanged = !context || context !== host.analysisContext;
     const shapeFiles = allFiles.filter(file => contextChanged || !host.analyses.get(file) || analysisHashes.get(file) !== host.analyzedHashes.get(file));
     const candidates = [...host.sources.aliasSources].sort(([a], [b]) => compareCodeUnits(a, b));
@@ -30,7 +30,7 @@ export async function analyzeSources(host: EngineHost, run: RunContext, analysis
     let uncertain = aliasesChanged;
     let { analysisContext, excludedAliases, aliasStamp } = host;
     try {
-        const result = await sourceAnalysisBatch(config.dotnet, host.options.analyzer, shapeFiles, host.options.storage, processOptions,
+        const result = await sourceAnalysisBatch(config.dotnet, host.options.analyzer, shapeFiles, host.options.storage, { ...processOptions, analyzerServers: host.analyzerServers },
             host.excludedAliases, analysisSlots, aliasesChanged ? { sources: candidates.map(([, content]) => content), allFiles } : undefined, true);
         if (!result.sourceHashes) {uncertain = true; throw new Error('Source analysis did not provide parsed-byte provenance.');}
         const mismatched = [...result.analyses.keys()].filter(file => result.sourceHashes!.get(file) !== analysisHashes.get(file));
@@ -41,7 +41,7 @@ export async function analyzeSources(host: EngineHost, run: RunContext, analysis
             throw new Error('Source inputs changed during analysis.');
         }
         if (context && (result.analyses.size || (aliasesChanged && candidates.length))
-            && context !== await sourceAnalysisContext(config.dotnet, host.options.analyzer, processOptions)) {
+            && context !== await sourceAnalysisContext(config.dotnet, host.options.analyzer, processOptions, host.toolIdentities)) {
             uncertain = true; throw new Error('Source analysis tools changed during analysis.');
         }
         signal.throwIfAborted();
@@ -95,7 +95,10 @@ export async function prepareTests(host: EngineHost, run: RunContext, plan: Buil
         try {
             coverageTool = await preparationBudget.run(signal, () => ensureCoverageTool(host, config, processOptions));
         }
-        catch (error) {signal.throwIfAborted(); events.output(`Coverage unavailable; tests will continue with conservative selection. ${String(error)}\n`);}
+        catch (error) {
+            signal.throwIfAborted(); events.output(`Coverage unavailable; tests will continue with conservative selection. ${String(error)}\n`);
+            events.coverageUnavailable?.(String(error));
+        }
     }
     const anticipatedTargets = new Set(anticipated.groups.map(group => testTargetKey(group.project, group.framework)));
     const prepared: PreparedTests = { coverageTool, runtimeTreeChanged: false, liveIds: new Set(), currentShapes: new Map(), sessions: undefined! };
@@ -103,13 +106,13 @@ export async function prepareTests(host: EngineHost, run: RunContext, plan: Buil
     const runnerOptions: RunnerOptions = {
         ...processOptions, dotnet: config.dotnet, storage: path.join(host.options.storage, 'runs'),
         testArguments: config.testArguments, coverageTool, managedCoverageTool: !config.coverageTool,
-        assemblies: host.projects.flatMap(project => project.assemblies ?? [project.assembly]), analyzer: host.options.analyzer, identity: host.identity,
+        assemblies: host.projects.flatMap(project => project.assemblies ?? [project.assembly]), analyzer: host.options.analyzer, analyzerServers: host.analyzerServers, identity: host.identity,
         modules: host.projects.flatMap(project => (project.contexts ?? [project]).map(context => ({
             name: context.assemblyName ?? path.basename(context.assembly, path.extname(context.assembly)), project: project.file,
             sources: [...project.sourceFiles, ...project.inputs ?? []]
         }))),
         outputRoot: outputLease.directory, snapshots: built.snapshots,
-        preparedOutputCache: host.preparedOutputs,
+        preparedOutputCache: host.preparedOutputs, preparedAfter: host.preparedOutputs.mark(),
         preparationToolIdentities: host.toolIdentities,
         // Primary discovery already owns one permit. Additional DLLs
         // may borrow spare capacity only during this preparation stage.
@@ -126,16 +129,11 @@ export async function prepareTests(host: EngineHost, run: RunContext, plan: Buil
         }))])),
         buildInputs: new Map(host.projects.filter(project => project.isTestProject).map(project => [project.file,
             [...new Set(buildOrder(host.projects, new Set([project.file])).flatMap(input => [...input.inputs ?? []]))]])),
-        onResult: (group, result, test) => {
-            if (host.runtime.observe(group, result, test)) {prepared.runtimeTreeChanged = true;}
-            host.lastOutcomes.record(group.id, result);
-            for (const observer of host.resultObservers) {observer(group, result);}
-            events.result(group, result);
-        }, onStarted: events.started, onPrepared: events.prepared,
+        onResult: (group, result, test) => {if (host.reportResult(group, result, test)) {prepared.runtimeTreeChanged = true;}}, onStarted: events.started, onPrepared: events.prepared,
         onExpanded: groups => events.selected({ groups, reason: 'Containing files for provider runtime identities', fallback: true }),
         debug: manual?.debug ? events.debug : undefined
     };
-    const sessions = prepared.sessions = state.sessions = new RunnerSession(runnerOptions);
+    const sessions = prepared.sessions = state.sessions = host.createSession(runnerOptions);
     const rebuilt = new Set(testBuilds.map(project => testTargetKey(project.file, project.framework)));
     const targets = new Set(host.projects.filter(isTestTarget).map(project => testTargetKey(project.file, project.framework)));
     const next = host.groups.filter(group => !rebuilt.has(testTargetKey(group.project, group.framework)) && targets.has(testTargetKey(group.project, group.framework)));

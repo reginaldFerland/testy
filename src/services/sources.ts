@@ -14,6 +14,10 @@ export class SourceTracker {
     private readonly states = new Map<string, SourceState>();
     private readonly dirty = new Set<string>();
     private current: ReadonlyMap<string, string> = new Map();
+    /** Which files each published hash map changed, so a consumer holding an older map need not compare whole maps (see changedSince). */
+    private readonly generations = new WeakMap<ReadonlyMap<string, string>, number>([[this.current, 0]]);
+    private readonly changeLog: { readonly generation: number; readonly files: readonly string[] }[] = [];
+    private generation = 0;
     private known = new Set<string>();
     /** `known` as a list, built once per setFiles: every full sweep reads it. */
     private knownList: readonly string[] | undefined;
@@ -44,10 +48,9 @@ export class SourceTracker {
 
     setFiles(files: readonly string[], analysisFiles: readonly string[] = []): void {
         const tracked = new Set(files), next = new Set([...files, ...analysisFiles]);
-        const hashes = new Map(this.current);
-        let changed = false;
+        const hashes = new Map(this.current), removed: string[] = [];
         for (const file of this.known) {
-            if (!next.has(file)) {this.states.delete(file); hashes.delete(file); this.dirty.delete(file); changed = true; this.derived = undefined;}
+            if (!next.has(file)) {this.states.delete(file); hashes.delete(file); this.dirty.delete(file); removed.push(file); this.derived = undefined;}
         }
         // Ordinary paths need no tombstone once they leave the source graph.
         for (const [file, classification] of this.classifications) {
@@ -56,7 +59,26 @@ export class SourceTracker {
         for (const file of next) {if (!this.known.has(file) || tracked.has(file) !== this.tracked.has(file)) {this.dirty.add(file);}}
         this.known = next; this.knownList = undefined;
         this.tracked = tracked;
-        if (changed) {this.current = hashes; this.revision++;}
+        if (removed.length) {this.publish(hashes, removed); this.revision++;}
+    }
+
+    /** The files whose versions differ between `hashes`, an earlier map this tracker published, and the current map; undefined
+     * when that is no longer known, and the caller compares the maps itself. May include files whose version only changed back. */
+    changedSince(hashes: ReadonlyMap<string, string>): readonly string[] | undefined {
+        if (hashes === this.current) {return [];}
+        const from = this.generations.get(hashes), first = this.changeLog[0];
+        if (from === undefined || !first || first.generation > from + 1) {return undefined;}
+        const files = new Set<string>();
+        for (const entry of this.changeLog) {if (entry.generation > from) {for (const file of entry.files) {files.add(file);}}}
+        return [...files];
+    }
+
+    private publish(hashes: ReadonlyMap<string, string>, files: readonly string[]): void {
+        this.current = hashes; this.generations.set(hashes, ++this.generation);
+        this.changeLog.push({ generation: this.generation, files });
+        // Bounded: a consumer further behind compares whole maps instead.
+        let logged = this.changeLog.reduce((total, entry) => total + entry.files.length, 0);
+        while (this.changeLog.length > 64 || (this.changeLog.length > 1 && logged > 100_000)) {logged -= this.changeLog.shift()!.files.length;}
     }
 
     mark(files: readonly string[]): void {
@@ -148,7 +170,7 @@ export class SourceTracker {
         if (revision === this.revision) {for (const file of queue) {if (!transient.has(file)) {this.dirty.delete(file);}}}
         for (const file of transient) {this.dirty.add(file);}
         this.derived = undefined;
-        if (hashes) {this.current = hashes;}
+        if (hashes) {this.publish(hashes, changed);}
         return changed;
     }
 }

@@ -16,15 +16,26 @@ namespace Testy.Analysis;
 // The body fingerprint covers the whole tree. The signature fingerprint covers
 // only what another file can depend on without executing a statement here: it
 // omits the executable bodies of methods and accessors and the expression bodies
-// of properties and indexers, replacing each with a marker. A file Roslyn sees as
+// of properties and indexers, and the bodies of instance constructors and
+// operators, replacing each with a marker. Ordinary comments are left out of it too (they
+// are in the body fingerprint). Everything else stays: documentation comments (a source
+// generator can copy them into code that no trace maps back), constructor
+// initializers (`: base(...)`), field and property initializers, static constructors and
+// finalizers (they run outside any one test, so no test's coverage vouches for an edit), disabled
+// `#if` text and directives. A file Roslyn sees as
 // coverage-blind (see SourceAnalysis) uses its body stream as its signature.
 // Either way, the directives found in the file are appended to the signature.
 static class Fingerprint
 {
+    // Mixed into both hashes: bump it when what a signature covers changes, so that no
+    // fingerprint made by another version can compare equal.
+    const string Format = "3";
+
     public static (string Signature, string Body) Compute(SyntaxNode root, bool blind, IReadOnlyList<string> directives)
     {
         using var body = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         using var signature = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        using (var writer = new Writer(body, signature)) { writer.Write('V', Format); }
         if (blind)
         {
             using var writer = new Writer(body, signature);
@@ -42,40 +53,46 @@ static class Fingerprint
         return (Convert.ToHexString(signature.GetHashAndReset()), Convert.ToHexString(body.GetHashAndReset()));
     }
 
-    // Replaced by a marker in the signature, exactly the nodes DeclarationSignature used to rewrite.
+    // Replaced by a marker in the signature: the executable bodies another file can only reach by running them.
     static bool Elided(SyntaxNode node) => node switch
     {
-        BlockSyntax => node.Parent is MethodDeclarationSyntax or AccessorDeclarationSyntax,
-        ArrowExpressionClauseSyntax => node.Parent is MethodDeclarationSyntax or AccessorDeclarationSyntax or PropertyDeclarationSyntax or IndexerDeclarationSyntax,
+        BlockSyntax => node.Parent is MethodDeclarationSyntax or AccessorDeclarationSyntax or OperatorDeclarationSyntax or ConversionOperatorDeclarationSyntax
+            || InstanceConstructor(node.Parent),
+        ArrowExpressionClauseSyntax => node.Parent is MethodDeclarationSyntax or AccessorDeclarationSyntax or PropertyDeclarationSyntax or IndexerDeclarationSyntax
+            or OperatorDeclarationSyntax or ConversionOperatorDeclarationSyntax || InstanceConstructor(node.Parent),
         _ => false
     };
+
+    static bool InstanceConstructor(SyntaxNode? node) => node is ConstructorDeclarationSyntax constructor && !constructor.Modifiers.Any(SyntaxKind.StaticKeyword);
 
     static void Walk(SyntaxNode root, bool elide, Writer writer)
     {
         // Flat enumeration: deeply nested expressions cannot overflow the stack.
         foreach (var child in root.DescendantNodesAndTokens(node => !elide || !Elided(node)))
         {
-            if (child.IsToken) { Token(child.AsToken(), writer); }
+            if (child.IsToken) { Token(child.AsToken(), writer, comments: !elide); }
             else if (elide && Elided(child.AsNode()!)) { writer.Write(child.AsNode() is BlockSyntax ? 'B' : 'E', ""); }
         }
     }
 
-    static void Token(SyntaxToken token, Writer writer)
+    static void Token(SyntaxToken token, Writer writer, bool comments)
     {
-        Trivia(token.LeadingTrivia, writer);
+        Trivia(token.LeadingTrivia, writer, comments);
         writer.Write('T', token.Text);
-        Trivia(token.TrailingTrivia, writer);
+        Trivia(token.TrailingTrivia, writer, comments);
     }
 
-    static void Trivia(SyntaxTriviaList list, Writer writer)
+    static void Trivia(SyntaxTriviaList list, Writer writer, bool comments)
     {
         foreach (var trivia in list)
         {
-            if (trivia.Kind() is SyntaxKind.WhitespaceTrivia or SyntaxKind.EndOfLineTrivia) { continue; }
+            var kind = trivia.Kind();
+            if (kind is SyntaxKind.WhitespaceTrivia or SyntaxKind.EndOfLineTrivia) { continue; }
+            if (!comments && kind is SyntaxKind.SingleLineCommentTrivia or SyntaxKind.MultiLineCommentTrivia) { continue; }
             if (trivia.HasStructure)
             {
                 // Directives and documentation comments: their tokens, not their layout.
-                foreach (var token in trivia.GetStructure()!.DescendantTokens()) { Token(token, writer); }
+                foreach (var token in trivia.GetStructure()!.DescendantTokens()) { Token(token, writer, comments); }
             }
             else { writer.Write('C', trivia.ToString()); }
         }

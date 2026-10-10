@@ -12,16 +12,17 @@ const {CoverageStore}=require('../../out/core/coverage');
 async function fixture(t){
  const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-aborted-save-')));
  t.after(()=>fs.rm(root,{recursive:true,force:true}));
- const engine=/** @type {any} */ (new TestEngine(/** @type {any} */ ({roots:[root],storage:path.join(root,'state'),tools:root,analyzer:'',configuration:()=>({}),events:{
-  output(){},phase(){},selected(){},discovered(){},coverage(){},invalidated(){},started(){},result(){}}})));
- const save=engine.cache.save.bind(engine.cache),writes=/** @type {string[][]} */ ([]);
+ const coverageCache=new CoverageCache(path.join(root,'state'),()=>{});
+ const save=coverageCache.save.bind(coverageCache),writes=/** @type {string[][]} */ ([]);
  let blocked=true,started=false;
  // The first write waits on another window's lock until its signal aborts; later writes go through.
- engine.cache.save=async(/** @type {any} */ delta,/** @type {AbortSignal} */ signal)=>{
+ coverageCache.save=async(/** @type {any} */ delta,/** @type {AbortSignal} */ signal)=>{
   writes.push(delta.traces.map((/** @type {any} */ trace)=>trace.groupId));
   if(blocked&&delta.traces.length){blocked=false;started=true;await new Promise((_,reject)=>{signal.addEventListener('abort',()=>reject(signal.reason),{once:true});});}
   return save(delta,signal);
  };
+ const engine=/** @type {any} */ (new TestEngine(/** @type {any} */ ({roots:[root],storage:path.join(root,'state'),tools:root,analyzer:'',configuration:()=>({}),events:{
+  output(){},phase(){},selected(){},discovered(){},coverage(){},invalidated(){},started(){},result(){}}}),{coverageCache}));
  const persisted=async()=>{const store=new CoverageStore();await new CoverageCache(path.join(root,'state'),()=>{}).restore(store);return [...store.traces.keys()].sort();};
  return {engine,writes,persisted,started:()=>started};
 }

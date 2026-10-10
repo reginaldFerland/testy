@@ -103,7 +103,9 @@ static class RoslynLoader
             if (common.Version < minimum) { problems.Add($"{directory}: Roslyn {common.Version} is older than {minimum}"); return null; }
             foreach (var name in new[] { common, csharp })
             {
-                if (!(name.GetPublicKeyToken() ?? []).AsSpan().SequenceEqual(PublicKeyToken)) { problems.Add($"{directory}: {name.Name} is not signed by Microsoft"); return null; }
+                // A sanity check that this is the Roslyn of an SDK, not a security boundary: the token is a public identity
+                // that anything can claim, and nothing here verifies the signature. Whoever can write to the SDK directory can do worse.
+                if (!(name.GetPublicKeyToken() ?? []).AsSpan().SequenceEqual(PublicKeyToken)) { problems.Add($"{directory}: {name.Name} has an unexpected public key token"); return null; }
             }
             return new Candidate(directory, common.Version);
         }

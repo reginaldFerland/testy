@@ -68,7 +68,8 @@ async function fixture(t,{xunit=false}={}) {
  /** @param {{engine: Engine, state: EngineState}} instance */
  const run=async(instance)=>{
   await instance.engine.restore();
-  const result=await instance.engine.run({files:[],full:true},new AbortController().signal);
+  // An explicit rebuild-and-run-all: a restart would otherwise trust the saved coverage and rerun only what changed.
+  const result=await instance.engine.run({files:[],full:true},new AbortController().signal,undefined,true);
   assert.equal(result.failed,0,instance.state.output.join(''));return result;
  };
  const reset=()=>{probe.instruments.length=0;probe.builds=0;probe.discoveries.length=0;probe.runs.length=0;};

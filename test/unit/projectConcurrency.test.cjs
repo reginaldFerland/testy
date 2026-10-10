@@ -110,3 +110,19 @@ test('batched restore, inspection and build reuse a deep shared graph',{timeout:
  const compiled=(await fs.readFile(counter,'utf8')).trim().split(/\r?\n/);
  assert.equal(compiled.length,6,'every shared project is compiled only once in the batch');assert.equal(new Set(compiled).size,6);
 });
+
+test('a slow directory delays only its own subtree, not the rest of its level',async t=>{
+ const root=await temporary(t),slow=path.join(root,'slow'),fast=path.join(root,'fast','deep');
+ await fs.mkdir(slow);await fs.mkdir(fast,{recursive:true});await fs.writeFile(path.join(slow,'S.csproj'),'');await fs.writeFile(path.join(fast,'F.csproj'),'');
+ const read=/** @type {(...args: any[]) => any} */ (fs.readdir);let release=()=>{};const gate=new Promise(resolve=>{release=()=>resolve(undefined);});let reachedDeep=false;
+ fs.readdir=/** @param {any[]} args */ async(...args)=>{
+  if(args[0]===slow)await gate;
+  if(args[0]===fast){reachedDeep=true;release();}
+  return read(...args);
+ };
+ try{
+  // Level-by-level traversal would wait for 'slow' before reading 'fast/deep', and never release it.
+  const projects=await findProjects([root],undefined,undefined,4);
+  assert.ok(reachedDeep);assert.deepEqual(projects.map(file=>path.basename(file)),['F.csproj','S.csproj']);
+ }finally{fs.readdir=read;release();}
+});

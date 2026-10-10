@@ -183,3 +183,55 @@ test('switching displayed source versions retains at most one derived line cache
  assert.equal(editor.lines[0].hits,7);assert.equal(JSON.stringify(first),saved);
  assert.equal(summaryOf(store,other,new Map([...hashes,[other,'v1']])).lines,otherSummary.lines);
 });
+
+test('a new contribution merges without reading others; only a removed sole maximum rescans its lines',()=>{
+ const store=new CoverageStore(),live=new Set();let reads=0;
+ /** A line whose hit count read is counted. @param {number} at @param {number} hits @returns {CoveredLine} */
+ const counted=(at,hits)=>({line:at,get hits(){reads++;return hits;}});
+ for(let index=0;index<50;index++){live.add(`g${index}`);store.replace([trace(`g${index}`,[coverage(file,'v1',[counted(1,1+index%3),counted(2,1)])])],live);}
+ assert.deepEqual(summaryOf(store,file,hashes).lines,[line(1,3),line(2,1)]);
+ reads=0;live.add('new');
+ store.replace([trace('new',[coverage(file,'v1',[line(1,5),line(3,2)])])],live);
+ assert.deepEqual(summaryOf(store,file,hashes).lines,[line(1,5),line(2,1),line(3,2)]);
+ assert.equal(reads,0,'merging one contribution reads only its own lines');
+ store.replace([trace('g0',[coverage(file,'v1',[line(2,1)])])],live);
+ assert.equal(summaryOf(store,file,hashes).covered,3);
+ assert.equal(reads,2,'replacing a value below the maximum, or one of several equal maxima, reads only the replaced lines');reads=0;
+ live.delete('new');store.replace([],live);
+ assert.deepEqual(summaryOf(store,file,hashes).lines,[line(1,3),line(2,1),line(3,0)]);
+ assert.ok(reads>0,'the removed sole maximum is recomputed from the remaining contributions');
+ assert.equal(summaryOf(store,file,hashes).covered,2);
+});
+
+test('running maxima match a recomputation through interleaved replacements, removals and paused aggregation',async()=>{
+ let seed=0x2f6b1c3d;
+ const random=(/** @type {number} */ limit)=>{seed^=seed<<13;seed^=seed>>>17;seed^=seed<<5;return(seed>>>0)%limit;};
+ const store=new CoverageStore(),live=new Set(),contributions=new Map(),other='/Other.cs',both=new Map([[file,'v1'],[other,'v1']]);
+ const expected=()=>{
+  const hits=new Map();for(const lines of contributions.values())for(const value of lines)hits.set(value.line,Math.max(hits.get(value.line)??0,value.hits));
+  return hits;
+ };
+ const mutate=()=>{
+  const group=`g${random(40)}`;
+  if(random(5)===0&&live.has(group)){live.delete(group);contributions.delete(group);store.replace([],live);return;}
+  live.add(group);
+  const lines=[...new Set(Array.from({length:1+random(12)},()=>1+random(16)))].sort((a,b)=>a-b).map(at=>line(at,random(4)));
+  const positive=lines.filter(value=>value.hits>0);
+  if(positive.length)contributions.set(group,positive);else contributions.delete(group);
+  store.replace([trace(group,[coverage(file,'v1',lines),coverage(other,'v1',[line(1,1)])])],live);
+ };
+ for(let step=0;step<400;step++){
+  mutate();
+  const summary=step%3?summaryOf(store,file,both):await (async()=>{
+   // Synchronous changes while an aggregation is paused supersede it.
+   const pending=store.summarizeAsync(both);if(random(2)){await turn();mutate();}
+   const summaries=await pending;return /** @type {CoverageSummary} */ (summaries.find(value=>value.file===file)??summaryOf(store,file,both));
+  })();
+  const hits=expected(),current=summaryOf(store,file,both);
+  if(!current){assert.equal(live.size,0);continue;}
+  assert.deepEqual(current.lines.filter(value=>value.hits).map(value=>[value.line,value.hits]),[...hits].filter(([,value])=>value).sort((a,b)=>a[0]-b[0]),`step ${step}`);
+  assert.equal(current.covered,hits.size,`step ${step} covered`);
+  assert.deepEqual(current.groupIds,[...live].sort(),`step ${step} owners`);
+  assert.ok(summary);
+ }
+});

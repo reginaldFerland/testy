@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import { helperPath } from './assets';
 import { ProcessOptions } from './process';
 import { ambiguousWindowsPath, resolveNodeExecutable, resolveOwnedCommand } from './executable';
-import { preparationToolIdentity } from './preparedOutputCache';
+import { preparationToolIdentity } from './preparationTools';
 
 interface PreparationTools extends Pick<ProcessOptions, 'signal' | 'dotnetHost' | 'cleanupDescendants'> {
     readonly dotnet: string;

@@ -1,6 +1,7 @@
 const test=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os'),{randomUUID}=require('node:crypto');
-const {PreparedOutputCache,outputManifest,preparationToolIdentity}=require('../../out/services/preparedOutputCache');
+const {PreparedOutputCache,outputManifest}=require('../../out/services/preparedOutputCache');
+const {preparationToolIdentity}=require('../../out/services/preparationTools');
 const {copyOutput,PreparedOutput}=require('../../out/services/output');
 const outputTools=require('../../out/services/output');
 
@@ -284,4 +285,42 @@ test('manifest hashes dereferenced content even with unchanged file size and rej
  const f=await fixture(t),first=await outputManifest(f.source);await fs.writeFile(path.join(f.source,'asset'),'mutated!');
  assert.notEqual((await outputManifest(f.source)).hash,first.hash);
  await fs.symlink(f.source,path.join(f.source,'cycle'));await assert.rejects(outputManifest(f.source),/cycle/);
+});
+
+test('an abort during retained-output validation settles the reservation so disposal completes and the entry is reusable',{timeout:20000},async t=>{
+ const f=await fixture(t),first=await f.acquire(),{output}=first.artifact,restore=output.restore;
+ await first.release();
+ const controller=new AbortController();
+ output.restore=async signal=>{controller.abort();signal?.throwIfAborted();};
+ await assert.rejects(f.cache.acquire(f.source,'context',f.create,controller.signal),{name:'AbortError'});
+ output.restore=restore;
+ const again=await f.acquire();assert.equal(again.hit,true,'the interrupted entry stays available');
+ await again.release();
+ await f.cache.dispose();
+});
+
+test('a claimed slot is refused without reading the build output, and lanes of one target share the source walk',async t=>{
+ /** @type {any} */ const real=fs.readdir; // any: pass-through wrapper over an overloaded function
+ const f=await fixture(t);let reads=0,requests=0,both=false;
+ // Lanes share a walk only while it is in flight. Both copies finish before either lane verifies the source,
+ // and the verification walk waits until both lanes have asked for it, so the sharing does not depend on timing.
+ const copied=deferred(),verifying=deferred();let creates=0;
+ /** @type {any} */ const cache=f.cache; // private: sourceManifest
+ const sourceManifest=cache.sourceManifest;
+ cache.sourceManifest=function(/** @type {any[]} */ ...args){if(++requests===4)verifying.resolve();return sourceManifest.apply(this,args);};
+ // Counting directory reads of the source.
+ /** @type {any} */ (fs).readdir=async(/** @type {any} */ directory,/** @type {any[]} */ ...rest)=>{
+  if(directory===f.source){reads++;if(rest[0]?.withFileTypes&&both)await verifying.promise;}
+  return real(directory,...rest);
+ };
+ t.after(()=>{fs.readdir=real;});
+ /** @param {string} directory */
+ const create=async directory=>{const artifact=await f.create(directory);if(++creates===2){both=true;copied.resolve();}await copied.promise;return artifact;};
+ const lanes=await Promise.all([0,1].map(lane=>f.acquire('context',create,undefined,JSON.stringify(['target',lane]))));
+ // Two reads are copies by create, one is the shared fingerprint and one the shared verification; unshared walks would make six.
+ assert.equal(reads,4,`two lanes read the source ${reads} times`);
+ const before=reads;
+ assert.equal(await f.cache.acquire(f.source,'context',f.create,undefined,JSON.stringify(['target',0])),undefined);
+ assert.equal(reads,before);
+ for(const lane of lanes)await lane.release();
 });

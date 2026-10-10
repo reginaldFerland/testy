@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 
@@ -14,6 +15,9 @@ static class Program
     // The installed Roslyn failed to load or its self-test failed. The extension must not fall
     // back to another run on the same Roslyn (src/services/analyzerServer.ts).
     internal const int SelfTestFailedExitCode = 70;
+
+    // The extension version this helper was built for (see Directory.Build.props), reported when the server starts.
+    internal static string Version { get; } = typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "";
 
     // Verifies the Roslyn this process runs on before any request is trusted.
     internal static async Task VerifyRoslynAsync()

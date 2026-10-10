@@ -1,9 +1,10 @@
 import { DiscoveredTest, TestFile, TestResult, Trace } from '../core/model';
-import { ProcessOptions } from './process';
 import { PreparedOutputCache } from './preparedOutputCache';
+import type { AnalysisOptions } from './analysis';
 import { RuntimeModule } from './runtimeObservation';
 
-export interface RunnerOptions extends ProcessOptions {
+/** `analyzerServers` serves the source-location reads of discovery. */
+export interface RunnerOptions extends AnalysisOptions {
     readonly dotnet: string;
     readonly storage: string;
     readonly testArguments: readonly string[];
@@ -21,6 +22,8 @@ export interface RunnerOptions extends ProcessOptions {
     readonly outputRoot?: string;
     readonly snapshots?: ReadonlyMap<string, string>;
     readonly preparedOutputCache?: PreparedOutputCache;
+    /** A mark of preparedOutputCache taken after this run's build and snapshots completed (see PreparedOutputCache.mark). */
+    readonly preparedAfter?: number;
     /** Evaluated target, reference, SDK and build configuration identity. */
     readonly preparationContexts?: ReadonlyMap<string, string>;
     /** Internal per-target private output slot; zero retains canonical native IDs. */

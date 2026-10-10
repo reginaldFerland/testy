@@ -9,6 +9,7 @@
 		"checkJs": true,
 		"noEmit": true,
 		"strict": true,
+		"noImplicitReturns": true,
 		"types": ["node"]
 	},
 	"include": ["test/**/*.cjs"]

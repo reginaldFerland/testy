@@ -34,9 +34,10 @@ sealed record CombinedAnalysis(string[] Aliases, Dictionary<string, SourceShape?
 sealed record SourceAnalysisProvenance(int Version, string RequestHash, string[] Aliases, Dictionary<string, SourceShape?> Analyses, Dictionary<string, string?> SourceHashes);
 
 // Bump Version when a field of the project graph is removed or changes meaning; the reader rejects other versions.
+// 2: the values of a listing query are one digest, not the names.
 sealed record ProjectGraphOutput(int Version, ProjectRecord[] Projects, RootRecord[] Roots, Dictionary<string, EvaluationInputs.Snapshot> Evaluations)
 {
-    public const int Current = 1;
+    public const int Current = 2;
 }
 
 sealed record ProjectRecord(string File, string Framework, string Assembly, string AssemblyName, string[] OutputDirectories, bool IsTestProject, bool IsMtp,

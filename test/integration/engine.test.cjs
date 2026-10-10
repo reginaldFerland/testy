@@ -80,7 +80,7 @@ test('MTP baseline, affected-file rerun, failure details, retained coverage and 
  await fs.writeFile(added,'namespace ImpactDemo; public class NewFeature { public int Value => 42; }');
  const fallback=await run({files:[added],full:false},signal);
  assert.equal(fallback.tests,3);assert.equal(/** @type {Selection} */ (selection).fallback,true);
- const snapshot=await fs.readdir(path.join(directory,'state/coverage-v2/traces'));
+ const snapshot=await fs.readdir(path.join(directory,'state/coverage-v3/traces'));
  assert.equal(snapshot.length,2);
  const calculatorGroup=/** @type {TestFile} */ (engine.groups.find(group=>/** @type {string} */ (group.file).endsWith('/CalculatorTests.cs')));
  const beforeManual=JSON.stringify([...engine.coverage.traces.values()]);

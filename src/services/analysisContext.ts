@@ -2,7 +2,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { compareCodeUnits, contentHash } from '../core/paths';
 import { ProcessOptions } from './process';
-import { preparationToolIdentity } from './preparedOutputCache';
+import { preparationToolIdentity } from './preparationTools';
 import { ambiguousWindowsPath, isNativeExecutable, resolveNodeExecutable } from './executable';
 
 /** The Roslyn builds the helper can load: those of every SDK installed beside the host (see
@@ -36,8 +36,9 @@ export async function roslynIdentity(dotnet: string, options: ProcessOptions): P
 /** Testy's syntax helper is pure for its source/alias inputs under an ordinary
  * installed CLR. Treat supported CLR implementation semantics as platform
  * behavior, while detecting host/asset replacements and runtime installations.
- * This does not claim transitive provenance for arbitrary injected CLR code. */
-export async function sourceAnalysisContext(dotnet: string, analyzer: string, options: ProcessOptions): Promise<string | undefined> {
+ * This does not claim transitive provenance for arbitrary injected CLR code. `identities` (the engine's
+ * tool hashes) reuses the helper's asset hashes while their metadata is unchanged. */
+export async function sourceAnalysisContext(dotnet: string, analyzer: string, options: ProcessOptions, identities?: Map<string, Promise<string>>): Promise<string | undefined> {
     const env = { ...process.env, ...options.env }, signal = options.signal;
     signal?.throwIfAborted();
     // These mechanisms can load arbitrary code/configuration outside the helper
@@ -85,7 +86,7 @@ export async function sourceAnalysisContext(dotnet: string, analyzer: string, op
         // The helper does not ship Roslyn; fingerprints come from the SDK's.
         const roslyn = await roslynInventory(root, env, signal);
         if (!roslyn) {return undefined;}
-        const assets = await preparationToolIdentity(actualAnalyzer, env, signal, options.cwd);
+        const assets = await preparationToolIdentity(actualAnalyzer, env, signal, options.cwd, identities);
         signal?.throwIfAborted();
         return contentHash(JSON.stringify([3, host, contentHash(bytes), assets, inventories, roslyn, await fs.realpath(options.cwd),
             Object.entries(env).sort(([left], [right]) => compareCodeUnits(left, right))]));

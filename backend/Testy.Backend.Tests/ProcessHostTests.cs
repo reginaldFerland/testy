@@ -48,6 +48,7 @@ public sealed class ProcessHostTests : IDisposable
     }
 
     [Fact]
+    [Trait("Platform", "Windows")]
     public async Task TheCommandsExitCodeAndOutputPassThrough()
     {
         Assert.SkipUnless(OperatingSystem.IsWindows(), "The process host requires Windows.");
@@ -57,6 +58,7 @@ public sealed class ProcessHostTests : IDisposable
     }
 
     [Fact]
+    [Trait("Platform", "Windows")]
     public async Task RestoredVariablesReachTheCommand()
     {
         Assert.SkipUnless(OperatingSystem.IsWindows(), "The process host requires Windows.");
@@ -67,6 +69,7 @@ public sealed class ProcessHostTests : IDisposable
     }
 
     [Fact]
+    [Trait("Platform", "Windows")]
     public async Task AMissingCommandIsAHostFailure()
     {
         Assert.SkipUnless(OperatingSystem.IsWindows(), "The process host requires Windows.");
@@ -87,6 +90,7 @@ public sealed class ProcessHostTests : IDisposable
     // The job is the ownership boundary: whatever the command left running dies with it. The
     // command here starts a long-lived grandchild, prints its id and exits at once.
     [Fact]
+    [Trait("Platform", "Windows")]
     public async Task AGrandchildIsKilledWhenTheCommandExits()
     {
         Assert.SkipUnless(OperatingSystem.IsWindows(), "The process host requires Windows.");
@@ -98,6 +102,7 @@ public sealed class ProcessHostTests : IDisposable
 
     // Standard input carries the owner protocol: the extension host closing it (or dying) must end the job.
     [Fact]
+    [Trait("Platform", "Windows")]
     public async Task ClosingTheHostsInputTearsDownTheJob()
     {
         Assert.SkipUnless(OperatingSystem.IsWindows(), "The process host requires Windows.");
@@ -117,6 +122,7 @@ public sealed class ProcessHostTests : IDisposable
     // The test holds an inheritable handle on a file, which every process it starts inherits
     // (Process.Start passes no handle list); the probe tells whether a process can read through it.
     [Fact]
+    [Trait("Platform", "Windows")]
     public async Task OnlyTheStandardHandlesAreInherited()
     {
         Assert.SkipUnless(OperatingSystem.IsWindows(), "The process host requires Windows.");

@@ -50,3 +50,28 @@ test('attachment notifications are reported as output lines; the client reports 
  assert.deepEqual(attachmentLines(null),[]);
  assert.equal(extensionVersion(),require('../../package.json').version);
 });
+
+test('only a closed connection is tolerated when saying goodbye after the final update',()=>{
+ const {connectionClosed}=require('../../out/services/mtp'),{ConnectionError,ConnectionErrors}=require('vscode-jsonrpc/node');
+ assert.equal(connectionClosed(new ConnectionError(ConnectionErrors.Closed,'closed')),true);
+ assert.equal(connectionClosed(new ConnectionError(ConnectionErrors.Disposed,'disposed')),true);
+ assert.equal(connectionClosed(new ConnectionError(ConnectionErrors.AlreadyListening,'listening')),false);
+ assert.equal(connectionClosed(Object.assign(new Error('write'),{code:'EPIPE'})),true);
+ assert.equal(connectionClosed(Object.assign(new Error('write'),{code:'ERR_STREAM_DESTROYED'})),true);
+ assert.equal(connectionClosed(Object.assign(new Error('disk'),{code:'EACCES'})),false);
+ assert.equal(connectionClosed(new Error('unrelated')),false);assert.equal(connectionClosed(undefined),false);
+});
+
+test('commands are resolved once each and the connect allowance starts only afterwards',async()=>{
+ const executable=require('../../out/services/executable'),original=executable.resolveOwnedCommand,resolved=/** @type {string[]} */ ([]);
+ /** @type {any} */ (executable).resolveOwnedCommand=async(/** @type {string} */ command,/** @type {any} */ env,/** @type {string} */ cwd)=>{resolved.push(command);await new Promise(done=>setTimeout(done,2000));return original(command,env,cwd);};
+ try{
+  // The allowance is shorter than the (deliberately slow) resolution, which it must not include,
+  // yet long enough for a loaded machine to start the peer.
+  await withTiming({connectMs:1500},async()=>{
+   const nodes=await requestTests({...peer,dotnetHost:process.execPath,env:{TESTY_UPDATES:JSON.stringify([{uid:'a','execution-state':'passed'}])}},'run');
+   assert.equal(nodes.length,1);
+  });
+  assert.deepEqual(resolved,[process.execPath]);
+ }finally{/** @type {any} */ (executable).resolveOwnedCommand=original;}
+});

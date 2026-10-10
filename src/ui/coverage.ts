@@ -5,6 +5,7 @@ import { Configuration } from '../configuration';
 import { CoverageSummary, declarationHits } from '../core/coverage';
 import { normalizePathAsync } from '../core/paths';
 import { TestEngine } from '../services/engine';
+import { inlineGutter } from './inlineStatus';
 
 const l10n = vscode.l10n;
 
@@ -16,6 +17,8 @@ interface EditorCoverageState {
     readonly lineCount: number;
     readonly dirty: boolean;
     readonly show: boolean;
+    /** Whether inline results own the covered lines' markers. */
+    readonly inline: boolean;
     readonly lines: CoverageSummary['lines'] | undefined;
     readonly stale: boolean | undefined;
 }
@@ -143,7 +146,8 @@ export class CoverageView {
         return summary ? this.coveringOf(summary).get(line) ?? [] : [];
     }
 
-    private coveringOf(summary: CoverageSummary): Map<number, string[]> {
+    /** Covered lines (1-based) of a summary's file and the real test files hitting each; cached per summary. */
+    coveringOf(summary: CoverageSummary): Map<number, string[]> {
         let covering = this.coveringLines.get(summary);
         if (covering) {return covering;}
         covering = new Map();
@@ -195,6 +199,8 @@ export class CoverageView {
         let hashes: ReadonlyMap<string, string>;
         let summaries: readonly CoverageSummary[];
         // Editor paths are resolved without blocking the extension host; nothing needs them while coverage is hidden.
+        // With inline results on, covered lines show their tests' outcomes there instead of the covered marker.
+        const inline = inlineGutter(host.config.inlineResults);
         const files = visible() ? await Promise.all(editors.map(editor => normalizePathAsync(editor.document.uri.fsPath))) : [];
         do {
             hashes = this.engine.hashes;
@@ -209,10 +215,10 @@ export class CoverageView {
             const document = editor.document, show = visible(), file = files[index];
             const summary = show && file !== undefined ? byFile.get(file) : undefined;
             const state: EditorCoverageState = { document, version: document.version, lineCount: document.lineCount, dirty: document.isDirty,
-                show, lines: summary?.lines, stale: summary?.stale };
+                show, inline, lines: summary?.lines, stale: summary?.stale };
             const previous = rendered.get(editor);
             // Nothing is drawn while coverage is hidden, so edits do not change the (empty) result.
-            if (previous && previous.document === document && previous.show === state.show && previous.lines === state.lines && previous.stale === state.stale
+            if (previous && previous.document === document && previous.show === state.show && previous.inline === inline && previous.lines === state.lines && previous.stale === state.stale
                 && (!state.show || (previous.version === state.version && previous.lineCount === state.lineCount && previous.dirty === state.dirty))) {continue;}
             const entries: Record<DecorationKind, vscode.DecorationOptions[]> = { covered: [], uncovered: [], stale: [] };
             if (summary) {
@@ -221,7 +227,7 @@ export class CoverageView {
                     uncovered: l10n.t('Testy: not covered by tests.')
                 };
                 for (const line of summary.lines) {
-                    if (line.line > state.lineCount) {continue;}
+                    if (line.line > state.lineCount || (inline && line.hits > 0)) {continue;}
                     const stale = summary.stale || state.dirty;
                     const kind = stale ? 'stale' : line.hits > 0 ? 'covered' : 'uncovered';
                     const covering = kind === 'covered' ? this.coveringOf(summary).get(line.line) : undefined;

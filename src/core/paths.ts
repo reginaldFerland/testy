@@ -10,6 +10,9 @@ export const defaultExcludes = [
 ] as const;
 Object.freeze(defaultExcludes);
 
+/** The default `testy.fileWatcherPattern`. */
+export const defaultWatcherPattern = '**/*.{cs,csproj,sln,slnx,slnf,props,targets,runsettings,json,config,resx,editorconfig,globalconfig,ruleset,razor,cshtml,xaml,axaml,proto}';
+
 class TtlMap<T> {
     private readonly entries = new Map<string, { readonly value: T; readonly expires: number }>();
     constructor(private readonly limit: number, private readonly ttl: number) {}

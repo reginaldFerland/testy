@@ -66,7 +66,7 @@ async function fixture(t, config = {}) {
             await config.run?.(options, state);
             return (selected ?? options.expectedTests).map((/** @type {any} */ node) => ({ ...node, 'execution-state': 'passed' }));
         } },
-        './preparedOutputCache': { ...cacheTools, preparationToolIdentity: async (/** @type {string | undefined} */ command) => command ?? '' },
+        './preparationTools': { preparationToolIdentity: async (/** @type {string | undefined} */ command) => command ?? '' },
         './preparationIdentity': { windowsPreparationTools: async (/** @type {{dotnet: string, coverageTool: string, analyzer: string}} */ options) => ({ dotnet: options.dotnet, collector: options.coverageTool, analyzer: options.analyzer, instrumentationLaunch: 'node' }) },
         './coverageReader': { CoverageReader: class { async read() { return []; } async dispose() {} } },
         './runtimeObservation': { RuntimeObservation: class { static async start(/** @type {string} */ _directory, /** @type {string} */ _assembly, /** @type {unknown} */ _modules, /** @type {unknown} */ _instrumented, /** @type {unknown} */ env) {
@@ -167,7 +167,7 @@ for (const scenario of ['inherited failure', 'borrowed failure', 'cancellation']
                 if (call.signal.aborted) { aborted++; resolve(); }
                 else { call.signal.addEventListener('abort', () => { aborted++; resolve(); }, { once: true }); }
             });
-            await drain.promise; call.signal.throwIfAborted();
+            await drain.promise; call.signal.throwIfAborted(); return undefined;
         }, release: () => { fail.resolve(); drain.resolve(); } });
         const pending = f.start();
         const observed = scenario === 'cancellation' ? assert.rejects(pending, (/** @type {Error} */ error) => error.name === 'AbortError') : pending;

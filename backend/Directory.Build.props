@@ -4,7 +4,11 @@
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <!-- A new advisory against a dependency must stay a visible warning, not break packaging. -->
-    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1900;NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
+    <!-- Audit direct and transitive packages for every severity; the warnings stay visible, and an offline audit (NU1900) must not fail a build either. -->
+    <NuGetAudit>true</NuGetAudit>
+    <NuGetAuditMode>all</NuGetAuditMode>
+    <NuGetAuditLevel>low</NuGetAuditLevel>
     <!-- Line numbers in helper stack traces without shipping separate .pdb files. -->
     <DebugType>embedded</DebugType>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
@@ -16,6 +20,16 @@
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <!-- Keep local source paths out of shipped binaries. -->
     <PathMap>$(MSBuildThisFileDirectory)=/_/backend/</PathMap>
+  </PropertyGroup>
+  <!-- The helpers carry the extension's version (package.json), also reported by the analyzer server when it starts.
+       Override with -p:TestyVersion=x.y.z; 0.0.0 when package.json is not beside backend/. -->
+  <PropertyGroup>
+    <TestyPackageJson>$([MSBuild]::NormalizePath('$(MSBuildThisFileDirectory)', '..', 'package.json'))</TestyPackageJson>
+    <TestyVersion Condition="'$(TestyVersion)' == '' And Exists('$(TestyPackageJson)')">$([System.Text.RegularExpressions.Regex]::Replace($([System.IO.File]::ReadAllText('$(TestyPackageJson)')), '^[\s\S]*?"version"\s*:\s*"([0-9][^"]*)"[\s\S]*$', '$1'))</TestyVersion>
+    <TestyVersion Condition="'$(TestyVersion)' == ''">0.0.0</TestyVersion>
+    <Version>$(TestyVersion)</Version>
+    <InformationalVersion>$(TestyVersion)</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
   <PropertyGroup Condition="'$(TESTY_RELEASE)' == 'true'">
     <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>

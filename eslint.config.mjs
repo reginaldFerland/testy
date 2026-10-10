@@ -109,13 +109,28 @@ export default tseslint.config(
         }
     },
     {
-        // Root ES module config and build scripts.
-        files: ['*.mjs'],
-        extends: [js.configs.recommended],
+        // Root ES module config, build scripts and the extension-test runner.
+        files: ['*.mjs', 'scripts/**/*.mjs', 'test/**/*.mjs'],
+        extends: [js.configs.recommended, tseslint.configs.base],
         languageOptions: {
             ecmaVersion: 'latest',
             sourceType: 'module',
-            globals: nodeGlobals
+            globals: nodeGlobals,
+            parserOptions: { project: './tsconfig.scripts.json', tsconfigRootDir: import.meta.dirname }
+        },
+        rules: {
+            '@typescript-eslint/no-floating-promises': 'error',
+            '@typescript-eslint/no-misused-promises': 'error',
+            '@typescript-eslint/await-thenable': 'error'
+        }
+    },
+    {
+        // Dynamic code evaluation has no place in the extension, its tests or its scripts.
+        files: ['src/**/*.ts', 'test/**/*.cjs', '*.mjs', 'scripts/**/*.mjs', 'test/**/*.mjs'],
+        rules: {
+            'no-eval': 'error',
+            'no-implied-eval': 'error',
+            'no-new-func': 'error'
         }
     }
 );

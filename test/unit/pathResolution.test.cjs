@@ -10,7 +10,7 @@ const {findProjects,refreshProjectSnapshotBatches}=require('../../out/services/p
 async function temporary(t){const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-paths-')));t.after(()=>fs.rm(root,{recursive:true,force:true}));return root;}
 const link=/** @param {string} target @param {string} file */ (target,file)=>fs.symlink(target,file,process.platform==='win32'?'junction':'dir');
 
-test('normalization resolves directory aliases for missing files, async variant included',async t=>{
+test('[windows] normalization resolves directory aliases for missing files, async variant included',async t=>{
  const root=await temporary(t),real=path.join(root,'real'),alias=path.join(root,'alias');
  await fs.mkdir(real);await link(real,alias);clearPathCache();
  const expected=normalizePath(path.join(real,'sub','Missing.cs'));
@@ -52,7 +52,7 @@ test('exclude patterns match repeatedly and keep their case-insensitive dotfile 
  assert.equal(matchesPattern('/w/proj/Skip/','Skip/**',['/w/proj']),true);
 });
 
-test('project discovery matches csproj case-insensitively and follows symlinked directories once',async t=>{
+test('[windows] project discovery matches csproj case-insensitively and follows symlinked directories once',async t=>{
  const root=await temporary(t),outside=await temporary(t);
  await fs.mkdir(path.join(root,'app'));await fs.writeFile(path.join(root,'app','App.CSPROJ'),'');
  await fs.mkdir(path.join(outside,'shared'));await fs.writeFile(path.join(outside,'shared','Shared.csproj'),'');

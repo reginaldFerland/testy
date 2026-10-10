@@ -7,5 +7,6 @@ test('a formerly absent build dependency invalidates retained coverage when crea
  store.replace([{groupId:'file',dependencies:['/Code.cs','/.editorconfig'],inputs:{'/Code.cs':'code','/.editorconfig':sourceVersion(initial,'/.editorconfig')},
   coverage:[{file:'/Code.cs',hash:'code',lines:[{line:1,hits:1}]}],reliable:true,timestamp:0}],new Set(['file']));
  assert.equal(store.summarize(initial)[0].stale,false);
- assert.equal(store.summarize(new Map([...initial,['/.editorconfig','new']]))[0].stale,true);
+ const created=new Map([...initial,['/.editorconfig','new']]);store.applyHashes(created);
+ assert.equal(store.summarize(created)[0].stale,true);
 });
