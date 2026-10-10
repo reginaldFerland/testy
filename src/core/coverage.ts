@@ -1,6 +1,6 @@
 import { setImmediate as yieldTurn } from 'node:timers/promises';
-import { CoveredLine, Declaration, Trace } from './model';
-import { contentHash, sourceVersion } from './paths';
+import { CoveredLine, Declaration, TestFile, Trace } from './model';
+import { contentHash, sourceVersion, testFileId } from './paths';
 import { finish, finishAsync, sortedUnion } from './work';
 
 export interface CoverageSummary {
@@ -626,3 +626,5 @@ export class CoverageStore {
         return { file, lines, ...declarations ? { declarations } : {}, stale, covered: aggregate.covered, total: lines.length, groupIds };
     }
 }
+
+export function projectCoverageId(group: TestFile): string { return `project:${testFileId(group.project, group.framework)}`; }

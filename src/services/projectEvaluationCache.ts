@@ -4,6 +4,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { Project } from '../core/model';
 import { mapConcurrent } from '../core/concurrency';
+import { EnvironmentError } from '../core/errors';
 import { EvaluationStorageLimits, readEvaluationSnapshot, writeEvaluationSnapshot } from './projectEvaluationStorage';
 import { isNativeExecutable, resolveNodeExecutable } from './executable';
 
@@ -56,7 +57,7 @@ export async function evaluationToolContext(dotnet: string, analyzer: string, di
             // Inspection uses a direct Node launch (cleanupDescendants:false),
             // including its cwd/PATH precedence and literal POSIX path spelling.
             const executable = await resolveNodeExecutable(dotnet, process.env, cwd, workerSignal);
-            if (!executable) {throw new Error('The configured .NET host could not be resolved.');}
+            if (!executable) {throw new EnvironmentError('host-unresolved', 'The configured .NET host could not be resolved.');}
             return fingerprint(executable);
         });
         const unique = [...new Set(hosts)], [host] = unique;

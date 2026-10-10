@@ -1,16 +1,20 @@
 import * as net from 'node:net';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { createMessageConnection, MessageConnection, StreamMessageReader, StreamMessageWriter } from 'vscode-jsonrpc/node';
 import { DiscoveredTest, TestResult } from '../core/model';
 import { normalizePath, pathNormalizer } from '../core/paths';
 import { nodeTraits } from '../core/traits';
-import { mergeTestUpdate, nodeName, nodeText, TestNode } from '../core/testUpdates';
+import { EnvironmentError } from '../core/errors';
+import { mergeTestUpdate, nodeName, nodeText, testName, TestNode } from '../core/testUpdates';
 import { OwnedProcess, ProcessOptions, ProcessResult, startProcess } from './process';
 import { resolveOwnedCommand } from './executable';
+import { extensionVersion } from './assets';
 
 export type { TestNode } from '../core/testUpdates';
 // Protocol messages from the test host; optional parts may be absent.
 interface TestUpdates { readonly runId: string; readonly changes?: readonly { readonly node: TestNode }[] | null; }
+interface AttachmentUpdates { readonly runId: string; readonly attachments?: readonly { readonly uri?: string; readonly 'display-name'?: string; readonly description?: string; readonly producer?: string }[] | null; }
 interface InitializeResult { readonly capabilities?: { readonly testing?: { readonly supportsDiscovery?: boolean } }; }
 
 export interface MtpOptions extends ProcessOptions {
@@ -105,7 +109,7 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
             // collector's cold start is slower, but nothing outlives the process timeout.
             if (!debugging) {
                 const limit = Math.min(options.wrapper ? mtpTiming.wrappedConnectMs : mtpTiming.connectMs, options.timeoutMs ?? 600_000);
-                connectionTimer = setTimeout(() => reject(new Error('The test application did not connect to Testy. Use a .NET 10+ Microsoft.Testing.Platform project.')), limit);
+                connectionTimer = setTimeout(() => reject(new EnvironmentError('not-mtp', 'The test application did not connect to Testy. Use a .NET 10+ Microsoft.Testing.Platform project.')), limit);
             }
             server.on('connection', candidate => {
                 if (socket) {
@@ -189,11 +193,14 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
             if (message.level === 'Error' || message.level === 'Warning' || (typeof message.level === 'number' && message.level >= 3)) {options.output?.(`${message.message ?? ''}\n`);}
         });
         rpc.onNotification('telemetry/update', () => undefined);
-        rpc.onNotification('testing/testUpdates/attachments', () => undefined);
+        rpc.onNotification('testing/testUpdates/attachments', (update: AttachmentUpdates) => {
+            if (update.runId !== runId) {return;}
+            for (const line of attachmentLines(update.attachments)) {options.output?.(`${line}\n`);}
+        });
         rpc.listen();
         const initialized = await request<InitializeResult>('initialize', {
             processId: global.process.pid,
-            clientInfo: { name: 'Testy', version: '1.0.0' },
+            clientInfo: { name: 'Testy', version: extensionVersion() },
             capabilities: { testing: { debuggerProvider: false, isStateful: true } }
         });
         if (!initialized.capabilities?.testing?.supportsDiscovery && operation === 'discover') {throw new Error('This MTP test framework does not support discovery.');}
@@ -236,6 +243,17 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
         process?.stop();
         await process?.done.catch(() => undefined);
     }
+}
+
+/** One output line per attachment: its name, the local path (file URIs are converted), and any description. */
+export function attachmentLines(attachments: AttachmentUpdates['attachments']): string[] {
+    return (attachments ?? []).flatMap(attachment => {
+        if (typeof attachment.uri !== 'string' || !attachment.uri) {return [];}
+        let location = attachment.uri;
+        try {if (location.startsWith('file:')) {location = fileURLToPath(location);}} catch { /* Keep the URI. */ }
+        const name = attachment['display-name'], extra = [attachment.producer, attachment.description].filter(Boolean).join(': ');
+        return [`Attachment${name ? ` ${name}` : ''}: ${location}${extra ? ` (${extra})` : ''}`];
+    });
 }
 
 /** Deferred theories can report new row IDs; match those to their discovered method. */
@@ -283,7 +301,7 @@ export function testConverter(normalize = pathNormalizer()): (node: TestNode) =>
 function testMetadata(node: TestNode, normalize: (file: string) => string): DiscoveredTest {
     const traits = nodeTraits(node);
     return {
-        id: node.uid, name: nodeName(node),
+        id: node.uid, name: testName(node),
         fullyQualifiedName: qualifiedName(node),
         file: typeof node['location.file'] === 'string' ? normalize(node['location.file']) : undefined,
         line: typeof node['location.line-start'] === 'number' ? Math.max(1, node['location.line-start']) : 1,
@@ -298,7 +316,7 @@ export function testResult(node: TestNode): TestResult | undefined {
     if (!isTerminal(node)) {return undefined;}
     const state = node['execution-state'];
     return {
-        id: node.uid, name: nodeName(node), fullyQualifiedName: qualifiedName(node),
+        id: node.uid, name: testName(node), fullyQualifiedName: qualifiedName(node),
         outcome: state === 'passed' ? 'passed' : state === 'failed' ? 'failed' : state === 'skipped' ? 'skipped' : 'errored',
         duration: Number(node['time.duration-ms'] ?? 0),
         message: typeof node['error.message'] === 'string' ? node['error.message'] : undefined,

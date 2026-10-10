@@ -1,6 +1,13 @@
 const test=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
-const {XMLParser,XMLValidator}=require('fast-xml-parser');
+const {readXml}=require('../../out/services/xml');
+// Minimal element tree over the project's strict reader; throws on any malformed document.
+const tree=xml=>{
+ const stack=[{name:'#document',attributes:new Map(),children:[],text:''}];
+ readXml(xml,{open:(name,attributes)=>{const node={name,attributes,children:[],text:''};stack.at(-1).children.push(node);stack.push(node);},close:()=>{stack.pop();},text:value=>{stack.at(-1).text+=value;}});
+ return stack[0].children[0];
+};
+const child=(node,name)=>node.children.filter(item=>item.name===name);
 const {toLcov,toCobertura,exportPath,exportCoverage}=require('../../out/core/coverageExport');
 const {loadUi}=require('./support/ui.cjs');
 
@@ -32,18 +39,17 @@ test('LCOV export writes complete records for current coverage only',()=>{
 
 test('Cobertura export is well-formed XML with escaped names and consistent rates',()=>{
  const xml=toCobertura(summaries,[root],1_700_000_000_000);
- assert.equal(XMLValidator.validate(xml),true);
- const parsed=new XMLParser({ignoreAttributes:false,attributeNamePrefix:'@_',isArray:name=>['class','line','source'].includes(name)}).parse(xml);
- const coverage=parsed.coverage;
- assert.equal(coverage['@_lines-valid'],'5');assert.equal(coverage['@_lines-covered'],'4');
- assert.equal(coverage['@_line-rate'],'0.8000');assert.equal(coverage['@_timestamp'],'1700000000');
- assert.deepEqual(coverage.sources.source,[root.replace(/\\/g,'/')]);
- const classes=coverage.packages.package.classes.class;
- assert.deepEqual(classes.map(item=>item['@_filename']).sort(),['src/A&B <x>.cs','src/Calculator.cs',path.resolve('/elsewhere/Outside.cs').replace(/\\/g,'/')].sort());
- const calculator=classes.find(item=>item['@_filename']==='src/Calculator.cs');
- assert.deepEqual(calculator.lines.line.map(line=>[line['@_number'],line['@_hits']]),[['1','1'],['2','0'],['3','2']]);
- assert.equal(calculator['@_line-rate'],'0.6667');
- assert.equal(XMLValidator.validate(toCobertura([],[root])),true,'an empty report is still a document');
+ const coverage=tree(xml),attribute=(node,name)=>node.attributes.get(name);
+ assert.equal(coverage.name,'coverage');
+ assert.equal(attribute(coverage,'lines-valid'),'5');assert.equal(attribute(coverage,'lines-covered'),'4');
+ assert.equal(attribute(coverage,'line-rate'),'0.8000');assert.equal(attribute(coverage,'timestamp'),'1700000000');
+ assert.deepEqual(child(child(coverage,'sources')[0],'source').map(item=>item.text),[root.replace(/\\/g,'/')]);
+ const classes=child(child(child(child(coverage,'packages')[0],'package')[0],'classes')[0],'class');
+ assert.deepEqual(classes.map(item=>attribute(item,'filename')).sort(),['src/A&B <x>.cs','src/Calculator.cs',path.resolve('/elsewhere/Outside.cs').replace(/\\/g,'/')].sort());
+ const calculator=classes.find(item=>attribute(item,'filename')==='src/Calculator.cs');
+ assert.deepEqual(child(child(calculator,'lines')[0],'line').map(line=>[attribute(line,'number'),attribute(line,'hits')]),[['1','1'],['2','0'],['3','2']]);
+ assert.equal(attribute(calculator,'line-rate'),'0.6667');
+ assert.equal(tree(toCobertura([],[root])).name,'coverage','an empty report is still a document');
  assert.equal(exportCoverage('cobertura',summaries,[root]).startsWith('<?xml'),true);
  assert.equal(exportCoverage('lcov',summaries,[root]).startsWith('TN:'),true);
 });

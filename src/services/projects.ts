@@ -4,6 +4,7 @@ import { Project } from '../core/model';
 import { defaultExcludes, isExcluded, isInside, matchesPattern, normalizePath, normalizePathAsync, normalizePathsAsync, pathNormalizer, preparePathNormalizer, testTargetKey } from '../core/paths';
 import { parseSolution } from '../core/solution';
 import { mapConcurrent } from '../core/concurrency';
+import { EnvironmentError } from '../core/errors';
 import { ProcessOptions, requireSuccess, runProcess } from './process';
 import { EvaluationInputs, evaluationInputs } from './projectEvaluationCache';
 
@@ -86,7 +87,7 @@ export async function filterEntryPoints(found: readonly string[], filter: EntryP
         inputs.push(solution);
         let content: string;
         try {content = await fs.readFile(solution, { encoding: 'utf8', signal });}
-        catch (error) {signal?.throwIfAborted(); throw new Error(`testy.solution could not be read: ${solution}. ${(error as Error).message}`);}
+        catch (error) {signal?.throwIfAborted(); throw new EnvironmentError('configuration', `testy.solution could not be read: ${solution}. ${(error as Error).message}`);}
         const listed = parseSolution(solution, content);
         if (listed.solution) {inputs.push(await normalizePathAsync(listed.solution));}
         const allowed = new Set(await normalizePathsAsync(listed.projects, signal));
@@ -96,7 +97,7 @@ export async function filterEntryPoints(found: readonly string[], filter: EntryP
     if (filter.include?.length) {entryPoints = entryPoints.filter(file => filter.include!.some(pattern => matchesPattern(file, pattern, roots)));}
     if (filter.exclude?.length) {entryPoints = entryPoints.filter(file => !filter.exclude!.some(pattern => matchesPattern(file, pattern, roots)));}
     if (found.length && !entryPoints.length) {
-        throw new Error('testy.solution and testy.projects exclude every project in the workspace. Check those settings.');
+        throw new EnvironmentError('configuration', 'testy.solution and testy.projects exclude every project in the workspace. Check those settings.');
     }
     return { entryPoints, inputs };
 }
@@ -186,15 +187,19 @@ export function unsupportedTestReason(project: Pick<Project, 'file' | 'framework
     return undefined;
 }
 
+/** The project-graph output format this reader understands (ProjectGraphOutput.Current in the helper). */
+const graphVersion = 1;
+
 /** Evaluate shared dependencies once, retaining each entry point's exact snapshot.
- * All files must select the SDK used by options.cwd (see sdkContextGroups). */
-export async function evaluateProjects(dotnet: string, files: readonly string[], configuration: string, options: ProcessOptions, analyzer: string, concurrency = 1): Promise<ReadonlyMap<string, readonly Project[]>> {
+ * All files must select the SDK used by options.cwd (see sdkContextGroups).
+ * digestCache names a directory where the helper keeps SDK file digests between evaluations. */
+export async function evaluateProjects(dotnet: string, files: readonly string[], configuration: string, options: ProcessOptions, analyzer: string, concurrency = 1, digestCache?: string): Promise<ReadonlyMap<string, readonly Project[]>> {
     if (!files.length) {return new Map();}
     options.signal?.throwIfAborted();
     const directory = await fs.mkdtemp(path.join((await import('node:os')).tmpdir(), 'testy-graph-'));
     try {
         const input = path.join(directory, 'input.json'), output = path.join(directory, 'output.json'), query = path.join(directory, 'query.proj');
-        await fs.writeFile(input, JSON.stringify({ files: [...new Set(files)], configuration, concurrency: parallelism(concurrency) }));
+        await fs.writeFile(input, JSON.stringify({ files: [...new Set(files)], configuration, concurrency: parallelism(concurrency), ...digestCache ? { digestCache } : {} }));
         // Attribute values are expanded by MSBuild, so '%', '$(' and ';' in a path need escaping too.
         const attribute = (value: string): string => xml(escapeMsbuild(value));
         await fs.writeFile(query, `<Project><UsingTask TaskName="Testy.Analysis.ProjectGraphTask" AssemblyFile="${attribute(analyzer)}"/><Target Name="Inspect"><ProjectGraphTask RequestFile="${attribute(input)}" OutputFile="${attribute(output)}"/></Target></Project>`);
@@ -203,10 +208,12 @@ export async function evaluateProjects(dotnet: string, files: readonly string[],
         requireSuccess(await runProcess(dotnet, ['msbuild', query, '-nologo', '-nodeReuse:false', '-target:Inspect', `-maxcpucount:${parallelism(concurrency)}`],
             { ...options, output: undefined, env: { ...options.env, DOTNET_CLI_USE_MSBUILD_SERVER: '0', MSBUILDNOINPROCNODE: undefined } }), `Inspecting ${files.length} project${files.length === 1 ? '' : 's'}`);
         const graph = JSON.parse(await fs.readFile(output, { encoding: 'utf8', signal: options.signal })) as {
+            version?: number;
             projects: (Project & { isMtp: boolean })[];
             roots: { file: string; contexts: string[]; entryPoints: string[]; evaluation?: (string | EvaluationInputs)[] }[];
             evaluations?: Readonly<Record<string, EvaluationInputs>>;
         };
+        if (graph.version !== graphVersion) {throw new Error(`Project inspection returned an unsupported graph version: ${String(graph.version)}.`);}
         // Every path in the graph, resolved before the synchronous mapping below.
         const normalize = await preparePathNormalizer([...files, ...graph.roots.map(root => root.file), ...graph.projects.flatMap(project => [
             project.file, project.assembly, ...project.sourceFiles, ...project.inputs ?? [], ...sdkConfigurationCandidates(project.file),

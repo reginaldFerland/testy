@@ -38,7 +38,7 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task, ICancelab
             var concurrency = request.RootElement.TryGetProperty("concurrency", out var workers) ? Math.Clamp(workers.GetInt32(), 1, Environment.ProcessorCount) : 1;
             var inputs = new ConcurrentDictionary<ProjectInstance, string[]>();
             var evaluationInputs = new ConcurrentDictionary<ProjectInstance, EvaluationInputs.Snapshot>();
-            var sharedInputs = new EvaluationInputs.Shared();
+            var sharedInputs = new EvaluationInputs.Shared(request.RootElement.TryGetProperty("digestCache", out var digestCache) ? digestCache.GetString() : null);
             using var collection = new ProjectCollection();
             var entryPoints = files.Select(file => new ProjectGraphEntryPoint(file, new Dictionary<string, string> { ["Configuration"] = configuration }));
             var graph = new ProjectGraph(entryPoints, collection, (projectFile, properties, projects) =>
@@ -75,10 +75,10 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task, ICancelab
                 var project = node.ProjectInstance;
                 var file = OperatingSystem.IsWindows() ? project.FullPath.ToUpperInvariant() : project.FullPath;
                 var properties = project.GlobalProperties.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
-                    .Select(pair => new[] { pair.Key.ToUpperInvariant(), pair.Value });
+                    .Select(pair => new[] { pair.Key.ToUpperInvariant(), pair.Value }).ToArray();
                 var sdk = project.GetPropertyValue("MSBuildToolsPath");
                 if (OperatingSystem.IsWindows()) { sdk = sdk.ToUpperInvariant(); }
-                return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { file, properties, sdk }))));
+                return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new ContextIdentity(file, properties, sdk), GraphJson.Default.ContextIdentity))));
             }
             var identities = graph.ProjectNodes.ToDictionary(node => node, Identity);
             var projects = graph.ProjectNodes.Where(node => !string.IsNullOrEmpty(node.ProjectInstance.GetPropertyValue("TargetFramework")))
@@ -100,33 +100,32 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task, ICancelab
                     compilerConfigs.Add(Path.Combine(project.Directory, ".globalconfig"));
                     var ruleSet = project.GetPropertyValue("CodeAnalysisRuleSet");
                     if (!string.IsNullOrWhiteSpace(ruleSet)) { compilerConfigs.Add(FullPath(ruleSet, project.Directory)); }
-                    return new
-                    {
-                        file = project.FullPath,
-                        framework = project.GetPropertyValue("TargetFramework"),
-                        assembly = project.GetPropertyValue("TargetPath"),
-                        assemblyName = project.GetPropertyValue("AssemblyName"),
-                        outputDirectories = EvaluationInputs.OutputProperties
+                    return new ProjectRecord(
+                        File: project.FullPath,
+                        Framework: project.GetPropertyValue("TargetFramework"),
+                        Assembly: project.GetPropertyValue("TargetPath"),
+                        AssemblyName: project.GetPropertyValue("AssemblyName"),
+                        OutputDirectories: EvaluationInputs.OutputProperties
                             .Select(project.GetPropertyValue).Where(value => !string.IsNullOrWhiteSpace(value))
                             .Select(value => Path.TrimEndingDirectorySeparator(FullPath(value, project.Directory)))
                             .Append(Path.GetDirectoryName(project.GetPropertyValue("TargetPath")) ?? project.Directory).Distinct().Order(StringComparer.Ordinal).ToArray(),
-                        isTestProject = project.GetPropertyValue("IsTestProject").Equals("true", StringComparison.OrdinalIgnoreCase)
+                        IsTestProject: project.GetPropertyValue("IsTestProject").Equals("true", StringComparison.OrdinalIgnoreCase)
                             || project.GetPropertyValue("IsTestingPlatformApplication").Equals("true", StringComparison.OrdinalIgnoreCase),
-                        isMtp = project.GetPropertyValue("IsTestingPlatformApplication").Equals("true", StringComparison.OrdinalIgnoreCase),
-                        properties = project.GlobalProperties,
-                        contextId = identities[node],
-                        contextReferences = node.ProjectReferences.SelectMany(Targets).Select(reference => identities[reference]).Distinct().Order(StringComparer.Ordinal).ToArray(),
-                        sourceFiles = Items("Compile"),
-                        inputs = inputs[project].Concat(Items("Content")).Concat(Items("None")).Concat(Items("EmbeddedResource"))
+                        IsMtp: project.GetPropertyValue("IsTestingPlatformApplication").Equals("true", StringComparison.OrdinalIgnoreCase),
+                        Properties: project.GlobalProperties,
+                        ContextId: identities[node],
+                        ContextReferences: node.ProjectReferences.SelectMany(Targets).Select(reference => identities[reference]).Distinct().Order(StringComparer.Ordinal).ToArray(),
+                        SourceFiles: Items("Compile"),
+                        Inputs: inputs[project].Concat(Items("Content")).Concat(Items("None")).Concat(Items("EmbeddedResource"))
                             .Concat(Items("AdditionalFiles")).Concat(Items("EditorConfigFiles")).Concat(Items("GlobalAnalyzerConfigFiles"))
                             .Concat(Items("AnalyzerConfigFiles")).Concat(compilerConfigs)
                             .Where(input => !input.StartsWith(project.GetPropertyValue("MSBuildToolsPath") + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
                             .Distinct().Order(StringComparer.Ordinal).ToArray(),
-                        references = node.ProjectReferences.Select(reference => reference.ProjectInstance.FullPath).Where(reference => reference != project.FullPath).Distinct().Order(StringComparer.Ordinal).ToArray(),
-                        binaryReferences = project.GetItems("Reference").Select(item => item.GetMetadataValue("HintPath"))
+                        References: node.ProjectReferences.Select(reference => reference.ProjectInstance.FullPath).Where(reference => reference != project.FullPath).Distinct().Order(StringComparer.Ordinal).ToArray(),
+                        BinaryReferences: project.GetItems("Reference").Select(item => item.GetMetadataValue("HintPath"))
                             .Where(value => value.Length > 0).Select(value => FullPath(value, project.Directory)).Distinct().Order(StringComparer.Ordinal).ToArray()
-                    };
-                }).OrderBy(project => project.contextId, StringComparer.Ordinal).ToArray();
+                    );
+                }).OrderBy(project => project.ContextId, StringComparer.Ordinal).ToArray();
             var comparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
             var roots = files.Distinct(comparer).Select(file =>
             {
@@ -138,18 +137,17 @@ public sealed class ProjectGraphTask : Microsoft.Build.Utilities.Task, ICancelab
                     if (!reachable.Add(node)) { continue; }
                     foreach (var reference in node.ProjectReferences) { pending.Push(reference); }
                 }
-                return new
-                {
-                    file = Path.GetFullPath(file),
-                    contexts = reachable.Where(node => !string.IsNullOrEmpty(node.ProjectInstance.GetPropertyValue("TargetFramework")))
+                return new RootRecord(
+                    File: Path.GetFullPath(file),
+                    Contexts: reachable.Where(node => !string.IsNullOrEmpty(node.ProjectInstance.GetPropertyValue("TargetFramework")))
                         .Select(node => identities[node]).Order(StringComparer.Ordinal).ToArray(),
-                    entryPoints = entryNodes.SelectMany(Targets).Select(node => identities[node]).Distinct().Order(StringComparer.Ordinal).ToArray(),
-                    evaluation = reachable.Select(node => identities[node]).Order(StringComparer.Ordinal).ToArray()
-                };
+                    EntryPoints: entryNodes.SelectMany(Targets).Select(node => identities[node]).Distinct().Order(StringComparer.Ordinal).ToArray(),
+                    Evaluation: reachable.Select(node => identities[node]).Order(StringComparer.Ordinal).ToArray()
+                );
             }).ToArray();
             var evaluations = graph.ProjectNodes.OrderBy(node => identities[node], StringComparer.Ordinal)
                 .ToDictionary(node => identities[node], node => evaluationInputs[node.ProjectInstance]);
-            File.WriteAllText(OutputFile, JsonSerializer.Serialize(new { projects, roots, evaluations }));
+            File.WriteAllText(OutputFile, JsonSerializer.Serialize(new ProjectGraphOutput(ProjectGraphOutput.Current, projects, roots, evaluations), GraphJson.Default.ProjectGraphOutput));
             return true;
         }
         // Not only OperationCanceledException: ProjectGraph can stop loading part-way and then fail

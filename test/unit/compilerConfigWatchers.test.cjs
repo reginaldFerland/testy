@@ -7,12 +7,12 @@ test('inherited compiler config watchers do not watch ancestors recursively or a
  const vscode={RelativePattern:class {constructor(/** @type {string} */base,/** @type {string} */pattern){Object.assign(this,{base,pattern});}},workspace:{createFileSystemWatcher(/** @type {{base:string,pattern:string}} */pattern){
   patterns.push(pattern);return{dispose(){},onDidChange(){},onDidCreate(){},onDidDelete(){}};
  }}};
- const {Testy}=loadUi({vscode});
- const requests=/** @type {unknown[][]} */([]),context={roots:['/workspace'],watchers:[],config:{trigger:'fileSystem',excludes:[],pattern:require('../../package.json').contributes.configuration.properties['testy.fileWatcherPattern'].default},
+ const ui=loadUi({vscode});
+ const requests=/** @type {unknown[][]} */([]),context={queueChanged(){},roots:['/workspace'],watchers:[],config:{trigger:'fileSystem',excludes:[],pattern:require('../../package.json').contributes.configuration.properties['testy.fileWatcherPattern'].default},
   engine:{inputVersion:1,knownFiles:['/.editorconfig','/workspace/Tests.cs'],directories:['/','/workspace'],markChanged:async()=>{}},scheduler:{request:(/** @type {unknown[]} */...args)=>requests.push(args)}};
- Testy.prototype.watch.call(context);
+ ui.changeWatcher(context).watch();
  assert.equal(patterns.some(p=>p.base==='/'&&p.pattern.includes('**')),false);
  assert.ok(patterns.some(p=>p.base==='/'&&p.pattern==='*'));
- await Testy.prototype.changed.call(context,{scheme:'file',fsPath:'/elsewhere/Unrelated.cs'},'class Unrelated {}');assert.equal(requests.length,0);
- await Testy.prototype.changed.call(context,{scheme:'file',fsPath:'/.editorconfig'},'root = true');assert.equal(requests.length,1);
+ await ui.changeWatcher(context).changed({scheme:'file',fsPath:'/elsewhere/Unrelated.cs'},'class Unrelated {}');assert.equal(requests.length,0);
+ await ui.changeWatcher(context).changed({scheme:'file',fsPath:'/.editorconfig'},'root = true');assert.equal(requests.length,1);
 });

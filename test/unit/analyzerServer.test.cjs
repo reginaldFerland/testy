@@ -47,7 +47,8 @@ test('an aborted request rejects at once, is cancelled in the server, and later 
  await new Promise(resolve=>setTimeout(resolve,100));
  const started=Date.now();abort.abort();
  await assert.rejects(slow,{name:'AbortError'});
- assert.ok(Date.now()-started<1000);
+ // The slow request would take 30s; the bound only proves the abort did not wait for it.
+ assert.ok(Date.now()-started<15_000);
  // The stale acknowledgement must not complete or confuse the next request.
  const next=await send(servers,'echo');
  assert.equal(next.pid,pid);
@@ -130,24 +131,28 @@ test('start failures are reported, then not retried until the retry window passe
   await assert.rejects(send(servers,'echo',{env}),/failed to start recently/,start);
  }
  await assert.rejects(servers.request('testy-missing-dotnet-host',peer,'{}',{cwd:os.tmpdir()}),AnalyzerServerUnavailable);
- await new Promise(resolve=>setTimeout(resolve,350));
- await assert.rejects(send(servers,'echo',{env:{PEER_START:'exit'}}),/exited unexpectedly \(7\)/);
+ // Poll until the retry window has passed instead of sleeping a fixed time.
+ await until(async()=>{
+  const error=await send(servers,'echo',{env:{PEER_START:'exit'}}).then(()=>undefined,reason=>reason);
+  assert.ok(error,'the exiting host cannot answer');
+  return /exited unexpectedly \(7\)/.test(error.message);
+ },'a start was not retried after the retry window');
  assert.equal(servers.size,0);
 });
 
 test('an idle server shuts down by itself and the next request starts another',async t=>{
- const servers=new AnalyzerServers({idleMs:150});t.after(()=>servers.dispose());
+ const servers=new AnalyzerServers({idleMs:1000});t.after(()=>servers.dispose());
  const {pid}=await send(servers,'echo');
  await until(()=>servers.size===0&&!alive(pid),'the idle server was not stopped');
  const next=await send(servers,'echo');
  assert.notEqual(next.pid,pid);
  // Activity keeps it alive.
- for(let index=0;index<4;index++){await new Promise(resolve=>setTimeout(resolve,60));assert.equal((await send(servers,'echo')).pid,next.pid);}
+ for(let index=0;index<4;index++){await new Promise(resolve=>setTimeout(resolve,150));assert.equal((await send(servers,'echo')).pid,next.pid);}
 });
 
 test('a request waiting on a server stopped on purpose is retried on a new one',async t=>{
  const servers=new AnalyzerServers();t.after(()=>servers.dispose());
- const pending=send(servers,'slow',{},{ms:400});
+ const pending=send(servers,'slow',{},{ms:1500});
  await until(()=>servers.size===1,'the server did not start');
  await new Promise(resolve=>setTimeout(resolve,100));
  await servers.dispose();

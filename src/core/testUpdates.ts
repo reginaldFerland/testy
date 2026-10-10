@@ -9,6 +9,27 @@ export function nodeText(node: TestNode, key: string): string {
 /** The display name, or the UID when the provider sent none. */
 export const nodeName = (node: TestNode): string => nodeText(node, 'display-name') || node.uid;
 
+/** The shown name: xUnit's default `Namespace.Class.Method(args)` is shortened to `Method(args)`; custom names are kept. */
+export function testName(node: TestNode): string {
+    const name = nodeName(node), type = nodeText(node, 'location.type'), method = nodeText(node, 'location.method');
+    const base = method.split('(')[0]!, prefix = `${type}.${base}`;
+    if (!type || !base || !name.startsWith(prefix)) {return name;}
+    const rest = name.slice(prefix.length);
+    return rest === '' || rest.startsWith('(') ? base + rest : name;
+}
+
+/** The declaring type (`location.type`) of a test row, when the provider reports one. */
+export function testType(node: Readonly<Record<string, unknown>> | undefined): string | undefined {
+    const type = node?.['location.type'];
+    return typeof type === 'string' && type ? type : undefined;
+}
+
+/** Class label from a type name: no namespace, nested types as `Outer.Inner`. */
+export function typeLabel(type: string): string {
+    const head = type.search(/[+<[]/), cut = (head < 0 ? type : type.slice(0, head)).lastIndexOf('.');
+    return type.slice(cut + 1).replace(/\+/g, '.') || type;
+}
+
 const isFailure = (node: TestNode): boolean => node['execution-state'] !== undefined
     && !['passed', 'skipped', 'in-progress', 'discovered'].includes(nodeText(node, 'execution-state'));
 

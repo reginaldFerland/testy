@@ -1,3 +1,4 @@
+// @ts-check
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
@@ -18,7 +19,7 @@ test('directory sync tolerates platforms that cannot open directories',async t=>
 
 test('an evaluation snapshot is flushed before it replaces the previous one, then its directory is flushed',async t=>{
  const root=await fs.mkdtemp(path.join(os.tmpdir(),'testy-durability-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));
- const events=[],open=fs.open,rename=fs.rename;
+ /** @type {any[]} */const events=[],open=fs.open,rename=fs.rename;
  fs.open=async function(file,flags,...args){
   const handle=await open.call(this,file,flags,...args),name=path.basename(String(file));
   if(name.endsWith('.tmp')){const sync=handle.sync;handle.sync=function(...rest){events.push('sync file');return sync.apply(this,rest);};}

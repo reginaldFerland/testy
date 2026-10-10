@@ -8,14 +8,14 @@ Testy runs your tests through **.NET 10+ and Microsoft.Testing.Platform (MTP)**,
 
 - **Affected tests on save.** Edits rerun every test file known to exercise the changed code, with a conservative project-wide fallback whenever impact is uncertain.
 - **Retained coverage.** Each test file keeps its own coverage contribution, so partial runs never erase coverage from other tests. Coverage appears in Test Explorer's native coverage view and can be filtered by test file or project.
-- **Test Explorer integration.** Run, debug, or continuously run individual tests, files, and projects. Failures show expected/actual diffs when the framework reports them, plus clickable stack frames.
+- **Test Explorer integration.** Tests are grouped as project, file, class, test, with xUnit's namespace-qualified default names shortened to the method name. Run, debug, or continuously run individual tests, classes, files, and projects. Failures show expected/actual diffs when the framework reports them, plus clickable stack frames.
 - **Build problems in the Problems panel.** Compiler errors and warnings from Testy's builds are listed there and cleared after the next successful build.
 - **Parallel and cached.** Discovery, builds, and test files run concurrently, and prepared outputs and project evaluations are reused safely across runs and restarts.
 - **No C# Dev Kit required.** Testy talks to MTP directly.
 
 ## Requirements
 
-- VS Code 1.99 or later.
+- VS Code 1.140 or later.
 - [.NET SDK 10](https://dotnet.microsoft.com/download) or later. If your workspace has a `global.json`, it must select a supported SDK.
 - C# test projects that target .NET 10 or later and use [Microsoft.Testing.Platform](https://learn.microsoft.com/en-us/dotnet/core/testing/microsoft-testing-platform-intro). MSTest, xUnit v3 (MTP v2), and NUnit with the MTP adapter are tested. VSTest projects and test targets older than .NET 10 are skipped and listed in Output.
 - A trusted workspace. Testy builds and runs workspace code, so in Restricted Mode it runs nothing: the status bar shows **Testy: Restricted Mode**, settings that choose what runs (`testy.dotnetPath`, `testy.coverageToolPath`, `testy.testArguments`, `testy.solution`, `testy.debugConfiguration`, `testy.buildConfiguration`, `testy.additionalConfigurations`) are ignored from workspace settings, and Testy starts as soon as you trust the workspace.

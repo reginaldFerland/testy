@@ -17,7 +17,7 @@ const options = {
     bundle: true,
     format: 'cjs',
     platform: 'node',
-    target: 'node20',
+    target: 'node24',
     external: ['vscode'],
     minify: production,
     sourcemap: !production,

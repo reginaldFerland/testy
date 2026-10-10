@@ -189,7 +189,7 @@ public class EvaluationInputsTests
     {
         var snapshot = new EvaluationInputs.Snapshot(true, ["a"], new Dictionary<string, string> { ["a"] = "h" },
             [new EvaluationInputs.Query("files", "/p", "*", true, ["x"])], ["/o"], "/sdk", null);
-        using var json = JsonDocument.Parse(JsonSerializer.Serialize(snapshot));
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(snapshot, GraphJson.Default.Snapshot));
         Assert.Equal(["reusable", "files", "hashes", "queries", "excludedDirectories", "sdkDirectory", "reason"], json.RootElement.EnumerateObject().Select(property => property.Name));
         Assert.Equal(["kind", "path", "pattern", "recursive", "values"], json.RootElement.GetProperty("queries")[0].EnumerateObject().Select(property => property.Name));
     }

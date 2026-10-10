@@ -16,9 +16,9 @@ test('bursts of file events never scan the known inputs linearly',async()=>{
  const files=[...projects,...Array.from({length:20000},(_,i)=>`${root}/proj${i%500}/Dir${i}/File${i}.json`),`${external}/lib/Shared.props`];
  const directories=[...new Set(files.map(file=>file.slice(0,file.lastIndexOf('/'))))];
  const engine={inputVersion:1,knownFiles:guarded(files),directories,markChanged:async()=>{}},requests=[];
- const {Testy}=loadUi();
- const context={disposed:false,roots:[root],config:{excludes:[],pattern:'**/*.{csproj,props}'},engine,scheduler:{request:(...args)=>requests.push(args)}};
- const changed=(file,directory=false)=>Testy.prototype.changed.call(context,{scheme:'file',fsPath:file},undefined,directory);
+ const ui=loadUi();
+ const context={disposed:false,roots:[root],config:{excludes:[],pattern:'**/*.{csproj,props}'},engine,scheduler:{request:(...args)=>requests.push(args)},queueChanged(){}};
+ const changed=(file,directory=false)=>ui.changeWatcher(context).changed({scheme:'file',fsPath:file},undefined,directory);
  for(const project of projects)await changed(project);
  assert.equal(requests.length,projects.length,'known inputs inside the workspace trigger once per event');
  requests.length=0;
@@ -36,12 +36,12 @@ test('bursts of file events never scan the known inputs linearly',async()=>{
 test('the cached index follows the engine when its inputs change',async()=>{
  const root=normalizePath('/testy-index-workspace'),requests=[];
  const engine={inputVersion:1,knownFiles:[],directories:[],markChanged:async()=>{}};
- const {Testy}=loadUi();
- const context={disposed:false,roots:[root],config:{excludes:[],pattern:'**/*.cs'},engine,scheduler:{request:(...args)=>requests.push(args)}};
+ const ui=loadUi();
+ const context={disposed:false,roots:[root],config:{excludes:[],pattern:'**/*.cs'},engine,scheduler:{request:(...args)=>requests.push(args)},queueChanged(){}};
  const outside={scheme:'file',fsPath:normalizePath('/testy-index-external/Extra.props')};
- await Testy.prototype.changed.call(context,outside);assert.equal(requests.length,0,'an unknown external file is ignored');
+ await ui.changeWatcher(context).changed(outside);assert.equal(requests.length,0,'an unknown external file is ignored');
  engine.inputVersion++;engine.knownFiles=[outside.fsPath];engine.directories=[normalizePath('/testy-index-external')];
- await Testy.prototype.changed.call(context,outside);assert.equal(requests.length,1,'a newly known input is recognized');
+ await ui.changeWatcher(context).changed(outside);assert.equal(requests.length,1,'a newly known input is recognized');
  engine.inputVersion++;engine.knownFiles=[];engine.directories=[];
- await Testy.prototype.changed.call(context,outside);assert.equal(requests.length,1,'a retired input is ignored again');
+ await ui.changeWatcher(context).changed(outside);assert.equal(requests.length,1,'a retired input is ignored again');
 });

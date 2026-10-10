@@ -12,6 +12,8 @@
   "{0} differ between workspace folders. Testy runs every folder with the workspace value.": "{0} differ between workspace folders. Testy runs every folder with the workspace value.",
   "Testy · run affected": "Testy · run affected",
   "Testy · run file: {0}": "Testy · run file: {0}",
+  "No retained test coverage hits this line.": "No retained test coverage hits this line.",
+  "Testy · run tests covering {0}:{1}": "Testy · run tests covering {0}:{1}",
   "{0} is excluded from Testy. Remove it from testy.projects.exclude to include it again.": "{0} is excluded from Testy. Remove it from testy.projects.exclude to include it again.",
   "Reset": "Reset",
   "Reset Testy caches?": "Reset Testy caches?",
@@ -99,7 +101,8 @@
   "Exported coverage for {0} files to {1}.": "Exported coverage for {0} files to {1}.",
   "Testy · retained coverage": "Testy · retained coverage",
   "Testy: coverage is out of date. It will refresh after the affected tests finish.": "Testy: coverage is out of date. It will refresh after the affected tests finish.",
-  "Testy: covered by tests.": "Testy: covered by tests.",
   "Testy: not covered by tests.": "Testy: not covered by tests.",
+  "Testy: covered by {0}.": "Testy: covered by {0}.",
+  "Testy: covered by tests.": "Testy: covered by tests.",
   "Testy: establishing baseline": "Testy: establishing baseline"
 }

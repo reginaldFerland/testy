@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # The Node version of the minimum supported VS Code's extension host.
+          node-version-file: .nvmrc
+          cache: npm
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: backend/**/packages.lock.json
+
+      - run: npm ci
+
+      # Compiles, lints, type-checks, then runs the unit tests.
+      - run: npm test
+
+      - name: .NET helper tests
+        run: npm run test:dotnet
+
+      - name: Integration tests
+        run: npm run test:integration
+
+      - name: Extension tests (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:extension
+
+      - name: Extension tests
+        if: runner.os != 'Linux'
+        run: npm run test:extension
+
+  package:
+    name: Package VSIX
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: backend/**/packages.lock.json
+
+      - run: npm ci
+
+      # vscode:prepublish lints and builds the release helpers and the minified bundle.
+      - run: npm run vscode:prepublish
+
+      - name: Assert VSIX file list
+        run: npm run check:vsix
+
+      # vsce runs vscode:prepublish again, so the VSIX is built from a fresh release build.
+      - run: npx vsce package --no-dependencies --out testy.vsix
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: testy-vsix
+          path: testy.vsix
+          if-no-files-found: error

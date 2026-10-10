@@ -1,0 +1,74 @@
+name: Bug report
+description: Something in Testy does not work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead? Include steps to reproduce if you can.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Testy Output log
+      description: "Run the command Testy: Show Output, reproduce the problem, and paste the log. Remove anything private."
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: testy-version
+    attributes:
+      label: Testy version
+    validations:
+      required: true
+  - type: input
+    id: vscode-version
+    attributes:
+      label: VS Code version
+      description: From **Help > About**.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Windows 11 / macOS 15 / Ubuntu 24.04
+    validations:
+      required: true
+  - type: textarea
+    id: dotnet
+    attributes:
+      label: Output of `dotnet --info`
+      description: Run it from the workspace folder so `global.json` is applied.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: framework
+    attributes:
+      label: Test framework
+      multiple: true
+      options:
+        - xUnit
+        - NUnit
+        - MSTest
+        - TUnit
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: devkit
+    attributes:
+      label: Is C# Dev Kit installed?
+      options:
+        - "Yes"
+        - "No"
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Settings you changed (`testy.*`), a minimal repository, or screenshots.

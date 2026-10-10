@@ -11,6 +11,17 @@ namespace Testy.Analysis;
 // requests, see AnalyzerServer.
 static class Program
 {
+    // The installed Roslyn failed to load or its self-test failed. The extension must not fall
+    // back to another run on the same Roslyn (src/services/analyzerServer.ts).
+    internal const int SelfTestFailedExitCode = 70;
+
+    // Verifies the Roslyn this process runs on before any request is trusted.
+    internal static async Task VerifyRoslynAsync()
+    {
+        try { await SourceAnalysis.WarmAsync(); }
+        catch (Exception exception) { throw new SelfTestFailedException(exception); }
+    }
+
     static async Task<int> Main(string[] args)
     {
         // Console streams default to the OEM/ANSI code page on Windows, but the
@@ -34,6 +45,8 @@ static class Program
             using var requestStream = new MemoryStream(requestBytes, writable: false);
             using var requestReader = new StreamReader(requestStream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
             using var request = JsonDocument.Parse(await requestReader.ReadToEndAsync());
+            // Reading portable symbols needs no Roslyn; every other request is fingerprinted with it.
+            if (!request.RootElement.TryGetProperty("assembly", out _)) { await VerifyRoslynAsync(); }
             var response = await SourceAnalysis.HandleAsync(request.RootElement, requestBytes, Directory.GetCurrentDirectory(), CancellationToken.None);
             await File.WriteAllTextAsync(args[1], response, utf8);
             return 0;
@@ -42,7 +55,9 @@ static class Program
         {
             if (RoslynLoader.Failure is { } failure) { Console.Error.WriteLine(failure); }
             Console.Error.WriteLine(exception.ToString());
-            return 1;
+            return exception is SelfTestFailedException ? SelfTestFailedExitCode : 1;
         }
     }
 }
+
+sealed class SelfTestFailedException(Exception inner) : Exception("The Roslyn self-test failed: " + inner.Message, inner);

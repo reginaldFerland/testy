@@ -1,3 +1,5 @@
+using System.Reflection;
+using System.Runtime.Loader;
 using Testy.Analysis;
 using Xunit;
 
@@ -5,6 +7,7 @@ namespace Testy.Backend.Tests;
 
 // Roslyn is loaded from an installed SDK. Among several SDKs, the analyzer prefers the line
 // it was built against, then stable SDKs, then the newest Roslyn, then the newest SDK.
+[Collection(ProcessState.Name)]
 public sealed class RoslynLoaderTests : IDisposable
 {
     private static readonly Version Minimum = new(5, 0, 0, 0);
@@ -75,5 +78,23 @@ public sealed class RoslynLoaderTests : IDisposable
         Assert.Null(RoslynLoader.Inspect(directory, Minimum, problems));
         Assert.Equal(2, problems.Count);
         Assert.Contains("mismatched Roslyn assemblies", problems[1], StringComparison.Ordinal);
+    }
+
+    // The resolver reports a failure through RoslynLoader.Failure and returns null instead of throwing,
+    // so the runtime's own load error can be printed beside the reasons. (FileLoadException and
+    // BadImageFormatException take the same path; a load failure after inspection cannot be forced.)
+    [Fact]
+    public void AMissingRoslynIsRecordedAsTheFailure()
+    {
+        var configured = Environment.GetEnvironmentVariable("TESTY_ROSLYN_DIR");
+        Environment.SetEnvironmentVariable("TESTY_ROSLYN_DIR", directory);
+        try
+        {
+            Assert.Null(RoslynLoader.Resolve(AssemblyLoadContext.Default, new AssemblyName("Microsoft.CodeAnalysis") { Version = Minimum }));
+            Assert.Contains(directory, RoslynLoader.Failure, StringComparison.Ordinal);
+            // Other assemblies are none of its business.
+            Assert.Null(RoslynLoader.Resolve(AssemblyLoadContext.Default, new AssemblyName("Unrelated")));
+        }
+        finally { Environment.SetEnvironmentVariable("TESTY_ROSLYN_DIR", configured); }
     }
 }

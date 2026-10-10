@@ -7,10 +7,10 @@ const {TestEngine}=require('../../out/services/engine');
 const {normalizePath}=require('../../out/core/paths');
 const {loadUi}=require('../unit/support/ui.cjs');
 
-async function fixture(t) {
+async function fixture(t,demo='ImpactDemo') {
  const temp=await fs.mkdtemp(path.join(os.tmpdir(),'testy regression '));t.after(()=>fs.rm(temp,{recursive:true,force:true}));
  const root=path.join(temp,'workspace');
- await fs.cp(path.resolve('test/fixtures/ImpactDemo'),root,{recursive:true,filter:file=>!/(^|[/\\])(bin|obj|TestResults)([/\\]|$)/.test(file)});
+ await fs.cp(path.resolve('test/fixtures',demo),root,{recursive:true,filter:file=>!/(^|[/\\])(bin|obj|TestResults)([/\\]|$)/.test(file)});
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:60000,coverageTool:process.env.TESTY_COVERAGE_TOOL};
  const state={selected:[],results:[],prepared:0,started:()=>{},inputsChanged:()=>{},output:[]};
  const engine=new TestEngine({roots:[root],storage:path.join(temp,'state'),tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,events:{
@@ -427,22 +427,9 @@ test('workspace roots can change and each nested SDK context is checked',{timeou
  f.engine.setRoots([f.root]);await assert.rejects(f.run([],true),/SDK|sdk|9\.0\.100/);
 });
 
-for(const framework of ['xunit','nunit']) {
+for(const [framework,demo] of [['xunit','XunitDemo'],['nunit','NUnitDemo']]) {
  test(`${framework} MTP discovers files, retains coverage and runs affected tests`,{timeout:120000},async t=>{
-  const f=await fixture(t), project=f.file('ImpactDemo.Tests/ImpactDemo.Tests.csproj');
-  const configuration=framework==='xunit'
-   ? '<UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>'
-   : '<EnableNUnitRunner>true</EnableNUnitRunner>';
-  const packages=framework==='xunit'
-   ? '<PackageReference Include="xunit.v3.mtp-v2" Version="3.2.0" />'
-   : '<PackageReference Include="NUnit" Version="4.4.0" /><PackageReference Include="NUnit3TestAdapter" Version="6.3.0" />';
-  await fs.writeFile(project,`<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><OutputType>Exe</OutputType><ImplicitUsings>enable</ImplicitUsings>${configuration}</PropertyGroup><ItemGroup>${packages}<ProjectReference Include="../ImpactDemo/ImpactDemo.csproj" /></ItemGroup></Project>`);
-  await fs.writeFile(f.file('ImpactDemo.Tests/CalculatorTests.cs'),framework==='xunit'
-   ? 'using Xunit; using ImpactDemo; public class CalculatorTests { [Theory][InlineData(1,2,3)][InlineData(4,5,9)] public void Add(int a,int b,int expected)=>Assert.Equal(expected,Calculator.Add(a,b)); }'
-   : 'using NUnit.Framework; using ImpactDemo; public class CalculatorTests { [TestCase(1,2,3)][TestCase(4,5,9)] public void Add(int a,int b,int expected)=>Assert.That(Calculator.Add(a,b),Is.EqualTo(expected)); }');
-  await fs.writeFile(f.file('ImpactDemo.Tests/GreetingTests.cs'),framework==='xunit'
-   ? 'using Xunit; using ImpactDemo; public class GreetingTests { [Fact] public void Hello()=>Assert.Equal("Hello, Ada",Greeting.For("Ada")); }'
-   : 'using NUnit.Framework; using ImpactDemo; public class GreetingTests { [Test] public void Hello()=>Assert.That(Greeting.For("Ada"),Is.EqualTo("Hello, Ada")); }');
+  const f=await fixture(t,demo);
   const baseline=await f.run([],true);assert.equal(baseline.passed,3);assert.equal(f.engine.groups.length,2);
   const source=f.file('ImpactDemo/Arithmetic.cs');await fs.writeFile(source,(await fs.readFile(source,'utf8')).replace('a + b','a + b + 1'));
   const affected=await f.run([source]);assert.equal(affected.files,1);assert.equal(affected.failed,2);
@@ -450,8 +437,7 @@ for(const framework of ['xunit','nunit']) {
 }
 
 test('xUnit Unicode and colliding row names retain stable IDs and support selected reruns',{timeout:90000},async t=>{
- const f=await fixture(t), prefix='a'.repeat(1000);
- await fs.writeFile(f.file('ImpactDemo.Tests/ImpactDemo.Tests.csproj'),'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><OutputType>Exe</OutputType><ImplicitUsings>enable</ImplicitUsings><UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner></PropertyGroup><ItemGroup><PackageReference Include="xunit.v3.mtp-v2" Version="3.2.0" /><ProjectReference Include="../ImpactDemo/ImpactDemo.csproj" /></ItemGroup></Project>');
+ const f=await fixture(t,'XunitDemo'), prefix='a'.repeat(1000);
  await fs.writeFile(f.file('ImpactDemo.Tests/CalculatorTests.cs'),`using Xunit; using ImpactDemo; public class CalculatorTests { [Theory][InlineData("${prefix}1")][InlineData("${prefix}2")] public void Duplicate(string value)=>Assert.EndsWith("1",value); [Fact(DisplayName="Unicode café 日本語 😀")] public void Normal()=>Assert.Equal(3,Calculator.Add(1,2)); }`);
  await fs.writeFile(f.file('ImpactDemo.Tests/GreetingTests.cs'),'using Xunit; public class GreetingTests { [Fact] public void Hello()=>Assert.True(true); }');
  const baseline=await f.run([],true);assert.equal(baseline.tests,4);assert.equal(baseline.failed,1);
@@ -468,8 +454,7 @@ test('xUnit Unicode and colliding row names retain stable IDs and support select
 });
 
 test('xUnit deferred theories retain failures when rerunning shared discovery identities',{timeout:90000},async t=>{
- const f=await fixture(t);
- await fs.writeFile(f.file('ImpactDemo.Tests/ImpactDemo.Tests.csproj'),'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><OutputType>Exe</OutputType><ImplicitUsings>enable</ImplicitUsings><UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner></PropertyGroup><ItemGroup><PackageReference Include="xunit.v3.mtp-v2" Version="3.2.0" /><ProjectReference Include="../ImpactDemo/ImpactDemo.csproj" /></ItemGroup></Project>');
+ const f=await fixture(t,'XunitDemo');
  await fs.writeFile(f.file('ImpactDemo.Tests/CalculatorTests.cs'),'using Xunit; using ImpactDemo; public class CalculatorTests { [Theory(DisableDiscoveryEnumeration=true)][InlineData(1,2,4)][InlineData(4,5,9)] public void Add(int a,int b,int expected)=>Assert.Equal(expected,Calculator.Add(a,b)); }');
  await fs.writeFile(f.file('ImpactDemo.Tests/GreetingTests.cs'),'using Xunit; public class GreetingTests { [Fact] public void Hello()=>Assert.True(true); }');
  const baseline=await f.run([],true);assert.equal(baseline.tests,2);assert.equal(baseline.failed,1);
@@ -637,10 +622,10 @@ test('shared editorconfig saves must invalidate the projects they compile',{time
  const baseline=await f.run([],true);assert.equal(baseline.passed,3);assert.ok(f.engine.knownFiles.includes(config));
  const contents='root = true\n[*.cs]\ndotnet_diagnostic.CS0168.severity = error\n';
  await fs.writeFile(config,contents);
- const exports={Testy:loadUi().Testy};
- const requests=[],context={roots:[normalizePath(f.root)],disposed:false,engine:f.engine,scheduler:{request:(...args)=>requests.push(args)},
+ const loaded=loadUi();
+ const requests=[],context={roots:[normalizePath(f.root)],disposed:false,engine:f.engine,scheduler:{request:(...args)=>requests.push(args)},queueChanged:files=>f.engine.markChanged(files),
   config:{excludes:[],pattern:'**/*.{cs,csproj,sln,slnx,props,targets,runsettings,json,config,resx}'}};
- await exports.Testy.prototype.changed.call(context,{scheme:'file',fsPath:config},contents);
+ await loaded.changeWatcher(context).changed({scheme:'file',fsPath:config},contents);
  let actualBuildError='';try {await f.run([],true);}catch(e){actualBuildError=e.message;}
  assert.match(actualBuildError,/CS0168/);
  assert.equal(requests.length,1,'the saved compiler configuration should trigger a run');
@@ -807,11 +792,11 @@ async function editorInputs(f,trigger='fileSystem') {
  const vscode={RelativePattern:class {constructor(base,pattern){Object.assign(this,{base,pattern});}},workspace:{createFileSystemWatcher:pattern=>{
   patterns.push(pattern);return {dispose(){},onDidChange(){},onDidCreate(){},onDidDelete(){}};
  }}};
- exports.Testy=loadUi({vscode}).Testy;
- const ui={roots:[normalizePath(f.root)],watchers:[],engine:f.engine,scheduler:{request:(...args)=>requests.push(args)},
+ exports.ui=loadUi({vscode});
+ const ui={roots:[normalizePath(f.root)],watchers:[],engine:f.engine,scheduler:{request:(...args)=>requests.push(args)},queueChanged:files=>f.engine.markChanged(files),
   config:{trigger,excludes:[],pattern:require('../../package.json').contributes.configuration.properties['testy.fileWatcherPattern'].default}};
- const watch=()=>exports.Testy.prototype.watch.call(ui);f.state.inputsChanged=watch;watch();
- return {patterns,requests,changed:file=>exports.Testy.prototype.changed.call(ui,{scheme:'file',fsPath:file})};
+ const watch=()=>exports.ui.changeWatcher(ui).watch();f.state.inputsChanged=watch;watch();
+ return {patterns,requests,changed:file=>exports.ui.changeWatcher(ui).changed({scheme:'file',fsPath:file})};
 }
 
 test('an inherited SDK pin remains observable through initial failure and subsequent saves',{timeout:90000},async t=>{

@@ -64,7 +64,7 @@ External input watchers are installed before builds and discovery, allowing a co
 
 ## Boundaries
 
-- VS Code 1.99 or later, with a trusted local workspace or a remote extension host that has the .NET CLI.
+- VS Code 1.140 or later, with a trusted local workspace or a remote extension host that has the .NET CLI.
 - .NET SDK 10 or later; test projects must target .NET 10 or later and enable MTP. Referenced production libraries may target compatible earlier frameworks.
 - An MTP test framework that supports the standard discovery and execution server protocol. Integration tests cover MSTest 4.3.3, xUnit v3 3.2.0 with MTP v2, and NUnit 4.4.0 with adapter 6.3.0.
 - Portable debug symbols for source mapping and coverage. A missing source location causes conservative selection.

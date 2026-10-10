@@ -3,15 +3,17 @@ import { helperPath, scriptPath } from './assets';
 import { randomUUID } from 'node:crypto';
 import { cleanupPosixOwner } from './posixProcesses';
 import { OutputTail } from '../core/outputTail';
+import { Cancelled, EnvironmentError } from '../core/errors';
 import { resolveOwnedCommand } from './executable';
 
-export class Cancelled extends Error {
-    constructor() { super('Run cancelled'); this.name = 'AbortError'; }
-}
+export { Cancelled };
 
 /** Exit code and stderr prefix of Testy.ProcessHost's own failures (backend/Testy.ProcessHost/Program.cs). */
 const processHostFailure = 125;
 const processHostMarker = 'Testy could not own the process tree:';
+
+/** Abort reason for disposal: owned processes are killed at once, skipping the graceful phase. */
+export class Shutdown extends Cancelled {}
 
 export interface ProcessResult {
     readonly code: number;
@@ -110,6 +112,7 @@ export function startProcess(command: string, args: readonly string[], options: 
     const stop = (): void => {
         if (closed || cancelled) {return;}
         cancelled = true;
+        if (options.signal?.reason instanceof Shutdown) {killTree(true); return;}
         killTree(false);
         killTimer = setTimeout(() => killTree(true), posixOwner ? 5000 : 1500);
         killTimer.unref();
@@ -149,7 +152,7 @@ export function startProcess(command: string, args: readonly string[], options: 
             else if (windowsOwner && code === processHostFailure && stderr.text().includes(processHostMarker)) {
                 // The host never started the command; do not report this as the command's own failure.
                 const text = stderr.text();
-                reject(new Error(`Could not start ${command}: ${text.slice(text.indexOf(processHostMarker) + processHostMarker.length).trim()}`));
+                reject(new EnvironmentError('dotnet-start', `Could not start ${command}: ${text.slice(text.indexOf(processHostMarker) + processHostMarker.length).trim()}`));
             }
             else {resolve({ code: code ?? -1, stdout: stdout.text(), stderr: stderr.text() });}
         };

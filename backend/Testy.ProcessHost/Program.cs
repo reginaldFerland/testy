@@ -121,7 +121,7 @@ static partial class ProcessOwner
                 if (Environment.TickCount64 > deadline)
                 {
                     // Closing the job below kills any stragglers; the command's own result stands.
-                    Console.Error.WriteLine($"Testy: {accounting.ActiveProcesses} process(es) in the job did not exit within {TerminationTimeout.TotalSeconds:0} seconds of termination.");
+                    Console.Error.WriteLine($"Testy: {accounting.ActiveProcesses} process(es) in the job did not exit within {TerminationTimeout.TotalSeconds.ToString("0", System.Globalization.CultureInfo.InvariantCulture)} seconds of termination.");
                     break;
                 }
                 Thread.Sleep(5);
@@ -144,6 +144,7 @@ static partial class ProcessOwner
     /// <summary>Explicit paths are used as given; a bare name is looked up on PATH alone, never in the current directory.</summary>
     internal static string ResolveApplication(string command)
     {
+        if (string.IsNullOrWhiteSpace(command)) { throw new ArgumentException("The command to run is empty."); }
         if (command.IndexOfAny(['\\', '/', ':']) >= 0) { return Path.GetFullPath(command); }
         var dot = command.IndexOf('.', 1);
         string[] names = dot >= 0 && dot < command.Length - 1 ? [command] : [command + ".com", command + ".exe"];

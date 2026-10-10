@@ -19,4 +19,4 @@ Testy is a VS Code extension that runs affected C# tests through Microsoft.Testi
 ## Tests
 - Tests are Node `node:test` files in `test/unit` and `test/integration` that `require` the compiled `out/` modules. Run `npm test` (compiles first) and `npm run test:integration`. Unit tests load the UI modules through `test/unit/support/ui.cjs`.
 - Add a regression test for every bug fix, named by topic rather than by review round.
-- No CI: run `npm test`, `npm run test:integration` and `npm run test:extension` locally before merging.
+- CI (`.github/workflows/ci.yml`) runs on push and PR; also run `npm test`, `npm run test:integration` and `npm run test:extension` locally before merging.

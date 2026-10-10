@@ -59,7 +59,7 @@ test('dead active owners are discarded even with a previous snapshot, while live
  const script=`const fs=require('node:fs/promises');const {claimPreparedStorage}=require(${JSON.stringify(path.resolve('out/services/preparedStorage.js'))});(async()=>{const lease=await claimPreparedStorage(${JSON.stringify(storage)});await fs.writeFile(${JSON.stringify(ready)},lease.directory);setInterval(()=>{},1000);})();`;
  const child=spawn(process.execPath,['-e',script],{stdio:'ignore'});
  t.after(()=>{if(child.exitCode===null&&child.signalCode===null)child.kill('SIGKILL');});
- let abandoned;for(let attempt=0;attempt<200;attempt++){try{abandoned=await fs.readFile(ready,'utf8');break;}catch{await delay(10);}}
+ let abandoned;for(let attempt=0;attempt<3000&&!abandoned;attempt++){try{abandoned=await fs.readFile(ready,'utf8');}catch{}if(!abandoned)await delay(10);}
  assert.ok(abandoned,'the child claimed its own active container');
  const record=JSON.parse(await fs.readFile(abandoned+'.owner.json','utf8'));
  await fs.writeFile(abandoned+'.owner.json',JSON.stringify({...record,snapshot:{stale:true},retention:{entries:1,bytes:1}}));

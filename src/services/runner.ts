@@ -2,98 +2,25 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
-import { DiscoveredTest, FileCoverage, Project, TestFile, TestResult, Trace } from '../core/model';
+import { DiscoveredTest, FileCoverage, Project, TestFile, TestResult } from '../core/model';
 import { compareCodeUnits, contentHash, preparePathNormalizer, sourceVersion, testFileId, testTargetKey } from '../core/paths';
+import { projectCoverageId } from '../core/coverage';
 import { requestTests, testConverter, TestNode, testResult } from './mtp';
-import { ProcessOptions, requireSuccess, runProcess } from './process';
+import { requireSuccess, runProcess } from './process';
 import { CoverageReader } from './coverageReader';
 import { copyOutput, fileHash, PreparedOutput, removeOutput } from './output';
-import { sourceLocations } from './analysis';
 import { claimRunOutputs, RunOutputLease } from './runOutputs';
-import { RuntimeModule, RuntimeObservation } from './runtimeObservation';
-import { PreparedArtifact, PreparedArtifactLease, PreparedOutputCache, preparationToolIdentity } from './preparedOutputCache';
+import { RuntimeObservation } from './runtimeObservation';
+import { PreparedArtifact, PreparedArtifactLease, preparationToolIdentity } from './preparedOutputCache';
 import { windowsPreparationTools } from './preparationIdentity';
 import { stableEnvironment } from '../core/environment';
-import { nodeText } from '../core/testUpdates';
 
-export interface RunnerOptions extends ProcessOptions {
-    readonly dotnet: string;
-    readonly storage: string;
-    readonly testArguments: readonly string[];
-    readonly coverageTool?: string | undefined;
-    /** The pinned collector receives a stable instrumentation environment across editor launches. */
-    readonly managedCoverageTool?: boolean;
-    /** Borrow an idle primary-preparation permit without waiting; the caller already owns one. */
-    readonly tryInstrumentation?: (<T>(signal: AbortSignal | undefined, work: () => Promise<T>) => Promise<T> | undefined) | undefined;
-    readonly assemblies?: readonly string[];
-    readonly modules?: readonly RuntimeModule[];
-    readonly buildInputs?: ReadonlyMap<string, readonly string[]>;
-    readonly analyzer?: string;
-    /** Stable within an engine, isolated from every other extension instance. */
-    readonly identity?: string;
-    readonly outputRoot?: string;
-    readonly snapshots?: ReadonlyMap<string, string>;
-    readonly preparedOutputCache?: PreparedOutputCache;
-    /** Evaluated target, reference, SDK and build configuration identity. */
-    readonly preparationContexts?: ReadonlyMap<string, string>;
-    /** Internal per-target private output slot; zero retains canonical native IDs. */
-    readonly preparationLane?: number;
-    /** Shared only by the private lanes of one run. */
-    readonly preparationTools?: Map<string, Promise<string>>;
-    /** Resolve commands per project, then share hashes of the same executable within one run. */
-    readonly preparationToolIdentities?: Map<string, Promise<string>>;
-    /** Defer coverage for targets awaiting affected-file selection; discovery remains fresh. */
-    readonly deferCoverage?: ((target: Pick<TestFile, 'project' | 'framework'>) => boolean) | undefined;
-    readonly onResult?: (group: TestFile, result: TestResult, test?: DiscoveredTest) => void;
-    readonly onStarted?: (group: TestFile, id: string) => void;
-    readonly onPrepared?: ((project: string) => void) | undefined;
-    readonly onExpanded?: (groups: readonly TestFile[]) => void;
-    /** Attach a debugger to each test host before it runs. */
-    readonly debug?: ((processId: number) => Promise<void>) | undefined;
-}
+import { discover, locationFiles, methodKey, nodeKey } from './runnerDiscovery';
+import { assemblyName, instrumentWithSpareCapacity, workspaceOutputs } from './runnerInstrumentation';
+import type { FileRun, RunnerOptions } from './runnerTypes';
 
-export async function discover(project: Project, options: RunnerOptions, discovered?: readonly TestNode[]): Promise<readonly TestFile[]> {
-    const nodes = discovered ?? await requestTests({ ...options, cwd: path.dirname(project.file), assembly: project.assembly, args: options.testArguments }, 'discover');
-    let locations: Awaited<ReturnType<typeof sourceLocations>> | undefined;
-    if (options.analyzer && nodes.some(node => !node['location.file'])) {
-        try {
-            locations = await sourceLocations(options.dotnet, options.analyzer, project.assembly, options.storage, options);
-        } catch (error) {options.signal?.throwIfAborted(); options.output?.(`Test source locations unavailable; retaining project fallback. ${String(error)}\n`);}
-    }
-    const byFile = new Map<string, DiscoveredTest[]>();
-    const sources = new Set(project.sourceFiles), located: TestNode[] = [];
-    let work = 0;
-    options.signal?.throwIfAborted();
-    for (let node of nodes) {
-        if (!node['location.file'] && locations) {
-            const location = locations.get(`${nodeText(node, 'location.type')}.${nodeText(node, 'location.method').split('(')[0]}`);
-            if (location && sources.has(location.file)) {node = { ...node, 'location.file': location.file, 'location.line-start': location.line };}
-        }
-        located.push(node);
-        if (++work % 512 === 0) {await yieldTurn(); options.signal?.throwIfAborted();}
-    }
-    const normalize = await preparePathNormalizer([project.file, ...locationFiles(located)], options.signal), convert = testConverter(normalize);
-    for (const node of located) {
-        const test = convert(node), key = test.file ?? '';
-        const tests = byFile.get(key) ?? []; tests.push(test); byFile.set(key, tests);
-        if (++work % 512 === 0) {await yieldTurn(); options.signal?.throwIfAborted();}
-    }
-    const groups: TestFile[] = [];
-    for (const [file, tests] of byFile) {
-        groups.push({ id: testFileId(project.file, project.framework, file || undefined, normalize), project: project.file,
-            framework: project.framework, assembly: project.assembly, file: file || undefined, tests });
-        if (++work % 512 === 0) {await yieldTurn(); options.signal?.throwIfAborted();}
-    }
-    return groups;
-}
-
-export function projectCoverageId(group: TestFile): string { return `project:${testFileId(group.project, group.framework)}`; }
-export interface FileRun {
-    readonly results: readonly TestResult[];
-    readonly trace: Trace;
-    readonly coverageAvailable: boolean;
-    readonly executedGroups: readonly TestFile[];
-}
+export { discover, projectCoverageId };
+export type { FileRun, RunnerOptions };
 interface Preparation {
     readonly root: string; output: PreparedOutput; readonly session: string; coverage: boolean; coveragePending?: boolean | undefined;
     nodes: readonly TestNode[]; nativeById: ReadonlyMap<string, TestNode>;
@@ -106,85 +33,6 @@ interface Preparation {
     collectorInterrupted?: boolean;
 }
 interface RunnerLane { readonly session: Promise<RunnerSession>; busy: boolean; }
-
-function locationFiles(nodes: Iterable<TestNode>): string[] {
-    const files: string[] = [];
-    for (const node of nodes) {if (typeof node['location.file'] === 'string') {files.push(node['location.file']);}}
-    return files;
-}
-
-function nodeKey(node: TestNode): string {
-    return JSON.stringify(['display-name', 'location.type', 'location.method', 'location.method-arity'].map(key => node[key] ?? null));
-}
-
-function methodKey(node: Readonly<Record<string, unknown>>): string | undefined {
-    return typeof node['location.type'] === 'string' && typeof node['location.method'] === 'string'
-        ? JSON.stringify([node['location.type'], node['location.method'].split('(')[0]]) : undefined;
-}
-
-function assemblyName(file: string): string {
-    const name = path.basename(file);
-    return process.platform === 'win32' ? name.toLowerCase() : name;
-}
-
-async function workspaceOutputs(directory: string, names: ReadonlySet<string>, signal?: AbortSignal): Promise<string[]> {
-    const files: string[] = [];
-    for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
-        signal?.throwIfAborted();
-        const file = path.join(directory, entry.name);
-        if (entry.isDirectory()) {files.push(...await workspaceOutputs(file, names, signal));}
-        else if (entry.isFile() && names.has(assemblyName(entry.name))) {files.push(file);}
-    }
-    return files;
-}
-
-/** Keep one inherited worker progressing even when every other preparation owns a permit. */
-async function instrumentWithSpareCapacity<T>(
-    assemblies: readonly string[], signal: AbortSignal | undefined, borrow: NonNullable<RunnerOptions['tryInstrumentation']>,
-    work: (assembly: string, signal: AbortSignal) => Promise<T>
-): Promise<T[]> {
-    signal?.throwIfAborted();
-    const controller = new AbortController(), results = new Array<T>(assemblies.length);
-    const running = new Set<Promise<void>>();
-    // Callbacks set these; `as boolean` keeps reads after the awaits from narrowing to false.
-    let next = 0, inheritedBusy = false as boolean, failed = false as boolean, failure: unknown;
-    const fail = (error: unknown): void => {
-        if (!failed) {failed = true; failure = error; controller.abort(error);}
-    };
-    const abort = (): void => fail(signal?.reason);
-    signal?.addEventListener('abort', abort, { once: true });
-    // Callers admit only indices below assemblies.length.
-    const start = (index: number): Promise<T> => Promise.resolve().then(() => work(assemblies[index]!, controller.signal));
-    const admit = (index: number, borrowed?: Promise<T>): void => {
-        if (!borrowed) {inheritedBusy = true;}
-        const pending = (borrowed ?? start(index))
-            .then(result => {results[index] = result;}, fail).finally(() => {
-                if (!borrowed) {inheritedBusy = false;}
-                running.delete(pending);
-            });
-        running.add(pending);
-    };
-    try {
-        while ((!failed && next < assemblies.length) || running.size) {
-            if (!failed && !inheritedBusy && next < assemblies.length) {admit(next++);}
-            while (!failed && next < assemblies.length) {
-                const index = next;
-                const borrowed = borrow(controller.signal, () => start(index));
-                if (!borrowed) {break;}
-                next++; admit(index, borrowed);
-            }
-            if (running.size) {await Promise.race(running);}
-        }
-    } catch (error) {fail(error);}
-    finally {
-        // No rollback, cache release or output removal may race an admitted instrument process.
-        await Promise.all(running);
-        signal?.removeEventListener('abort', abort);
-    }
-    if (failed) {throw failure;}
-    signal?.throwIfAborted();
-    return results;
-}
 
 export class RunnerSession {
     private readonly prepared = new Map<string, Preparation>();

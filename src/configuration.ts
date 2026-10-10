@@ -1,7 +1,7 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { escape } from 'minimatch';
-import { EngineConfiguration } from './services/engine';
+import { EngineConfiguration } from './core/model';
 import { additionalConfigurations } from './core/buildConfigurations';
 import { defaultExcludes, normalizePath } from './core/paths';
 

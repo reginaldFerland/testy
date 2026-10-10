@@ -1,9 +1,10 @@
+// @ts-check
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {normalizePath,normalizePathAsync,pathNormalizer,clearPathCache}=require('../../out/core/paths');
 
-async function temporary(t){const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-case-')));t.after(()=>fs.rm(root,{recursive:true,force:true}));return root;}
+async function temporary(/** @type {import('node:test').TestContext} */t){const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'testy-case-')));t.after(()=>fs.rm(root,{recursive:true,force:true}));return root;}
 
 test('macOS leaf names take the on-disk case, sync and async',{skip:process.platform!=='darwin'},async t=>{
  const root=await temporary(t);await fs.writeFile(path.join(root,'Foo.cs'),'');clearPathCache();

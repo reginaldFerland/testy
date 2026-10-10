@@ -1,6 +1,8 @@
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 
+namespace Testy.Analysis;
+
 static class SourceLocations
 {
     public sealed record Location(string File, int Line);

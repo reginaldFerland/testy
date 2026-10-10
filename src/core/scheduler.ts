@@ -1,4 +1,4 @@
-import { Cancelled } from '../services/process';
+import { Cancelled } from './errors';
 import { isAbortError } from './errors';
 
 export interface ChangeBatch { readonly files: readonly string[]; readonly full: boolean; readonly generation?: number; }

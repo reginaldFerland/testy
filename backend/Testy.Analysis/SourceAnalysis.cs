@@ -13,7 +13,9 @@ namespace Testy.Analysis;
 // cannot serve results for bytes that have since changed.
 static class SourceAnalysis
 {
-    static readonly JsonSerializerOptions Serialization = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+    // The extension can keep several servers, each serving requests concurrently with several
+    // workers apiece. Without a shared bound they would oversubscribe the machine.
+    internal static readonly SemaphoreSlim Cpu = new(Environment.ProcessorCount, Environment.ProcessorCount);
 
     // Runs a sample that uses every Roslyn API the analysis depends on, so that a Roslyn
     // that cannot be loaded, or that behaves differently from what this analysis was
@@ -58,11 +60,11 @@ static class SourceAnalysis
         if (!combined && request.TryGetProperty("aliasSources", out var aliasSources))
         {
             var names = aliasSources.Deserialize<string[]>()!.SelectMany(GlobalAliases).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
-            return JsonSerializer.Serialize(names);
+            return JsonSerializer.Serialize(names, AnalysisJson.Default.StringArray);
         }
         if (request.TryGetProperty("assembly", out var assembly))
         {
-            return JsonSerializer.Serialize(SourceLocations.Read(Path.GetFullPath(assembly.GetString()!, cwd), cancellationToken), Serialization);
+            return JsonSerializer.Serialize(SourceLocations.Read(Path.GetFullPath(assembly.GetString()!, cwd), cancellationToken), AnalysisJson.Default.DictionaryStringLocation);
         }
         var files = request.GetProperty("files").Deserialize<string[]>()
             ?? throw new ArgumentException("Expected an array of source paths.");
@@ -93,9 +95,9 @@ static class SourceAnalysis
         {
             var sourceHashes = new Dictionary<string, string?>();
             for (var index = 0; index < files.Length; index++) { sourceHashes[files[index]] = analyses[index].SourceHash; }
-            return JsonSerializer.Serialize(new { version = 1, requestHash = Convert.ToHexString(SHA256.HashData(requestBytes)), aliases, analyses = result, sourceHashes }, Serialization);
+            return JsonSerializer.Serialize(new SourceAnalysisProvenance(1, Convert.ToHexString(SHA256.HashData(requestBytes)), aliases, result, sourceHashes), AnalysisJson.Default.SourceAnalysisProvenance);
         }
-        return combined ? JsonSerializer.Serialize(new { aliases, analyses = result }, Serialization) : JsonSerializer.Serialize(result, Serialization);
+        return combined ? JsonSerializer.Serialize(new CombinedAnalysis(aliases, result), AnalysisJson.Default.CombinedAnalysis) : JsonSerializer.Serialize(result, AnalysisJson.Default.DictionaryStringSourceShape);
     }
 
     static async Task<AnalyzedSource> AnalyzeSource(string file, string[] aliases, CancellationToken cancellationToken)
@@ -107,7 +109,11 @@ static class SourceAnalysis
         byte[] bytes;
         try { bytes = await File.ReadAllBytesAsync(file, cancellationToken); }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException) { return new(null, null); }
-        return await AnalyzeBytes(bytes, aliases, cancellationToken);
+        // Parsing and hashing are CPU-bound. Every request in this process, however many
+        // are running and however many workers each fans out to, shares these slots.
+        await Cpu.WaitAsync(cancellationToken);
+        try { return await AnalyzeBytes(bytes, aliases, cancellationToken); }
+        finally { Cpu.Release(); }
     }
 
     internal static async Task<AnalyzedSource> AnalyzeBytes(byte[] bytes, string[] aliases, CancellationToken cancellationToken)
@@ -119,38 +125,55 @@ static class SourceAnalysis
             return new(null, sourceHash);
         }
         var root = await tree.GetRootAsync(cancellationToken);
-        var allTrivia = root.DescendantTrivia(descendIntoTrivia: true).ToArray();
-        // Directives can change compilation or metadata even when they occur
-        // inside a method whose executable body is omitted from the signature.
-        var directives = string.Join("\n", allTrivia.Where(trivia => trivia.IsDirective).Select(trivia => trivia.ToFullString()));
+        // One pass over the nodes; the lists below are filtered once the aliases are known.
+        var usings = new List<UsingDirectiveSyntax>(); var allAttributes = new List<AttributeSyntax>(); var types = new List<TypeDeclarationSyntax>();
+        foreach (var node in root.DescendantNodes())
+        {
+            switch (node)
+            {
+                case UsingDirectiveSyntax directive: usings.Add(directive); break;
+                case AttributeSyntax attribute: allAttributes.Add(attribute); break;
+                case TypeDeclarationSyntax type: types.Add(type); break;
+            }
+        }
         // An excluded method can share a file with instrumented code. In that
         // case a hit elsewhere in this file cannot prove its callers are known.
-        var localAliases = root.DescendantNodes().OfType<UsingDirectiveSyntax>()
-            .Where(directive => directive.Alias is not null && IsExcluded(Name(directive.Name)))
+        var localAliases = usings.Where(directive => directive.Alias is not null && IsExcluded(Name(directive.Name)))
             .SelectMany(directive => AliasNames(directive.Alias!.Name.Identifier.ValueText)).ToArray();
         var excludedAliases = aliases.Concat(localAliases).ToHashSet(StringComparer.Ordinal);
         bool Excluded(AttributeSyntax attribute) => IsExcluded(Name(attribute.Name)) || excludedAliases.Contains(Name(attribute.Name));
-        var attributes = root.DescendantNodes().OfType<AttributeSyntax>().Where(Excluded).ToArray();
-        var blind = attributes.Length > 0 || localAliases.Length > 0
-            // Mapped documents/line numbers cannot reliably be joined to the
-            // physical file in a coverage report. Include these bodies too.
-            || allTrivia.Any(trivia => trivia.GetStructure() is LineDirectiveTriviaSyntax or LineSpanDirectiveTriviaSyntax);
-        var body = root.NormalizeWhitespace().ToFullString();
-        var declarations = blind ? body : new DeclarationSignature().Visit(root)!.NormalizeWhitespace().ToFullString();
-        var partialTypes = root.DescendantNodes().OfType<TypeDeclarationSyntax>()
-            .Where(type => type.Modifiers.Any(SyntaxKind.PartialKeyword)).Select(TypeKey).Distinct().ToArray();
+        var attributes = allAttributes.Where(Excluded).ToArray();
+        // Compilation symbols are project-specific. An exclusion in disabled
+        // text cannot safely be ruled out by this syntax-only analysis.
+        var wholeAssembly = attributes.Any(attribute => (attribute.Parent as AttributeListSyntax)?.Target?.Identifier.ValueText == "assembly");
+        // Mapped documents/line numbers cannot reliably be joined to the
+        // physical file in a coverage report. Include these bodies too.
+        var lineMapped = false;
+        // Directives can change compilation or metadata even when they occur
+        // inside a method whose executable body is omitted from the signature.
+        var directives = new List<string>();
+        foreach (var trivia in root.DescendantTrivia(descendIntoTrivia: true))
+        {
+            if (trivia.IsDirective)
+            {
+                directives.Add(trivia.ToFullString());
+                lineMapped |= trivia.Kind() is SyntaxKind.LineDirectiveTrivia or SyntaxKind.LineSpanDirectiveTrivia;
+            }
+            else if (!wholeAssembly && trivia.IsKind(SyntaxKind.DisabledTextTrivia))
+            {
+                var text = trivia.ToFullString();
+                wholeAssembly = HasExcludedName(text) || excludedAliases.Any(alias => text.Contains(alias, StringComparison.Ordinal));
+            }
+        }
+        var blind = attributes.Length > 0 || localAliases.Length > 0 || lineMapped;
+        var (signature, body) = Fingerprint.Compute(root, blind, directives);
+        var partialTypes = types.Where(type => type.Modifiers.Any(SyntaxKind.PartialKeyword)).Select(TypeKey).Distinct().ToArray();
         // Attributes on a partial member's defining declaration also affect its
         // implementation in another file. Track the containing type in that case.
         var excludedTypes = attributes.Select(attribute => attribute.FirstAncestorOrSelf<TypeDeclarationSyntax>())
             .OfType<TypeDeclarationSyntax>().Select(TypeKey).ToHashSet(StringComparer.Ordinal);
-        // Compilation symbols are project-specific. An exclusion in disabled
-        // text cannot safely be ruled out by this syntax-only analysis.
-        if (attributes.Any(attribute => (attribute.Parent as AttributeListSyntax)?.Target?.Identifier.ValueText == "assembly")
-            || allTrivia.Where(trivia => trivia.IsKind(SyntaxKind.DisabledTextTrivia))
-                .Select(trivia => trivia.ToFullString())
-                .Any(text => HasExcludedName(text) || excludedAliases.Any(alias => text.Contains(alias, StringComparison.Ordinal))))
-        { excludedTypes.Add("*"); }
-        return new(new SourceShape(Hash(declarations + directives), Hash(body), partialTypes, [.. excludedTypes]), sourceHash);
+        if (wholeAssembly) { excludedTypes.Add("*"); }
+        return new(new SourceShape(signature, body, partialTypes, [.. excludedTypes]), sourceHash);
     }
 
     // Same result as a StreamReader with BOM detection, without the stream and
@@ -191,8 +214,6 @@ static class SourceAnalysis
     static bool HasExcludedName(string text) => ExcludingAttributes
         .Any(name => text.Contains(name, StringComparison.Ordinal));
 
-    static string Hash(string text) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
-
     static string TypeKey(TypeDeclarationSyntax type)
     {
         var ns = string.Join(".", type.Ancestors().OfType<BaseNamespaceDeclarationSyntax>().Reverse()
@@ -205,25 +226,3 @@ static class SourceAnalysis
 
 sealed record SourceShape(string Signature, string Body, string[] PartialTypes, string[] ExcludedTypes);
 sealed record AnalyzedSource(SourceShape? Shape, string? SourceHash);
-
-// Only executable method/accessor bodies can use runtime traces alone. Keep
-// initializers, constants, constructors, attributes, signatures, and type shape:
-// consumers can depend on these without executing a statement in this file.
-sealed class DeclarationSignature : CSharpSyntaxRewriter
-{
-    private static BlockSyntax? Body(BlockSyntax? body) => body is null ? null : SyntaxFactory.Block();
-    private static ArrowExpressionClauseSyntax? Expression(ArrowExpressionClauseSyntax? body) =>
-        body is null ? null : SyntaxFactory.ArrowExpressionClause(SyntaxFactory.LiteralExpression(SyntaxKind.DefaultLiteralExpression));
-
-    public override SyntaxNode? VisitMethodDeclaration(MethodDeclarationSyntax node) =>
-        node.WithBody(Body(node.Body)).WithExpressionBody(Expression(node.ExpressionBody));
-
-    public override SyntaxNode? VisitAccessorDeclaration(AccessorDeclarationSyntax node) =>
-        node.WithBody(Body(node.Body)).WithExpressionBody(Expression(node.ExpressionBody));
-
-    public override SyntaxNode? VisitPropertyDeclaration(PropertyDeclarationSyntax node) =>
-        base.VisitPropertyDeclaration(node.WithExpressionBody(Expression(node.ExpressionBody)));
-
-    public override SyntaxNode? VisitIndexerDeclaration(IndexerDeclarationSyntax node) =>
-        base.VisitIndexerDeclaration(node.WithExpressionBody(Expression(node.ExpressionBody)));
-}

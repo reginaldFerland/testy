@@ -3,12 +3,13 @@ import * as path from 'node:path';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { BuildDiagnostic } from '../core/diagnostics';
 import { TestFile, TestResult } from '../core/model';
-import { isInside, normalizePath } from '../core/paths';
+import { displayPath, isInside, lowercaseKeys, normalizePath, resolveDisplayPaths } from '../core/paths';
+import { testType, typeLabel } from '../core/testUpdates';
 import { traitsSignature, traitTagIds } from '../core/traits';
 import { failingFrame, parseStackTrace } from '../core/stackTrace';
 import { Selection } from '../core/selection';
 import { RunScope, TestEngine } from '../services/engine';
-import { projectCoverageId } from '../services/runner';
+import { projectCoverageId } from '../core/coverage';
 import { explainSelection } from './selectionCause';
 
 // Call sites use l10n.t(...) literally so `npm run l10n:export` can extract them.
@@ -29,11 +30,14 @@ type TestIds = ReadonlyMap<string, { group: string; test: string }>;
 /** Translate Test Explorer items into an engine selection. */
 function scopeOf(testIds: TestIds, items: readonly vscode.TestItem[] | undefined, all = false): RunScope {
     const groups = new Set<string>(), projects = new Set<string>(), tests = new Map<string, Set<string>>();
+    const add = (identity: { group: string; test: string }): void => {
+        const ids = tests.get(identity.group) ?? new Set<string>(); ids.add(identity.test); tests.set(identity.group, ids); groups.add(identity.group);
+    };
     for (const item of items ?? []) {
         const identity = testIds.get(item.id);
-        if (identity) {
-            const ids = tests.get(identity.group) ?? new Set<string>(); ids.add(identity.test); tests.set(identity.group, ids); groups.add(identity.group);
-        } else if (item.id.startsWith('project:')) {projects.add(item.id.slice('project:'.length));}
+        if (identity) {add(identity);}
+        else if (item.id.startsWith('class:')) {item.children.forEach(child => {const test = testIds.get(child.id); if (test) {add(test);}});}
+        else if (item.id.startsWith('project:')) {projects.add(item.id.slice('project:'.length));}
         else if (item.id.startsWith('file:')) {groups.add(item.id.slice('file:'.length));}
     }
     // Container selection wins when VS Code also includes a child.
@@ -80,7 +84,7 @@ export class TestTree {
     readonly outcomes = new Map<string, string>();
     passed = 0;
     failed = 0;
-    private readonly treeFiles = new Map<string, { tests: TestFile['tests']; ids: Set<string>; dirty?: boolean }>();
+    private readonly treeFiles = new Map<string, { tests: TestFile['tests']; ids: Set<string>; classes: Set<string>; dirty?: boolean }>();
     private readonly treeProjects = new Map<string, readonly string[]>();
     private treeRoots: readonly string[] = [];
     /** Project items currently showing a build failure. */
@@ -99,12 +103,13 @@ export class TestTree {
         if (outcome === 'failed' || outcome === 'errored') {this.failed++;}
     }
 
+    /** `file` is a canonical path; the item shows its on-disk spelling. */
     item(id: string, label: string, file?: string): vscode.TestItem {
-        const existing = this.items.get(id);
-        if (existing && (existing.uri ? file !== undefined && path.normalize(existing.uri.fsPath) === path.normalize(file) : file === undefined)) {
+        const existing = this.items.get(id), shown = file === undefined ? undefined : displayPath(file);
+        if (existing && (existing.uri ? shown !== undefined && path.normalize(existing.uri.fsPath) === path.normalize(shown) : shown === undefined)) {
             if (existing.label !== label) {existing.label = label;} return existing;
         }
-        const item = this.controller.createTestItem(id, label, file ? vscode.Uri.file(file) : undefined);
+        const item = this.controller.createTestItem(id, label, shown ? vscode.Uri.file(shown) : undefined);
         this.items.set(id, item); return item;
     }
 
@@ -157,45 +162,62 @@ export class TestTree {
             if (++work % 512 === 0) {await yieldTurn(); if (this.host.disposed) {return;}}
             const tests = this.engine.knownTests(group), previous = this.treeFiles.get(group.id);
             projectCounts.set(group.project, (projectCounts.get(group.project) ?? 0) + tests.length);
-            const projectId = `project:${group.project}`, projectName = path.basename(group.project, '.csproj');
+            if (lowercaseKeys()) {await resolveDisplayPaths([group.project, ...group.file ? [group.file] : [], ...new Set(tests.map(test => test.file).filter(file => file && file !== group.file) as string[])]); if (this.host.disposed) {return;}}
+            const projectId = `project:${group.project}`, projectName = path.basename(displayPath(group.project), '.csproj');
             const projectTag = `project:${projectName}`, tags = [projectTag, `framework:${group.framework}`];
             setTags(this.item(projectId, projectName, group.project), [projectTag]);
             live.add(group.id);
             owners.set(group.id, `file:${group.id}`); owners.set(projectCoverageId(group), projectId);
             const files = projects.get(projectId) ?? [];
-            const file = this.item(`file:${group.id}`, `${path.basename(group.file ?? (group.runtimeOnly ? l10n.t('Unmapped runtime tests') : l10n.t('Other tests')))} · ${group.framework}`, group.file);
+            const file = this.item(`file:${group.id}`, `${path.basename(group.file ? displayPath(group.file) : group.runtimeOnly ? l10n.t('Unmapped runtime tests') : l10n.t('Other tests'))} · ${group.framework}`, group.file);
             setTags(file, tags);
             files.push(file); projects.set(projectId, files);
             let same = !previous?.dirty && previous?.tests.length === tests.length;
             // same implies both lists have tests.length entries.
             if (same && previous!.tests !== tests) {for (let index = 0; index < tests.length; index++) {
                 const a = previous!.tests[index]!, b = tests[index]!;
-                if (a.id !== b.id || a.name !== b.name || a.file !== b.file || a.line !== b.line || a.endLine !== b.endLine || (a.traits !== b.traits && traitsSignature(a.traits) !== traitsSignature(b.traits))) {same = false; break;}
+                if (a.id !== b.id || a.name !== b.name || a.file !== b.file || a.line !== b.line || testType(a.node) !== testType(b.node) || a.endLine !== b.endLine || (a.traits !== b.traits && traitsSignature(a.traits) !== traitsSignature(b.traits))) {same = false; break;}
                 if (++work % 512 === 0) {await yieldTurn(); if (this.host.disposed) {return;}}
             }}
-            if (same) {this.treeFiles.set(group.id, { tests, ids: previous!.ids }); continue;}
-            const children: vscode.TestItem[] = [], ids = new Set<string>();
+            if (same) {this.treeFiles.set(group.id, { tests, ids: previous!.ids, classes: previous!.classes }); continue;}
+            const children: vscode.TestItem[] = [], ids = new Set<string>(), classes = new Map<string, { item: vscode.TestItem; members: vscode.TestItem[] }>();
             for (const test of tests) {
-                const id = `${group.id}:${test.id}`, item = this.item(id, test.name, test.file);
+                const id = `${group.id}:${test.id}`, type = testType(test.node);
+                let owner = file;
+                if (type !== undefined) {
+                    let entry = classes.get(type);
+                    if (!entry) {
+                        const item = this.item(`class:${group.id}:${type}`, typeLabel(type), test.file);
+                        setTags(item, tags); entry = { item, members: [] }; classes.set(type, entry); children.push(item);
+                    }
+                    owner = entry.item;
+                }
+                let item = this.item(id, test.name, test.file);
+                // A test moving between the file and a class gets a fresh item; the old one leaves with its parent's replacement.
+                if (item.parent && item.parent !== owner) {this.items.delete(id); item = this.item(id, test.name, test.file);}
                 // Span the declaration when the provider reports its end; otherwise the whole first line.
                 const start = Math.max(0, test.line - 1);
                 item.range = test.file ? new vscode.Range(start, 0, Math.max(start + 1, test.endLine ?? 0), 0) : undefined;
                 setTags(item, test.traits ? [...tags, ...traitTagIds(test.traits)] : tags);
-                ids.add(id); this.testIds.set(id, { group: group.id, test: test.id }); children.push(item);
+                ids.add(id); this.testIds.set(id, { group: group.id, test: test.id }); if (owner === file) {children.push(item);} else {classes.get(type!)!.members.push(item);}
                 if (++work % 512 === 0) {await yieldTurn(); if (this.host.disposed) {return;}}
             }
+            const classIds = new Set<string>();
+            for (const [type, { item, members }] of classes) {item.children.replace(members); classIds.add(`class:${group.id}:${type}`);}
             file.children.replace(children);
+            for (const id of previous?.classes ?? []) {if (!classIds.has(id)) {this.items.delete(id);}}
             for (const id of previous?.ids ?? []) {if (!ids.has(id)) {
                 this.testIds.delete(id); this.items.delete(id); this.setOutcome(id);
                 if (++work % 512 === 0) {await yieldTurn(); if (this.host.disposed) {return;}}
             }}
-            this.treeFiles.set(group.id, { tests, ids });
+            this.treeFiles.set(group.id, { tests, ids, classes: classIds });
         }
         for (const [group, previous] of this.treeFiles) {if (!live.has(group)) {
             for (const id of previous.ids) {
                 this.testIds.delete(id); this.items.delete(id); this.setOutcome(id);
                 if (++work % 512 === 0) {await yieldTurn(); if (this.host.disposed) {return;}}
             }
+            for (const id of previous.classes) {this.items.delete(id);}
             this.items.delete(`file:${group}`); this.treeFiles.delete(group);
         }}
         const sameIds = (previous: readonly string[] | undefined, next: readonly string[]): boolean => !!previous && previous.length === next.length && previous.every((id, index) => id === next[index]);
@@ -216,7 +238,7 @@ export class TestTree {
         if (group.runtimeOnly && !this.treeFiles.has(group.id)) {
             const file = this.item(`file:${group.id}`, `${l10n.t('Unmapped runtime tests')} · ${group.framework}`);
             this.items.get(`project:${group.project}`)?.children.add(file);
-            this.treeFiles.set(group.id, { tests: [], ids: new Set(), dirty: true });
+            this.treeFiles.set(group.id, { tests: [], ids: new Set(), classes: new Set(), dirty: true });
         }
         const id = `${group.id}:${result.id}`;
         this.testIds.set(id, { group: group.id, test: result.id });
@@ -225,7 +247,18 @@ export class TestTree {
         let item = this.items.get(id);
         if (!item) {
             item = this.item(id, result.name, group.file);
-            this.items.get(`file:${group.id}`)?.children.add(item);
+            let parent = this.items.get(`file:${group.id}`);
+            const type = testType(result.node);
+            if (parent && type !== undefined) {
+                const classId = `class:${group.id}:${type}`;
+                let owner = this.items.get(classId);
+                if (!owner) {
+                    owner = this.item(classId, typeLabel(type), group.file); setTags(owner, parent.tags.map(tag => tag.id));
+                    parent.children.add(owner); file?.classes.add(classId); if (file) {file.dirty = true;}
+                }
+                parent = owner;
+            }
+            parent?.children.add(item);
         }
         this.setOutcome(id, result.outcome);
         const run = this.host.activeRun;

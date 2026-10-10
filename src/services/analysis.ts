@@ -2,6 +2,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { contentHash, preparePathNormalizer } from '../core/paths';
 import { Project } from '../core/model';
+import { EnvironmentError } from '../core/errors';
 import { ProcessOptions, requireSuccess, runProcess } from './process';
 import { analyzerServers, AnalyzerRequestFailed, AnalyzerServerUnavailable } from './analyzerServer';
 import { roslynIdentity } from './analysisContext';
@@ -15,7 +16,7 @@ export { disposeAnalyzerServers } from './analyzerServer';
 async function analyze(dotnet: string, analyzer: string, storage: string, prefix: string, request: string, operation: string, options: ProcessOptions): Promise<string> {
     try {return await analyzerServers.request(dotnet, analyzer, request, options, await roslynIdentity(dotnet, options));}
     catch (error) {
-        if (error instanceof AnalyzerRequestFailed) {throw new Error(`${operation} failed.\n${error.message}`);}
+        if (error instanceof AnalyzerRequestFailed) {throw new EnvironmentError('analyzer', `${operation} failed.\n${error.message}`);}
         if (!(error instanceof AnalyzerServerUnavailable)) {throw error;}
         options.signal?.throwIfAborted();
     }

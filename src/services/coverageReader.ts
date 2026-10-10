@@ -84,7 +84,7 @@ export class CoverageReader {
         const worker = new Worker(scriptPath('coverageWorker'));
         this.worker = worker;
         worker.on('message', (response: CoverageResponse) => this.pending.get(response.id)?.resolve(response));
-        worker.on('error', error => this.fail(worker, error));
+        worker.on('error', (error: Error) => this.fail(worker, error));
         worker.on('exit', code => this.fail(worker, new Error(`The coverage parser exited unexpectedly (exit ${code}).`)));
         return worker;
     }

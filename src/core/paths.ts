@@ -169,6 +169,33 @@ export function pathNormalizer(): (file: string) => string {
     };
 }
 
+/** On-disk spellings of canonical paths. Windows keys are lowercase for identity only; labels and URIs show the real case. */
+const spellings = new TtlMap<string>(65536, Infinity);
+
+/** Whether canonical paths lose their on-disk case (Windows). */
+export const lowercaseKeys = (): boolean => process.platform === 'win32';
+
+/** Recover the on-disk case of canonical paths asynchronously (a no-op elsewhere); see displayPath. */
+export async function resolveDisplayPaths(files: Iterable<string>, concurrency = 16): Promise<void> {
+    if (!lowercaseKeys()) {return;}
+    const pending = [...new Set(files)].filter(file => file && spellings.get(file) === undefined);
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(concurrency, pending.length) }, async () => {
+        for (let file = pending[next++]; file !== undefined; file = pending[next++]) {
+            let real: string;
+            try { real = await fsp.realpath(file); }
+            catch {
+                const directory = path.dirname(path.resolve(file));
+                real = directory === path.resolve(file) ? file : path.join(await resolveDirectoryAsync(directory, sharedDirectories), path.basename(file));
+            }
+            spellings.set(file, real);
+        }
+    }));
+}
+
+/** The on-disk spelling of a canonical path once resolveDisplayPaths has seen it; otherwise the path itself. */
+export function displayPath(file: string): string { return lowercaseKeys() ? spellings.get(file) ?? file : file; }
+
 export function isInside(file: string, folder: string): boolean {
     const relative = path.relative(folder, file);
     return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));

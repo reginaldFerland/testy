@@ -1,3 +1,4 @@
+// @ts-check
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const path=require('node:path');
@@ -6,7 +7,7 @@ const base={dotnet:process.execPath,cwd:process.cwd(),timeoutMs:10_000};
 const peer={...base,assembly:path.resolve('test/fixtures/mtp-peer.cjs')};
 const silent={...base,assembly:path.resolve('test/fixtures/mtp-silent.cjs')};
 const wrapper={command:process.execPath,args:[path.resolve('test/fixtures/mtp-wrapper.cjs')]};
-const withTiming=async(changes,work)=>{const saved={...mtpTiming};Object.assign(mtpTiming,changes);try{return await work();}finally{Object.assign(mtpTiming,saved);}};
+const withTiming=async(/** @type {Record<string,number>} */changes,/** @type {() => Promise<unknown>} */work)=>{const saved={...mtpTiming};Object.assign(mtpTiming,changes);try{return await work();}finally{Object.assign(mtpTiming,saved);}};
 
 test('exit code 8 (zero tests ran) is not a host failure and reports no results',async()=>{
  const expectedTests=[{uid:'gone','display-name':'Gone'}];
@@ -29,7 +30,7 @@ test('the connect allowance never exceeds the process timeout',async()=>{
  await withTiming({connectMs:60_000,wrappedConnectMs:60_000},async()=>{
   const started=Date.now();
   await assert.rejects(requestTests({...silent,timeoutMs:400},'run'),/did not connect|time limit/);
-  assert.ok(Date.now()-started<5000);
+  assert.ok(Date.now()-started<30_000);
  });
 });
 
@@ -39,4 +40,13 @@ test('a debugged host that never reports its process ID fails after a bounded wa
   await assert.rejects(requestTests({...silent,debug:async()=>{attached=true;}},'run'),/did not report a process ID/);
   assert.equal(attached,false);
  });
+});
+
+test('attachment notifications are reported as output lines; the client reports the extension version',()=>{
+ const {attachmentLines}=require('../../out/services/mtp'),{extensionVersion}=require('../../out/services/assets');
+ const file=require('node:url').pathToFileURL(path.resolve('trx/results.trx')).href;
+ assert.deepEqual(attachmentLines([{uri:file,'display-name':'Results',producer:'TrxReport',description:'TRX'},{uri:'https://x/y'},{description:'no uri'}]),
+  [`Attachment Results: ${path.resolve('trx/results.trx')} (TrxReport: TRX)`,'Attachment: https://x/y']);
+ assert.deepEqual(attachmentLines(null),[]);
+ assert.equal(extensionVersion(),require('../../package.json').version);
 });

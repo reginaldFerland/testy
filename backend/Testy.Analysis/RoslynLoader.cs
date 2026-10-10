@@ -26,11 +26,11 @@ static class RoslynLoader
     // the reasons the handler had, so callers print this beside the exception.
     public static string? Failure { get; private set; }
 
-    static Assembly? Resolve(AssemblyLoadContext context, AssemblyName requested)
+    internal static Assembly? Resolve(AssemblyLoadContext context, AssemblyName requested)
     {
         if (requested.Name is null || Array.IndexOf(Names, requested.Name) < 0) { return null; }
         try { return context.LoadFromAssemblyPath(Path.Combine(Locate(requested.Version ?? new Version(0, 0)), requested.Name + ".dll")); }
-        catch (FileNotFoundException error) { Failure = error.Message; return null; }
+        catch (Exception error) when (error is FileNotFoundException or FileLoadException or BadImageFormatException) { Failure = error.Message; return null; }
     }
 
     static string Locate(Version minimum)

@@ -1,4 +1,5 @@
 import * as path from 'node:path';
+import { readFileSync } from 'node:fs';
 
 // Compiled modules live in out/services (tests) or are bundled into dist/
 // (the packaged extension). Scripts sit next to the running module either way;
@@ -11,3 +12,14 @@ export function scriptPath(name: string): string { return path.join(__dirname, `
 
 /** A bundled .NET helper file under dist/. */
 export function helperPath(...segments: string[]): string { return path.join(extensionRoot, 'dist', ...segments); }
+
+let version: string | undefined;
+/** The extension's own version, read once from its package.json. */
+export function extensionVersion(): string {
+    if (version !== undefined) {return version;}
+    try {
+        const manifest: unknown = JSON.parse(readFileSync(path.join(extensionRoot, 'package.json'), 'utf8'));
+        version = typeof manifest === 'object' && manifest !== null && 'version' in manifest && typeof manifest.version === 'string' ? manifest.version : 'unknown';
+    } catch {version = 'unknown';}
+    return version;
+}

@@ -31,6 +31,12 @@ public sealed class ProjectGraphTaskTests : IDisposable
         Assert.True(task.Execute(), string.Join("\n", engine.Errors));
         using var graph = JsonDocument.Parse(File.ReadAllText(task.OutputFile));
         Assert.Equal(Path.Combine(directory, "a.proj"), graph.RootElement.GetProperty("projects")[0].GetProperty("file").GetString());
+        // The TypeScript reader rejects any other version, and the members it reads keep their names.
+        Assert.Equal(["version", "projects", "roots", "evaluations"], graph.RootElement.EnumerateObject().Select(property => property.Name));
+        Assert.Equal(1, graph.RootElement.GetProperty("version").GetInt32());
+        Assert.Equal(["file", "framework", "assembly", "assemblyName", "outputDirectories", "isTestProject", "isMtp", "properties", "contextId", "contextReferences",
+            "sourceFiles", "inputs", "references", "binaryReferences"], graph.RootElement.GetProperty("projects")[0].EnumerateObject().Select(property => property.Name));
+        Assert.Equal(["file", "contexts", "entryPoints", "evaluation"], graph.RootElement.GetProperty("roots")[0].EnumerateObject().Select(property => property.Name));
     }
 
     [Fact]

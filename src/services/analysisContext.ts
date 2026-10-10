@@ -87,7 +87,7 @@ export async function sourceAnalysisContext(dotnet: string, analyzer: string, op
         if (!roslyn) {return undefined;}
         const assets = await preparationToolIdentity(actualAnalyzer, env, signal, options.cwd);
         signal?.throwIfAborted();
-        return contentHash(JSON.stringify([2, host, contentHash(bytes), assets, inventories, roslyn, await fs.realpath(options.cwd),
+        return contentHash(JSON.stringify([3, host, contentHash(bytes), assets, inventories, roslyn, await fs.realpath(options.cwd),
             Object.entries(env).sort(([left], [right]) => compareCodeUnits(left, right))]));
     } catch {signal?.throwIfAborted(); return undefined;}
 }

@@ -2,7 +2,7 @@ const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),{cre
 
 const out=path.resolve('out');
 // Modules that import `vscode` are evaluated against the stub; everything else loads normally.
-const stubbed=new Set(['extension','controller','configuration','ui/coverage','ui/statusBar','ui/testTree','ui/exportCoverage','ui/selectionCause','ui/baselineProgress']);
+const stubbed=new Set(['extension','controller','changeWatcher','commands','diagnosticsPublisher','configuration','ui/coverage','ui/statusBar','ui/testTree','ui/exportCoverage','ui/selectionCause','ui/baselineProgress']);
 
 /**
  * Loads the compiled extension-host modules from out/ into one sandbox with a stub `vscode`.
@@ -23,7 +23,13 @@ function loadUi({vscode={},stubs={},globals={}}={}) {
   return module.exports;
  };
  const module=name=>load(path.join(out,`${name}.js`));
- return{module,get Testy(){return module('controller').Testy;},get TestTree(){return module('ui/testTree').TestTree;},
+ const watchers=new WeakMap();
+ return{module,get Testy(){return module('controller').Testy;},/** The `ChangeWatcher` of a plain-object host, created once; the host's `queueChanged` replaces the debounced one. */
+  changeWatcher(host){
+   let watcher=watchers.get(host);
+   if(!watcher){watcher=new (module('changeWatcher').ChangeWatcher)(host);if(host.queueChanged)watcher.queueChanged=files=>host.queueChanged(files);watchers.set(host,watcher);}
+   return watcher;
+  },get TestTree(){return module('ui/testTree').TestTree;},
   get CoverageView(){return module('ui/coverage').CoverageView;},get failureMessage(){return module('ui/testTree').failureMessage;}};
 }
 

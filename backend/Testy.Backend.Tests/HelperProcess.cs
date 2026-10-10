@@ -13,13 +13,22 @@ internal static class HelperProcess
 
     public static string Output(string name) => Path.Combine(AppContext.BaseDirectory, name);
 
-    public static async Task<(int ExitCode, string Output, string Error)> Run(string helper, IEnumerable<string> arguments, IDictionary<string, string?>? environment = null)
+    // Starts `dotnet <assembly> <arguments>` with all three standard streams redirected.
+    public static Process Start(string assembly, IEnumerable<string> arguments, IDictionary<string, string?>? environment = null)
     {
         var start = new ProcessStartInfo(Dotnet) { RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
-        start.ArgumentList.Add(Output(helper));
+        start.ArgumentList.Add(assembly);
         foreach (var argument in arguments) { start.ArgumentList.Add(argument); }
         foreach (var (name, value) in environment ?? new Dictionary<string, string?>()) { start.Environment[name] = value; }
-        using var process = Process.Start(start)!;
+        return Process.Start(start)!;
+    }
+
+    public static Task<(int ExitCode, string Output, string Error)> Run(string helper, IEnumerable<string> arguments, IDictionary<string, string?>? environment = null) =>
+        Run(Start(Output(helper), arguments, environment));
+
+    public static async Task<(int ExitCode, string Output, string Error)> Run(Process started)
+    {
+        using var process = started;
         // stdin stays open until exit: the process host treats its end as cancellation.
         var output = process.StandardOutput.ReadToEndAsync(TestContext.Current.CancellationToken);
         var error = process.StandardError.ReadToEndAsync(TestContext.Current.CancellationToken);

@@ -23,7 +23,8 @@ test('manifest: numeric navigation order, context menus with localized titles, l
  assert.equal(trust.supported,'limited');
  for(const key of ['testy.dotnetPath','testy.coverageToolPath','testy.testArguments','testy.solution','testy.debugConfiguration'])assert.ok(trust.restrictedConfigurations.includes(key),key);
  for(const key of trust.restrictedConfigurations)assert.ok(configuration.properties[key],`${key} is a contributed setting`);
- for(const key of ['solution','projects.include','projects.exclude','exclude','buildConfiguration','testArguments','debugConfiguration'])assert.equal(configuration.properties[`testy.${key}`].scope,'resource',key);
+ for(const key of ['solution','projects.include','projects.exclude','exclude','debugConfiguration'])assert.equal(configuration.properties[`testy.${key}`].scope,'resource',key);
+ for(const key of ['buildConfiguration','testArguments'])assert.equal(configuration.properties[`testy.${key}`].scope,'window',`${key} applies to the whole workspace`);
 });
 
 test('failure messages carry the context value the Show Output message action is bound to',()=>{
@@ -75,11 +76,12 @@ test('the status bar exposes its state and details to screen readers without ico
 test('in Restricted Mode activation executes nothing and starts Testy once trust is granted',async()=>{
  let grant,constructed=0,started=0,item;
  const subscriptions=[];
- const vscode={StatusBarAlignment:{Left:1},workspace:{isTrusted:false,workspaceFolders:[{uri:{fsPath:'/workspace'}}],onDidGrantWorkspaceTrust:handler=>{grant=handler;return{dispose(){}};}},
+ const vscode={StatusBarAlignment:{Left:1},ExtensionMode:{Test:3},workspace:{isTrusted:false,workspaceFolders:[{uri:{fsPath:'/workspace'}}],onDidGrantWorkspaceTrust:handler=>{grant=handler;return{dispose(){}};}},
   window:{createStatusBarItem:()=>(item={disposed:false,show(){},dispose(){item.disposed=true;}})}};
  class Testy {constructor(){constructed++;} start(){started++;return Promise.resolve();} snapshot(){return{started:true};} dispose(){return Promise.resolve();}}
  const extension=loadUi({vscode,stubs:{controller:{Testy}}}).module('extension');
- const api=extension.activate({subscriptions});
+ assert.equal(extension.activate({subscriptions,extensionMode:1}),undefined,'the snapshot API is for tests only');
+ const api=extension.activate({subscriptions,extensionMode:3});
  assert.equal(constructed,0);assert.deepEqual({...api.snapshot()},{restricted:true});
  assert.equal(item.text,'$(shield) Testy: Restricted Mode');
  grant();await tick();

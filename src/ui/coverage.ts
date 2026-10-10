@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
 import { Configuration } from '../configuration';
 import { CoverageSummary, declarationHits } from '../core/coverage';
 import { normalizePath } from '../core/paths';
@@ -47,6 +48,9 @@ export class CoverageView {
     private rendering = false;
     private readonly pendingEditors = new Set<vscode.TextEditor>();
     private decoratedEditors?: WeakMap<vscode.TextEditor, EditorCoverageState>;
+    /** Whether gutter markers may be on screen; while false and coverage is not shown, there is nothing to update or clear. */
+    private drawn = false;
+    private readonly coveringLines = new WeakMap<CoverageSummary, Map<number, string[]>>();
     private decorationIndex?: { readonly summaries: readonly CoverageSummary[]; readonly files: ReadonlyMap<string, CoverageSummary> };
 
     constructor(extensionUri: vscode.Uri, private readonly controller: vscode.TestController, private readonly profile: vscode.TestRunProfile,
@@ -129,8 +133,36 @@ export class CoverageView {
         this.queue(vscode.window.visibleTextEditors); this.host.updateStatus();
     }
 
+    /** Ids of the test files whose retained coverage hits a line (1-based) of a source file. */
+    covering(file: string, line: number): string[] {
+        const summary = this.engine.coverage.summary(file, this.engine.hashes);
+        return summary ? this.coveringOf(summary).get(line) ?? [] : [];
+    }
+
+    private coveringOf(summary: CoverageSummary): Map<number, string[]> {
+        let covering = this.coveringLines.get(summary);
+        if (covering) {return covering;}
+        covering = new Map();
+        const real = new Set(this.engine.displayGroups.map(group => group.id));
+        for (const id of summary.groupIds) {
+            if (!real.has(id)) {continue;}
+            for (const { line, hits } of this.engine.coverage.contribution(summary.file, new Set([id]), this.engine.hashes) ?? []) {
+                if (hits > 0) {covering.set(line, [...covering.get(line) ?? [], id]);}
+            }
+        }
+        this.coveringLines.set(summary, covering);
+        return covering;
+    }
+
+    /** Names of test files, the first few then a count of the rest. */
+    private coveringText(ids: readonly string[]): string {
+        const names = new Map(this.engine.displayGroups.map(group => [group.id, path.basename(group.file ?? group.project)]));
+        const shown = ids.slice(0, 10).map(id => names.get(id) ?? id).join(', ');
+        return ids.length > 10 ? l10n.t('{0} and {1} more', shown, ids.length - 10) : shown;
+    }
+
     queue(editors: readonly vscode.TextEditor[]): void {
-        if (this.host.disposed) {return;}
+        if (this.host.disposed || (!this.drawn && !(this.host.config.showCoverage && !this.hidden))) {return;}
         editors.forEach(editor => this.pendingEditors.add(editor));
         if (this.rendering) {return;}
         this.renderTimer ??= setTimeout(() => {
@@ -173,26 +205,31 @@ export class CoverageView {
             const state: EditorCoverageState = { document, version: document.version, lineCount: document.lineCount, dirty: document.isDirty,
                 show, lines: summary?.lines, stale: summary?.stale };
             const previous = rendered.get(editor);
-            if (previous && previous.document === document && previous.version === state.version && previous.lineCount === state.lineCount
-                && previous.dirty === state.dirty && previous.show === state.show && previous.lines === state.lines && previous.stale === state.stale) {continue;}
+            // Nothing is drawn while coverage is hidden, so edits do not change the (empty) result.
+            if (previous && previous.document === document && previous.show === state.show && previous.lines === state.lines && previous.stale === state.stale
+                && (!state.show || (previous.version === state.version && previous.lineCount === state.lineCount && previous.dirty === state.dirty))) {continue;}
             const entries: Record<DecorationKind, vscode.DecorationOptions[]> = { covered: [], uncovered: [], stale: [] };
             if (summary) {
                 const hovers = {
                     stale: l10n.t('Testy: coverage is out of date. It will refresh after the affected tests finish.'),
-                    covered: l10n.t('Testy: covered by tests.'), uncovered: l10n.t('Testy: not covered by tests.')
+                    uncovered: l10n.t('Testy: not covered by tests.')
                 };
                 for (const line of summary.lines) {
                     if (line.line > state.lineCount) {continue;}
                     const stale = summary.stale || state.dirty;
                     const kind = stale ? 'stale' : line.hits > 0 ? 'covered' : 'uncovered';
-                    entries[kind].push({ range: new vscode.Range(line.line - 1, 0, line.line - 1, 0), hoverMessage: hovers[kind] });
+                    const covering = kind === 'covered' ? this.coveringOf(summary).get(line.line) : undefined;
+                    const hoverMessage = kind === 'covered' ? covering?.length ? l10n.t('Testy: covered by {0}.', this.coveringText(covering)) : l10n.t('Testy: covered by tests.') : hovers[kind];
+                    entries[kind].push({ range: new vscode.Range(line.line - 1, 0, line.line - 1, 0), hoverMessage });
                 }
             }
             // A partially failed submission must never make an older state look current.
             rendered.delete(editor);
             for (const kind of ['covered', 'uncovered', 'stale'] as const) {editor.setDecorations(this.decorations[kind], entries[kind]);}
             rendered.set(editor, state);
+            if (summary) {this.drawn = true;}
         }
+        if (!visible()) {this.drawn = false;}
     }
 
     dispose(): void {

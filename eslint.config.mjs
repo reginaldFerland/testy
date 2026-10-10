@@ -57,6 +57,24 @@ export default tseslint.config(
         }
     },
     {
+        // Layering: core is pure; services do not reach into the UI.
+        files: ['src/core/**/*.ts'],
+        rules: {
+            '@typescript-eslint/no-restricted-imports': ['error', {
+                paths: [{ name: 'vscode', message: 'src/core must not depend on the VS Code API.' }],
+                patterns: [{ group: ['**/services/*', '**/ui/*', '../controller', '../configuration', '../extension'], message: 'src/core must not import services, ui or the extension host.' }]
+            }]
+        }
+    },
+    {
+        files: ['src/services/**/*.ts'],
+        rules: {
+            '@typescript-eslint/no-restricted-imports': ['error', {
+                patterns: [{ group: ['**/ui/*', '../controller', '../configuration', '../extension'], message: 'src/services must not import ui or the extension host.' }]
+            }]
+        }
+    },
+    {
         // CommonJS test files. Syntax and scope rules only; no type-aware rules.
         files: ['test/**/*.cjs'],
         extends: [js.configs.recommended],

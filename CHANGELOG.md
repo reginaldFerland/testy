@@ -26,9 +26,12 @@
 - **Continuous coverage:** the Run with coverage profile supports continuous runs, which collect and show coverage in their automatic runs.
 - **Multi-root settings:** `testy.solution`, `testy.exclude` and `testy.projects.*` can be set per folder and apply to that folder's projects, with relative paths resolved against it. Differing folder values of `testy.buildConfiguration` or `testy.testArguments` are reported.
 - Testy activates for workspaces that only contain `.slnf` solution filters.
+- **Covering tests:** hovering a covered gutter line names the test files that cover it, and **Run Tests Covering This Line** in the editor context menu runs them.
+- Attachments reported by the test framework (for example TRX files or screenshots) are listed in the run output.
 
 ### Changed
 
+- **Requires VS Code 1.140 or later** (previously 1.99). The extension is built for the Node 24 runtime that version ships.
 - Pausing automatic testing is remembered per workspace and no longer edits `.vscode/settings.json`; `testy.autoRun` is now only the default.
 - Test Explorer's refresh button rediscovers tests without running them. **Refresh and Run All C# Tests** still rebuilds and runs everything.
 - Gutter coverage markers are optional (`testy.showCoverage` now defaults to `false`), and have light and dark theme variants.
@@ -52,6 +55,15 @@
 - The analyzer starts faster and uses less memory; its diagnostics are UTF-8.
 - Source analysis runs in a long-lived helper process, so repeated analyses take milliseconds instead of about 150 ms each; it falls back to one process per request if the helper cannot start.
 - The analyzer uses the Roslyn compiler of your installed .NET SDK instead of bundling it, shrinking the package from about 3.8 MB to 0.3 MB. After an SDK update that changes Roslyn, the first run may select a few extra tests.
+- **Readable test names:** Test Explorer groups tests by class (Project → File → Class → Test), and test names no longer repeat the namespace and class (xUnit shows `Method(args)`). Custom display names are kept.
+- Project and file names, project tags and opened editor paths keep their real case on Windows instead of being lowercased.
+- `testy.buildConfiguration` and `testy.testArguments` are window-scoped, since they always applied to the whole workspace.
+- The runtime observer targets .NET 8, so older managed processes that inherit it can load it.
+- Analyzer errors show `Type: message` instead of a stack trace.
+- A burst of file changes, such as a branch switch, is handled as one update; writes to `bin/` and `obj/` are ignored without touching the disk, and large workspaces use far fewer file watchers.
+- Coverage decorations are no longer recomputed on every keystroke while gutter coverage is hidden.
+- Source analysis is about 4x faster and uses less CPU and memory: fingerprints are streamed instead of building normalized copies of each file, and all analyzer requests share one CPU budget. Cached fingerprints are recomputed once after upgrading.
+- SDK resolver digests are kept on disk between project evaluations instead of being rehashed by each evaluation process.
 
 ### Fixed
 
@@ -93,6 +105,11 @@
 - An error while workspace folders change is reported instead of escaping the event handler.
 - Ending the baseline progress disposes its cancellation listener.
 - The Pause/Resume and Run buttons in Test Explorer's title bar use numeric ordering.
+- Saves made while Testy starts up are kept and run only after the pause and baseline-consent settings are applied; before, they could build while paused or before consent. A failed cache restore no longer prevents those settings and file watching from being applied.
+- If the installed Roslyn fails the analyzer self-test, analysis fails with a clear error instead of retrying in a one-shot process with the same Roslyn, which could produce wrong fingerprints and skip affected tests.
+- Each error is logged once instead of up to three times.
+- Closing VS Code stops test processes immediately, and deactivation finishes within about 3 seconds.
+- An empty command passed to the Windows process host reports a clear error.
 
 ### Internal
 
@@ -104,7 +121,11 @@
 - `extension.ts` is split into a controller and UI presenters (`src/controller.ts`, `src/ui/*`).
 - Test files are linted; the .NET helpers build with the recommended analyzer rules and have their own xUnit tests (`npm run test:dotnet`).
 - Cancelling source analysis now also interrupts Roslyn parsing.
-- There is no CI; validation is local (see CONTRIBUTING).
+- CI on Windows, macOS and Linux (Node 20 and 22), a tag-triggered release to the Marketplace and Open VSX, CodeQL, Dependabot, and a packaged-file snapshot check.
+- Environment errors are typed instead of matched by message text; architecture layering is enforced by lint rules.
+- The MTP client reports the real extension version; project-graph output carries a format version and uses source-generated JSON.
+- Checked-in xUnit v3 and NUnit fixtures, extension-host tests for every command and for each framework, process-level analyzer tests, and timing-independent waits in previously flaky tests.
+- `backend/global.json` was removed so backend tests use the pinned SDK; `SECURITY.md`, a code of conduct, and issue and PR templates were added.
 
 ## 1.2.0
 

@@ -11,6 +11,12 @@
   },
   "homepage": "https://github.com/reginaldFerland/testy#readme",
   "license": "MIT",
+  "qna": "https://github.com/reginaldFerland/testy/issues",
+  "pricing": "Free",
+  "galleryBanner": {
+    "color": "#1e1e1e",
+    "theme": "dark"
+  },
   "keywords": [
     "csharp",
     "dotnet",
@@ -28,7 +34,7 @@
   "version": "1.2.0",
   "icon": "testy.png",
   "engines": {
-    "vscode": "^1.99.0"
+    "vscode": "^1.140.0"
   },
   "categories": [
     "Testing"
@@ -128,6 +134,11 @@
         "title": "%command.runFile%",
         "category": "Testy",
         "icon": "$(play)"
+      },
+      {
+        "command": "testy.runCoveringTests",
+        "title": "%command.runCoveringTests%",
+        "category": "Testy"
       }
     ],
     "menus": {
@@ -224,6 +235,10 @@
         {
           "command": "testy.runFile",
           "when": "testy.active && resourceScheme == file && resourceExtname == .cs"
+        },
+        {
+          "command": "testy.runCoveringTests",
+          "when": "testy.active && editorLangId == csharp"
         }
       ],
       "testing/item/context": [
@@ -246,6 +261,11 @@
         }
       ],
       "editor/context": [
+        {
+          "command": "testy.runCoveringTests",
+          "when": "testy.active && resourceScheme == file && resourceExtname == .cs",
+          "group": "testy@2"
+        },
         {
           "command": "testy.runFile",
           "when": "testy.active && resourceScheme == file && resourceExtname == .cs",
@@ -371,7 +391,7 @@
           "type": "string",
           "default": "Debug",
           "markdownDescription": "%config.buildConfiguration%",
-          "scope": "resource",
+          "scope": "window",
           "order": 11
         },
         "testy.maxParallelProjects": {
@@ -404,7 +424,7 @@
             "type": "string"
           },
           "markdownDescription": "%config.testArguments%",
-          "scope": "resource",
+          "scope": "window",
           "order": 15
         },
         "testy.timeoutSeconds": {
@@ -504,7 +524,7 @@
     ]
   },
   "scripts": {
-    "vscode:prepublish": "npm run build:dotnet:release && npm run bundle -- --production",
+    "vscode:prepublish": "npm run lint && npm run build:dotnet:release && npm run bundle -- --production",
     "compile": "tsc -p ./ && npm run bundle && npm run build:dotnet",
     "bundle": "node esbuild.mjs",
     "watch:bundle": "node esbuild.mjs --watch",
@@ -515,29 +535,28 @@
     "build:analyzer": "node -e \"require('fs').rmSync('dist/analyzer', { recursive: true, force: true })\" && dotnet build backend/Testy.Analysis/Testy.Analysis.csproj --configuration Release --output dist/analyzer --nologo",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint && npm run typecheck:tests",
-    "lint": "eslint src test *.mjs .vscode-test.mjs",
+    "lint": "eslint src test scripts *.mjs",
     "typecheck:tests": "tsc -p tsconfig.tests.json",
     "test": "node --test test/unit/*.test.cjs",
     "test:integration": "npm run compile && node --test test/integration/*.test.cjs",
     "test:dotnet": "cd backend && dotnet test --project Testy.Backend.Tests",
-    "test:extension": "vscode-test",
-    "package": "vsce package",
+    "pretest:extension": "npm run compile",
+    "test:extension": "node test/extension/run.mjs",
+    "coverage": "node --test --experimental-test-coverage test/unit/*.test.cjs",
+    "package": "vsce package --no-dependencies",
+    "check:vsix": "node scripts/check-vsix-files.mjs",
     "benchmark": "npm run compile && node test/performance/benchmark.cjs",
     "benchmark:responsiveness": "npm run compile && node test/performance/responsiveness.cjs",
-    "l10n:export": "npx @vscode/l10n-dev export --outDir ./l10n ./src"
+    "l10n:export": "npx --yes @vscode/l10n-dev@0.0.35 export --outDir ./l10n ./src"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
-    "@types/mocha": "^10.0.10",
-    "@types/node": "^20.19.43",
-    "@types/vscode": "~1.99.1",
-    "@vscode/l10n-dev": "^0.0.35",
-    "@vscode/test-cli": "^0.0.15",
+    "@types/node": "^24.19.2",
+    "@types/vscode": "~1.140.0",
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^4.0.0",
     "esbuild": "^0.28.2",
     "eslint": "^9.39.5",
-    "fast-xml-parser": "^5.11.1",
     "minimatch": "^10.2.6",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.71.1",
@@ -561,9 +580,5 @@
       "supported": false,
       "description": "%capabilities.virtual%"
     }
-  },
-  "overrides": {
-    "serialize-javascript": "^7.0.5",
-    "diff": "^8.0.3"
   }
 }

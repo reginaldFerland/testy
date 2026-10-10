@@ -33,7 +33,7 @@ test('inherited SDK candidates use bounded watchers and ignore unrelated externa
  ui.engine.setInputs([...candidates,path.join(workspace,'Tests.cs')]);
  assert.equal(patterns.some(p=>p.base===root&&p.pattern.includes('**')),false);assert.ok(patterns.some(p=>p.base===root&&p.pattern==='*'));
  const requests=/** @type {unknown[][]} */([]);ui.scheduler.request=(/** @type {unknown[]} */...args)=>requests.push(args);ui.engine.markChanged=async()=>{};
- await ui.changed({scheme:'file',fsPath:path.join(root,'elsewhere','Unrelated.cs')},'class C {}');assert.equal(requests.length,0);
- await ui.changed({scheme:'file',fsPath:global},'{}');assert.equal(requests.length,1);
+ await ui.changes.changed({scheme:'file',fsPath:path.join(root,'elsewhere','Unrelated.cs')},'class C {}');assert.equal(requests.length,0);
+ await ui.changes.changed({scheme:'file',fsPath:global},'{}');assert.equal(requests.length,1);
  const count=patterns.length;ui.engine.setInputs([...candidates,path.join(workspace,'Tests.cs')]);assert.equal(patterns.length,count,'unchanged inputs preserve watchers');
 });

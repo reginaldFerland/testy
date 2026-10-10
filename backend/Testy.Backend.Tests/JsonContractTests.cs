@@ -157,7 +157,7 @@ public sealed class JsonContractTests : IDisposable
             Assert.Equal(["id", "result"], Names(byId[1].RootElement));
             Assert.Equal(["signature", "body", "partialTypes", "excludedTypes"], Names(byId[1].RootElement.GetProperty("result").GetProperty("a.cs")));
             Assert.Equal(["id", "error"], Names(byId[2].RootElement));
-            Assert.Contains("KeyNotFoundException", byId[2].RootElement.GetProperty("error").GetString(), StringComparison.Ordinal);
+            Assert.Equal(typeof(KeyNotFoundException).FullName, byId[2].RootElement.GetProperty("error").GetProperty("type").GetString());
             Assert.Equal(JsonValueKind.Array, byId[3].RootElement.GetProperty("result").ValueKind);
         }
         finally { foreach (var answer in answers) { answer.Dispose(); } }

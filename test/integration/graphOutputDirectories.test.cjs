@@ -41,6 +41,6 @@ test('portable symbol locations use the camelCase response contract',{timeout:60
  const {sourceLocations}=require('../../out/services/analysis');
  const storage=await fs.mkdtemp(path.join(os.tmpdir(),'testy-locations-'));t.after(()=>fs.rm(storage,{recursive:true,force:true}));
  const locations=await sourceLocations('dotnet',analyzer,analyzer,storage,{cwd:storage});
- const read=locations.get('SourceLocations.Read');
+ const read=locations.get('Testy.Analysis.SourceLocations.Read');
  assert.ok(read&&read.line>0&&/SourceLocations\.cs$/.test(read.file),JSON.stringify([...locations].slice(0,3)));
 });

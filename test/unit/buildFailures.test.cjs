@@ -59,12 +59,12 @@ async function execute(t,{fail,aborted=false}) {
  const proto=f.ui.Testy.prototype;
  const run={token:{onCancellationRequested:()=>({dispose(){}})},end(){},appendOutput(){}};
  const abort=new AbortController();
- const context={controller:{createTestRun:()=>run},runProfile:{},coverageProfile:{},debugProfile:{},config:{coverage:false},continuousCoverage:new Set(),runName:()=>'Testy',coverage:{beginRun(){}},
+ const context={changes:{flush:async()=>{}},controller:{createTestRun:()=>run},runProfile:{},coverageProfile:{},debugProfile:{},config:{coverage:false},continuousCoverage:new Set(),runName:()=>'Testy',coverage:{beginRun(){}},
   tree:{showBuildFailures:(diagnostics,fallback)=>calls.push(['show',[...diagnostics].map(d=>d.code),fallback]),clearBuildFailures:()=>calls.push(['clear'])},
-  lines:{flush:()=>[]},output:{info(){},warn(){}},lastError:'',buildDiagnostics:new Map(),updateStatus(){},log(){},
-  publishDiagnostics:()=>calls.push(['diagnostics']),reportError(error){context.lastError=error.message;}};
+  diagnostics:{items:new Map(),begin(){this.items=new Map();},flush(){},get values(){return this.items.values();},publish:()=>calls.push(['diagnostics'])},output:{info(){},warn(){}},lastError:'',updateStatus(){},
+  reportError(error){context.lastError=error.message;}};
  context.engine={run:async()=>{
-  context.build='building';context.buildDiagnostics.set('k',error('One'));
+  context.build='building';context.diagnostics.items.set('k',error('One'));
   if(aborted)abort.abort();
   if(!fail)context.build='built';
   else throw new Error('Build failed');

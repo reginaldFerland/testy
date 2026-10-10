@@ -53,7 +53,7 @@ export function explainItem(selection: Selection | undefined, testIds: ReadonlyM
         const cause = selection.causes?.get(first.id);
         return l10n.t('{0}: {1} test files were selected in the latest run. {2}: {3}', label, selected.length, groupName(first), cause ? describeCause(cause) : selection.reason);
     }
-    const id = testIds.get(itemId)?.group ?? (itemId.startsWith('file:') ? itemId.slice('file:'.length) : undefined);
+    const id = testIds.get(itemId)?.group ?? (itemId.startsWith('file:') ? itemId.slice('file:'.length) : itemId.startsWith('class:') ? itemId.split(':')[1] : undefined);
     const group = id === undefined ? undefined : selection.groups.find(candidate => candidate.id === id);
     if (!group) {return l10n.t('{0} was not selected in the latest run ({1}).', label, selection.reason);}
     const cause = selection.causes?.get(group.id);

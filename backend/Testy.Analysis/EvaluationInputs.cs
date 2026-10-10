@@ -26,10 +26,14 @@ internal sealed partial class EvaluationInputs : MSBuildFileSystemBase
         internal readonly bool ReusableResolvers;
         // Why resolver state cannot be fingerprinted; null when it can.
         internal readonly string? Unsupported;
-        public Shared()
+        private readonly DigestStore? store;
+        public Shared() : this(null) { }
+        // cacheDirectory persists file digests across evaluations, each a fresh process.
+        public Shared(string? cacheDirectory)
         {
             try
             {
+                if (!string.IsNullOrEmpty(cacheDirectory)) { store = DigestStore.Open(cacheDirectory, Sdk); }
                 // Capture before any graph project is evaluated. The same original
                 // resolver bytes/inventory are validated again by every cache hit.
                 var dotnetRoot = Path.GetDirectoryName(Path.GetDirectoryName(Sdk))!;
@@ -77,6 +81,7 @@ internal sealed partial class EvaluationInputs : MSBuildFileSystemBase
                 captured.Add(Path.Combine(Sdk, "Microsoft.Build.dll")); captured.Add(Path.Combine(Sdk, "MSBuild.dll"));
                 captured.Add(Path.Combine(dotnetRoot, OperatingSystem.IsWindows() ? "dotnet.exe" : "dotnet"));
                 foreach (var file in captured) { _ = Hash(file); }
+                store?.Save();
                 ResolverFiles = captured.ToArray(); ResolverQueries = queries.ToArray(); Unsupported = unsupported; ReusableResolvers = unsupported is null;
             }
             catch (Exception exception)
@@ -90,8 +95,11 @@ internal sealed partial class EvaluationInputs : MSBuildFileSystemBase
             var info = new FileInfo(file);
             return hashes.GetOrAdd((file, info.Length, info.LastWriteTimeUtc.Ticks), key => new(() =>
             {
+                if (store?.TryGet(key.path, key.length, key.ticks) is { } known) { return known; }
                 using var stream = new FileStream(key.path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1, FileOptions.SequentialScan);
-                return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+                var hash = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+                store?.Add(key.path, key.length, key.ticks, hash);
+                return hash;
             })).Value;
         }
         internal (XDocument xml, string hash, bool valid) Parsed(ProjectRootElement root) => parsed.GetOrAdd(root, project => new(() =>
@@ -110,8 +118,9 @@ internal sealed partial class EvaluationInputs : MSBuildFileSystemBase
             return (xml, EvaluationInputs.Hash(saved), XNode.DeepEquals(xml.Root, disk.Root));
         })).Value;
     }
-    internal sealed record Query(string kind, string path, string? pattern, bool recursive, string[] values);
-    internal sealed record Snapshot(bool reusable, string[] files, IReadOnlyDictionary<string, string> hashes, Query[] queries, string[] excludedDirectories, string sdkDirectory, string? reason);
+    // Serialized by AnalysisJson (camelCase), which the TypeScript side reads.
+    internal sealed record Query(string Kind, string Path, string? Pattern, bool Recursive, string[] Values);
+    internal sealed record Snapshot(bool Reusable, string[] Files, IReadOnlyDictionary<string, string> Hashes, Query[] Queries, string[] ExcludedDirectories, string SdkDirectory, string? Reason);
     private readonly ConcurrentDictionary<string, Query> queries = new();
     private readonly ConcurrentDictionary<string, string> reads = new();
     private readonly Shared shared;
@@ -127,7 +136,7 @@ internal sealed partial class EvaluationInputs : MSBuildFileSystemBase
         file = Path.GetFullPath(file);
         var key = $"{kind}\0{file}\0{pattern}\0{recursive}";
         var query = new Query(kind, file, pattern, recursive, values);
-        queries.AddOrUpdate(key, query, (_, before) => before.values.SequenceEqual(values) ? before : query with { kind = "changed" });
+        queries.AddOrUpdate(key, query, (_, before) => before.Values.SequenceEqual(values) ? before : query with { Kind = "changed" });
     }
     private bool Exists(string kind, string file, Func<bool> read)
     {
@@ -216,15 +225,15 @@ internal sealed partial class EvaluationInputs : MSBuildFileSystemBase
             }
         }
         foreach (var file in shared.ResolverFiles) { reads.TryAdd(file, shared.Hash(file)); }
-        var recorded = queries.Values.Where(query => query.kind is not ("files" or "directories" or "entries" or "directory") || !outputs.Any(output => Within(query.path, output))).Select(query => query.kind is "files" or "directories" or "entries"
-            ? query with { values = query.values.Where(file => !outputs.Any(output => Within(file, output))).ToArray() } : query).ToArray();
-        reusable &= recorded.All(query => query.kind is not ("attributes" or "changed") && (query.pattern is null || query.kind == "imports" || query.pattern is "*" || ExtensionPattern().IsMatch(query.pattern)));
+        var recorded = queries.Values.Where(query => query.Kind is not ("files" or "directories" or "entries" or "directory") || !outputs.Any(output => Within(query.Path, output))).Select(query => query.Kind is "files" or "directories" or "entries"
+            ? query with { Values = query.Values.Where(file => !outputs.Any(output => Within(file, output))).ToArray() } : query).ToArray();
+        reusable &= recorded.All(query => query.Kind is not ("attributes" or "changed") && (query.Pattern is null || query.Kind == "imports" || query.Pattern is "*" || ExtensionPattern().IsMatch(query.Pattern)));
         reusable &= reads.Values.All(hash => hash != "changed");
         // Sorted so equal evaluations serialize identically regardless of read order.
         return new Snapshot(reusable, imports.Concat(reads.Keys).Distinct().Order(StringComparer.Ordinal).ToArray(),
             reads.OrderBy(pair => pair.Key, StringComparer.Ordinal).ToDictionary(pair => pair.Key, pair => pair.Value),
-            recorded.Concat(shared.ResolverQueries).OrderBy(query => query.kind, StringComparer.Ordinal).ThenBy(query => query.path, StringComparer.Ordinal)
-                .ThenBy(query => query.pattern, StringComparer.Ordinal).ThenBy(query => query.recursive).ToArray(), outputs, sdk, reason);
+            recorded.Concat(shared.ResolverQueries).OrderBy(query => query.Kind, StringComparer.Ordinal).ThenBy(query => query.Path, StringComparer.Ordinal)
+                .ThenBy(query => query.Pattern, StringComparer.Ordinal).ThenBy(query => query.Recursive).ToArray(), outputs, sdk, reason);
     }
 
     [GeneratedRegex(@"^\*\.[A-Za-z0-9]+$")]

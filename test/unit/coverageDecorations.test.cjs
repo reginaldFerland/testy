@@ -5,17 +5,19 @@ const {normalizePath}=require('../../out/core/paths');
 function deferred(){let resolve;const promise=new Promise(done=>{resolve=done;});return{promise,resolve};}
 function fixture(){
  const calls=[],metrics={ranges:0,reads:0,indexes:0},file=normalizePath('/workspace/Coverage.cs');
- let summaries=[],read;
+ let summaries=[],read,contribution=()=>undefined;
+ const displayGroups=[];
  const vscode={l10n:{t:(message,...args)=>message.replace(/\{(\d+)\}/g,(_,index)=>String(args[index]))},window:{visibleTextEditors:[]},Uri:{file:fsPath=>({fsPath})},
   FileCoverage:class{constructor(uri,statementCoverage){Object.assign(this,{uri,statementCoverage});}},
   Range:class{constructor(startLine,startCharacter,endLine,endCharacter){metrics.ranges++;this.start={line:startLine,character:startCharacter};this.end={line:endLine,character:endCharacter};}}};
  const host={disposed:false,activeRun:undefined,config:{showCoverage:true},lifetime:new AbortController(),updateStatus(){},reportError(error){throw error;}};
  const proto=loadUi({vscode}).CoverageView.prototype,context={host,engine:{hashes:new Map(),coverage:{
-  async summarizeAsync(hashes,signal){metrics.reads++;signal?.throwIfAborted();return read?read(hashes,signal):summaries;},summarize:()=>summaries}},
+  async summarizeAsync(hashes,signal){metrics.reads++;signal?.throwIfAborted();return read?read(hashes,signal):summaries;},summarize:()=>summaries,summary:(f)=>summaries.find(x=>x.file===f),contribution:(f,ids,h)=>contribution(f,ids,h)},displayGroups},coveringLines:new WeakMap(),drawn:false,
   decorations:{covered:'covered',uncovered:'uncovered',stale:'stale'},pendingEditors:new Set(),rendering:false,
   productionSources:new Set([file]),owners:new Map(),items:new Map(),publishedCoverage:new Map(),details:new WeakMap()};
  context.decorate=editors=>proto.decorate.call(context,editors);context.queue=editors=>proto.queue.call(context,editors);
  context.render=()=>proto.render.call(context);
+ context.coveringOf=value=>proto.coveringOf.call(context,value);context.coveringText=ids=>proto.coveringText.call(context,ids);
  const summary=(lines=[{line:1,hits:2},{line:2,hits:0},{line:5,hits:3}],overrides={})=>Object.freeze({file,lines:Object.freeze(lines.map(line=>Object.freeze({...line}))),
   stale:false,total:lines.length,covered:lines.filter(line=>line.hits>0).length,groupIds:['owner'],...overrides});
  const set=values=>{summaries=new Proxy(Object.freeze([...values]),{get(target,key,receiver){if(key==='map')metrics.indexes++;return Reflect.get(target,key,receiver);}});return summaries;};
@@ -24,7 +26,7 @@ function fixture(){
   return value;
  };
  const render=(...editors)=>context.decorate(editors),last=editor=>Object.fromEntries(['covered','uncovered','stale'].map(kind=>[kind,calls.filter(call=>call.editor===editor&&call.kind===kind).at(-1)?.lines]));
- return{proto,context,host,metrics,calls,file,vscode,summary,set,editor,render,last,read:callback=>{read=callback;}};
+ return{displayGroups,setContribution:value=>{contribution=value;},proto,context,host,metrics,calls,file,vscode,summary,set,editor,render,last,read:callback=>{read=callback;}};
 }
 
 test('unchanged coverage reuses editor decorations without allocating ranges or rebuilding the summary index',async()=>{
@@ -132,4 +134,25 @@ test('each new TestRun still receives FileCoverage even when editor decorations 
  f.context.publishedCoverage.clear();f.host.activeRun={addCoverage:coverage=>second.push(coverage)};
  f.proto.publish.call(f.context);assert.equal(second.length,1);assert.notEqual(first[0],second[0]);
  assert.equal(f.context.details.get(second[0]),summary);await f.render(editor);assert.equal(f.calls.length,3);
+});
+
+test('the covered hover names the covering test files, capped at ten',async()=>{
+ const f=fixture(),editor=f.editor();
+ for(let i=0;i<12;i++)f.displayGroups.push({id:`g${i}`,file:`/w/T${i}.cs`,project:'/w/P.csproj'});
+ f.setContribution((_file,ids)=>[{line:1,hits:ids.has('g0')||ids.has('g11')?1:0},{line:2,hits:0},{line:5,hits:1}]);
+ f.set([f.summary(undefined,{groupIds:[...f.displayGroups.map(g=>g.id),'project:x']})]);await f.render(editor);
+ const hovers=f.calls.filter(call=>call.kind==='covered').at(-1).hovers;
+ assert.equal(hovers[0],'Testy: covered by T0.cs, T11.cs.');
+ assert.equal(hovers[1],'Testy: covered by T0.cs, T1.cs, T2.cs, T3.cs, T4.cs, T5.cs, T6.cs, T7.cs, T8.cs, T9.cs and 2 more.');
+ assert.deepEqual([...f.context.coveringOf(f.context.engine.coverage.summary(f.file)).get(1)],['g0','g11']);
+});
+
+test('while coverage is hidden and nothing is drawn, edits neither queue nor resubmit decorations',async()=>{
+ const f=fixture(),editor=f.editor();f.set([f.summary()]);f.host.config.showCoverage=false;f.context.hidden=false;
+ f.context.queue([editor]);assert.equal(f.context.pendingEditors.size,0);assert.equal(f.context.renderTimer,undefined);
+ await f.render(editor);const calls=f.calls.length;editor.document.version++;await f.render(editor);editor.document.version++;await f.render(editor);
+ assert.equal(calls,3);assert.equal(f.calls.length,3,'hidden edits do not clear again');
+ f.host.config.showCoverage=true;await f.render(editor);assert.equal(f.context.drawn,true);
+ f.host.config.showCoverage=false;f.context.queue([editor]);assert.equal(f.context.pendingEditors.size,1,'a drawn editor is still cleared');
+ clearTimeout(f.context.renderTimer);await f.render(editor);assert.equal(f.context.drawn,false);
 });

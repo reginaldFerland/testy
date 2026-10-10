@@ -1,6 +1,7 @@
 import * as fs from 'node:fs/promises';
 import { constants } from 'node:fs';
 import * as path from 'node:path';
+import { EnvironmentError } from '../core/errors';
 
 /** Match child_process.spawn's environment-key precedence without mutating it. */
 export function processEnvironmentValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
@@ -143,5 +144,5 @@ async function searchOwnedCommand(command: string, search: string, cwd: string):
             try {if ((await fs.stat(candidate)).isFile()) {return candidate;}} catch { /* Try the next candidate. */ }
         }
     }
-    throw new Error(`Cannot find ${command} on PATH; the working directory ${cwd} is not searched. Configure an absolute path.`);
+    throw new EnvironmentError('dotnet-missing', `Cannot find ${command} on PATH; the working directory ${cwd} is not searched. Configure an absolute path.`);
 }

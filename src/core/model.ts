@@ -108,3 +108,22 @@ export interface TestResult {
 export function isTestTarget(project: Project): boolean {
     return project.isTestProject && project.entryPoint !== false && !project.unsupported;
 }
+
+export interface EngineConfiguration {
+    readonly dotnet: string;
+    readonly configuration: string;
+    readonly mode: 'affected' | 'all';
+    readonly coverage: boolean;
+    readonly excludes: readonly string[];
+    readonly testArguments: readonly string[];
+    readonly timeout: number;
+    readonly coverageTool?: string | undefined;
+    readonly maxParallelProjects?: number;
+    readonly maxParallelTestFiles?: number;
+    /** Optional .sln, .slnx or .slnf limiting the workspace's entry-point projects. */
+    readonly solution?: string | undefined;
+    /** Solutions that limit only the entry points inside their workspace folder (folder-level `testy.solution`). */
+    readonly solutions?: readonly { readonly file: string; readonly root: string }[] | undefined;
+    /** Entry-point project globs; exclusions win over inclusions. */
+    readonly projects?: { readonly include: readonly string[]; readonly exclude: readonly string[] };
+}

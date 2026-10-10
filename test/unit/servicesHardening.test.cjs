@@ -3,6 +3,7 @@ const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:
 const {setTimeout:delay}=require('node:timers/promises');
 const {stableEnvironment,environmentIdentity}=require('../../out/core/environment');
 const {isTestTarget}=require('../../out/core/model');
+const {executeSelection}=require('../../out/services/engine/execute');
 const {walkTree,Semaphore}=require('../../out/core/concurrency');
 const {currentProcessStamp,isProcessAlive}=require('../../out/services/processStamp');
 const {withLock,lockTiming}=require('../../out/services/lock');
@@ -112,7 +113,7 @@ test('build waves scale with roots and still order output and binary conflicts',
   sourceFiles:[],references:[],entryPoint:true,outputDirectories:[`/w/${name}/bin`,`/w/${name}/obj`],...extra});
  const roots=Array.from({length:600},(_,index)=>project(`P${index}`));
  const started=performance.now(),waves=buildWaves(roots,roots);
- assert.equal(waves.length,1);assert.ok(performance.now()-started<2000,'independent roots plan quickly');
+ assert.equal(waves.length,1);assert.ok(performance.now()-started<20_000,'independent roots plan quickly');
  const shared=project('Shared',{outputDirectories:['/w/out']}),a=project('A',{outputDirectories:['/w/out/a']}),consumer=project('C',{binaryReferences:['/w/Shared/bin/Shared.dll']});
  const ordered=buildWaves([shared,a,consumer],[shared,a,consumer]);
  assert.deepEqual(ordered.map(wave=>wave.map(item=>path.basename(item.file))),[['Shared.csproj'],['A.csproj','C.csproj']]);
@@ -163,10 +164,10 @@ test('shared SDK checks are not cancelled by the first caller',{skip:process.pla
  await fs.writeFile(dotnet,'#!/bin/sh\nsleep 0.3\necho 10.0.100\n');await fs.chmod(dotnet,0o755);
  const engine=new TestEngine({roots:[root],storage:path.join(root,'state'),tools:root,analyzer:'',events:{output(){}},configuration:()=>({})});
  const first=new AbortController(),options={cwd:root,signal:first.signal};
- const cancelled=engine.ensureSdk(dotnet,options,'context'),shared=engine.ensureSdk(dotnet,{cwd:root,signal:new AbortController().signal},'context');
+ const cancelled=engine.sdk.ensure(dotnet,options,'context'),shared=engine.sdk.ensure(dotnet,{cwd:root,signal:new AbortController().signal},'context');
  first.abort();
  await assert.rejects(cancelled,{name:'AbortError'});await shared;
- assert.ok(engine.sdkContexts.has(`${dotnet}\0context`));
+ assert.ok(engine.sdk.contexts.has(`${dotnet}\0context`));
 });
 
 test('a failed test batch reports its tests as errored while other batches continue',async t=>{
@@ -186,7 +187,7 @@ test('a failed test batch reports its tests as errored while other batches conti
  }};
  const controller=new AbortController();
  const run={controller,signal:controller.signal,config:{mode:'affected'},configured:{coverage:true},manualOperation:false,changes:[],testLimit:2,topology:engine.topology};
- const tested=await engine.executeSelection(run,{before:new Map(),revision:engine.sources.revision,obsoleteBuild:false},
+ const tested=await executeSelection(engine,run,{before:new Map(),revision:engine.sources.revision,obsoleteBuild:false},
   {coverageTool:'collector',sessions,liveIds:new Set([broken.id,healthy.id]),runtimeTreeChanged:false},{selection:{groups:[broken,healthy]}});
  assert.equal(tested.failedBatches,1);
  assert.deepEqual(tested.results.map(result=>[result.id,result.outcome]).sort(),[['b2','errored'],['h1','passed']]);

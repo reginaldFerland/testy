@@ -86,7 +86,10 @@ public sealed class AnalyzerServerTests : IDisposable
         using var answer = await Next();
         var (id, kind, value) = Answer(answer);
         Assert.Equal((3L, "error"), (id, kind));
-        Assert.Contains("KeyNotFoundException", value.GetString(), StringComparison.Ordinal);
+        // Only the type and message reach the caller; the stack goes to stderr.
+        Assert.Equal(["type", "message"], value.EnumerateObject().Select(property => property.Name));
+        Assert.Equal(typeof(KeyNotFoundException).FullName, value.GetProperty("type").GetString());
+        Assert.DoesNotContain("   at ", value.GetProperty("message").GetString(), StringComparison.Ordinal);
         Assert.Equal("", await Close());
     }
 
@@ -135,5 +138,42 @@ public sealed class AnalyzerServerTests : IDisposable
         using var ready = await Next();
         await Send(Slow(4));
         Assert.Equal("""{"id":4,"error":"cancelled"}""" + "\n", await Close());
+    }
+
+    // Stdout is a pipe the host may close at any moment; the first line (ready) is written normally.
+    private sealed class BrokenPipe(Func<Exception> failure) : Stream
+    {
+        private int writes;
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) =>
+            Interlocked.Increment(ref writes) == 1 ? ValueTask.CompletedTask : ValueTask.FromException(failure());
+    }
+
+    public static TheoryData<string> Failures => new() { nameof(IOException), nameof(ObjectDisposedException), nameof(OperationCanceledException) };
+
+    [Theory]
+    [MemberData(nameof(Failures))]
+    public async Task AnAnswerThatCannotBeWrittenDoesNotFailTheServer(string kind)
+    {
+        var input = new Pipe();
+        Exception Failure() => kind switch
+        {
+            nameof(IOException) => new IOException("Broken pipe"),
+            nameof(ObjectDisposedException) => new ObjectDisposedException("pipe"),
+            _ => new OperationCanceledException(),
+        };
+        var done = AnalyzerServer.RunAsync(input.Reader.AsStream(), new BrokenPipe(Failure));
+        await input.Writer.AsStream().WriteAsync(Encoding.UTF8.GetBytes(Quick(1) + "\n" + Quick(2) + "\n"), TestContext.Current.CancellationToken);
+        await input.Writer.CompleteAsync();
+        Assert.Equal(0, await done.WaitAsync(Timeout, TestContext.Current.CancellationToken));
     }
 }

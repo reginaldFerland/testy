@@ -1,5 +1,5 @@
 // @ts-check
-const {suite,test} = require('mocha');
+const {suite,test} = require('./harness.cjs');
 const assert = require('node:assert/strict');
 const vscode = require('vscode');
 const path = require('node:path');

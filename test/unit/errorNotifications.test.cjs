@@ -14,15 +14,14 @@ function fixture(choose=()=>undefined) {
  return{...f,shown,commands,changeFolders:()=>folders()};
 }
 
-test('environment failures are recognized; routine build and test failures are not',()=>{
+test('environment failures are recognized by type; routine build and test failures are not',()=>{
  const {environmentError}=createTesty().ui.module('controller');
- for(const message of ['Cannot find dotnet on PATH; the working directory /w is not searched. Configure an absolute path.',
-  'Could not start /usr/bin/dotnet: permission denied','Testy requires .NET SDK 10 or later; /w selects 8.0.100. Check its global.json.',
-  'Analyzing C# declarations failed.\nUnhandled exception','The command exceeded its time limit: analyzer',
-  'testy.solution could not be read: /w/A.sln. ENOENT','No test project can run under Testy.\nA: not MTP'])
-  assert.equal(environmentError(message),true,message);
- for(const message of ['Build failed (exit 1).\nerror CS1002: ; expected','The test application exited during run (exit 3).','The command exceeded its time limit: dotnet build'])
-  assert.equal(environmentError(message),false,message);
+ const {EnvironmentError}=require('../../out/core/errors');
+ for(const code of ['dotnet-missing','dotnet-start','sdk-unsupported','analyzer','configuration','no-test-project','not-mtp','host-unresolved'])
+  assert.equal(environmentError(new EnvironmentError(code,'whatever')),true,code);
+ assert.equal(new EnvironmentError('analyzer','x').code,'analyzer');
+ for(const error of [new Error('Build failed (exit 1).\nerror CS1002: ; expected'),new Error('The test application exited during run (exit 3).'),new Error('Cannot find dotnet on PATH'),'Cannot find dotnet on PATH',undefined])
+  assert.equal(environmentError(error),false);
 });
 
 test('startup and environment errors notify once per distinct error with Show Output and Open Settings; routine failures stay quiet',async()=>{
@@ -30,8 +29,9 @@ test('startup and environment errors notify once per distinct error with Show Ou
  f.testy.reportError(new Error('Build failed (exit 1).\nerror CS1002'));
  assert.equal(f.shown.length,0,'routine run failures only update the status bar');
  assert.equal(f.testy.snapshot().error,'Build failed (exit 1).\nerror CS1002');
- f.testy.reportError(new Error('Cannot find dotnet on PATH; configure an absolute path.'));
- f.testy.reportError(new Error('Cannot find dotnet on PATH; configure an absolute path.'));
+ const {EnvironmentError}=require('../../out/core/errors');
+ f.testy.reportError(new EnvironmentError('dotnet-missing','Cannot find dotnet on PATH; configure an absolute path.'));
+ f.testy.reportError(new EnvironmentError('dotnet-missing','Cannot find dotnet on PATH; configure an absolute path.'));
  await tick();
  assert.equal(f.shown.length,1,'the same error is shown once per session');
  assert.deepEqual(f.shown[0],{severity:'error',message:'Testy: Cannot find dotnet on PATH; configure an absolute path.',actions:['Show Output','Open Settings']});

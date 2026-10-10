@@ -15,6 +15,7 @@
   "command.explainSelection": "Why Was This Selected?",
   "command.excludeProject": "Exclude Project from Testy",
   "command.runFile": "Run Affected Tests for This File",
+  "command.runCoveringTests": "Run Tests Covering This Line",
   "config.autoRun": "Automatically run affected tests after changes. The first time a workspace opens, Testy asks before building and running the baseline. Pausing from the status bar or Test Explorer is remembered per workspace without changing this setting.",
   "config.runMode": "Choose affected test files or the entire C# suite.",
   "config.runMode.affected": "Use recorded code usage, with project fallback when information is incomplete.",

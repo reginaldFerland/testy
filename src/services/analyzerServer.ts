@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { contentHash } from '../core/paths';
 import { OutputTail } from '../core/outputTail';
+import { EnvironmentError } from '../core/errors';
 import { Cancelled, ProcessOptions } from './process';
 
 /** The server could not serve a request (it failed to start, crashed, or broke the protocol).
@@ -16,6 +17,13 @@ export class AnalyzerServerUnavailable extends Error {
 export class AnalyzerRequestFailed extends Error {
     constructor(message: string) { super(message); this.name = 'AnalyzerRequestFailed'; }
 }
+
+/** The analyzer's Roslyn failed its self-test (exit code of backend/Testy.Analysis/Program.cs). The one-shot
+ * fallback runs the same self-test before any request that needs Roslyn, so only Roslyn-free requests succeed there. */
+export class AnalyzerSelfTestFailed extends AnalyzerServerUnavailable {
+    constructor(message: string) { super(message); this.name = 'AnalyzerSelfTestFailed'; }
+}
+const selfTestFailedExitCode = 70;
 
 interface Pending {
     resolve(response: string): void;
@@ -63,7 +71,9 @@ class AnalyzerServer {
         this.child.once('close', (code, signal) => {
             const tail = this.stderr.text().trim();
             this.gone = true;
-            this.terminate(new AnalyzerServerUnavailable(`The analyzer server exited unexpectedly (${signal ?? code}).${tail ? `\n${tail}` : ''}`), false);
+            this.terminate(code === selfTestFailedExitCode && !this.started
+                ? new AnalyzerSelfTestFailed(`The installed Roslyn failed the analyzer self-test.${tail ? `\n${tail}` : ''}`)
+                : new AnalyzerServerUnavailable(`The analyzer server exited unexpectedly (${signal ?? code}).${tail ? `\n${tail}` : ''}`), false);
             exit();
         });
         this.child.once('error', error => {
@@ -125,7 +135,11 @@ class AnalyzerServer {
         if (head[2] === 'result') {entry.resolve(body);}
         else {
             let message = body;
-            try {message = JSON.parse(body) as string;} catch {/* keep the raw text */}
+            try {
+                const parsed = JSON.parse(body) as string | { type?: unknown; message?: unknown } | null;
+                if (typeof parsed === 'string') {message = parsed;}
+                else if (parsed && typeof parsed.message === 'string') {message = typeof parsed.type === 'string' ? `${parsed.type}: ${parsed.message}` : parsed.message;}
+            } catch {/* keep the raw text */}
             entry.reject(new AnalyzerRequestFailed(message));
         }
     }
@@ -188,7 +202,7 @@ class AnalyzerServer {
             signal?.addEventListener('abort', onAbort, { once: true });
             const timer = setTimeout(() => {
                 // Its work cannot be recovered; replace the server, and let the others retry elsewhere.
-                entry.settle(); reject(new Error('The command exceeded its time limit: analyzer'));
+                entry.settle(); reject(new EnvironmentError('analyzer', 'The command exceeded its time limit: analyzer'));
                 this.terminate(new AnalyzerServerUnavailable('The analyzer server was stopped after a request exceeded its time limit.'), false);
             }, options.timeoutMs ?? 600_000);
             timer.unref();

@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: CI gate
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Package and publish
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: backend/**/packages.lock.json
+
+      - run: npm ci
+
+      - name: Check tag matches package version
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package.json version ${version}" >&2
+            exit 1
+          fi
+
+      - run: npx vsce package --no-dependencies --out testy.vsix
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" testy.vsix --title "${GITHUB_REF_NAME}" --generate-notes
+
+      - name: Publish to Visual Studio Marketplace
+        run: |
+          if [ -z "${VSCE_PAT}" ]; then echo "VSCE_PAT not set; skipping."; exit 0; fi
+          npx vsce publish --no-dependencies --packagePath testy.vsix
+
+      - name: Publish to Open VSX
+        run: |
+          if [ -z "${OVSX_PAT}" ]; then echo "OVSX_PAT not set; skipping."; exit 0; fi
+          # Pinned: this step runs with the publish token. ovsx reads OVSX_PAT from the environment.
+          npx --yes ovsx@1.2.0 publish testy.vsix

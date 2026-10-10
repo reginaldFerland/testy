@@ -35,6 +35,15 @@ public sealed class ApplicationResolutionTests : IDisposable
 
     private static void SetPath(params string[] directories) => Environment.SetEnvironmentVariable("PATH", string.Join(';', directories));
 
+    [Theory]
+    [InlineData("")]
+    [InlineData("  ")]
+    public void AnEmptyCommandIsRejectedWithAClearError(string command)
+    {
+        var error = Assert.Throws<ArgumentException>(() => ProcessOwner.ResolveApplication(command));
+        Assert.Contains("empty", error.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void FindsABareNameWithAnExecutableExtension()
     {

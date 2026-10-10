@@ -4,6 +4,8 @@ import { normalizePath } from './core/paths';
 import { restrictedStatus } from './ui/statusBar';
 
 let activeExtension: Testy | undefined;
+/** Upper bound on deactivation; remaining cleanup finishes in the background or is reclaimed on the next start. */
+const shutdownTimeout = 3000;
 
 export function activate(context: vscode.ExtensionContext): { snapshot: () => unknown } | undefined {
     if (!vscode.workspace.workspaceFolders?.length) {return;}
@@ -25,10 +27,12 @@ export function activate(context: vscode.ExtensionContext): { snapshot: () => un
             try {start();} catch (error) {void vscode.window.showErrorMessage(vscode.l10n.t('Testy: {0}', error instanceof Error ? error.message : String(error)));}
         }));
     }
-    return { snapshot: () => activeExtension?.snapshot() ?? { restricted: true } };
+    // The state snapshot exists for the extension tests only.
+    return context.extensionMode === vscode.ExtensionMode.Test ? { snapshot: () => activeExtension?.snapshot() ?? { restricted: true } } : undefined;
 }
 
 export async function deactivate(): Promise<void> {
-    try {await activeExtension?.dispose();}
-    finally {activeExtension = undefined;}
+    let timer: NodeJS.Timeout | undefined;
+    try {await Promise.race([activeExtension?.dispose(), new Promise<void>(resolve => {timer = setTimeout(resolve, shutdownTimeout);})]);}
+    finally {clearTimeout(timer); activeExtension = undefined;}
 }

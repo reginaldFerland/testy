@@ -8,7 +8,7 @@ const token=()=>{const listeners=[];return{isCancellationRequested:false,onCance
 function fixture(configuration={}) {
  const f=createTesty({configuration});
  const configs=[];
- f.testy.engine.run=async()=>{configs.push(f.testy.engine.options.configuration());return summary;};
+ f.testy.engine.run=async(_batch,_signal,_manual,_operation,_scope,coverage)=>{const configured=f.testy.engine.options.configuration();configs.push({...configured,coverage:coverage??configured.coverage});return summary;};
  const run=(batch,...rest)=>f.testy.execute(batch,new AbortController().signal,...rest);
  return{...f,configs,run};
 }
@@ -18,7 +18,7 @@ test('automatic runs are named by their trigger and files; discovery-only runs a
  await f.run({files:['/workspace/src/Foo.cs'],full:false});
  await f.run({files:['/workspace/src/Foo.cs','/workspace/src/Bar.cs','/workspace/src/Baz.cs'],full:false});
  await f.run({files:[],full:true});
- await f.run({files:[],full:false},undefined,{all:true,groups:new Set(),discoverOnly:true});
+ await f.run({files:[],full:false},{manual:{all:true,groups:new Set(),discoverOnly:true}});
  await f.testy.runAffected();
  await f.testy.runFiles([{scheme:'file',fsPath:'/workspace/src/Qux.cs'}]);
  f.testy.config.trigger='fileSystem';

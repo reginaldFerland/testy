@@ -69,7 +69,7 @@ test('an SDK wildcard import appearing after evaluation cannot validate an older
  <Reference Include="Microsoft.Build.Framework" HintPath="$(MSBuildToolsPath)/Microsoft.Build.Framework.dll" Private="false"/>
  <Reference Include="Microsoft.Build.Utilities.Core" HintPath="$(MSBuildToolsPath)/Microsoft.Build.Utilities.Core.dll" Private="false"/>
  </ItemGroup></Project>`);
- await fs.writeFile(path.join(probe,'Probe.cs'),`using System; using System.IO; using System.Reflection; using System.Text.Json;
+ await fs.writeFile(path.join(probe,'Probe.cs'),`using System; using System.IO; using System.Reflection; using System.Text.Json; using System.Text.Json.Serialization.Metadata;
  using Microsoft.Build.Evaluation; using Microsoft.Build.Evaluation.Context; using Microsoft.Build.Definition; using Microsoft.Build.FileSystem;
  public class Probe : Microsoft.Build.Utilities.Task {
  public string Analyzer {get;set;} public string Input {get;set;} public string Output {get;set;}
@@ -85,8 +85,9 @@ test('an SDK wildcard import appearing after evaluation cannot validate an older
  File.Delete(added); var stableRecorder=Recorder(); using var stableCollection=new ProjectCollection();
  var stableProject=Project.FromFile(Input,new ProjectOptions {ProjectCollection=stableCollection,EvaluationContext=EvaluationContext.Create(EvaluationContext.SharingPolicy.Shared,stableRecorder)});
  var stableSnapshot=type.GetMethod("Complete",BindingFlags.Instance|BindingFlags.NonPublic).Invoke(stableRecorder,new[]{stableProject});
- var stable=(bool)stableSnapshot.GetType().GetProperty("reusable").GetValue(stableSnapshot);
- File.WriteAllText(Output,JsonSerializer.Serialize(new { raced=JsonSerializer.SerializeToElement(snapshot,snapshot.GetType()),stable }));return true;
+ var stable=(bool)stableSnapshot.GetType().GetProperty("Reusable").GetValue(stableSnapshot);
+ var context=type.Assembly.GetType("Testy.Analysis.GraphJson").GetProperty("Default").GetValue(null); var info=(JsonTypeInfo)context.GetType().GetProperty("Snapshot").GetValue(context);
+ File.WriteAllText(Output,JsonSerializer.Serialize(new { raced=JsonSerializer.SerializeToElement(snapshot,info),stable }));return true;
  }} `);
  const {runProcess,requireSuccess}=require('../../out/services/process'),options={cwd:probe,timeoutMs:60000};
  requireSuccess(await runProcess('dotnet',['build',taskProject,'-o',taskOutput,'--nologo'],options),'Building evaluation race probe');
