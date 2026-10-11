@@ -62,7 +62,7 @@ export class RunnerSession {
     private readonly laneOptions = new Map<RunnerSession, Partial<RunnerOptions>>();
     constructor(options: RunnerOptions) {
         this.options = options; this.link(options.signal);
-        const preparer = this.preparer = new RunnerPreparations(options, () => this.outputRoot(), this.projects);
+        const preparer = this.preparer = new RunnerPreparations(options, () => this.outputRoot(), this.projects, (group, preparation) => this.discoverInHost(group, preparation));
         this.prepared = preparer.prepared;
         this.lanes = new RunnerLanes((number, slot) => this.outputRoot().then(root => {
             const own: Partial<RunnerOptions> = { outputRoot: path.join(root, 'lanes', String(number)), preparationLane: slot, preparationTools: preparer.toolContexts,
@@ -267,7 +267,7 @@ export class RunnerSession {
         if (isolated) {const existing = this.liveHosts.get(preparation); if (existing) {this.liveHosts.delete(preparation); await existing.close();}}
         const perTest = !!single && !!options.perTestCoverage?.(single.id) && preparation.coverage && !options.debug && executedGroups.length === 1;
         const live = reuse ? this.liveHosts.get(preparation) : undefined;
-        if (preparation.runs++ && !live?.session.alive) {await preparation.output.restore(options.signal);}
+        if ((preparation.runs++ || preparation.hostDiscovered) && !live?.session.alive) {await preparation.output.restore(options.signal);}
         let work = 0;
         const originalNode = (node: TestNode): TestNode => {
             const original = originals.get(node.uid);
@@ -333,7 +333,7 @@ export class RunnerSession {
                             const testReport = path.join(preparation.root, `coverage-${preparation.runs}-${index}.xml`);
                             try {
                                 await this.snapshot(preparation.session, testReport);
-                                testCoverage!.set(originalNode(node).uid, await this.coverageReader.read(testReport, options.cwd, hashes, options.signal));
+                                testCoverage!.set(originalNode(node).uid, await this.coverageReader.read(testReport, options.cwd, hashes, options.signal, preparation.session));
                             } catch (error) {uncollected(error);}
                             finally {await fs.rm(testReport, { force: true }).catch(() => undefined);}
                         }
@@ -375,7 +375,7 @@ export class RunnerSession {
             if (!results.length) {throw new Error(`No test results were received for ${group.file ?? group.project}.`);}
             if (available && !perTest) {
                 try {
-                    coverage.push(...await this.coverageReader.read(report, options.cwd, hashes, options.signal));
+                    coverage.push(...await this.coverageReader.read(report, options.cwd, hashes, options.signal, preparation.session));
                 } catch (error) {
                     options.signal?.throwIfAborted(); available = false; preparation.collectorInterrupted = true;
                     options.output?.(`Coverage unavailable for ${path.basename(group.project)}; test results are retained. ${String(error)}\n`);
@@ -411,6 +411,32 @@ export class RunnerSession {
             await Promise.all(artifacts.map(cleanup => cleanup.catch(() => undefined)));
             // After the batch has read the host's observer log: a replaced host takes it along.
             if (kept) {await this.recycleOverLimit(preparation, kept).catch((error: unknown) => {if (!this.options.signal?.aborted) {this.options.output?.(`Could not measure a reused test host's memory: ${String(error)}\n`);}});}
+        }
+    }
+
+    /** Discover a target's tests in the reused test host that will run them, rather than in a process of its own: its first batch
+     * then starts no process. Only for outputs prepared with coverage, which this run executes (others defer it, see
+     * RunnerOptions.deferCoverage), when hosts are reused. Hits that discovery causes, for example in data sources, join the first
+     * batch's coverage without a snapshot to separate them: frameworks discover again inside every run request (MSTest evaluates
+     * every class's data sources for a run of one file), so a batch's coverage already holds such hits, and they only widen selection.
+     * Undefined when it does not apply, or when it failed: the caller discovers in a process. */
+    private async discoverInHost(group: TestFile, preparation: Preparation): Promise<readonly TestNode[] | undefined> {
+        const options = this.projectOptions(group);
+        if (!options.reuseHosts || options.debug || !preparation.coverage || !options.modules || this.disposed) {return undefined;}
+        const assembly = path.join(preparation.output.directory, path.basename(group.assembly));
+        let host: LiveHost | undefined;
+        try {
+            host = await this.openHost(preparation, group, assembly, new Map(), true);
+            const nodes = await host.session.discover();
+            preparation.hostDiscovered = true;
+            return nodes;
+        } catch (error) {
+            // Whatever the host collected or changed is discarded with it; the output is restored after the separate discovery.
+            preparation.collectorInterrupted = true;
+            if (host) {this.liveHosts.delete(preparation); await host.close();}
+            options.signal?.throwIfAborted();
+            options.output?.(`Could not discover ${path.basename(group.project)} (${group.framework}) in its test host; discovering in a separate process. ${String(error)}\n`);
+            return undefined;
         }
     }
 

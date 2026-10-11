@@ -2,6 +2,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { CoverageDelta, CoverageSource, CoverageStore, mergeDeclarations, StoredTrace } from '../core/coverage';
+import { FileCoverage } from '../core/model';
 import { contentHash } from '../core/paths';
 import { OutcomeDelta, StoredOutcomes } from '../core/runPolicy';
 import { mapConcurrent } from '../core/concurrency';
@@ -10,7 +11,8 @@ import { lockTiming, withLock } from './lock';
 export { validOutcomes, validSource } from './cacheFormat';
 export type { SavedCheckpoint } from './cacheFormat';
 import { cacheDirectory, cacheFormat, CacheLimits, CheckpointRecord, defaultCacheLimits, legacyCacheDirectories, recordFormat, SavedCheckpoint, TableEntry,
-    TraceRecord, validPointer, validSegment, validSource } from './cacheFormat';
+    TestCoverageRecord, TraceRecord, validPointer, validSegment, validSource, validTestCoverage } from './cacheFormat';
+import { TestCoverageDelta } from '../core/testCoverage';
 import { CacheContents, readCache } from './cacheReader';
 import { finishAsync, sortedUnion } from '../core/work';
 import { jsonChunks, syncDirectory } from './jsonWriter';
@@ -43,8 +45,11 @@ class TraceIndex {
     }
 }
 
-/** What a save writes besides coverage: changed outcomes, and the checkpoint (undefined keeps the saved one, null deletes it). */
-export type CacheDelta = CoverageDelta & { readonly outcomes?: OutcomeDelta; readonly checkpoint?: SavedCheckpoint | null };
+/** What a save writes besides coverage: changed outcomes, each test's own coverage, and the checkpoint (undefined keeps the saved
+ * one, null deletes it). */
+export type CacheDelta = CoverageDelta & { readonly outcomes?: OutcomeDelta; readonly tests?: TestCoverageDelta; readonly checkpoint?: SavedCheckpoint | null };
+/** Saved per-test coverage of one test file, by test ID: the hits of each version it covers (see restoredRecords). */
+export type SavedTestCoverage = ReadonlyMap<string, readonly { readonly file: string; readonly hash: string; readonly hits: ReadonlyMap<number, number> }[]>;
 /** What a restore found: the saved outcomes, and the checkpoint when it was saved under the requested identity. */
 export interface RestoredCache { readonly outcomes: readonly StoredOutcomes[]; readonly checkpoint: SavedCheckpoint | undefined }
 
@@ -115,11 +120,12 @@ export class CoverageCache {
 
     async save(delta: CacheDelta, signal?: AbortSignal): Promise<void> {
         signal?.throwIfAborted();
-        const outcomes = delta.outcomes ?? { saved: [], removed: [] };
-        if (!delta.sources.length && !delta.traces.length && !delta.removedTraces.length && !outcomes.saved.length && !outcomes.removed.length && delta.checkpoint === undefined) {return;}
+        const outcomes = delta.outcomes ?? { saved: [], removed: [] }, tests = delta.tests ?? { saved: [], removed: [] };
+        if (!delta.sources.length && !delta.traces.length && !delta.removedTraces.length && !outcomes.saved.length && !outcomes.removed.length
+            && !tests.saved.length && !tests.removed.length && delta.checkpoint === undefined) {return;}
         await withLock(`${this.directory}.lock`, signal, async () => {
             try {
-                await Promise.all(['sources', 'traces', ...outcomes.saved.length ? ['outcomes'] : [], ...delta.checkpoint ? ['checkpoint'] : []]
+                await Promise.all(['sources', 'traces', ...outcomes.saved.length ? ['outcomes'] : [], ...tests.saved.length ? ['tests'] : [], ...delta.checkpoint ? ['checkpoint'] : []]
                     .map(kind => fs.mkdir(path.join(this.directory, kind), { recursive: true })));
                 await this.beginWrite(signal);
                 const table = this.table ??= await this.loadTable(signal);
@@ -159,10 +165,39 @@ export class CoverageCache {
                 // Each file's outcomes replace its previous record whole; nothing else refers to them.
                 await this.publish('outcomes', outcomes.saved.map(stored => ({ id: contentHash(stored.groupId), value: { format: cacheFormat, ...stored } })), signal);
                 for (const id of outcomes.removed) {signal?.throwIfAborted(); await fs.rm(path.join(this.directory, 'outcomes', `${contentHash(id)}.json`), { force: true });}
+                // Per-test coverage names its versions itself; restore checks them against the trace saved beside it.
+                await this.publish('tests', tests.saved.map(({ groupId, records }) => ({ id: contentHash(groupId), value: encodeTests(groupId, records) })), signal);
+                for (const id of tests.removed) {signal?.throwIfAborted(); await fs.rm(path.join(this.directory, 'tests', `${contentHash(id)}.json`), { force: true });}
                 await this.flush(signal);
                 if (++this.writes % this.limits.maintenanceSaves === 0) {await this.maintain(signal);}
             } catch (error) {this.invalidateMaintenance(); throw error;}
         });
+    }
+
+    /** Each saved test file's per-test coverage, by test file ID. Records that are unreadable, of another format or larger than the
+     * restore limit are skipped: those files narrow by test again once they have run completely. */
+    async restoreTests(signal?: AbortSignal): Promise<Map<string, SavedTestCoverage>> {
+        const directory = path.join(this.directory, 'tests'), restored = new Map<string, SavedTestCoverage>();
+        let names: string[];
+        try {names = (await fs.readdir(directory)).filter(name => /^[a-f0-9]{64}\.json$/.test(name));}
+        catch (error) {signal?.throwIfAborted(); if ((error as NodeJS.ErrnoException).code === 'ENOENT') {return restored;} throw error;}
+        let budget = this.limits.maxBytes;
+        await mapConcurrent(names, 4, signal, async name => {
+            const file = path.join(directory, name);
+            try {
+                const { size } = await fs.stat(file);
+                if (size > budget) {return;}
+                budget -= size;
+                const value: unknown = JSON.parse(await fs.readFile(file, { encoding: 'utf8', signal }));
+                if (recordFormat(value) !== 'current' || !validTestCoverage(value) || `${contentHash(value.groupId)}.json` !== name) {return;}
+                restored.set(value.groupId, new Map(value.tests.map(([test, coverage]) => [test, coverage.map(entry => {
+                    const [file, hash] = value.sources[entry[0]!]!, hits = new Map<number, number>();
+                    for (let position = 1; position < entry.length; position += 2) {hits.set(entry[position]!, entry[position + 1]!);}
+                    return { file, hash, hits };
+                })])));
+            } catch {signal?.throwIfAborted();}
+        });
+        return restored;
     }
 
     /** The file and version of every source the delta's traces use: the delta carries them, or an earlier save wrote them. */
@@ -456,4 +491,18 @@ export class CoverageCache {
         }
         finally { await handle?.close(); if (!staged) {await fs.rm(temporary, { force: true });} }
     }
+}
+
+/** A test file's per-test coverage as saved: only the lines that ran, since restore rebuilds the rest from each version's geometry. */
+function encodeTests(groupId: string, records: ReadonlyMap<string, readonly FileCoverage[]>): TestCoverageRecord {
+    const sources: [string, string][] = [], positions = new Map<string, number>();
+    const source = (file: string, hash: string): number => {
+        const key = `${file}\0${hash}`;
+        let position = positions.get(key);
+        if (position === undefined) {position = sources.length; sources.push([file, hash]); positions.set(key, position);}
+        return position;
+    };
+    const tests = [...records].map(([test, coverage]) => [test, coverage.map(entry => [source(entry.file, entry.hash),
+        ...entry.lines.flatMap(line => line.hits > 0 ? [line.line, line.hits] : [])])] as const);
+    return { format: cacheFormat, groupId, sources, tests };
 }

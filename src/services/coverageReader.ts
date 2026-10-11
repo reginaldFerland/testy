@@ -23,8 +23,9 @@ export class CoverageReader {
     private sent?: { readonly worker: Worker; readonly hashes: ReadonlyMap<string, string>; readonly size: number; readonly version: number };
 
     /** `hashes` is an immutable snapshot (the engine replaces its map on change), so its
-     * file list is sent to a worker once and again only for a different snapshot. */
-    async read(report: string, cwd: string, hashes: ReadonlyMap<string, string>, signal?: AbortSignal): Promise<readonly FileCoverage[]> {
+     * file list is sent to a worker once and again only for a different snapshot. `layout` names the instrumented output the
+     * report comes from, whose later reports the worker reads faster (see CoverageRequest.layout). */
+    async read(report: string, cwd: string, hashes: ReadonlyMap<string, string>, signal?: AbortSignal, layout?: string): Promise<readonly FileCoverage[]> {
         signal?.throwIfAborted();
         if (this.disposed) {throw new Cancelled();}
         const worker = this.worker ?? this.start(), id = ++this.sequence;
@@ -45,7 +46,7 @@ export class CoverageReader {
                 };
                 this.pending.set(id, entry);
                 signal?.addEventListener('abort', abort, { once: true });
-                worker.postMessage({ id, report, cwd, filesVersion } satisfies CoverageRequest);
+                worker.postMessage({ id, report, cwd, filesVersion, layout } satisfies CoverageRequest);
             });
         } finally {
             // Conversion below observes the signal itself and must not stop a shared worker.

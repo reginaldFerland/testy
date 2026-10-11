@@ -7,24 +7,85 @@ export type TestRecords = ReadonlyMap<string, readonly FileCoverage[]>;
 /**
  * The coverage of every test of a test file, learned by running its tests one request at a time (`testy.selectionGranularity:
  * test`). Records describe the same source versions as the file's trace: they are replaced whenever the trace is, and a record
- * whose version of a file differs from the trace's cannot narrow (see narrowTests). Kept for the session only: after a restart a
- * file narrows by test again once it has run completely.
+ * whose version of a file differs from the trace's cannot narrow (see narrowTests). They are saved with the coverage cache (see
+ * take) and restored after a restart when they still describe the versions of the restored trace (see restore).
  */
 export class TestCoverageStore {
     private readonly files = new Map<string, TestRecords>();
+    /** Files whose records changed since the last save (see take). */
+    private dirty = new Set<string>();
+    /** Files a run set or deleted: records restored later are older, and do not replace what the run decided. */
+    private readonly decided = new Set<string>();
 
     get size(): number { return this.files.size; }
 
     get(groupId: string): TestRecords | undefined { return this.files.get(groupId); }
 
-    set(groupId: string, records: TestRecords): void { this.files.set(groupId, records); }
+    set(groupId: string, records: TestRecords): void { this.files.set(groupId, records); this.dirty.add(groupId); this.decided.add(groupId); }
 
-    delete(groupId: string): void { this.files.delete(groupId); }
+    delete(groupId: string): void {
+        this.decided.add(groupId);
+        if (this.files.delete(groupId)) {this.dirty.add(groupId);}
+    }
 
     /** Forget files that no longer exist. */
-    retain(groupIds: ReadonlySet<string>): void { for (const id of [...this.files.keys()]) {if (!groupIds.has(id)) {this.files.delete(id);}} }
+    retain(groupIds: ReadonlySet<string>): void { for (const id of [...this.files.keys()]) {if (!groupIds.has(id)) {this.delete(id);}} }
 
-    clear(): void { this.files.clear(); }
+    /** Forget everything, without saving it: the cache is reset with it. */
+    clear(): void { this.files.clear(); this.dirty.clear(); this.decided.clear(); }
+
+    /** Records read back from the cache, for files no run has decided on since this session started. */
+    restore(groupId: string, records: TestRecords): boolean {
+        if (this.decided.has(groupId) || this.files.has(groupId)) {return false;}
+        this.files.set(groupId, records);
+        return true;
+    }
+
+    /** Saved records that cannot be restored: the next save removes them, unless a run has given the file records since. */
+    discardSaved(groupId: string): void { if (!this.files.has(groupId)) {this.dirty.add(groupId);} }
+
+    /** What changed since the last save: the records to write, and the files whose records to remove. */
+    take(): TestCoverageDelta {
+        const ids = [...this.dirty]; this.dirty = new Set();
+        const saved: { groupId: string; records: TestRecords }[] = [], removed: string[] = [];
+        for (const groupId of ids) {const records = this.files.get(groupId); if (records) {saved.push({ groupId, records });} else {removed.push(groupId);}}
+        return { saved, removed };
+    }
+
+    /** A save failed: write its files again with the next one (with their records then). */
+    retry(delta: TestCoverageDelta | undefined): void {
+        for (const { groupId } of delta?.saved ?? []) {this.dirty.add(groupId);}
+        for (const groupId of delta?.removed ?? []) {this.dirty.add(groupId);}
+    }
+}
+
+/** Per-test coverage a save writes (see TestCoverageStore.take). */
+export interface TestCoverageDelta {
+    readonly saved: readonly { readonly groupId: string; readonly records: TestRecords }[];
+    readonly removed: readonly string[];
+}
+
+/** The records of a restored file, rebuilt from the saved hits: every line of each version's geometry, with its hits or 0, as a
+ * collector reports them. Undefined unless each version a test ran is a version the file's restored trace covers, with known
+ * geometry: anything else could not have been saved with that trace. A file the test did not run that the restored trace does
+ * not cover is left out, as the trace leaves it out: narrowing counts any change to such a file as reaching every test. */
+export function restoredRecords(saved: ReadonlyMap<string, readonly { readonly file: string; readonly hash: string; readonly hits: ReadonlyMap<number, number> }[]>,
+    trace: Pick<Trace, 'coverage'>, geometry: (file: string, hash: string) => VersionGeometry | undefined): Map<string, readonly FileCoverage[]> | undefined {
+    const versions = new Map(trace.coverage.map(entry => [entry.file, entry.hash]));
+    const records = new Map<string, readonly FileCoverage[]>();
+    for (const [test, entries] of saved) {
+        const coverage: FileCoverage[] = [];
+        for (const { file, hash, hits } of entries) {
+            if (!hits.size && !versions.has(file)) {continue;}
+            const source = versions.get(file) === hash ? geometry(file, hash) : undefined;
+            if (!source) {return undefined;}
+            const lines = new Set(source.lines);
+            if ([...hits.keys()].some(line => !lines.has(line))) {return undefined;}
+            coverage.push({ file, hash, lines: source.lines.map(line => ({ line, hits: hits.get(line) ?? 0 })), ...source.declarations?.length ? { declarations: source.declarations } : {} });
+        }
+        records.set(test, coverage);
+    }
+    return records;
 }
 
 /** What narrowing a selected test file to its affected tests reads. */

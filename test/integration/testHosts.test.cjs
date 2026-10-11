@@ -147,3 +147,45 @@ test('a run whose builds changed nothing reuses the previous run\'s test hosts; 
  const third=await pids();
  assert.ok([...third].some(pid=>!first.has(pid)),'the rebuilt output runs in a new host');
 });
+
+test('a reused host discovers the tests it then runs, so no process starts only to discover them',{timeout:240000},async t=>{
+ const f=await fixture(t),os=require('node:os'),path=require('node:path');
+ f.config.reuseTestHosts=true;f.config.maxParallelTestFiles=1;
+ const marker=path.join(os.tmpdir(),`testy-discovery-${process.pid}-${Date.now()}`);
+ t.after(()=>fs.rm(marker,{force:true}));
+ const log=(/** @type {string} */ text)=>`System.IO.File.AppendAllText(${JSON.stringify(marker)}, ${text} + "\\n");`;
+ await fs.writeFile(f.file('ImpactDemo/Rows.cs'),'namespace ImpactDemo; public static class Rows {\n    public static int Count()\n    {\n        return 2;\n    }\n}\n');
+ await fs.writeFile(f.file('ImpactDemo.Tests/Startup.cs'),`namespace ImpactDemo.Tests; static class Startup { [System.Runtime.CompilerServices.ModuleInitializer] internal static void Run() { ${log('"start " + System.Environment.ProcessId')} } }`);
+ await fs.writeFile(f.file('ImpactDemo.Tests/RowTests.cs'),'using Microsoft.VisualStudio.TestTools.UnitTesting; namespace ImpactDemo.Tests; [TestClass] public class RowTests {\n'+
+  ' public static IEnumerable<object[]> Data => Enumerable.Range(0, ImpactDemo.Rows.Count()).Select(i => new object[] { i });\n'+
+  ` [TestMethod] [DynamicData(nameof(Data))] public void Row(int i) { ${log('"run " + System.Environment.ProcessId')} Assert.IsTrue(i >= 0); }\n}\n`);
+ const baseline=await f.run([],true);
+ assert.equal(baseline.failed,0,f.state.output.join(''));
+ assert.ok(!f.state.output.some(line=>/Could not discover/.test(line)),f.state.output.join(''));
+ const lines=(await fs.readFile(marker,'utf8')).trim().split('\n'),pids=(/** @type {string} */ kind)=>new Set(lines.filter(line=>line.startsWith(`${kind} `)).map(line=>line.split(' ')[1]));
+ // Every process that started ran tests: none was started only to discover them.
+ assert.deepEqual([...pids('start')].sort(),[...pids('run')].sort(),lines.join('\n'));
+ const rows=defined(f.engine.groups.find(item=>item.file?.endsWith('RowTests.cs')));
+ assert.equal(f.state.results.filter(result=>result.name.startsWith('Row')).length,2,'both rows ran, by the identities the host discovered');
+ assert.ok(defined(f.engine.coverage.traces.get(rows.id)).coverage.some(entry=>path.basename(entry.file)==='Rows.cs'&&entry.lines.some(line=>line.hits>0)));
+ // A second complete run discovers in new hosts again.
+ f.state.output.length=0;
+ const again=await f.run([],true);
+ assert.equal(again.failed,0,f.state.output.join(''));
+});
+
+for(const demo of ['XunitDemo','NUnitDemo']){
+ test(`${demo}: discovering in the reused host reports what separate discovery and test processes report`,{timeout:300000},async t=>{
+  /** @param {boolean} reuse */
+  const outcomes=async reuse=>{
+   const f=await fixture(t,demo);
+   f.config.reuseTestHosts=reuse;
+   await f.run([],true);
+   assert.ok(!f.state.output.some(line=>/Could not discover/.test(line)),f.state.output.join(''));
+   return{results:f.state.results.map(result=>`${result.name} ${result.outcome}`).sort(),tests:f.engine.groups.flatMap(group=>group.tests.map(test=>test.name)).sort()};
+  };
+  const separate=await outcomes(false),reused=await outcomes(true);
+  assert.ok(separate.results.length>0);
+  assert.deepEqual(reused,separate);
+ });
+}

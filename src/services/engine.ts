@@ -5,7 +5,7 @@ import { eligibleGroups } from '../core/traits';
 import { DiscoveredTest, EngineConfiguration, Project, TestFile, TestResult, Trace } from '../core/model';
 import { ChangeBatch } from '../core/scheduler';
 import { Timeline } from '../core/timeline';
-import { TestCoverageStore } from '../core/testCoverage';
+import { restoredRecords, TestCoverageStore } from '../core/testCoverage';
 import { ProjectIndex, selectTests, Selection } from '../core/selection';
 import { defaultExcludes, isConfigurationFile, isExcluded, isToolingFile, normalizePath, normalizePathsAsync, sourceVersion, testTargetKey } from '../core/paths';
 import { consumesChanges, FailingTests, isStructuralChange, needsSourceSweep, shareElapsed, TestOutcome, TestOutcomes, traceIsCurrent } from '../core/runPolicy';
@@ -224,12 +224,31 @@ export class TestEngine implements EngineHost {
             const restored = await this.cache.restore(this.coverage, signal, identity);
             this.lastOutcomes.restore(restored.outcomes);
             if (restored.checkpoint && !this.learned) {this.resume(restored.checkpoint, settingsIdentity(configured, this.roots));}
+            await this.restoreTestCoverage(identity, signal);
             this.options.events.restored?.();
         } catch (error) {
             signal?.throwIfAborted();
             if (isAbortError(error)) {throw error;}
             this.options.events.output(`Coverage cache unavailable; starting a fresh baseline. ${String(error)}\n`);
         }
+    }
+
+    /** Each test's own coverage, for files whose restored trace was learned under the current identity, is reliable, and covers the
+     * same versions as the saved records (see restoredRecords): they narrow by test at once, rather than after running completely.
+     * Records that cannot be restored are removed by the next save. */
+    private async restoreTestCoverage(identity: string, signal?: AbortSignal): Promise<void> {
+        let saved: Awaited<ReturnType<CoverageCache['restoreTests']>>;
+        try {saved = await this.cache.restoreTests(signal);}
+        catch (error) {signal?.throwIfAborted(); this.options.events.output(`Saved per-test coverage unavailable; files narrow by test once they have run completely. ${String(error)}\n`); return;}
+        let count = 0;
+        for (const [groupId, tests] of saved) {
+            const trace = this.coverage.traces.get(groupId);
+            const records = trace?.identity === identity && trace.reliable && !trace.historical
+                ? restoredRecords(tests, trace, (file, hash) => this.coverage.versionGeometry(file, hash)) : undefined;
+            if (!records) {this.testCoverage.discardSaved(groupId); continue;}
+            if (this.testCoverage.restore(groupId, records)) {count++;}
+        }
+        if (count) {this.options.events.output(`Restored each test's own coverage for ${count} test file${count === 1 ? '' : 's'}.\n`);}
     }
 
     /** Only files whose restored trace was learned under the checkpoint's identity, and was current and reliable when saved, are
@@ -700,9 +719,9 @@ export class TestEngine implements EngineHost {
         const coverage = await this.coverage.takeDeltaAsync(signal);
         // Taken with the delta, without yielding: every file the checkpoint completes has its trace in this delta or a saved one.
         const state = this.checkpointState();
-        const delta = { ...coverage, outcomes: this.lastOutcomes.take(), ...state === this.savedCheckpoint ? {} : { checkpoint: this.checkpoint() } };
+        const delta = { ...coverage, outcomes: this.lastOutcomes.take(), tests: this.testCoverage.take(), ...state === this.savedCheckpoint ? {} : { checkpoint: this.checkpoint() } };
         try {await this.cache.save(delta, signal); this.savedCheckpoint = state;}
-        catch (error) {this.coverage.retryDelta(delta); this.lastOutcomes.retry(delta.outcomes); signal?.throwIfAborted(); this.options.events.output(`Coverage could not be saved; current test results remain available. ${String(error)}\n`);}
+        catch (error) {this.coverage.retryDelta(delta); this.lastOutcomes.retry(delta.outcomes); this.testCoverage.retry(delta.tests); signal?.throwIfAborted(); this.options.events.output(`Coverage could not be saved; current test results remain available. ${String(error)}\n`);}
     }
 
     /** Changes whenever the checkpoint would. */

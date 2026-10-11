@@ -67,7 +67,9 @@ async function main(){
  const seen={};
  const latest=()=>seen.selection;
  /** @type {import('../../out/core/model').EngineConfiguration} */
- const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:120000};
+ // Hosts are reused as by default in the extension; TESTY_SAVE_REUSE=0 starts a process per file. TESTY_COVERAGE_TOOL reuses an installed collector.
+ const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:120000,
+  reuseTestHosts:process.env.TESTY_SAVE_REUSE!=='0',...process.env.TESTY_COVERAGE_TOOL?{coverageTool:process.env.TESTY_COVERAGE_TOOL}:{}};
  const engine=new TestEngine({roots:[workspace],storage:path.join(temp,'state'),tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
   events:{output:text=>output.push(text),phase(){},discovered(){},selected(value){seen.selection=value;},result(){},started(){},coverage(){},invalidated(){}}});
  const signal=AbortSignal.timeout(30*60*1000);

@@ -363,37 +363,69 @@ export class MtpSession {
     /** Run tests (every test when `tests` is undefined) and return their terminal leaf nodes. Rejects, and closes the session,
      * when the host fails, the stream is incomplete, a group fails, or the run exceeds the time limit. */
     async run(tests: readonly TestNode[] | undefined, run: SessionRun = {}): Promise<readonly TestNode[]> {
+        const watchdog = new TestWatchdog(this.options.testTimeoutMs, () => this.host.process.stop());
+        try {
+            const nodes = await this.request('run', node => {watchdog.observe(node); run.onNode?.(node);}, tests, () => watchdog.expired);
+            const failedGroup = nodes.find(node => node['node-type'] === 'group' && ['failed', 'errored'].includes(testResult(node)?.outcome ?? ''));
+            if (failedGroup) {throw this.fail(new Error(`The test group failed: ${nodeName(failedGroup)}. ${nodeText(failedGroup, 'error.message')}`));}
+            const leaves = nodes.filter(node => node['node-type'] !== 'group');
+            if (leaves.length) {try {assertComplete(nodes, run.expectedTests ?? tests ?? [], run.onNode);} catch (error) {throw this.fail(error);}}
+            this.options.signal?.throwIfAborted();
+            return leaves;
+        } catch (error) {
+            await this.close();
+            throw error;
+        } finally {watchdog.dispose();}
+    }
+
+    /** Discover the tests of the host's assembly and return the leaf nodes, as a separate discovery process would (see requestTests):
+     * the host that later runs them discovers them, so a run needs one process start instead of two. Rejects, and closes the
+     * session, when the framework cannot discover, the host fails, the stream is incomplete, a test fails discovery, or it exceeds
+     * the time limit. */
+    async discover(): Promise<readonly TestNode[]> {
+        try {
+            if (!this.host.initialized.capabilities?.testing?.supportsDiscovery) {throw this.fail(new Error('This MTP test framework does not support discovery.'));}
+            const nodes = await this.request('discover', undefined, undefined, () => undefined);
+            const failure = nodes.find(node => ['failed', 'errored'].includes(testResult(node)?.outcome ?? ''));
+            if (failure) {throw this.fail(new Error(`Test discovery failed: ${nodeName(failure)}. ${nodeText(failure, 'error.message')}`));}
+            this.options.signal?.throwIfAborted();
+            return nodes.filter(node => node['node-type'] !== 'group');
+        } catch (error) {
+            await this.close();
+            throw error;
+        }
+    }
+
+    /** Send one request and collect its complete update stream within the time limit. A failure is recorded (see fail). */
+    private async request(operation: 'discover' | 'run', onNode: ((node: TestNode) => void) | undefined, tests: readonly TestNode[] | undefined,
+        expired: () => Error | undefined): Promise<TestNode[]> {
         if (this.closing) {throw new Error('The test host session is closed.');}
         if (this.failure) {throw this.failure;}
         this.options.signal?.throwIfAborted();
-        const watchdog = new TestWatchdog(this.options.testTimeoutMs, () => this.host.process.stop());
-        const runId = randomUUID(), updates = collectUpdates('run', node => {watchdog.observe(node); run.onNode?.(node);});
+        const runId = randomUUID(), updates = collectUpdates(operation, onNode);
         const unsubscribe = this.host.observe(runId, updates.handle);
         // Set by the timer; `as boolean` keeps the read after the await from narrowing to false.
         let timer: NodeJS.Timeout | undefined, timedOut = false as boolean;
         const limit = new Promise<never>((_resolve, reject) => {
             timer = setTimeout(() => {
                 timedOut = true; this.host.process.stop();
-                reject(new Error(`The test run exceeded its time limit of ${Math.round((this.options.timeoutMs ?? 600_000) / 1000)} seconds.`));
+                reject(new Error(`The test ${operation === 'run' ? 'run' : 'discovery'} exceeded its time limit of ${Math.round((this.options.timeoutMs ?? 600_000) / 1000)} seconds.`));
             }, this.options.timeoutMs ?? 600_000);
         });
         void limit.catch(() => undefined);
         try {
-            await Promise.race([this.host.request('testing/runTests', { runId, ...(tests ? { tests } : {}) }), limit]);
+            await Promise.race([this.host.request(operation === 'run' ? 'testing/runTests' : 'testing/discoverTests', { runId, ...(tests ? { tests } : {}) }), limit]);
             if (!updates.completed) {throw new Error('The test runner ended without a complete test update stream.');}
-            const nodes = [...updates.nodes.values()];
-            const failedGroup = nodes.find(node => node['node-type'] === 'group' && ['failed', 'errored'].includes(testResult(node)?.outcome ?? ''));
-            if (failedGroup) {throw new Error(`The test group failed: ${nodeName(failedGroup)}. ${nodeText(failedGroup, 'error.message')}`);}
-            const leaves = nodes.filter(node => node['node-type'] !== 'group');
-            if (leaves.length) {assertComplete(nodes, run.expectedTests ?? tests ?? [], run.onNode);}
-            this.options.signal?.throwIfAborted();
-            return leaves;
+            return [...updates.nodes.values()];
         } catch (error) {
-            const reason = watchdog.expired ?? (timedOut ? error : this.host.process.interruption ?? error);
-            this.failure ??= reason instanceof Error ? reason : new Error(String(reason));
-            await this.close();
-            throw reason;
-        } finally {clearTimeout(timer); unsubscribe(); watchdog.dispose();}
+            throw this.fail(expired() ?? (timedOut ? error : this.host.process.interruption ?? error));
+        } finally {clearTimeout(timer); unsubscribe();}
+    }
+
+    /** Record why the session can take no further requests, and return it to throw. */
+    private fail(reason: unknown): unknown {
+        this.failure ??= reason instanceof Error ? reason : new Error(String(reason));
+        return reason;
     }
 
     /** Say goodbye and wait for the host (and a wrapping collector) to exit, stopping it when it lingers. Idempotent. */

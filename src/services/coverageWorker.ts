@@ -1,7 +1,7 @@
 import * as fs from 'node:fs/promises';
 import { parentPort } from 'node:worker_threads';
 import { Declaration } from '../core/model';
-import { parseCobertura } from './reports';
+import { parseCobertura, readWithLayout, ReportLayout } from './reports';
 
 export interface CoverageRequest {
     readonly id: number;
@@ -9,6 +9,9 @@ export interface CoverageRequest {
     readonly cwd: string;
     /** The version of the allowed file list this request was issued against. */
     readonly filesVersion: number;
+    /** Names the instrumented output the report comes from (its collector session): reports with the same name share a layout,
+     * so after the first one only their hit counts are read (see readWithLayout). */
+    readonly layout?: string | undefined;
 }
 /** The workspace's tracked files, sent once per worker and again only when they change. */
 export interface CoverageFiles {
@@ -26,14 +29,30 @@ export const maxReportBytes = 256 * 1024 * 1024;
 
 let allowed: { readonly version: number; readonly files: ReadonlySet<string> } = { version: 0, files: new Set() };
 
+/** Learned report layouts by request `layout` and working directory, oldest first; a run uses a few per test target and lane. */
+const layouts = new Map<string, ReportLayout>();
+const maxLayouts = 64;
+
 async function handle(request: CoverageRequest, list: typeof allowed): Promise<void> {
     try {
         if (list.version !== request.filesVersion) {throw new Error('The coverage parser received an outdated file list.');}
         const size = (await fs.stat(request.report)).size;
         if (size > maxReportBytes) {throw new Error(`The coverage report is ${size} bytes; the limit is ${maxReportBytes}.`);}
         const xml = await fs.readFile(request.report, 'utf8');
-        const declarations = new Map<string, readonly Declaration[]>();
-        const parsed = parseCobertura(xml, request.cwd, list.files, declarations);
+        const key = request.layout === undefined ? undefined : `${request.layout}\0${request.cwd}`, known = key === undefined ? undefined : layouts.get(key);
+        let declarations = new Map<string, readonly Declaration[]>();
+        let parsed = known && readWithLayout(xml, known, list.files, declarations);
+        if (!parsed) {
+            declarations = new Map();
+            if (key !== undefined) {layouts.delete(key);}
+            parsed = parseCobertura(xml, request.cwd, list.files, declarations, key === undefined ? undefined : layout => {
+                layouts.set(key, layout);
+                for (const oldest of layouts.keys()) {if (layouts.size <= maxLayouts) {break;} layouts.delete(oldest);}
+            });
+        } else {
+            // Most recently used last.
+            layouts.delete(key!); layouts.set(key!, known!);
+        }
         const files = [...parsed].map(([file, lines]) => {
             const values = new Float64Array(lines.length * 2);
             let index = 0;

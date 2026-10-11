@@ -18,7 +18,16 @@ Four changes contribute; the stages they shorten run in sequence:
 - **MSBuild server**: an incremental build of the two projects fell from ~380 to ~200 ms in isolation (Building ~470 → ~265 ms in the loop).
 - **Save debounce**: 500 → 50 ms of waiting before each run in the default `save` trigger mode.
 
-The remaining ~1 s is three process launches in sequence: the build (~265 ms), instrumentation of the rebuilt DLLs in parallel and discovery (~350 ms), and the collector-wrapped test host (~420 ms). Discovery is not reused across builds: provider IDs can depend on the prepared output path and binary, so the runner rediscovers every rebuilt target.
+The remaining ~1 s was three process launches in sequence: the build (~265 ms), instrumentation of the rebuilt DLLs in parallel and discovery (~350 ms), and the collector-wrapped test host (~420 ms). Discovery is not reused across builds: provider IDs can depend on the prepared output path and binary, so the runner rediscovers every rebuilt target.
+
+**Discovery in the reused host** now removes one of those launches: with `testy.reuseTestHosts` (the default, and now the benchmark's default; `TESTY_SAVE_REUSE=0` restores a process per file), the host that runs a target's tests also discovers them, so the discovery process is gone. Same machine, two runs per variant, alternating (before, after, after, before); edits that select one file after the first:
+
+| Variant | Elapsed per edit | Preparing tests | Testing |
+| --- | --- | --- | --- |
+| Separate discovery process | ~1,350–1,380 ms | ~490–580 ms | ~435–475 ms |
+| Discovery in the reused host | ~1,090–1,130 ms | ~570–615 ms | ~205–220 ms |
+
+The edit's run takes about **250 ms (19%) less**. Preparing tests now includes the host's start, which Testing no longer pays. A first version also took a collector snapshot after discovery to keep its hits out of the first file's coverage; that cost about 47 ms and was dropped, because MSTest evaluates every class's data sources inside each run request anyway (an integration test observed this with and without reused hosts), so a file's coverage already holds such hits. Edits that select nothing are unchanged (~360–450 ms).
 
 ## Reused test hosts
 
@@ -74,6 +83,16 @@ At 120 files, every current unchanged refresh started zero source-analysis helpe
 At 400 files, the unchanged-refresh first result arrived **337 ms earlier (13.1%)**, with both current observations faster than either baseline observation. Source-analysis helpers fell from one per refresh to zero, with matching test identities, results, coverage, dependencies and raw/resolved shapes. Whole-run throughput is inconclusive: the baseline repeats ranged from 41.128 to 45.791 s amid chronological slowdown, larger than the midpoint difference. The Testing phase, including coverage processing and commits, occupied 39–44 s of those repeats. Initial analysis gained validation overhead (625 → 703 ms) that overlapped preparation; this change targets reuse, not the first baseline.
 
 There is no demonstrated memory or event-loop improvement. At 400 files, sampled repeat process-tree RSS midpoints were 2,632 → 2,754 MiB and maximum timer-gap midpoints were 170 → 174 ms. The 120-file equivalents were 2,200 → 2,227 MiB and 60 → 60 ms. These are small-sample observations, not retained-memory measurements.
+
+## Coverage report layouts
+
+Every test file's (and, with test granularity, every test's) coverage is a Cobertura report of the whole instrumented output, so its size grows with the source files, not with what the test ran: the 400-file benchmark's reports held 2,001 class records, unselected zero-hit lines included, and were read 400 times. The reports of one instrumented output always list the same classes, filenames and lines; only hit counts differ. The coverage worker now keeps the layout a complete parse learned for each collector session and reads later reports of that session against it: it checks the `<sources>`, every class's filename and every class-level line number in order, skips the method subtrees (method spans come from the layout), and reads only the hit counts, without building attribute maps or resolving paths. Any difference, or a form the check does not cover (comments, CDATA, a document type, entities in filenames, single quotes, non-integer hits, a truncated document), falls back to the complete parse. A layout is offered only when the fast read reproduces the complete parse that learned it, and the corpus differential test checks both reads agree on every corpus report that learns one.
+
+On a synthetic report of 2,001 classes with four methods and 20 lines each (4.7 MB), the complete parse took a median **33–35 ms** and the layout read **10.8 ms** (20 reads each, one process, warm). The complete parse spent about 40% of its time in the XML tokenizer and about 13% resolving and normalizing filenames, which it repeated for every report. This is a component measurement: the run-wide saving is the per-report difference times the reports read, spread over the test-file workers, and it was not measured end to end.
+
+## Per-test coverage across restarts
+
+With test granularity, each test's own coverage is now saved beside its file's trace and restored when the restored trace covers the same versions. After a reload, the first edit narrows by test at once, where before the file first ran completely and took a snapshot per test (one snapshot costs about 47 ms per test). Records store only the lines that ran and are rebuilt from each version's geometry on restore. This was verified functionally, not timed.
 
 ## Remaining opportunities
 

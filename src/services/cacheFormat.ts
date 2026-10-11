@@ -100,6 +100,30 @@ export function validCheckpoint(value: unknown): value is CheckpointRecord {
         && (checkpoint.untracked === undefined || Array.isArray(checkpoint.untracked) && checkpoint.untracked.every((pair: unknown) => strings(pair) && pair.length === 2));
 }
 
+/** Each test's own coverage of one test file (see core/testCoverage), saved beside its trace. `sources` holds the (file, version)
+ * pairs the records cover; each record entry is a source's position in `sources` followed by the (line, hits) pairs of lines that
+ * ran, so a covered file the test never ran is its position alone. Restore accepts it only with a trace of those same versions. */
+export interface TestCoverageRecord {
+    readonly format: number; readonly groupId: string;
+    readonly sources: readonly (readonly [file: string, hash: string])[];
+    readonly tests: readonly (readonly [test: string, coverage: readonly (readonly number[])[]])[];
+}
+
+export function validTestCoverage(value: unknown): value is TestCoverageRecord {
+    const saved = record(value);
+    if (!saved || typeof saved.groupId !== 'string' || !Array.isArray(saved.sources) || !saved.sources.every((pair: unknown) => strings(pair) && pair.length === 2)) {return false;}
+    const sources = saved.sources.length;
+    return Array.isArray(saved.tests) && saved.tests.every((entry: unknown) => Array.isArray(entry) && entry.length === 2 && typeof entry[0] === 'string'
+        && Array.isArray(entry[1]) && (entry[1] as unknown[]).every((file: unknown) => {
+            if (!Array.isArray(file) || file.length % 2 !== 1 || !index(file[0]) || file[0] >= sources) {return false;}
+            for (let position = 1; position < file.length; position += 2) {
+                const hits: unknown = file[position + 1];
+                if (!positive(file[position]) || typeof hits !== 'number' || !Number.isFinite(hits) || hits <= 0) {return false;}
+            }
+            return true;
+        }));
+}
+
 /** A file's latest test outcomes and run time; caches written before outcomes were saved have none, before run times were saved no `elapsed`, and before test durations were saved no `durations`. */
 export function validOutcomes(value: unknown): value is StoredOutcomes {
     const outcomes = record(value);

@@ -27,7 +27,13 @@ export interface Preparation {
     /** A collector using this instrumentation session was stopped or failed. Its
      * session may retain partial state, so the template is not reused. */
     collectorInterrupted?: boolean;
+    /** Its tests were discovered in a reused test host (see HostDiscovery), which may have changed the output: a new host restores it first. */
+    hostDiscovered?: boolean;
 }
+
+/** Discovers a prepared target's tests in the test host that will run them, or returns undefined to discover them in a process of
+ * their own (see RunnerSession.discoverInHost). */
+export type HostDiscovery = (group: TestFile, preparation: Preparation) => Promise<readonly TestNode[] | undefined>;
 
 /** Prepares each test target of one runner session once: a private output, optionally
  * instrumented and cached, with its native discovery inventory. */
@@ -37,7 +43,7 @@ export class RunnerPreparations {
     readonly toolContexts: Map<string, Promise<string>>;
     readonly toolIdentities: Map<string, Promise<string>>;
     constructor(private options: RunnerOptions, private readonly outputRoot: () => Promise<string>,
-        private readonly projects: ReadonlyMap<string, Project>) {
+        private readonly projects: ReadonlyMap<string, Project>, private readonly hostDiscovery?: HostDiscovery) {
         this.toolContexts = options.preparationTools ?? new Map<string, Promise<string>>();
         this.toolIdentities = options.preparationToolIdentities ?? new Map<string, Promise<string>>();
     }
@@ -104,7 +110,8 @@ export class RunnerPreparations {
                 await lease?.update(artifact, options.signal);
             }
             const { output, session, coverage, coveragePending, instrumented } = artifact;
-            const prepared = { root, output, session, coverage, coveragePending, ...await this.discoverArtifact(group, output), instrumented, lease, source, runs: 0 };
+            const prepared: Preparation = { root, output, session, coverage, coveragePending, nodes: [], nativeById: new Map(), byKey: new Map(), instrumented, lease, source, runs: 0 };
+            Object.assign(prepared, await this.discoverArtifact(group, output, prepared));
             this.prepared.set(key, prepared); options.onPrepared?.(group.project);
             return prepared;
         } catch (error) {
@@ -113,11 +120,15 @@ export class RunnerPreparations {
         }
     }
 
-    private async discoverArtifact(group: TestFile, output: PreparedOutput): Promise<Pick<Preparation, 'nodes' | 'nativeById' | 'byKey'>> {
+    /** `preparation`, when it is the target's, may discover in the host that will run its tests (see HostDiscovery). */
+    private async discoverArtifact(group: TestFile, output: PreparedOutput, preparation?: Preparation): Promise<Pick<Preparation, 'nodes' | 'nativeById' | 'byKey'>> {
         const options = this.projectOptions(group);
-        const nodes = await requestTests({ ...options, assembly: path.join(output.directory, path.basename(group.assembly)), args: options.testArguments }, 'discover');
-        // Discovery can also execute user code and mutate assets.
-        await output.restore(options.signal);
+        let nodes = preparation && await this.hostDiscovery?.(group, preparation);
+        if (!nodes) {
+            nodes = await requestTests({ ...options, assembly: path.join(output.directory, path.basename(group.assembly)), args: options.testArguments }, 'discover');
+            // Discovery can also execute user code and mutate assets.
+            await output.restore(options.signal);
+        }
         const nativeById = new Map<string, TestNode>(), byKey = new Map<string, TestNode[]>();
         let work = 0;
         for (const node of nodes) {
@@ -135,7 +146,8 @@ export class RunnerPreparations {
             session: preparation.session, coverage: preparation.coverage, coveragePending: true, instrumented: preparation.instrumented ?? [],
             reusable: preparation.lease?.artifact.reusable ?? true });
         await preparation.lease?.update(artifact, this.options.signal);
-        Object.assign(preparation, artifact, await this.discoverArtifact(group, artifact.output));
+        Object.assign(preparation, artifact);
+        Object.assign(preparation, await this.discoverArtifact(group, artifact.output, preparation));
         // Providers may derive IDs from the rewritten binary. Resolve selections only
         // against this refreshed inventory, retaining the ordinary ambiguity guards.
         const project = this.projects.get(testTargetKey(group.project, group.framework));

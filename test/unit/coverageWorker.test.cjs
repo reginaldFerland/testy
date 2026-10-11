@@ -50,3 +50,23 @@ test('a report above the size limit is rejected without being read',async t=>{
  f.worker.postMessage({version:1,files:[f.source]});
  assert.match(/** @type {string} */ ((await f.request(1,report)).error),/limit is \d+/);
 });
+
+test('reports sharing a layout name are read with the learned layout, and a report with other lines under that name is parsed whole',async t=>{
+ const f=await fixture(t),report=path.join(f.root,'cobertura.xml');
+ const write=(/** @type {string} */ lines)=>fs.writeFile(report,`<coverage><packages><package><classes><class filename="${f.source}"><methods><method name="Run" signature="()"><lines>${lines}</lines></method></methods><lines>${lines}</lines></class></classes></package></packages></coverage>`);
+ f.worker.postMessage({version:1,files:[f.source]});
+ /** @param {number} id */
+ const read=id=>new Promise(resolve=>{
+  const listen=(/** @type {Response} */ response)=>{if(response.id!==id)return;f.worker.off('message',listen);resolve(response);};
+  f.worker.on('message',listen);f.worker.postMessage({id,report,cwd:f.root,filesVersion:1,layout:'session'});
+ });
+ const values=(/** @type {any} */ response)=>{assert.equal(response.error,undefined);return[[...response.files[0].values],response.files[0].declarations];};
+ await write('<line number="3" hits="1"/><line number="4" hits="0"/>');
+ assert.deepEqual(values(await read(1)),[[3,1,4,0],[{name:'Run()',start:3,end:4}]]);
+ await write('<line number="3" hits="4"/><line number="4" hits="2"/>');
+ assert.deepEqual(values(await read(2)),[[3,4,4,2],[{name:'Run()',start:3,end:4}]]);
+ await write('<line number="3" hits="1"/><line number="5" hits="1"/>');
+ assert.deepEqual(values(await read(3)),[[3,1,5,1],[{name:'Run()',start:3,end:5}]],'other lines: a complete parse, which learns them');
+ await write('<line number="3" hits="0"/><line number="5" hits="7"/>');
+ assert.deepEqual(values(await read(4)),[[3,0,5,7],[{name:'Run()',start:3,end:5}]]);
+});

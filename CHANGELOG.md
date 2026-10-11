@@ -4,6 +4,10 @@
 
 ### Added
 
+- **Discovery in the reused host:** with `testy.reuseTestHosts`, the test host that runs a project's tests also discovers them, so a save that runs tests starts one process fewer. On the save-loop benchmark an edit that runs one test file took about 250 ms (19%) less.
+- **Faster coverage reading:** later coverage reports of the same instrumented output are checked against the layout of the first and only their hit counts are read; on a 2,001-class report, reading fell from about 34 to 11 ms. Anything unexpected falls back to the full parse.
+- **Per-test coverage survives restarts:** with `testy.selectionGranularity: "test"`, each test's own coverage is saved and restored, so the first edit after a reload already runs only the affected tests of a file.
+
 - **Saves finish running tests:** a save during an automatic run no longer throws away the test files it is running. Running files finish and report their results within `testy.finishRunningTests` seconds (default 5) while no further files start, unless the change affects all of them, and the next run does not repeat files that already ran against the changes.
 - **Per-test durations and time limit:** Testy learns each test's own duration, **Show Slowest Test Files and Tests** lists the slowest tests too, and `testy.testTimeoutSeconds` (default 120) stops a test that runs too long and reports it as errored, instead of holding a worker for the whole `testy.timeoutSeconds`.
 - **Long files split:** baselines and runs of everything split a test file that would finish alone at the end into parts that several workers run at once, by the duration of each test, and combine its results and coverage as one run (`testy.splitLongTestFiles`).

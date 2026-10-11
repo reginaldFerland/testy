@@ -113,3 +113,40 @@ test('a trace stale at shutdown, or a change no run consumed, reruns on reopen',
  assert.deepEqual(f.selected(),['CalculatorTests.cs','GreetingTests.cs']);assert.equal(pending.tests,3);
  assert.equal((await f.reopen()).tests,0,'that run consumed the change');
 });
+
+test('each test\'s own coverage survives reopening, so the first edit after it narrows by test',{timeout:300000},async t=>{
+ const directory=await fs.mkdtemp(path.join(os.tmpdir(),'testy resume '));
+ const control=new AbortController(),signal=AbortSignal.any([t.signal,control.signal]);
+ const root=path.join(directory,'workspace');
+ await fs.cp(path.resolve('test/fixtures/ImpactDemo'),root,{recursive:true,filter:file=>!/(^|[/\\])(bin|obj|TestResults)([/\\]|$)/.test(file)});
+ const source=normalizePath(path.join(root,'ImpactDemo/Calculator.cs'));
+ await fs.writeFile(source,'namespace ImpactDemo; public static class Calculator {\n    public static int Add(int a, int b)\n    {\n        return Arithmetic.Sum(a, b);\n    }\n    public static int Mul(int a, int b)\n    {\n        return a * b;\n    }\n}\n');
+ await fs.writeFile(path.join(root,'ImpactDemo.Tests/CalculatorTests.cs'),'using Microsoft.VisualStudio.TestTools.UnitTesting; namespace ImpactDemo.Tests; [TestClass] public class CalculatorTests {\n'+
+  ' [TestMethod] public void AddsOne() => Assert.AreEqual(2, Calculator.Add(1, 1));\n [TestMethod] public void Multiplies() => Assert.AreEqual(6, Calculator.Mul(2, 3));\n'+
+  ' [TestMethod] public void Both() => Assert.AreEqual(7, Calculator.Add(Calculator.Mul(2, 3), 1));\n}\n');
+ /** @type {import('../../out/core/model').EngineConfiguration} */
+ const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:60000,coverageTool:process.env.TESTY_COVERAGE_TOOL,granularity:'test'};
+ /** @type {string[]} */ const output=[];
+ /** @type {string[]} */ const ran=[];
+ const create=()=>new TestEngine({roots:[root],storage:path.join(directory,'state'),tools:toolsDirectory(directory),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
+  events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result:(_group,result)=>{ran.push(result.name);},started(){},coverage(){},invalidated(){}}});
+ let engine=create();
+ t.after(async()=>{control.abort();try{await engine.dispose();}finally{await fs.rm(directory,{recursive:true,force:true});}});
+ const edit=async(/** @type {string} */ from,/** @type {string} */ to)=>{
+  ran.length=0;
+  await fs.writeFile(source,(await fs.readFile(source,'utf8')).replace(from,to));
+  await engine.markChanged([source]);return engine.run({files:[source],full:false},signal);
+ };
+ await engine.restore(signal);
+ assert.equal((await engine.run({files:[],full:true},signal)).failed,0,output.join(''));
+ // The first edit that selects the file runs it whole and learns each test's own coverage.
+ await edit('return a * b;','return b * a;');
+ assert.deepEqual(ran.sort(),['AddsOne','Both','Multiplies'],output.join(''));
+ await engine.dispose();engine=create();output.length=0;
+ await engine.restore(signal);
+ assert.ok(output.some(line=>/Restored each test's own coverage for 1 test file/.test(line)),output.join(''));
+ assert.equal((await engine.run({files:[],full:true},signal)).tests,0,'nothing changed while closed');
+ await edit('return b * a;','return a * b;');
+ assert.deepEqual(ran.sort(),['Both','Multiplies'],output.join(''));
+ assert.ok(output.some(line=>/Narrowed CalculatorTests\.cs to 2 of 3 tests/.test(line)),output.join(''));
+});
