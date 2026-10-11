@@ -41,12 +41,30 @@ public sealed class JsonContractTests : IDisposable
         {
             Assert.Equal(["a.cs", "missing.cs", "broken.cs"], Names(response.RootElement));
             var shape = response.RootElement.GetProperty("a.cs");
-            Assert.Equal(["signature", "body", "partialTypes", "excludedTypes"], Names(shape));
+            Assert.Equal(["signature", "body", "partialTypes", "excludedTypes", "members", "gaps"], Names(shape));
+            // An excluded type makes the file blind: it has no members.
+            Assert.Equal(0, shape.GetProperty("members").GetArrayLength());
             Assert.Equal(JsonValueKind.String, shape.GetProperty("signature").ValueKind);
             Assert.Equal(["N:C`0"], shape.GetProperty("partialTypes").EnumerateArray().Select(item => item.GetString()));
             Assert.Equal(["N:C`0"], shape.GetProperty("excludedTypes").EnumerateArray().Select(item => item.GetString()));
             // An unreadable file is unknown, not a failure of the batch.
             Assert.Equal(JsonValueKind.Null, response.RootElement.GetProperty("missing.cs").ValueKind);
+        }
+    }
+
+    [Fact]
+    public async Task MembersCarryTheirLinesAndHash()
+    {
+        var file = Source("m.cs", "class C\n{\n    int M() => 1;\n}\n");
+        var (response, _) = await Handle($$"""{"files":["{{file}}"],"excludedAliases":[]}""");
+        using (response)
+        {
+            var member = Assert.Single(response.RootElement.GetProperty("m.cs").GetProperty("members").EnumerateArray());
+            Assert.Equal(["start", "end", "hash"], Names(member));
+            Assert.Equal(3, member.GetProperty("start").GetInt32());
+            Assert.Equal(3, member.GetProperty("end").GetInt32());
+            Assert.Matches("^[0-9A-F]{64}$", member.GetProperty("hash").GetString());
+            Assert.Equal(2, response.RootElement.GetProperty("m.cs").GetProperty("gaps").GetArrayLength());
         }
     }
 
@@ -88,7 +106,9 @@ public sealed class JsonContractTests : IDisposable
             Assert.Equal(["aliases", "analyses"], Names(response.RootElement));
             Assert.Equal(["Hidden"], response.RootElement.GetProperty("aliases").EnumerateArray().Select(item => item.GetString()));
             var shape = response.RootElement.GetProperty("analyses").GetProperty("a.cs");
-            Assert.Equal(["signature", "body", "partialTypes", "excludedTypes"], Names(shape));
+            Assert.Equal(["signature", "body", "partialTypes", "excludedTypes", "members", "gaps"], Names(shape));
+            // An excluded type makes the file blind: it has no members.
+            Assert.Equal(0, shape.GetProperty("members").GetArrayLength());
             Assert.Equal(shape.GetProperty("signature").GetString(), shape.GetProperty("body").GetString());
         }
     }
@@ -156,7 +176,7 @@ public sealed class JsonContractTests : IDisposable
             var byId = answers.ToDictionary(line => line.RootElement.GetProperty("id").GetInt64());
             Assert.Equal([1L, 2L, 3L], byId.Keys.Order());
             Assert.Equal(["id", "result"], Names(byId[1].RootElement));
-            Assert.Equal(["signature", "body", "partialTypes", "excludedTypes"], Names(byId[1].RootElement.GetProperty("result").GetProperty("a.cs")));
+            Assert.Equal(["signature", "body", "partialTypes", "excludedTypes", "members", "gaps"], Names(byId[1].RootElement.GetProperty("result").GetProperty("a.cs")));
             Assert.Equal(["id", "error"], Names(byId[2].RootElement));
             Assert.Equal(typeof(KeyNotFoundException).FullName, byId[2].RootElement.GetProperty("error").GetProperty("type").GetString());
             Assert.Equal(JsonValueKind.Array, byId[3].RootElement.GetProperty("result").ValueKind);

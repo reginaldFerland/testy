@@ -1,5 +1,6 @@
 // Patch the defining modules: `projects` only re-exports them through read-only bindings.
 const projectGraph=require('../../out/services/projectGraph'),projectBuild=require('../../out/services/projectBuild');
+const {toolsDirectory}=require('./support/tools.cjs');
 const {test}=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {TestEngine}=require('../../out/services/engine'),{normalizePath}=require('../../out/core/paths');
@@ -44,7 +45,7 @@ async function fixture(t,{privateAnalyzer=false}={}){
  projectGraph.evaluateProjects=async(...args)=>{inspect++;return evaluate(...args);};
  projectBuild.restoreProjects=async(...args)=>{restore++;await restoreProjects(...args);await afterRestore?.(...args);};
  processes.runProcess=(command,args,...options)=>{if(args.length===1&&args[0]==='--version')sdk++;return runProcess(command,args,...options);};
- const create=()=>new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer,configuration:()=>config,
+ const create=()=>new TestEngine({roots:[root],storage,tools:toolsDirectory(temp),analyzer,configuration:()=>config,
   events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result:(group,result)=>results.set(`${group.id}:${result.id}`,result),started(){},coverage(){},invalidated(){}}});
  engine=create();
  t.after(async()=>{control.abort();projectGraph.evaluateProjects=evaluate;projectBuild.restoreProjects=restoreProjects;processes.runProcess=runProcess;await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});

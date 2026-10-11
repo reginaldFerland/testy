@@ -31,6 +31,8 @@ export function describeCause(cause: SelectionCause): string {
         case 'baseline': return l10n.t('baseline: learning coverage');
         case 'manual': return l10n.t('manual run');
         case 'all': return l10n.t('run all mode');
+        case 'pinned': return l10n.t('pinned: runs with every automatic run');
+        case 'failing': return l10n.t('failing: reruns with every automatic run');
         case 'fallback':
             switch (cause.reason) {
                 case 'configuration': return l10n.t('project fallback: configuration change ({0})', fileList(cause));

@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+### Added
+
+- **Saves finish running tests:** a save during an automatic run no longer throws away the test files it is running. Running files finish and report their results within `testy.finishRunningTests` seconds (default 5) while no further files start, unless the change affects all of them, and the next run does not repeat files that already ran against the changes.
+- **Per-test durations and time limit:** Testy learns each test's own duration, **Show Slowest Test Files and Tests** lists the slowest tests too, and `testy.testTimeoutSeconds` (default 120) stops a test that runs too long and reports it as errored, instead of holding a worker for the whole `testy.timeoutSeconds`.
+- **Long files split:** baselines and runs of everything split a test file that would finish alone at the end into parts that several workers run at once, by the duration of each test, and combine its results and coverage as one run (`testy.splitLongTestFiles`).
+- **Kept test hosts:** a run whose builds changed nothing reuses the previous run's test hosts, prepared outputs and discovery. `testy.isolatedTraits` gives test files a process of their own, and `testy.testProcessMemoryLimit` replaces a reused host that grew too large.
+- **Pinned tests:** **Pin to Automatic Runs** on Test Explorer items runs them with every automatic run; **Testy: Unpin All Tests** clears them. `testy.alwaysRunFailing` reruns failing files with every automatic run.
+- **Markers follow unsaved edits:** inline results and exception markers move with your edits until you save, instead of turning grey or disappearing; a changed line loses its marker.
+- **Shared resources:** `testy.inclusiveTraits` lets test files share a resource with each other but not with exclusive users of it, and `testy.workerTraits` lets a test file that uses several CPUs take several test-file workers.
+- **Testy Queue view:** the Testing sidebar lists the current run's test files, running, queued and finished, with times and why each was selected.
+- **Richer timeline:** the exported timeline shows each build, discovery and instrumentation on preparation lanes, waits for shared resources on worker lanes, passing and failing batches in colour, and the editor's event-loop delay.
+- **Coverage suppression:** `// testy: no coverage` before a member or type, or `// testy: no coverage start` … `end` around several, leaves that code uninstrumented; edits in such files select conservatively.
+- **Faster coverage snapshots:** the collector's snapshot command runs without Testy's process owner, cutting each snapshot (one per test file with reused hosts, one per test with test granularity) from about 70 to 47 ms.
+- **Line costs:** the covering hover says how long the tests through a line take, and which is the slowest.
+- **Lower process priority:** builds, instrumentation and test processes run below normal priority, so the editor stays responsive during runs (`testy.processPriority`).
+
+- **Learned scheduling:** Testy saves how long each test file takes and uses it to order runs. Affected runs start previously failing files, then new files, then the shortest. Baselines and run-all runs start the longest files first so none is left running alone at the end, while one worker works from the short end so results still arrive early. The status bar shows the expected time left while tests run.
+- **Test granularity:** `testy.selectionGranularity: "test"` learns each test's own coverage, with a collector snapshot per test, and reruns only the tests inside a covered file that executed the edited body. The file's coverage stays complete and current after such a partial run.
+- **Reused test hosts:** `testy.reuseTestHosts` runs a project's test files in one long-lived test process per worker, splitting coverage between them with collector snapshots, so only the first file per worker pays the test host's start-up.
+- **Timeline and slow files:** **Testy: Export Timeline…** writes the last 10 minutes of runs, phases and test batches per worker as a trace file for Perfetto or `chrome://tracing`, and **Testy: Show Slowest Test Files** (now **Show Slowest Test Files and Tests**) lists the test files that take longest. Both are in the status bar menu.
+- **Safety net:** `testy.safetyNet` (`related` or `all`) runs the test files an affected run did not select once the editor is quiet, without delaying feedback on a save. A file that newly fails is reported as a selection miss.
+- **Exception markers:** every line of your code on the stack of a failing test is marked at the end of the line and in the scroll bar, where it threw and the callers that led there, with the failure in the hover. They follow `testy.inlineResults`.
+- **Debug a Test Covering This Line:** debugs one covering test file and stops on the line, with a temporary breakpoint. It is in the editor context menu and the inline results hover.
+- **Shared resources:** `testy.exclusiveTraits` keeps test files that share an external resource apart. Files whose tests have the same trait, such as `Database`, never run at the same time, while other files stay parallel. `testy.serialTraits` runs matching files with nothing else beside them.
+- **Excluded traits:** `testy.excludeTraits` keeps tests with the named traits, such as `Integration` or `Category=Slow`, out of automatic runs and the baseline. They stay in Test Explorer and run when you run them yourself.
+
+### Fixed
+
+- A test project that another workspace project references no longer builds twice in parallel. Testy built it with an explicit `TargetFramework`, which MSBuild's own build of the reference does not pass, so the two instances could fail writing the same outputs (for example `The process cannot access the file '….runtimeconfig.json'`).
+- Test traits and categories from MSTest 4, NUnit and xUnit v3 are read again: those frameworks report each trait as a `{ "name": "value" }` object (a category as its name with an empty value), which discovery dropped, so no `trait:` or `category:` tags appeared.
+
+### Changed
+
+- **Reused test hosts by default:** `testy.reuseTestHosts` is now on. A baseline of 120 files took about a third less time, and a run of everything less than half. Tests share static state with earlier files of the same process; list their traits in `testy.isolatedTraits` or turn the setting off for suites that need a fresh process per file.
+- **Lazy per-test coverage:** with `testy.selectionGranularity: "test"`, a baseline or a run of everything no longer takes a coverage snapshot per test; each test's coverage is learned by the first edit that selects its file.
+
+- **Method-level selection:** an edit inside a method, accessor or constructor body reruns only the test files whose coverage executed that body, instead of every test file that reached the file. Saving one handler that a shared registry or DI container constructs for every test no longer reruns the whole project. Test files that provably missed the edit keep their coverage current, moved to the new version of the file. Set `testy.selectionGranularity` to `file` for the previous behaviour.
+- **Faster saves:** body edits build, instrument and discover only the test projects that will run, the build keeps the MSBuild server alive between saves, and `testy.debounceTime` now defaults to 50 ms for the `save` trigger (500 ms, as before, for `fileSystem`).
+
 ## 1.3.0
 
 ### Added

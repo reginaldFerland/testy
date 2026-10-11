@@ -4,11 +4,12 @@ import { SchedulerState } from '../core/scheduler';
 
 // Call sites use l10n.t(...) literally so `npm run l10n:export` can extract them.
 const l10n = vscode.l10n;
-const contextValues = new Map<string, boolean>();
+const contextValues = new Map<string, boolean | readonly string[]>();
 
 /** Context keys drive menus and command enablement; only changes are sent. */
-export function setContext(key: string, value: boolean): void {
-    if (contextValues.get(key) === value) {return;}
+export function setContext(key: string, value: boolean | readonly string[]): void {
+    const previous = contextValues.get(key);
+    if (previous === value || (Array.isArray(previous) && Array.isArray(value) && previous.length === value.length && previous.every((item, index) => item === value[index]))) {return;}
     contextValues.set(key, value);
     void Promise.resolve(vscode.commands.executeCommand('setContext', key, value)).catch(() => undefined);
 }
@@ -21,11 +22,18 @@ export function describePhase(phase: RunPhase): string {
         case 'building': return l10n.t('Building');
         case 'preparingTests': return total === undefined ? l10n.t('Preparing tests') : l10n.t('Preparing tests {0}/{1} · {2} active', completed, total, active);
         case 'testing': {
-            const progress = total === undefined ? l10n.t('Testing') : l10n.t('Testing {0}/{1} · {2} active', completed, total, active);
+            const counts = total === undefined ? l10n.t('Testing') : l10n.t('Testing {0}/{1} · {2} active', completed, total, active);
+            const progress = phase.remaining ? `${counts} · ${l10n.t('about {0} left', formatRemaining(phase.remaining))}` : counts;
             return phase.learned === undefined ? progress : `${progress} · ${l10n.t('{0}/{1} files learned', phase.learned, phase.learnedTotal ?? 0)}`;
         }
         case 'settingUpCoverage': return l10n.t('Setting up coverage');
     }
+}
+
+/** A short localized duration such as `45s` or `3m 20s`, rounded up to whole seconds. */
+export function formatRemaining(milliseconds: number): string {
+    const seconds = Math.max(1, Math.ceil(milliseconds / 1000));
+    return seconds < 60 ? l10n.t('{0}s', seconds) : l10n.t('{0}m {1}s', Math.floor(seconds / 60), seconds % 60);
 }
 
 /** Everything the status bar shows. */
@@ -122,6 +130,8 @@ export interface MenuActions {
     cancel(): unknown;
     clearCoverage(): unknown;
     exportCoverage(): unknown;
+    exportTimeline(): unknown;
+    showSlowestTests(): unknown;
     resetCaches(): unknown;
     showOutput(): unknown;
     openSettings(): unknown;
@@ -138,6 +148,8 @@ export async function showMenu(state: { readonly paused: boolean; readonly runni
         ...state.running ? [{ label: `$(debug-stop) ${l10n.t('Cancel Current Run')}`, run: () => actions.cancel() }] : [],
         { label: `$(clear-all) ${l10n.t('Clear Coverage')}`, run: () => actions.clearCoverage() },
         { label: `$(export) ${l10n.t('Export Coverage…')}`, run: () => actions.exportCoverage() },
+        { label: `$(watch) ${l10n.t('Show Slowest Test Files')}`, run: () => actions.showSlowestTests() },
+        { label: `$(graph-line) ${l10n.t('Export Timeline…')}`, run: () => actions.exportTimeline() },
         { label: `$(trash) ${l10n.t('Reset Caches and Baseline')}`, run: () => actions.resetCaches() },
         { label: `$(output) ${l10n.t('Show Output')}`, run: () => actions.showOutput() },
         { label: `$(settings-gear) ${l10n.t('Open Testy Settings')}`, run: () => actions.openSettings() }

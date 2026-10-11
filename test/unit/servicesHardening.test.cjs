@@ -207,3 +207,30 @@ test('a failed test batch reports its tests as errored while other batches conti
  assert.equal(controller.signal.aborted,false);
  assert.equal(engine.coverage.traces.get(broken.id)?.reliable,false,'the failed file keeps a conservative trace');
 });
+
+test('a test batch records its process time, its timeline spans and the expected time left',async t=>{
+ const root=await temporary(t,'batch-timing');
+ /** @type {import('../../out/services/engine').RunPhase[]} */ const phases=[];
+ const engine=new TestEngine({roots:[root],storage:path.join(root,'state'),tools:root,analyzer:'',configuration:/** @type {any} */ (()=>({})),events:{
+  output(){},phase:phase=>phases.push(phase),selected(){},discovered(){},coverage(){},invalidated(){},started(){},result(){}}});
+ /** @param {string} name @param {string[]} tests @returns {import('../../out/core/model').TestFile} */
+ const group=(name,tests)=>({id:`file:${name}`,project:'/w/T.csproj',framework:'net10.0',assembly:'/w/T.dll',file:`/w/${name}.cs`,
+  tests:tests.map(id=>({id,name:id,fullyQualifiedName:id,line:1,node:{uid:id}}))});
+ const slow=group('Slow',['s1','s2','s3']),fast=group('Fast',['f1']);
+ engine.groups=[slow,fast];
+ engine.recordElapsed([slow],400);
+ /** @type {any} Partial RunnerSession: only the members executeSelection calls. */
+ const sessions={canRunParallel:()=>false,run:async(/** @type {import('../../out/core/model').TestFile[]} */ groups)=>({
+  results:groups[0].tests.map(test=>({id:test.id,name:test.id,fullyQualifiedName:test.id,outcome:test.id==='f1'?'failed':'passed',duration:1})),coverageAvailable:false,executedGroups:groups,elapsed:groups[0]===slow?200:30,
+  trace:{groupId:groups[0].id,dependencies:[],coverage:[],reliable:false,timestamp:Date.now(),inputs:{}}})};
+ const controller=new AbortController();
+ /** @type {any} Partial RunContext: only the fields executeSelection reads. */
+ const run={controller,signal:controller.signal,config:{mode:'affected'},configured:{coverage:true},manualOperation:false,changes:[],testLimit:1,topology:engine.topology};
+ await executeSelection(engine,run,/** @type {any} */ ({before:new Map(),revision:engine.sources.revision,obsoleteBuild:false}),
+  /** @type {any} */ ({coverageTool:'collector',sessions,liveIds:new Set([slow.id,fast.id]),runtimeTreeChanged:false}),/** @type {any} */ ({selection:{groups:[slow,fast]},priority:'responsiveness'}));
+ assert.equal(engine.elapsed(slow.id),300,'averaged with the earlier time');assert.equal(engine.elapsed(fast.id),30);
+ assert.ok(phases.some(phase=>phase.remaining!==undefined),'a known time gives an estimate');
+ const spans=engine.timeline.recent();
+ assert.deepEqual(spans.filter(span=>span.category==='batch').map(span=>[span.name,span.lane,span.details?.failed]).sort(),[['Fast.cs',1,1],['Slow.cs',1,0]],'batches can start within one millisecond');
+ assert.equal(spans.filter(span=>span.category==='process').length,2);
+});

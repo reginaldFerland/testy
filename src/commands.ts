@@ -15,6 +15,10 @@ export interface CommandHandlers {
     cancelRun(): void;
     clearCoverage(): void;
     exportCoverage(): Promise<void>;
+    /** Write the recent run timeline as a trace file. */
+    exportTimeline(): Promise<void>;
+    /** List the test files that take longest. */
+    showSlowestTests(): Promise<void>;
     resetCaches(): Promise<void>;
     showOutput(): void;
     showMenu(): Promise<void>;
@@ -22,9 +26,26 @@ export interface CommandHandlers {
     excludeProject(item?: vscode.TestItem): Promise<void>;
     /** Lines are 1-based; without a line, the cursor line of the active editor. */
     runCoveringTests(target?: { readonly uri: vscode.Uri; readonly line: number }): Promise<void>;
+    /** Debug one test file whose retained coverage hits the line, stopping at a breakpoint on it; lines as for runCoveringTests. */
+    debugCoveringTests(target?: { readonly uri: vscode.Uri; readonly line: number }): Promise<void>;
     /** Reveal a Test Explorer item by its id. */
     showTest(id: string): Promise<void>;
     runFile(uris: readonly vscode.Uri[]): Promise<void>;
+    /** Pin Test Explorer items, so every automatic run also runs them, or unpin them. */
+    pinTests(items: readonly vscode.TestItem[]): void;
+    unpinTests(items: readonly vscode.TestItem[]): void;
+    unpinAllTests(): void;
+}
+
+/** The Test Explorer items a test item context menu command received: the clicked item, or every selected one. */
+function testItems(args: readonly unknown[]): vscode.TestItem[] {
+    const items = args.flatMap(arg => Array.isArray(arg) ? arg as unknown[] : [arg]);
+    return items.filter((item): item is vscode.TestItem => !!item && typeof item === 'object' && typeof (item as { id?: unknown }).id === 'string');
+}
+
+/** A hover link's or context menu's line target: a URI (or URI string) and a 1-based line; otherwise the cursor line. */
+function lineTarget(uri: vscode.Uri | string | undefined, line: unknown): { readonly uri: vscode.Uri; readonly line: number } | undefined {
+    return uri !== undefined && typeof line === 'number' && Number.isInteger(line) && line > 0 ? { uri: typeof uri === 'string' ? vscode.Uri.parse(uri, true) : uri, line } : undefined;
 }
 
 export function registerCommands(handlers: CommandHandlers): vscode.Disposable[] {
@@ -37,14 +58,19 @@ export function registerCommands(handlers: CommandHandlers): vscode.Disposable[]
         vscode.commands.registerCommand('testy.cancelRun', () => handlers.cancelRun()),
         vscode.commands.registerCommand('testy.clearCoverage', () => handlers.clearCoverage()),
         vscode.commands.registerCommand('testy.exportCoverage', () => handlers.exportCoverage()),
+        vscode.commands.registerCommand('testy.exportTimeline', () => handlers.exportTimeline()),
+        vscode.commands.registerCommand('testy.showSlowestTests', () => handlers.showSlowestTests()),
         vscode.commands.registerCommand('testy.resetCaches', () => handlers.resetCaches()),
         vscode.commands.registerCommand('testy.showOutput', () => handlers.showOutput()),
         vscode.commands.registerCommand('testy.showMenu', () => handlers.showMenu()),
         vscode.commands.registerCommand('testy.explainSelection', (item?: vscode.TestItem) => handlers.explainSelection(item)),
         vscode.commands.registerCommand('testy.excludeProject', (item?: vscode.TestItem) => handlers.excludeProject(item)),
+        vscode.commands.registerCommand('testy.pinTests', (...args: unknown[]) => handlers.pinTests(testItems(args))),
+        vscode.commands.registerCommand('testy.unpinTests', (...args: unknown[]) => handlers.unpinTests(testItems(args))),
+        vscode.commands.registerCommand('testy.unpinAllTests', () => handlers.unpinAllTests()),
         // The editor context menu passes the document's URI; hover links pass a URI string and a 1-based line.
-        vscode.commands.registerCommand('testy.runCoveringTests', (uri?: vscode.Uri | string, line?: unknown) => handlers.runCoveringTests(
-            uri !== undefined && typeof line === 'number' && Number.isInteger(line) && line > 0 ? { uri: typeof uri === 'string' ? vscode.Uri.parse(uri, true) : uri, line } : undefined)),
+        vscode.commands.registerCommand('testy.runCoveringTests', (uri?: vscode.Uri | string, line?: unknown) => handlers.runCoveringTests(lineTarget(uri, line))),
+        vscode.commands.registerCommand('testy.debugCoveringTests', (uri?: vscode.Uri | string, line?: unknown) => handlers.debugCoveringTests(lineTarget(uri, line))),
         vscode.commands.registerCommand('testy.showTest', (id?: unknown) => typeof id === 'string' ? handlers.showTest(id) : undefined),
         vscode.commands.registerCommand('testy.runFile', (uri?: vscode.Uri, uris?: readonly vscode.Uri[]) => handlers.runFile(uris?.length ? uris : uri ? [uri] : [])),
         vscode.commands.registerCommand('testy.runFolder', (uri?: vscode.Uri, uris?: readonly vscode.Uri[]) => handlers.runFile(uris?.length ? uris : uri ? [uri] : []))
@@ -52,8 +78,9 @@ export function registerCommands(handlers: CommandHandlers): vscode.Disposable[]
 }
 
 /** Every contributed command; `registerCommands` registers the same set. */
-export const commandIds = ['testy.refreshTests', 'testy.toggleAutoRun', 'testy.pause', 'testy.resume', 'testy.runAffected', 'testy.cancelRun', 'testy.clearCoverage', 'testy.exportCoverage',
-    'testy.resetCaches', 'testy.showOutput', 'testy.showMenu', 'testy.explainSelection', 'testy.excludeProject', 'testy.runCoveringTests', 'testy.showTest', 'testy.runFile', 'testy.runFolder'] as const;
+export const commandIds = ['testy.refreshTests', 'testy.toggleAutoRun', 'testy.pause', 'testy.resume', 'testy.runAffected', 'testy.cancelRun', 'testy.clearCoverage', 'testy.exportCoverage', 'testy.exportTimeline', 'testy.showSlowestTests',
+    'testy.resetCaches', 'testy.showOutput', 'testy.showMenu', 'testy.explainSelection', 'testy.excludeProject', 'testy.runCoveringTests', 'testy.debugCoveringTests', 'testy.showTest', 'testy.runFile', 'testy.runFolder',
+    'testy.pinTests', 'testy.unpinTests', 'testy.unpinAllTests'] as const;
 
 /**
  * Before Testy can start (Restricted Mode, or no folder open), its commands only explain why:

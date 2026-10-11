@@ -1,4 +1,5 @@
 const {test}=require('node:test');
+const {toolsDirectory}=require('./support/tools.cjs');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {constants}=require('node:fs');
@@ -96,7 +97,7 @@ async function fixture(t,{copyAnalyzer=false}={}){
  // Requests are served by the engine's long-lived analyzer unless it cannot start.
  const servers=new AnalyzerServers(),serve=servers.request.bind(servers);
  servers.request=async(/** @type {Parameters<typeof serve>} */ ...args)=>{const value=JSON.parse(args[2]);if(value.files)requests.push(value);return serve(...args);};
- const engine=new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer,configuration:()=>config,
+ const engine=new TestEngine({roots:[root],storage,tools:toolsDirectory(temp),analyzer,configuration:()=>config,
   events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result:(group,result)=>results.push([group.id,result.id,result.outcome]),started(){},coverage(){},invalidated(){}}},{analyzerServers:servers});
  const run=processes.runProcess,batch=analysis.sourceAnalysisBatch;
  processes.runProcess=async(command,args,options)=>{

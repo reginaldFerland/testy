@@ -58,6 +58,71 @@ public class SourceFingerprintTests
         var edited = await Shape(Baseline.Replace(before, after, StringComparison.Ordinal));
         Assert.Equal(original.Signature, edited.Signature);
         Assert.NotEqual(original.Body, edited.Body);
+        // Equal signatures pair the members by position; only the edited bodies differ.
+        Assert.Equal(original.Members.Length, edited.Members.Length);
+        var line = Baseline.Split('\n').TakeWhile(text => !text.Contains(before, StringComparison.Ordinal)).Count() + 1;
+        var changed = original.Members.Zip(edited.Members).Where(pair => pair.First.Hash != pair.Second.Hash).Select(pair => pair.First).ToArray();
+        Assert.NotEmpty(changed);
+        Assert.All(changed, member => Assert.InRange(line, member.Start, member.End));
+    }
+
+    [Fact]
+    public async Task MembersAreTheElidedBodiesInOrderWithTheirLines()
+    {
+        var shape = await Shape(Baseline);
+        // A(), D(), D(int), operator +, implicit operator, M, P, this[] get, Expr, Accessors get and set, Local.
+        Assert.Equal(12, shape.Members.Length);
+        Assert.All(shape.Members, member => Assert.Matches("^[0-9A-F]{64}$", member.Hash));
+        Assert.Equal(shape.Members.Length, shape.Members.Select(member => member.Hash).Distinct().Count());
+        var lines = Baseline.Split('\n');
+        var m = shape.Members[5];
+        Assert.Contains("public int M(int x)", lines[m.Start - 1], StringComparison.Ordinal);
+        Assert.Equal(m.Start, m.End);
+    }
+
+    [Fact]
+    public async Task AddingLinesToOneBodyShiftsLaterMembersWithoutChangingThem()
+    {
+        var original = await Shape(Baseline);
+        var edited = await Shape(Baseline.Replace("public int M(int x) { return x; }", "public int M(int x)\n    {\n        return x + 1;\n    }", StringComparison.Ordinal));
+        Assert.Equal(original.Signature, edited.Signature);
+        var pairs = original.Members.Zip(edited.Members).ToArray();
+        Assert.Equal([5], pairs.Select((pair, index) => (pair, index)).Where(item => item.pair.First.Hash != item.pair.Second.Hash).Select(item => item.index));
+        Assert.Equal(original.Members[6].Start + 3, edited.Members[6].Start);
+        Assert.Equal(original.Members[6].Hash, edited.Members[6].Hash);
+        // The line break after the parameter list belongs to the text before M's body.
+        Assert.Equal([5], original.Gaps.Zip(edited.Gaps).Select((pair, index) => (pair, index)).Where(item => item.pair.First != item.pair.Second).Select(item => item.index));
+    }
+
+    [Fact]
+    public async Task MembersAndGapsKeepTheLayoutOfTheirLines()
+    {
+        var original = await Shape(Baseline);
+        Assert.Equal(original.Members.Length + 1, original.Gaps.Length);
+        var spaced = await Shape(Baseline.Replace("return x;", "return   x ;", StringComparison.Ordinal).Replace("public int P", "public  int P", StringComparison.Ordinal));
+        Assert.Equal(original.Members.Select(member => member.Hash), spaced.Members.Select(member => member.Hash));
+        Assert.Equal(original.Gaps, spaced.Gaps);
+        // A line break inside M changes M only; one between declarations changes that gap only.
+        var broken = await Shape(Baseline.Replace("{ return x; }", "{\n        return x;\n    }", StringComparison.Ordinal));
+        Assert.Equal(original.Signature, broken.Signature);
+        Assert.Equal([5], original.Members.Zip(broken.Members).Select((pair, index) => (pair, index)).Where(item => item.pair.First.Hash != item.pair.Second.Hash).Select(item => item.index));
+        Assert.Equal(original.Gaps, broken.Gaps);
+        var separated = await Shape(Baseline.Replace("    public int P => 1;", "\n    public int P => 1;", StringComparison.Ordinal));
+        Assert.Equal(original.Signature, separated.Signature);
+        Assert.Equal(original.Members.Select(member => member.Hash), separated.Members.Select(member => member.Hash));
+        Assert.Equal([6], original.Gaps.Zip(separated.Gaps).Select((pair, index) => (pair, index)).Where(item => item.pair.First != item.pair.Second).Select(item => item.index));
+        // A comment between declarations is a gap edit, not a declaration edit.
+        var commented = await Shape(Baseline.Replace("    public int P => 1;", "    // about P\n    public int P => 1;", StringComparison.Ordinal));
+        Assert.Equal(original.Signature, commented.Signature);
+        Assert.NotEqual(original.Gaps[6], commented.Gaps[6]);
+    }
+
+    [Fact]
+    public async Task ABlindFileHasNoMembers()
+    {
+        var shape = await Shape(Baseline.Replace("[Obsolete] public void A() { }", "[System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage] public void A() { }", StringComparison.Ordinal));
+        Assert.Empty(shape.Members);
+        Assert.Empty(shape.Gaps);
     }
 
     [Theory]
@@ -280,7 +345,9 @@ public class SourceFingerprintTests
     private sealed class ShapeComparer : IEqualityComparer<SourceShape?>
     {
         public bool Equals(SourceShape? x, SourceShape? y) => x is not null && y is not null && x.Signature == y.Signature && x.Body == y.Body
-            && x.PartialTypes.SequenceEqual(y.PartialTypes) && x.ExcludedTypes.SequenceEqual(y.ExcludedTypes);
+            && x.PartialTypes.SequenceEqual(y.PartialTypes) && x.ExcludedTypes.SequenceEqual(y.ExcludedTypes)
+            // Line breaks move and change members and gaps (see MembersAndGapsKeepTheLayoutOfTheirLines); their structure stays.
+            && x.Members.Length == y.Members.Length && x.Gaps.Length == y.Gaps.Length;
 
         public int GetHashCode(SourceShape? obj) => obj!.Signature.GetHashCode(StringComparison.Ordinal);
     }

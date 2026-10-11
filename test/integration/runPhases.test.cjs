@@ -1,4 +1,5 @@
 const {test}=require('node:test');
+const {toolsDirectory}=require('./support/tools.cjs');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {TestEngine}=require('../../out/services/engine');
@@ -12,7 +13,7 @@ test('runs report typed phases while timing lines keep their English names',{tim
  const output=[];
  /** @type {import('../../out/core/model').EngineConfiguration} */
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:false,excludes:[],testArguments:[],timeout:60000};
- const engine=new TestEngine({roots:[workspace],storage:path.join(temp,'state'),tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
+ const engine=new TestEngine({roots:[workspace],storage:path.join(temp,'state'),tools:toolsDirectory(temp),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
   events:{output:text=>output.push(text),phase:phase=>phases.push(phase),discovered(){},selected(){},result(){},started(){},coverage(){},invalidated(){}}});
  t.after(async()=>{await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
  await engine.run({files:[],full:true},t.signal);

@@ -1,5 +1,6 @@
 // Shared fixtures of the regression suites (test/integration/regression*.test.cjs).
 const fs=require('node:fs/promises');
+const {toolsDirectory}=require('./tools.cjs');
 const path=require('node:path');
 const os=require('node:os');
 const {TestEngine}=require('../../../out/services/engine');
@@ -24,11 +25,15 @@ async function fixture(t,demo='ImpactDemo') {
  await fs.cp(path.resolve('test/fixtures',demo),root,{recursive:true,filter:file=>!/(^|[/\\])(bin|obj|TestResults)([/\\]|$)/.test(file)});
  /** @type {MutableConfiguration} */ const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:60000,coverageTool:process.env.TESTY_COVERAGE_TOOL};
  /** @type {FixtureState} */ const state={selected:[],results:[],prepared:0,started:()=>{},inputsChanged:()=>{},output:[]};
- const engine=new TestEngine({roots:[root],storage:path.join(temp,'state'),tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,events:{
+ const engine=new TestEngine({roots:[root],storage:path.join(temp,'state'),tools:toolsDirectory(temp),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,events:{
   output:text=>state.output.push(text),phase:()=>{},inputsChanged:()=>state.inputsChanged(),discovered:()=>{},selected:s=>state.selected=s.groups.map(group=>path.basename(group.file||group.project)),
   result:(group,result)=>state.results.push({file:group.file,...result}),started:(group,id)=>state.started(group,id),coverage:()=>{},invalidated:()=>{},prepared:()=>state.prepared++
  }});
- settle=()=>/** @type {any} */ (engine).flushSaves();
+ // Disposal also stops test hosts a run kept for the next one (testy.reuseTestHosts), which would keep this process alive.
+ settle=async()=>{await /** @type {any} */ (engine).flushSaves();await engine.dispose().catch(()=>undefined);};
+ // A failed test shows what the engine logged, so an intermittent failure can be diagnosed from one run.
+ // `passed` (Node 21.7+) is missing from the installed type declarations.
+ t.after(()=>{if(/** @type {{passed?: boolean}} */ (/** @type {unknown} */ (t)).passed===false)console.error(`--- Testy output of the failed test (last 12,000 characters) ---\n${state.output.join('').slice(-12_000)}\n--- end of Testy output ---`);});
  // `internal` is the same engine seen through any: the tests reach private members (cache, saves) and replace methods.
  return {root,temp,config,state,engine,internal:/** @type {any} */ (engine),file:(/** @type {string} */ relative)=>normalizePath(path.join(root,relative)),run:(/** @type {string[]} */ files=[],full=false,/** @type {import('../../../out/services/engine').ManualSelection | undefined} */ manual=undefined)=>engine.run({files,full},new AbortController().signal,manual)};
 }

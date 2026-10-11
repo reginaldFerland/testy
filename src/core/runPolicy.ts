@@ -37,10 +37,23 @@ export function traceIsCurrent(trace: Pick<Trace, 'inputs'>, hashes: ReadonlyMap
     return Object.entries(trace.inputs ?? {}).every(([file, hash]) => sourceVersion(hashes, file) === hash);
 }
 
-/** A completed file run may be committed only if nothing it was built and attributed against has changed since. */
-export function commitIsCurrent(run: { readonly topology: number; readonly revision: number; readonly obsoleteBuild: boolean }, current: { readonly topology: number; readonly revision: number },
+/** Whether changes made while a batch runs are known to affect it, so finishing it would be wasted: a change of a non-C# file
+ * (configuration, project or data, which select whole projects), of a test file of the batch, or of a file its earlier coverage
+ * reached. Only an early answer: the commit of a finished batch still requires its own inputs to be current (see commitIsCurrent). */
+export function batchAffected(groups: readonly Pick<TestFile, 'id' | 'file'>[], changes: readonly string[], trace: (id: string) => Pick<Trace, 'dependencies'> | undefined): boolean {
+    if (changes.some(file => !/\.cs$/i.test(file))) {return true;}
+    return groups.some(group => {
+        const reached = new Set(trace(group.id)?.dependencies);
+        return changes.some(file => file === group.file || reached.has(file));
+    });
+}
+
+/** A completed file run may be committed only if nothing it was built and attributed against has changed since. A superseded
+ * run (`superseded`) finishes the files that newer changes cannot affect: their commits need only their own inputs current, and
+ * a later run decides from the committed traces what those changes select, as for changes made just after a commit. */
+export function commitIsCurrent(run: { readonly topology: number; readonly revision: number; readonly obsoleteBuild: boolean; readonly superseded?: boolean }, current: { readonly topology: number; readonly revision: number },
     trace: Pick<Trace, 'inputs'>, hashes: ReadonlyMap<string, string>): boolean {
-    return run.topology === current.topology && !run.obsoleteBuild && run.revision === current.revision && traceIsCurrent(trace, hashes);
+    return run.topology === current.topology && !run.obsoleteBuild && (run.revision === current.revision || !!run.superseded) && traceIsCurrent(trace, hashes);
 }
 
 /** Unselected stale traces whose inputs match the build's source versions are fresh again. Fresh and
@@ -81,9 +94,68 @@ export function baselineOrder(pending: readonly TestFile[], affected: ReadonlySe
     return [...pending].sort((a, b) => Number(affected.has(a.id)) - Number(affected.has(b.id)));
 }
 
-/** Files whose latest results include a failure run first; otherwise the order is kept. */
-export function failingFirst(groups: readonly TestFile[], failing: (id: string) => boolean): TestFile[] {
-    return [...groups.filter(group => failing(group.id)), ...groups.filter(group => !failing(group.id))];
+/** `responsiveness` reports the likeliest failures soonest; `throughput` finishes the whole selection soonest. */
+export type SchedulingPriority = 'responsiveness' | 'throughput';
+
+/** Large runs (a baseline, run-all mode, a manual run of everything) want the whole result; the others want the first failure. */
+export function schedulingPriority(run: { readonly baseline: boolean; readonly mode: 'affected' | 'all'; readonly all: boolean }): SchedulingPriority {
+    return run.baseline || run.mode === 'all' || run.all ? 'throughput' : 'responsiveness';
+}
+
+/** The order in which a run starts its files, from the run time each file last took (`elapsed`; unknown for a file that never
+ * ran completely). For responsiveness: files whose latest results include a failure, then files without a known time (usually
+ * new ones), then the shortest first. For throughput: the longest first, so no long file is left to finish alone at the end;
+ * a file without a known time counts as the average. Ties keep the given order. */
+export function scheduleOrder(groups: readonly TestFile[], priority: SchedulingPriority, failing: (id: string) => boolean, elapsed: (id: string) => number | undefined): TestFile[] {
+    const keyed = groups.map((group, position) => ({ group, position, failing: failing(group.id), time: elapsed(group.id) }));
+    const known = keyed.flatMap(item => item.time === undefined ? [] : [item.time]);
+    const typical = known.length ? known.reduce((sum, time) => sum + time, 0) / known.length : 0;
+    keyed.sort(priority === 'responsiveness'
+        ? (a, b) => Number(b.failing) - Number(a.failing) || Number(a.time !== undefined) - Number(b.time !== undefined) || (a.time ?? 0) - (b.time ?? 0) || a.position - b.position
+        : (a, b) => (b.time ?? typical) - (a.time ?? typical) || a.position - b.position);
+    return keyed.map(item => item.group);
+}
+
+/** For a throughput run on several workers: the files long enough to hold up its end, each split into parts of its tests that
+ * workers can run side by side; every other file stays whole (one part). A file is long when its learned time is at least
+ * `minimum` and at least each worker's share of the whole run. Its tests are dealt longest first to the part with the least
+ * expected time, by their own durations (unknown ones count as the file's average), and keep their order within a part. */
+export function splitLongFiles<T extends { readonly id: string; readonly tests: readonly { readonly id: string }[] }>(groups: readonly T[], workers: number, elapsed: (id: string) => number | undefined,
+    duration: (groupId: string, testId: string) => number | undefined, eligible: (group: T) => boolean, minimum = 2000): T[][] {
+    const known = groups.flatMap(group => {const time = elapsed(group.id); return time === undefined ? [] : [time];});
+    const typical = known.length ? known.reduce((sum, time) => sum + time, 0) / known.length : 0;
+    const share = groups.reduce((sum, group) => sum + (elapsed(group.id) ?? typical), 0) / Math.max(1, workers);
+    return groups.map(group => {
+        const time = elapsed(group.id);
+        if (workers < 2 || time === undefined || time < minimum || time < share || group.tests.length < 2 || !eligible(group)) {return [group];}
+        const count = Math.min(workers, group.tests.length, Math.ceil(time / Math.max(share, minimum / 2)));
+        if (count < 2) {return [group];}
+        const average = time / group.tests.length;
+        const weighted = group.tests.map((test, index) => ({ test, index, weight: duration(group.id, test.id) ?? average })).sort((a, b) => b.weight - a.weight || a.index - b.index);
+        const parts = Array.from({ length: count }, () => ({ load: 0, tests: [] as typeof weighted }));
+        for (const item of weighted) {const part = parts.reduce((least, candidate) => candidate.load < least.load ? candidate : least); part.load += item.weight; part.tests.push(item);}
+        return parts.filter(part => part.tests.length).map(part => ({ ...group, tests: part.tests.sort((a, b) => a.index - b.index).map(item => item.test) }));
+    });
+}
+
+/** How much of a batch's run time each of its files takes: shared by test count, since a batch reports one time for all of them. */
+export function shareElapsed(groups: readonly Pick<TestFile, 'id' | 'tests'>[], elapsed: number): Map<string, number> {
+    const tests = groups.reduce((sum, group) => sum + group.tests.length, 0);
+    return new Map(groups.map(group => [group.id, tests ? Math.round(elapsed * group.tests.length / tests) : Math.round(elapsed / groups.length)]));
+}
+
+/** Expected time left for queued and running batches over `workers`, or undefined while no batch has an expected time. */
+export function remainingTime(batches: readonly { readonly expected: number | undefined; readonly started?: number | undefined; readonly finished: boolean }[], workers: number, now: number): number | undefined {
+    const known = batches.flatMap(batch => batch.expected === undefined ? [] : [batch.expected]);
+    if (!known.length) {return undefined;}
+    const typical = known.reduce((sum, time) => sum + time, 0) / known.length;
+    let total = 0, left = 0;
+    for (const batch of batches) {
+        if (batch.finished) {continue;}
+        const expected = batch.expected ?? typical;
+        total += batch.started === undefined ? expected : Math.max(0, expected - (now - batch.started)); left++;
+    }
+    return left ? Math.round(total / Math.max(1, Math.min(workers, left))) : 0;
 }
 
 /** The latest outcome of each test by file: which files still have a failing or errored test. */
@@ -115,8 +187,11 @@ export class FailingTests {
 export type TestOutcome = TestResult['outcome'];
 const testOutcomes: readonly TestOutcome[] = ['passed', 'failed', 'errored', 'skipped'];
 
-/** One file's latest outcomes as saved: its test ids listed under their outcome, empty lists omitted. */
-export type StoredOutcomes = { readonly groupId: string } & { readonly [outcome in TestOutcome]?: readonly string[] };
+/** One file's latest outcomes as saved: its test ids listed under their outcome, empty lists omitted, the run time in
+ * milliseconds it took when it last ran completely (see TestOutcomes.recordElapsed), and each test's own duration as the
+ * framework reported it (see TestOutcomes.duration). */
+export type StoredOutcomes = { readonly groupId: string; readonly elapsed?: number; readonly durations?: Readonly<Record<string, number>> }
+    & { readonly [outcome in TestOutcome]?: readonly string[] };
 
 /** Files whose outcomes to save, and files whose saved outcomes to delete. */
 export interface OutcomeDelta { readonly saved: readonly StoredOutcomes[]; readonly removed: readonly string[]; }
@@ -127,14 +202,49 @@ export class TestOutcomes {
     readonly failing = new FailingTests();
     private readonly files = new Map<string, Map<string, TestOutcome>>();
     private readonly tests = new Map<string, TestOutcome>();
+    /** By file: how long its latest complete runs took, smoothed (see recordElapsed). */
+    private readonly times = new Map<string, number>();
+    /** By file and test: how long the test itself took by the framework's measure, smoothed like file times. */
+    private readonly durations = new Map<string, Map<string, number>>();
     private readonly changed = new Set<string>();
 
     /** Every outcome by `group:test`. */
     get byTest(): ReadonlyMap<string, TestOutcome> { return this.tests; }
 
-    record(groupId: string, result: Pick<TestResult, 'id' | 'outcome'>): void {
+    /** How long the file's latest complete runs took, in milliseconds; unknown until one finished. */
+    elapsed(groupId: string): number | undefined { return this.times.get(groupId); }
+
+    /** Every known run time by file. */
+    get elapsedByFile(): ReadonlyMap<string, number> { return this.times; }
+
+    /** A complete run of the file took `elapsed` milliseconds. Averaged with the previous time, so one slow outlier (a cold
+     * disk, a busy machine) moves the order only halfway. Saved with the file's outcomes once it has any. */
+    recordElapsed(groupId: string, elapsed: number): void {
+        if (!Number.isFinite(elapsed) || elapsed < 0) {return;}
+        const previous = this.times.get(groupId), next = Math.round(previous === undefined ? elapsed : (previous + elapsed) / 2);
+        if (next === previous) {return;}
+        this.times.set(groupId, next); this.changed.add(groupId);
+    }
+
+    record(groupId: string, result: Pick<TestResult, 'id' | 'outcome'> & { readonly duration?: number }): void {
         this.failing.record(groupId, result);
         if (this.set(groupId, result.id, result.outcome)) {this.changed.add(groupId);}
+        // A skipped test, or an errored batch that never ran it, reports no duration of its own.
+        if (result.duration && Number.isFinite(result.duration) && result.duration > 0 && result.outcome !== 'skipped') {
+            let tests = this.durations.get(groupId);
+            if (!tests) {tests = new Map(); this.durations.set(groupId, tests);}
+            const previous = tests.get(result.id), next = Math.round(previous === undefined ? result.duration : (previous + result.duration) / 2);
+            if (next !== previous) {tests.set(result.id, next); this.changed.add(groupId);}
+        }
+    }
+
+    /** How long the test took by the framework's measure in its latest runs, in milliseconds; unknown until it ran. */
+    duration(groupId: string, testId: string): number | undefined { return this.durations.get(groupId)?.get(testId); }
+
+    /** The tests with the longest known durations, longest first. */
+    slowestTests(limit = 50): { readonly groupId: string; readonly testId: string; readonly duration: number }[] {
+        return [...this.durations].flatMap(([groupId, tests]) => [...tests].map(([testId, duration]) => ({ groupId, testId, duration })))
+            .sort((a, b) => b.duration - a.duration).slice(0, limit);
     }
 
     /** After a complete run or a rediscovery of a file: tests it no longer reports no longer exist. */
@@ -143,6 +253,9 @@ export class TestOutcomes {
         const tests = this.files.get(groupId);
         for (const id of tests?.keys() ?? []) {if (!reported.has(id)) {tests!.delete(id); this.tests.delete(`${groupId}:${id}`); this.changed.add(groupId);}}
         if (tests && !tests.size) {this.files.delete(groupId);}
+        const durations = this.durations.get(groupId);
+        for (const id of durations?.keys() ?? []) {if (!reported.has(id)) {durations!.delete(id); this.changed.add(groupId);}}
+        if (durations && !durations.size) {this.durations.delete(groupId);}
     }
 
     /** Forget files that no longer exist. */
@@ -151,14 +264,18 @@ export class TestOutcomes {
         for (const id of [...this.files.keys()]) {if (!groupIds.has(id)) {this.forget(id);}}
     }
 
-    clear(): void { this.failing.clear(); for (const id of [...this.files.keys()]) {this.forget(id);} }
+    clear(): void { this.failing.clear(); for (const id of [...this.files.keys()]) {this.forget(id);} this.times.clear(); this.durations.clear(); }
 
     /** Adopt saved outcomes, as after a restart; outcomes recorded meanwhile are newer and kept. */
     restore(saved: readonly StoredOutcomes[]): void {
-        for (const stored of saved) {for (const outcome of testOutcomes) {for (const id of stored[outcome] ?? []) {
-            if (this.files.get(stored.groupId)?.has(id)) {continue;}
-            this.failing.record(stored.groupId, { id, outcome }); this.set(stored.groupId, id, outcome);
-        }}}
+        for (const stored of saved) {
+            for (const outcome of testOutcomes) {for (const id of stored[outcome] ?? []) {
+                if (this.files.get(stored.groupId)?.has(id)) {continue;}
+                this.failing.record(stored.groupId, { id, outcome }); this.set(stored.groupId, id, outcome);
+            }}
+            if (stored.elapsed !== undefined && !this.times.has(stored.groupId)) {this.times.set(stored.groupId, stored.elapsed);}
+            if (stored.durations && !this.durations.has(stored.groupId)) {this.durations.set(stored.groupId, new Map(Object.entries(stored.durations)));}
+        }
     }
 
     /** What changed since the previous call, to save. */
@@ -167,9 +284,9 @@ export class TestOutcomes {
         for (const groupId of this.changed) {
             const tests = this.files.get(groupId);
             if (!tests) {removed.push(groupId); continue;}
-            const lists: { [outcome in TestOutcome]?: string[] } = {};
+            const lists: { [outcome in TestOutcome]?: string[] } = {}, elapsed = this.times.get(groupId), durations = this.durations.get(groupId);
             for (const [id, outcome] of tests) {(lists[outcome] ??= []).push(id);}
-            saved.push({ groupId, ...lists });
+            saved.push({ groupId, ...elapsed === undefined ? {} : { elapsed }, ...durations?.size ? { durations: Object.fromEntries(durations) } : {}, ...lists });
         }
         this.changed.clear(); return { saved, removed };
     }
@@ -186,7 +303,7 @@ export class TestOutcomes {
 
     private forget(groupId: string): void {
         for (const id of this.files.get(groupId)?.keys() ?? []) {this.tests.delete(`${groupId}:${id}`);}
-        this.files.delete(groupId); this.changed.add(groupId);
+        this.files.delete(groupId); this.times.delete(groupId); this.durations.delete(groupId); this.changed.add(groupId);
     }
 }
 

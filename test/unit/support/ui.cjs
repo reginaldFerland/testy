@@ -2,7 +2,7 @@ const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),{cre
 
 const out=path.resolve('out');
 // Modules that import `vscode` are evaluated against the stub; everything else loads normally.
-const stubbed=new Set(['extension','controller','changeWatcher','commands','diagnosticsPublisher','configuration','ui/coverage','ui/statusBar','ui/testTree','ui/exportCoverage','ui/selectionCause','ui/baselineProgress','ui/inlineResults']);
+const stubbed=new Set(['extension','controller','changeWatcher','commands','diagnosticsPublisher','configuration','ui/coverage','ui/statusBar','ui/testTree','ui/exportCoverage','ui/selectionCause','ui/baselineProgress','ui/inlineResults','ui/exceptionMarkers','ui/queueView']);
 
 /**
  * Loads the compiled extension-host modules from out/ into one sandbox with a stub `vscode`.
@@ -14,7 +14,21 @@ const stubbed=new Set(['extension','controller','changeWatcher','commands','diag
  */
 function loadUi({vscode={},stubs={},globals={}}={}) {
  stubs={configuration:{},...stubs};
- vscode={l10n:{t:(/** @type {string} */ message,/** @type {unknown[]} */ ...args)=>message.replace(/\{(\d+)\}/g,(/** @type {string} */ _,/** @type {number} */ index)=>String(args[index]))},TestTag:class{constructor(/** @type {string} */ id){this.id=id;}},...vscode};
+ vscode={l10n:{t:(/** @type {string} */ message,/** @type {unknown[]} */ ...args)=>message.replace(/\{(\d+)\}/g,(/** @type {string} */ _,/** @type {number} */ index)=>String(args[index]))},TestTag:class{constructor(/** @type {string} */ id){this.id=id;}},
+  // The queue view's surface, unless a test stubs it itself.
+  EventEmitter:class{
+   constructor(){
+    /** @type {((value: unknown) => void)[]} */
+    const listeners=[];
+    this.listeners=listeners;this.event=(/** @type {(value: unknown) => void} */ listener)=>{listeners.push(listener);return{dispose(){}};};
+   }
+   fire(/** @type {unknown} */ value){for(const listener of this.listeners)listener(value);}
+   dispose(){}
+  },
+  ...vscode};
+ // Tests replace members of their own window stub later, so the default joins that object rather than a copy.
+ if(vscode.window&&!vscode.window.registerTreeDataProvider)vscode.window.registerTreeDataProvider=()=>({dispose(){}});
+ else if(!vscode.window)vscode.window={registerTreeDataProvider:()=>({dispose(){}})};
  const sandbox=vm.createContext({Buffer,setTimeout,clearTimeout,AbortController,...globals}),cache=new Map();
  /** @type {(file: string) => any} */
  const load=file=>{

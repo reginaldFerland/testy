@@ -20,6 +20,8 @@ export interface Preparation {
     nodes: readonly TestNode[]; nativeById: ReadonlyMap<string, TestNode>;
     byKey: ReadonlyMap<string, readonly TestNode[]>; instrumented?: readonly string[]; groups?: readonly TestFile[]; runs: number;
     readonly lease?: PreparedArtifactLease | undefined;
+    /** The build output it was prepared from: the target's output directory, or its snapshot. */
+    readonly source?: string | undefined;
     /** An in-place coverage upgrade did not finish; the template must not be retained. */
     interrupted?: { readonly error: unknown };
     /** A collector using this instrumentation session was stopped or failed. Its
@@ -34,11 +36,14 @@ export class RunnerPreparations {
     private readonly preparations = new Map<string, Promise<Preparation>>();
     readonly toolContexts: Map<string, Promise<string>>;
     readonly toolIdentities: Map<string, Promise<string>>;
-    constructor(private readonly options: RunnerOptions, private readonly outputRoot: () => Promise<string>,
+    constructor(private options: RunnerOptions, private readonly outputRoot: () => Promise<string>,
         private readonly projects: ReadonlyMap<string, Project>) {
         this.toolContexts = options.preparationTools ?? new Map<string, Promise<string>>();
         this.toolIdentities = options.preparationToolIdentities ?? new Map<string, Promise<string>>();
     }
+
+    /** Serve a later run (see RunnerSession.rebind): its signal, callbacks and settings replace the earlier run's. */
+    rebind(options: RunnerOptions): void { this.options = options; }
 
     /** Preparations still in progress, which disposal must drain. */
     pending(): Promise<Preparation>[] { return [...this.preparations.values()]; }
@@ -99,7 +104,7 @@ export class RunnerPreparations {
                 await lease?.update(artifact, options.signal);
             }
             const { output, session, coverage, coveragePending, instrumented } = artifact;
-            const prepared = { root, output, session, coverage, coveragePending, ...await this.discoverArtifact(group, output), instrumented, lease, runs: 0 };
+            const prepared = { root, output, session, coverage, coveragePending, ...await this.discoverArtifact(group, output), instrumented, lease, source, runs: 0 };
             this.prepared.set(key, prepared); options.onPrepared?.(group.project);
             return prepared;
         } catch (error) {
@@ -203,8 +208,11 @@ export class RunnerPreparations {
             const files = await workspaceOutputs(template, assemblies, options.signal);
             const instrument = async (assembly: string, signal: AbortSignal | undefined): Promise<string | undefined> => {
                 const before = await fileHash(assembly, signal);
-                requireSuccess(await runProcess(options.coverageTool!, ['instrument', assembly, '--session-id', session, '--nologo'],
-                    { ...options, signal }), `Instrumenting ${path.basename(assembly)}`);
+                const ended = options.track?.(`Instrument ${path.basename(assembly)}`, 'instrumentation');
+                try {
+                    requireSuccess(await runProcess(options.coverageTool!, ['instrument', assembly, '--session-id', session, '--nologo', ...options.coverageSettings ? ['--settings', options.coverageSettings] : []],
+                        { ...options, signal }), `Instrumenting ${path.basename(assembly)}`);
+                } finally {ended?.();}
                 // The collector can exit 0 after skipping a module (for
                 // example, no_symbols). An unchanged DLL must retain its
                 // whole-module dependency when the observer sees it load.

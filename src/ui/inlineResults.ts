@@ -2,11 +2,13 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { Configuration } from '../configuration';
 import { CoverageSummary } from '../core/coverage';
+import { LineMap } from '../core/lineMap';
 import { TestFile } from '../core/model';
 import { normalizePathAsync } from '../core/paths';
 import { TestEngine } from '../services/engine';
 import { CoverageView } from './coverage';
-import { fileStatus, inlineGutter, LineStatus, lineStatuses, orderByStatus, summarizeLine } from './inlineStatus';
+import { ExceptionMarkers } from './exceptionMarkers';
+import { fileStatus, inlineGutter, lineCost, LineStatus, lineStatuses, orderByStatus, summarizeLine } from './inlineStatus';
 import { TestTree } from './testTree';
 
 // Call sites use l10n.t(...) literally so `npm run l10n:export` can extract them.
@@ -21,6 +23,7 @@ const hoverTests = 3;
 export interface InlineResultsHost {
     readonly disposed: boolean;
     readonly config: Configuration;
+    readonly roots: readonly string[];
     /** Aborted on disposal; cancels pending summary work. */
     readonly lifetime: AbortController;
     reportError(error: unknown): void;
@@ -40,6 +43,8 @@ interface EditorState {
     readonly version: number;
     readonly lineCount: number;
     readonly dirty: boolean;
+    /** The version of the unsaved edits' line map the lines were placed with. */
+    readonly mapVersion: number | undefined;
     readonly summary: CoverageSummary | undefined;
     readonly snapshot: Snapshot | undefined;
     readonly lines: Record<LineStatus, number[]>;
@@ -68,9 +73,20 @@ export class InlineResults implements vscode.Disposable {
     private drawn = false;
     private snapshot: Snapshot | undefined;
     private readonly paths = new WeakMap<vscode.TextDocument, Promise<string>>();
+    /** Where failing tests threw, drawn whenever inline results are on (see ExceptionMarkers). */
+    readonly exceptions: ExceptionMarkers;
+    /** How the unsaved edits of each document moved its saved lines (see track). */
+    private readonly edits = new WeakMap<vscode.TextDocument, LineMap>();
+    /** Documents last seen saved: their next edits can be followed from the saved text. */
+    private readonly clean = new WeakSet<vscode.TextDocument>();
 
     constructor(private readonly extensionUri: vscode.Uri, private readonly engine: TestEngine, private readonly coverage: CoverageView,
         private readonly tree: TestTree, private readonly host: InlineResultsHost) {
+        this.exceptions = new ExceptionMarkers({
+            get disposed() { return host.disposed; }, get roots() { return host.roots; }, get enabled() { return host.config.inlineResults !== 'off'; },
+            get hashes() { return engine.hashes; }, named: name => tree.namedSources(name), reportError: error => host.reportError(error),
+            lineMap: document => this.lineMap(document)
+        });
         this.syncHover();
     }
 
@@ -94,10 +110,31 @@ export class InlineResults implements vscode.Disposable {
         } else if (!wanted && this.hover) {this.hover.dispose(); this.hover = undefined;}
     }
 
+    /** Follow an edit of a C# document, so markers keep to the lines they belong to until it is saved. Edits are followed only from
+     * the saved text: a document already unsaved when first seen keeps its markers pending. */
+    track(event: vscode.TextDocumentChangeEvent): void {
+        const document = event.document;
+        if (!csharp(document) || !event.contentChanges.length) {return;}
+        if (!document.isDirty) {this.saved(document); return;}
+        let map = this.edits.get(document);
+        if (!map) {
+            if (!this.clean.has(document)) {return;}
+            map = new LineMap(); this.edits.set(document, map); this.clean.delete(document);
+        }
+        map.apply(event.contentChanges);
+    }
+
+    /** A document was saved (or reverted): its lines are the saved lines again. */
+    saved(document: vscode.TextDocument): void { this.edits.delete(document); this.clean.add(document); }
+
+    /** The line map of an unsaved document whose edits were all followed; undefined for a saved one. */
+    lineMap(document: vscode.TextDocument): LineMap | undefined { return document.isDirty ? this.edits.get(document) : undefined; }
+
     /** Redraw the visible editors, for example after results, coverage or settings changed. */
     refresh(): void { this.syncHover(); this.queue(vscode.window.visibleTextEditors); }
 
     queue(editors: readonly vscode.TextEditor[]): void {
+        this.exceptions.queue(editors);
         if (this.host.disposed || (!this.drawn && !this.gutter)) {return;}
         for (const editor of editors) {this.pending.add(editor);}
         if (this.rendering) {return;}
@@ -146,9 +183,10 @@ export class InlineResults implements vscode.Disposable {
         return status;
     }
 
-    /** An unsaved document, or coverage of another version of the file that no stale test file explains, has no current results. */
+    /** An unsaved document whose edits were not followed, or coverage of another version of the file that no stale test file
+     * explains, has no current results. */
     private unverified(summary: CoverageSummary, document: vscode.TextDocument): boolean {
-        return document.isDirty || (summary.stale && !summary.groupIds.some(id => this.engine.coverage.traces.get(id)?.stale));
+        return (document.isDirty && !this.lineMap(document)) || (summary.stale && !summary.groupIds.some(id => this.engine.coverage.traces.get(id)?.stale));
     }
 
     private async decorate(editors: readonly vscode.TextEditor[]): Promise<void> {
@@ -160,14 +198,16 @@ export class InlineResults implements vscode.Disposable {
         const visible = show && this.gutter;
         for (const [index, editor] of editors.entries()) {
             const document = editor.document, file = files[index];
+            if (!document.isDirty) {this.saved(document);}
+            const map = this.lineMap(document);
             const summary = visible && snapshot && file !== undefined ? snapshot.files.get(file) : undefined;
             const previous = this.rendered.get(editor);
             const unchanged = previous?.document === document && previous.summary === summary && previous.snapshot === snapshot && previous.dirty === document.isDirty
-                && previous.lineCount === document.lineCount && (previous.version === document.version || document.isDirty || !summary);
+                && previous.lineCount === document.lineCount && previous.mapVersion === map?.version && (previous.version === document.version || document.isDirty || !summary);
             if (unchanged) {continue;}
             const lines = summary && snapshot ? lineStatuses(this.coverage.coveringOf(summary), group => this.statusOf(snapshot, group),
-                { pending: this.unverified(summary, document), lineCount: document.lineCount }) : empty();
-            const state: EditorState = { document, version: document.version, lineCount: document.lineCount, dirty: document.isDirty, summary, snapshot, lines };
+                { pending: this.unverified(summary, document), lineCount: document.lineCount, map: map && (line => map.map(line)) }) : empty();
+            const state: EditorState = { document, version: document.version, lineCount: document.lineCount, dirty: document.isDirty, mapVersion: map?.version, summary, snapshot, lines };
             if (sameLines(previous?.lines ?? empty(), lines)) {this.rendered.set(editor, state); continue;}
             // A partially failed submission must never make an older state look current.
             this.rendered.delete(editor);
@@ -185,7 +225,9 @@ export class InlineResults implements vscode.Disposable {
         const [file, snapshot] = await Promise.all([this.path(document), this.current()]);
         const summary = snapshot?.files.get(file);
         if (!snapshot || !summary || token?.isCancellationRequested) {return undefined;}
-        const groups = this.coverage.coveringOf(summary).get(position.line + 1);
+        // An unsaved document's line shows the saved line its edits moved there, if they did not write it.
+        const map = this.lineMap(document), saved = map ? map.inverse(position.line) : position.line;
+        const groups = saved === undefined ? undefined : this.coverage.coveringOf(summary).get(saved + 1);
         if (!groups?.length || position.line >= document.lineCount) {return undefined;}
         const unverified = this.unverified(summary, document);
         const statusOf = (group: string): LineStatus => unverified ? 'pending' : this.statusOf(snapshot, group);
@@ -196,7 +238,7 @@ export class InlineResults implements vscode.Disposable {
         const icons: Record<LineStatus, string> = { passed: '$(pass)', failed: '$(error)', pending: '$(circle-outline)' };
         const labels: Record<LineStatus, string> = { passed: l10n.t('passed'), failed: l10n.t('failed'), pending: l10n.t('not run since a change') };
         const markdown = new vscode.MarkdownString(undefined, true);
-        markdown.isTrusted = { enabledCommands: ['testy.runCoveringTests', 'testy.showTest'] };
+        markdown.isTrusted = { enabledCommands: ['testy.runCoveringTests', 'testy.debugCoveringTests', 'testy.showTest'] };
         markdown.appendMarkdown(`**Testy** · ${escape(failing ? l10n.t('Covered by {0} test files ({1} failing)', files, failing) : l10n.t('Covered by {0} test files', files))}`);
         if (pending) {markdown.appendMarkdown(` · ${escape(l10n.t('{0} not run since a change', pending))}`);}
         markdown.appendMarkdown('\n\n');
@@ -213,13 +255,37 @@ export class InlineResults implements vscode.Disposable {
             markdown.appendMarkdown(`${entry}\n`);
         }
         if (ordered.length > hoverFiles) {markdown.appendMarkdown(`- ${escape(l10n.t('+{0} more', ordered.length - hoverFiles))}\n`);}
-        markdown.appendMarkdown(`\n[$(play) ${escape(l10n.t('Run covering tests'))}](${command('testy.runCoveringTests', [document.uri.toString(), position.line + 1])})`);
+        const cost = this.cost(file, saved! + 1, groups, known);
+        if (cost) {
+            const seconds = (milliseconds: number): string => l10n.t('{0}s', (milliseconds / 1000).toFixed(2));
+            markdown.appendMarkdown(`\n$(watch) ${escape(cost.tests
+                ? l10n.t('{0} tests through this line take {1} in all; slowest: {2} ({3})', cost.count, seconds(cost.total), cost.slowest.name, seconds(cost.slowest.milliseconds))
+                : l10n.t('Covering test files take {0} in all; slowest: {1} ({2})', seconds(cost.total), cost.slowest.name, seconds(cost.slowest.milliseconds)))}\n`);
+        }
+        const target = [document.uri.toString(), position.line + 1];
+        markdown.appendMarkdown(`\n[$(play) ${escape(l10n.t('Run covering tests'))}](${command('testy.runCoveringTests', target)})`);
+        markdown.appendMarkdown(` · [$(debug-alt) ${escape(l10n.t('Debug to this line'))}](${command('testy.debugCoveringTests', target)})`);
         return new vscode.Hover(markdown, new vscode.Range(position.line, 0, position.line, document.lineAt(position.line).text.length));
+    }
+
+    /** The time the tests through a covered line take (see lineCost): by the tests whose own coverage ran the line, when every
+     * covering file learned each test's coverage, or else by the covering files' learned run times. */
+    private cost(file: string, line: number, groups: readonly string[], known: ReadonlyMap<string, TestFile>): (NonNullable<ReturnType<typeof lineCost>> & { readonly tests: boolean }) | undefined {
+        const perTest = groups.every(id => this.engine.testCoverage.get(id));
+        if (perTest) {
+            const entries = groups.flatMap(id => [...this.engine.testCoverage.get(id)!].filter(([, records]) =>
+                records.some(record => record.file === file && record.lines.some(item => item.line === line && item.hits > 0)))
+                .map(([test]) => ({ name: this.tree.items.get(`${id}:${test}`)?.label ?? test, milliseconds: this.engine.testDuration(id, test) })));
+            const cost = lineCost(entries);
+            if (cost) {return { ...cost, tests: true };}
+        }
+        const cost = lineCost(groups.map(id => ({ name: path.basename(known.get(id)?.file ?? id), milliseconds: this.engine.elapsed(id) })));
+        return cost && { ...cost, tests: false };
     }
 
     dispose(): void {
         if (this.timer) {clearTimeout(this.timer);} this.pending.clear();
-        this.hover?.dispose();
+        this.hover?.dispose(); this.exceptions.dispose();
         for (const decoration of Object.values(this.decorations ?? {})) {decoration.dispose();}
     }
 }

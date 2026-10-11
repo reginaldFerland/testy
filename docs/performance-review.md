@@ -2,6 +2,41 @@
 
 Measurements below describe one Apple M5 machine with 10 logical CPUs and 16 GiB RAM. They distinguish measured component costs from estimates of possible savings. Overlapping stages and parallel worker durations must **not** be added together as expected wall-time improvements.
 
+## Save loop
+
+[save-loop.cjs](../test/performance/save-loop.cjs) measures the run that one save causes once the baseline is learned: 24 handlers in one project, one test file per handler across three MSTest projects, and a registry that constructs every handler, so every test file's coverage reaches every handler file. Each save edits one handler. Engine time from the save to the completed run, excluding the debounce (macOS, one observation per edit, eight edits; before is `29f408e`, with one or three test projects alike):
+
+| Edit | Before: files run, time | After: files run, time |
+| --- | --- | --- |
+| Body of the handler method its test calls | 24 of 24, ~3.6 s | 1 of 24, ~1.06 s |
+| Body no test calls, or a comment between members | 24 of 24, ~3.6–3.9 s | 0, ~0.34 s |
+
+Four changes contribute; the stages they shorten run in sequence:
+
+- **Method-level selection** ([core/memberImpact.ts](../src/core/memberImpact.ts)): Testing fell from ~2.6–2.8 s (24 files on nine lanes) to ~0.42 s (one file). After every edit, no trace was left stale.
+- **Narrowed builds** ([engine/plan.ts](../src/services/engine/plan.ts)): with three test projects, Building fell from ~510 to ~265 ms and Preparing tests from ~590 to ~350 ms (one target instead of three); an edit that selects nothing skips preparation entirely.
+- **MSBuild server**: an incremental build of the two projects fell from ~380 to ~200 ms in isolation (Building ~470 → ~265 ms in the loop).
+- **Save debounce**: 500 → 50 ms of waiting before each run in the default `save` trigger mode.
+
+The remaining ~1 s is three process launches in sequence: the build (~265 ms), instrumentation of the rebuilt DLLs in parallel and discovery (~350 ms), and the collector-wrapped test host (~420 ms). Discovery is not reused across builds: provider IDs can depend on the prepared output path and binary, so the runner rediscovers every rebuilt target.
+
+## Reused test hosts
+
+`testy.reuseTestHosts` is now on by default. An ad-hoc comparison on the same machine used a generated Core → App workspace with two MSTest projects, 120 test files and 600 cases, coverage enabled and automatic workers (nine file workers). It ran a baseline then a run of every test in fresh engines, in ABBA order (off, on, on, off; one observation per engine):
+
+| Hosts | Baseline | Testing phase | Run of everything | Its testing phase |
+| --- | --- | --- | --- | --- |
+| A new process per file | 17.68 / 15.98 s | 14.06 / 13.10 s | 12.74 / 11.49 s | 11.74 / 10.56 s |
+| Reused per worker | 10.78 / 11.07 s | 7.69 / 8.21 s | 5.13 / 5.37 s | 4.21 / 4.45 s |
+
+The baseline took about **35% less time** (16.8 → 10.9 s midpoints) and the run of everything about **57% less** (12.1 → 5.2 s); all four observations agree in direction. Test outcomes were identical, and each file's own coverage is kept by collector snapshots (see [Reused test hosts](how-it-works.md#reused-test-hosts)). The saving is mostly test-host start-up (about 400 ms per file with the collector) spread over nine workers. Two observations per variant do not establish a confidence interval, and suites with expensive per-process fixtures will see different ratios. Isolation remains available per trait (`testy.isolatedTraits`) or by turning the setting off.
+
+Hosts, prepared outputs and discoveries are also kept between runs when every build output they were prepared from is unchanged (manifest hashes, as for prepared-output reuse). This removes the host start and per-target discovery for runs such as safety-net runs; it was verified functionally (the same host processes ran consecutive runs) but not timed.
+
+## Coverage snapshots
+
+Reused hosts take one collector snapshot per test file, and test granularity one per test. `dotnet-coverage` exposes snapshots only through its command-line client (`snapshot <session> --reset`; no in-process or IPC interface is documented). A timing harness on ImpactDemo (one file of 32 tests, test granularity, one worker, two edits) measured per test: the MTP run request 1.5 ms, reading the snapshot report 0.5 ms, and the snapshot **69.8 ms** (medians of 64). The client alone starts in about 39 ms, while the owned launch path (the POSIX supervisor and its cleanup) added about 43 ms to every spawn. Snapshots now run directly (`ProcessOptions.direct`; the client starts no processes of its own and is still killed on cancellation or timeout): the snapshot median fell to **46.8 ms (−33%)** and each learning run of the 32-test file from about 3.7 to 2.95 s (−20%). The remainder is mostly the client's own start-up.
+
 ## Parallel instrumentation
 
 The bundled collector now instruments independent workspace DLLs concurrently during initial preparation. Each target keeps one worker and borrows only immediately available project workers. Queued preparation keeps priority, private test-file workers retain their existing limit, and every admitted process drains before rollback or cancellation removes outputs. Custom collectors retain sequential instrumentation. See [runnerInstrumentation.ts](../src/services/runnerInstrumentation.ts#L23), [engine/prepare.ts](../src/services/engine/prepare.ts#L82) and [concurrency.ts](../src/core/concurrency.ts).

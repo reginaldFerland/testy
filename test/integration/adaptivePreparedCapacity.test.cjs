@@ -1,4 +1,5 @@
 const {test}=require('node:test');
+const {toolsDirectory}=require('./support/tools.cjs');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {TestEngine}=require('../../out/services/engine');
@@ -71,7 +72,7 @@ test('seventeen test targets retain every instrumented preparation through warm 
  };
  const makeEngine=()=>{
   /** @type {State} */ const state={output:[],results:[]};states.push(state);
-  const engine=new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
+  const engine=new TestEngine({roots:[root],storage,tools:toolsDirectory(temp),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
    events:{output:(/** @type {string} */ text)=>state.output.push(text),phase:(/** @type {unknown} */ value)=>{phase=value;},discovered(){},selected(){},result:(/** @type {import('../../out/core/model').TestFile} */ group,/** @type {import('../../out/core/model').TestResult} */ result)=>state.results.push({group:group.id,...result}),
     started(){},coverage(){},invalidated(){}}});
   engines.push(engine);return{engine,state};

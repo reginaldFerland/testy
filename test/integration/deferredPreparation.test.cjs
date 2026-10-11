@@ -1,4 +1,5 @@
 const {test}=require('node:test');
+const {toolsDirectory}=require('./support/tools.cjs');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {TestEngine}=require('../../out/services/engine');
@@ -11,8 +12,10 @@ const {normalizePath}=require('../../out/core/paths');
 /** @typedef {{assembly:string,instruments:number,nodes?:unknown}} RequestCall */
 /** @typedef {{instruments:InstrumentCall[],discoveries:RequestCall[],runs:RequestCall[],activeInstruments:number,activeRequests:number,afterInstrument?:((invocation:InstrumentCall)=>unknown)|undefined}} Probe */
 
-/** @param {import('node:test').TestContext} t @param {{dynamic?:'xunit'|'mstest'}} [options] */
-async function fixture(t,{dynamic}={}) {
+/** File granularity builds every target that depends on an edited project, which these tests of deferred preparation rely on;
+ * method granularity builds only the selected targets (see 'a body edit builds, instruments and discovers only the targets it selects').
+ * @param {import('node:test').TestContext} t @param {{dynamic?:'xunit'|'mstest',granularity?:'method'|'file'}} [options] */
+async function fixture(t,{dynamic,granularity='file'}={}) {
  const temp=await fs.mkdtemp(path.join(os.tmpdir(),'testy-deferred-preparation-'));
  const root=path.join(temp,'workspace'),storage=path.join(temp,'state'),control=path.join(temp,'rows.txt');
  const file=(/** @type {string} */ relative)=>normalizePath(path.join(root,relative));
@@ -43,9 +46,9 @@ async function fixture(t,{dynamic}={}) {
  }
  /** @type {import('../../out/core/model').EngineConfiguration} */
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:60000,
-  coverageTool:process.env.TESTY_COVERAGE_TOOL,maxParallelProjects:4,maxParallelTestFiles:4};
+  coverageTool:process.env.TESTY_COVERAGE_TOOL,maxParallelProjects:4,maxParallelTestFiles:4,granularity};
  const state=/** @type {{output:string[],results:(TestResult&{group:TestFile})[],selections:import('../../out/core/selection').Selection[]}} */ ({output:[],results:[],selections:[]});
- const engine=new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
+ const engine=new TestEngine({roots:[root],storage,tools:toolsDirectory(temp),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
   events:{output:text=>state.output.push(text),phase(){},discovered(){},selected:selection=>state.selections.push(selection),
    result:(group,result)=>state.results.push({group,...result}),started(){},coverage(){},invalidated(){}}});
  const processes=require('../../out/services/process'),mtp=require('../../out/services/mtp');
@@ -104,6 +107,29 @@ test('an affected dependency rebuild freshly discovers every target but instrume
  assert.equal(/** @type {RequestCall} */ (f.probe.discoveries[0]).assembly,deferredPath,'a retained discovery-only cache entry preserves the canonical path when promoted');
  f.reset();assert.equal((await f.run({files:[],full:false},manual)).passed,1,f.state.output.join(''));
  assert.equal(f.probe.instruments.length,0,'the promoted artifact is reusable on the next unchanged run');
+});
+
+test('a body edit builds, instruments and discovers only the targets it selects',{timeout:150000},async t=>{
+ const f=await fixture(t,{granularity:'method'});assert.equal((await f.run()).passed,4,f.state.output.join(''));
+ const before=new Map(f.engine.groups.map(group=>[group.id,group]));
+ f.reset();const changed=await f.change();
+ const result=await f.run(changed);assert.equal(result.tests,1);assert.equal(result.failed,1,f.state.output.join(''));
+ assert.deepEqual(f.probe.discoveries.map(item=>path.basename(item.assembly)),['Suite0.dll'],'targets that run nothing keep their inventory');
+ assert.deepEqual(preparedProjects(f.probe),['Suite0']);
+ assert.match(f.state.output.join(''),/Suite0 ->/);
+ assert.doesNotMatch(f.state.output.join(''),/Suite[123] ->/,'dependent test projects that select nothing are not built');
+ for(const group of f.engine.groups.filter(item=>path.basename(item.project)!=='Suite0.csproj')){
+  assert.equal(group,before.get(group.id),'their discovered files are retained as they were');
+  const trace=/** @type {StoredTrace} */ (f.engine.coverage.traces.get(group.id));assert.equal(trace.reliable,true);assert.equal(trace.stale,false,'and their coverage stays current');
+ }
+ // The next edit that selects a skipped target builds and discovers it.
+ f.reset();
+ const source=f.file('Web/Feature2.cs');await fs.writeFile(source,(await fs.readFile(source,'utf8')).replace('Scale.Infra.Feature2.Value(value)','Scale.Infra.Feature2.Value(value) + 1'));
+ await f.engine.markChanged([source]);
+ // The file that failed keeps running until it passes: a failing run cannot narrow.
+ const second=await f.run({files:[source],full:false});assert.equal(second.tests,2);assert.equal(second.failed,2,f.state.output.join(''));
+ assert.deepEqual(f.probe.discoveries.map(item=>path.basename(item.assembly)).sort(),['Suite0.dll','Suite2.dll']);
+ assert.doesNotMatch(f.state.output.join(''),/Suite[13] ->/);
 });
 
 test('changed dynamic inventories can select and upgrade a previously unanticipated target',{timeout:150000},async t=>{

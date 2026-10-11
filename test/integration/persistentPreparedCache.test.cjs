@@ -1,4 +1,5 @@
 const {test}=require('node:test');
+const {toolsDirectory}=require('./support/tools.cjs');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {TestEngine}=require('../../out/services/engine');
@@ -42,7 +43,7 @@ async function fixture(t,{xunit=false}={}) {
  const makeEngine=()=>{
   /** @type {EngineState} */
   const state={output:[],results:[],started(){}};states.push(state);
-  const engine=new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer:path.join(analyzerDirectory,'Testy.Analysis.dll'),configuration:()=>config,
+  const engine=new TestEngine({roots:[root],storage,tools:toolsDirectory(temp),analyzer:path.join(analyzerDirectory,'Testy.Analysis.dll'),configuration:()=>config,
    events:{output:text=>state.output.push(text),phase(){},discovered(){},selected(){},result:(group,result)=>state.results.push({group,...result}),
     started:(...args)=>state.started(...args),coverage(){},invalidated(){}}});
   engines.push(engine);return {engine,state};

@@ -125,13 +125,55 @@ test('selection rules for shapes, merged impact, completeness and checkpoints',(
 test('previously failing files are scheduled first, and a passing rerun clears them',()=>{
  const failing=new policy.FailingTests();
  failing.record('b',{id:'b1',outcome:'failed'});failing.record('c',{id:'c1',outcome:'errored'});failing.record('a',{id:'a1',outcome:'passed'});
- const order=()=>policy.failingFirst(/** @type {any[]} */ (['a','b','c','d'].map(id=>({id}))),id=>failing.has(id)).map(group=>group.id);
+ const order=()=>policy.scheduleOrder(/** @type {any[]} */ (['a','b','c','d'].map(id=>({id}))),'responsiveness',id=>failing.has(id),()=>undefined).map(group=>group.id);
  assert.deepEqual(order(),['b','c','a','d']);
  failing.record('b',{id:'b1',outcome:'passed'});assert.equal(failing.has('b'),false);
  failing.record('c',{id:'c2',outcome:'failed'});failing.settle('c',new Set(['c2']));assert.equal(failing.has('c'),true,'a removed test cannot keep its file failing, a reported one does');
  failing.record('c',{id:'c2',outcome:'skipped'});assert.equal(failing.has('c'),false);
  failing.record('d',{id:'d1',outcome:'failed'});failing.settle('d',new Set());assert.equal(failing.has('d'),false);
  failing.record('e',{id:'e1',outcome:'failed'});failing.retain(new Set(['a']));assert.equal(failing.has('e'),false,'deleted files are forgotten');
+});
+
+test('responsiveness runs failing files, then unmeasured ones, then the shortest first; throughput runs the longest first',()=>{
+ const times=new Map([['a',300],['b',100],['c',200],['e',50]]),failing=new Set(['c']);
+ const groups=/** @type {any[]} */ (['a','b','c','d','e'].map(id=>({id})));
+ const order=(/** @type {import('../../out/core/runPolicy').SchedulingPriority} */ priority)=>policy.scheduleOrder(groups,priority,id=>failing.has(id),id=>times.get(id)).map(group=>group.id);
+ assert.deepEqual(order('responsiveness'),['c','d','e','b','a']);
+ // d has no time and counts as the average (162.5 ms): after a and c, before b.
+ assert.deepEqual(order('throughput'),['a','c','d','b','e'],'failures do not reorder a throughput run');
+ assert.deepEqual(policy.scheduleOrder(groups,'throughput',()=>false,()=>undefined).map(group=>group.id),['a','b','c','d','e'],'without times the order is kept');
+ assert.equal(policy.schedulingPriority({baseline:true,mode:'affected',all:false}),'throughput');
+ assert.equal(policy.schedulingPriority({baseline:false,mode:'all',all:false}),'throughput');
+ assert.equal(policy.schedulingPriority({baseline:false,mode:'affected',all:true}),'throughput');
+ assert.equal(policy.schedulingPriority({baseline:false,mode:'affected',all:false}),'responsiveness');
+});
+
+test('a batch time is shared by test count, and the time left counts queued and running batches over the workers',()=>{
+ assert.deepEqual([...policy.shareElapsed([{id:'a',tests:/** @type {any[]} */ ([1,2,3])},{id:'b',tests:/** @type {any[]} */ ([1])}],400)],[['a',300],['b',100]]);
+ assert.deepEqual([...policy.shareElapsed([{id:'a',tests:[]},{id:'b',tests:[]}],400)],[['a',200],['b',200]]);
+ assert.equal(policy.remainingTime([{expected:undefined,finished:false}],2,0),undefined,'nothing is known yet');
+ const batches=[{expected:1000,started:0,finished:false},{expected:3000,finished:false},{expected:undefined,finished:false},{expected:500,finished:true}];
+ // Running: 1000 - 400 = 600; queued: 3000 and the average of the known (1500); over two workers.
+ assert.equal(policy.remainingTime(batches,2,400),2550);
+ assert.equal(policy.remainingTime(batches,8,400),1700,'never more workers than batches left');
+ assert.equal(policy.remainingTime([{expected:100,started:0,finished:false}],1,500),0,'an overdue batch is not negative');
+ assert.equal(policy.remainingTime([{expected:100,finished:true}],1,0),0);
+});
+
+test('learned run times are smoothed, saved with outcomes, restored without overriding newer ones, and forgotten with the file',()=>{
+ const outcomes=new policy.TestOutcomes();
+ outcomes.record('f',{id:'t1',outcome:'passed'});outcomes.recordElapsed('f',100);
+ assert.equal(outcomes.elapsed('f'),100);
+ outcomes.recordElapsed('f',300);assert.equal(outcomes.elapsed('f'),200,'averaged with the previous time');
+ outcomes.recordElapsed('f',Number.NaN);outcomes.recordElapsed('f',-1);assert.equal(outcomes.elapsed('f'),200,'invalid times are ignored');
+ assert.deepEqual(outcomes.take().saved,[{groupId:'f',elapsed:200,passed:['t1']}]);
+ outcomes.recordElapsed('f',200);assert.deepEqual(outcomes.take().saved,[],'an unchanged time saves nothing');
+ const restored=new policy.TestOutcomes();
+ restored.recordElapsed('g',40);
+ restored.restore([{groupId:'f',elapsed:200,passed:['t1']},{groupId:'g',elapsed:900,passed:['t2']}]);
+ assert.equal(restored.elapsed('f'),200);assert.equal(restored.elapsed('g'),40,'a time measured in this session is newer');
+ restored.retain(new Set(['g']));assert.equal(restored.elapsed('f'),undefined);
+ restored.clear();assert.equal(restored.elapsed('g'),undefined);assert.equal(restored.elapsedByFile.size,0);
 });
 
 test('target reports keep the union of every file report without rebuilding it',()=>{
@@ -159,4 +201,73 @@ test('impact runs schedule files with failures in their latest results first',as
  const selected=await selectRun(engine,run,/** @type {any} */ ({before:new Map()}),/** @type {any} */ ({currentShapes:new Map([[p('App/A.cs'),'shape']]),sessions:{}}));
  assert.deepEqual(selected.selection.groups.map(group=>group.id),['third','first','second']);
  assert.equal(selected.checkpoint,undefined,'only a baseline has checkpoints to update');
+});
+
+test('a batch is affected by changes to its test files, to files its coverage reached, or to non-C# files',()=>{
+ const {batchAffected}=require('../../out/core/runPolicy');
+ const traces=new Map([['t1',{dependencies:['/w/A.cs','/w/T1.cs']}]]);const trace=(/** @type {string} */ id)=>traces.get(id);
+ const groups=[{id:'t1',file:'/w/T1.cs'},{id:'t2',file:'/w/T2.cs'}];
+ assert.equal(batchAffected(groups,['/w/B.cs'],trace),false);
+ assert.equal(batchAffected(groups,['/w/A.cs'],trace),true);
+ assert.equal(batchAffected(groups,['/w/T2.cs'],trace),true,'a test file without coverage');
+ assert.equal(batchAffected(groups,['/w/app.json'],trace),true);
+});
+
+test('a superseded run commits a finished file whose own inputs are current although the revision moved',()=>{
+ const {commitIsCurrent}=require('../../out/core/runPolicy');
+ const trace={inputs:{'/w/A.cs':'h1'}},hashes=new Map([['/w/A.cs','h1'],['/w/B.cs','h9']]);
+ const run={topology:1,revision:3,obsoleteBuild:false},now={topology:1,revision:4};
+ assert.equal(commitIsCurrent(run,now,trace,hashes),false);
+ assert.equal(commitIsCurrent({...run,superseded:true},now,trace,hashes),true);
+ assert.equal(commitIsCurrent({...run,superseded:true},now,trace,new Map([['/w/A.cs','h2']])),false,'its own input changed');
+ assert.equal(commitIsCurrent({...run,superseded:true},{...now,topology:2},trace,hashes),false);
+});
+
+test('files a superseded run committed are selected again only by what changed since they ran',()=>{
+ const {alreadyRan}=require('../../out/services/engine/select');
+ const ran=new Map([['/w/A.cs','a1'],['/w/B.cs','b2']]),entry={versions:ran,topology:7};
+ const host={topology:7,ranAgainst:new Map([['g1',entry],['g2',entry]])};
+ /** @type {string[][]} */ const asked=[];
+ const select=(/** @type {readonly string[]} */ files)=>{asked.push([...files]);return {groups:files.includes('/w/C.cs')?[{id:'g2'}]:[]};};
+ // Nothing changed since: both files are current.
+ assert.deepEqual([...alreadyRan(host,['/w/B.cs'],new Map(ran),[{id:'g1'},{id:'g2'},{id:'g3'}],select)].sort(),['g1','g2']);
+ // C changed since (new version); it selects g2 again, not g1.
+ const before=new Map([...ran,['/w/C.cs','c1']]);
+ assert.deepEqual([...alreadyRan(host,['/w/B.cs','/w/C.cs'],before,[{id:'g1'},{id:'g2'}],select)],['g1']);
+ assert.deepEqual(asked.at(-1),['/w/C.cs']);
+ // An untracked change, or another topology, keeps every file.
+ assert.equal(alreadyRan(host,['/w/app.json'],new Map(ran),[{id:'g1'}],select).size,0);
+ assert.equal(alreadyRan({...host,topology:8},['/w/B.cs'],new Map(ran),[{id:'g1'}],select).size,0);
+});
+
+test('long files of a throughput run are split into balanced parts, and short, ineligible or unknown files stay whole',()=>{
+ const {splitLongFiles}=require('../../out/core/runPolicy');
+ const file=(/** @type {string} */ id,/** @type {number} */ tests)=>({id,tests:Array.from({length:tests},(_,index)=>({id:`${id}${index}`}))});
+ const groups=[file('long',6),file('short',3),file('other',4),file('unknown',2)];
+ const times=new Map([['long',12000],['short',1000],['other',1000]]);
+ const durations=new Map([['long0',5000],['long1',3000],['long2',1000],['long3',1000],['long4',1000],['long5',1000]]);
+ const split=splitLongFiles(groups,4,id=>times.get(id),(_group,test)=>durations.get(test),group=>group.id!=='other');
+ assert.deepEqual(split.slice(1).map(parts=>parts.length),[1,1,1]);
+ const parts=split[0];assert.ok(parts.length>=2&&parts.length<=4,`${parts.length}`);
+ assert.deepEqual(parts.flatMap(part=>part.tests.map(test=>test.id)).sort(),['long0','long1','long2','long3','long4','long5']);
+ assert.ok(parts.every(part=>part.id==='long'));
+ for(const part of parts){const ids=part.tests.map(test=>test.id);assert.deepEqual(ids,[...ids].sort(),'tests keep their order');}
+ assert.deepEqual(splitLongFiles(groups,1,id=>times.get(id),()=>undefined,()=>true).map(parts=>parts.length),[1,1,1,1],'one worker splits nothing');
+ assert.deepEqual(splitLongFiles([file('a',4)],4,()=>1500,()=>undefined,()=>true)[0].length,1,'below the minimum');
+});
+
+test('automatic runs add pinned items and, when asked, failing files, joining tests of files already selected',()=>{
+ const {withAlwaysRun}=require('../../out/services/engine/select');
+ const test=(/** @type {string} */ id)=>({id,name:id,fullyQualifiedName:id,line:1,node:{uid:id}});
+ const file=(/** @type {string} */ id,/** @type {string[]} */ tests)=>({id,project:'/w/T.csproj',framework:'net10.0',assembly:'/w/T.dll',file:`/w/${id}.cs`,tests:tests.map(test)});
+ const groups=[file('a',['a1','a2']),file('b',['b1','b2']),file('c',['c1'])];
+ const failing=new Set(['c']);
+ const host={groups,pinned:{groups:new Set(['a','b']),tests:new Map([['a',new Set(['a2'])]])},failing:{has:(/** @type {string} */ id)=>failing.has(id)},knownTests:(/** @type {any} */ group)=>group.tests};
+ const narrowed=new Map([['a',new Set(['a1'])]]);
+ const selection={groups:[{...groups[0],tests:[groups[0].tests[0]]}],reason:'Affected',fallback:false,causes:new Map()};
+ const result=withAlwaysRun(/** @type {any} */ (host),{alwaysRunFailing:true},/** @type {any} */ (selection),narrowed);
+ assert.deepEqual(result.groups.map(group=>[group.id,group.tests.map(item=>item.id)]),[['a',['a1','a2']],['b',['b1','b2']],['c',['c1']]]);
+ assert.deepEqual([...(narrowed.get('a')??[])].sort(),['a1','a2'],'a pinned test joins a narrowed file');
+ assert.equal(result.causes?.get('b')?.kind,'pinned');assert.equal(result.causes?.get('c')?.kind,'failing');
+ assert.equal(withAlwaysRun(/** @type {any} */ ({...host,pinned:undefined}),{alwaysRunFailing:false},/** @type {any} */ (selection)),selection);
 });

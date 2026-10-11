@@ -1,4 +1,5 @@
 const {test} = require('node:test');
+const {toolsDirectory}=require('./support/tools.cjs');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
@@ -35,7 +36,7 @@ test('MTP baseline, affected-file rerun, failure details, retained coverage and 
  let cancellationStarted;
   /** @type {import('../../out/core/model').EngineConfiguration} */
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:60000,coverageTool:process.env.TESTY_COVERAGE_TOOL};
- engine=new TestEngine({roots:[root],storage:path.join(directory,'state'),tools:path.join(directory,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,events:{
+ engine=new TestEngine({roots:[root],storage:path.join(directory,'state'),tools:toolsDirectory(directory),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,events:{
    output:text=>{if(/error/i.test(text)) console.log(text);},phase:phase=>phases.push(phase),discovered:()=>{},selected:value=>{selection=value;},
    result:(group,result)=>observed.push({file:path.basename(/** @type {string} */ (group.file)),...result}),started:()=>{
     if(cancelOnStart&&!cancelOnStart.signal.aborted){cancellationStarted=Date.now();cancelOnStart.abort();}

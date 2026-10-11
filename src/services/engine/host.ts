@@ -1,6 +1,9 @@
 import { CoverageStore } from '../../core/coverage';
 import { DiscoveredTest, Project, TestFile, TestResult, Trace } from '../../core/model';
 import { FailingTests } from '../../core/runPolicy';
+import { Timeline } from '../../core/timeline';
+import { TestCoverageStore } from '../../core/testCoverage';
+import type { MemberLayouts } from '../../core/memberImpact';
 import { ProjectIndex, Selection } from '../../core/selection';
 import { SourceShape } from '../analysis';
 import { AnalyzerServers } from '../analyzerServer';
@@ -13,10 +16,13 @@ import { RunnerOptions } from '../runnerTypes';
 import { SourceTracker } from '../sources';
 import { SdkChecks } from './sdk';
 import type { Baseline } from './baseline';
-import type { AnalysisState, EngineOptions, StructureState } from './types';
+import type { AnalysisState, EngineOptions, RunScope, StructureState } from './types';
+
+/** The source versions and topology an automatic run attributed a committed file to (see EngineHost.ranAgainst). */
+export interface RanAgainst { readonly versions: ReadonlyMap<string, string>; readonly topology: number }
 
 /** The coverage the stages read. Marking traces stale is the one write they make directly: it only widens later selections. */
-export type CoverageView = Readonly<Pick<CoverageStore, 'traces' | 'dependentGroups' | 'dependentProjects' | 'markStale'>>;
+export type CoverageView = Readonly<Pick<CoverageStore, 'traces' | 'dependentGroups' | 'dependentProjects' | 'fileHits' | 'versionGeometry' | 'markStale'>>;
 /** Source versions. Refreshing rereads the disk and marking forces a reread; neither discards what the tracker knows. */
 export type SourceView = Readonly<Pick<SourceTracker, 'hashes' | 'revision' | 'files' | 'analysisHashes' | 'aliasSources' | 'isGenerated' | 'refresh' | 'mark'>>;
 
@@ -30,12 +36,35 @@ export interface EngineHost {
     readonly sources: SourceView;
     readonly runtime: { readonly containers: ReadonlyMap<string, TestFile> };
     readonly failing: FailingTests;
+    /** What runs did and when, for the exported timeline. */
+    readonly timeline: Timeline;
+    /** Each test's own coverage of its test file, when learned (see core/testCoverage). */
+    readonly testCoverage: TestCoverageStore;
+    /** Files an automatic run that did not consume its changes (a superseded or cancelled run) committed, with the source versions
+     * and topology they ran against: the next affected run selects them only for what changed since (see engine/select). */
+    readonly ranAgainst: Map<string, RanAgainst>;
+    /** Pinned test items, which every automatic run also runs (see engine/select). */
+    readonly pinned: RunScope | undefined;
+    /** How long the file's latest complete runs took, in milliseconds; unknown until one finished (see TestOutcomes.elapsed). */
+    elapsed(groupId: string): number | undefined;
+    /** How long one test took in its latest runs by the framework's measure, in milliseconds; unknown until it ran. */
+    testDuration(groupId: string, testId: string): number | undefined;
+    /** A complete batch of these files ran in `elapsed` milliseconds; each file is charged its share by test count. */
+    recordElapsed(groups: readonly TestFile[], elapsed: number): void;
     readonly sdk: Pick<SdkChecks, 'ensure' | 'resolved'>;
     readonly identity: string;
     readonly preparedOutputs: PreparedOutputCache;
     readonly projectEvaluations: ProjectEvaluationCache;
     readonly analyzerServers: AnalyzerServers;
     readonly createSession: (options: RunnerOptions) => RunnerSession;
+    /** The session the previous run kept, rebound to this run's options, when `key` matches and every build output it prepared is
+     * byte for byte unchanged; otherwise it is released (see releaseSession) and the run prepares its own. */
+    takeSession(key: string, options: RunnerOptions, signal: AbortSignal): Promise<RunnerSession | undefined>;
+    /** The collector's exclusion patterns of every `// testy: no coverage` member in the tracked C# sources, sorted. */
+    coverageSuppressions(signal: AbortSignal): Promise<readonly string[]>;
+    /** Release a kept session: its hosts exit and its prepared outputs are freed, with the output lease it kept unless a run holds it
+     * (`withLease` false). */
+    releaseSession(withLease?: boolean): Promise<void>;
     /** Restore keys completed since the last `forgetRestores`. */
     readonly restored: ReadonlySet<string>;
     /** Tool hashes keyed by path and metadata stamp; a shared memo that survives runs. */
@@ -46,6 +75,7 @@ export interface EngineHost {
     readonly inputs: readonly string[];
     readonly displayGroups: readonly TestFile[];
     readonly projects: readonly Project[];
+    readonly discovered: readonly TestFile[];
     readonly groups: readonly TestFile[];
     readonly buildGraph: readonly Project[];
     readonly index: ProjectIndex;
@@ -53,6 +83,10 @@ export interface EngineHost {
     readonly shapes: ReadonlyMap<string, string | null>;
     readonly analyses: ReadonlyMap<string, SourceShape | null>;
     readonly analyzedHashes: ReadonlyMap<string, string>;
+    /** Analyzed body layouts of the current versions and of those traces still refer to. */
+    readonly members: Pick<MemberLayouts, 'get'>;
+    /** Whether plain C# edits may build only the test targets they select (see engine/plan); off for one run after a mismatch. */
+    readonly narrowBuilds: boolean;
     readonly analysisContext: string | undefined;
     readonly aliasStamp: string | undefined;
     readonly excludedAliases: readonly string[];

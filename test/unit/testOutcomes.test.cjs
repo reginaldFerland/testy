@@ -137,3 +137,18 @@ test('impact runs schedule files that failed before a reload first',async t=>{
  const selected=await selectRun(reloaded,run,/** @type {any} */ ({before:new Map()}) /* partial BuildResult */,/** @type {any} */ ({currentShapes:new Map([[p('App/A.cs'),'shape']]),sessions:{}})); // partial PreparedTests: only what selection reads
  assert.deepEqual(selected.selection.groups.map(group=>group.id),['third','first','second']);
 });
+
+test('test durations are smoothed, listed longest first, saved, restored and forgotten with their tests',()=>{
+ const {TestOutcomes}=require('../../out/core/runPolicy');
+ const {validOutcomes}=require('../../out/services/cacheFormat');
+ const outcomes=new TestOutcomes();
+ outcomes.record('f',{id:'a',outcome:'passed',duration:100});outcomes.record('f',{id:'a',outcome:'passed',duration:300});
+ outcomes.record('f',{id:'b',outcome:'failed',duration:50});outcomes.record('f',{id:'c',outcome:'skipped',duration:900});outcomes.record('g',{id:'d',outcome:'passed',duration:0});
+ assert.equal(outcomes.duration('f','a'),200);assert.equal(outcomes.duration('f','c'),undefined,'skipped tests have no duration');assert.equal(outcomes.duration('g','d'),undefined);
+ assert.deepEqual(outcomes.slowestTests(),[{groupId:'f',testId:'a',duration:200},{groupId:'f',testId:'b',duration:50}]);
+ const saved=outcomes.take().saved;const file=saved.find(item=>item.groupId==='f');
+ assert.deepEqual(file?.durations,{a:200,b:50});assert.ok(saved.every(item=>validOutcomes(item)));
+ assert.equal(validOutcomes({groupId:'f',durations:{a:-1}}),false);
+ const restored=new TestOutcomes();restored.restore(saved);assert.equal(restored.duration('f','b'),50);
+ restored.settle('f',new Set(['a']));assert.equal(restored.duration('f','b'),undefined);assert.equal(restored.duration('f','a'),200);
+});

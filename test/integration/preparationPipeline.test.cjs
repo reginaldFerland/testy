@@ -1,4 +1,5 @@
 const {test}=require('node:test');
+const {toolsDirectory}=require('./support/tools.cjs');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {TestEngine}=require('../../out/services/engine');
@@ -14,7 +15,7 @@ async function fixture(t,limit){
  /** @type {import('../../out/core/model').EngineConfiguration} */ const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:false,excludes:[],testArguments:[],timeout:60000,maxParallelProjects:limit,maxParallelTestFiles:limit};
  /** @type {string[]} */ const output=[];
  /** @type {(() => void)[]} */ const cleanup=[];
- const engine=new TestEngine({roots:[workspace],storage,tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
+ const engine=new TestEngine({roots:[workspace],storage,tools:toolsDirectory(temp),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
   events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result(){},started(){},coverage(){},invalidated(){}}});
  t.after(async()=>{control.abort();for(const release of cleanup)release();await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
  return{engine,signal,storage,output,cleanup:(/** @type {() => void} */ release)=>cleanup.push(release)};

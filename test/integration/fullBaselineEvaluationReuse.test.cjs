@@ -1,4 +1,5 @@
 const {test}=require('node:test');
+const {toolsDirectory}=require('./support/tools.cjs');
 // Patch the defining modules: `projects` only re-exports them through read-only bindings.
 const projectGraph=require('../../out/services/projectGraph'),projectBuild=require('../../out/services/projectBuild');
 const assert=require('node:assert/strict');
@@ -44,7 +45,7 @@ async function fixture(t,{privateAnalyzer=false}={}){
  projectGraph.evaluateProjects=async(/** @type {Parameters<typeof evaluate>} */ ...args)=>{evaluations++;return evaluate(...args);};
  projectBuild.restoreProjects=async(/** @type {Parameters<typeof restore>} */ ...args)=>{restores++;await restore(...args);await afterRestore?.(...args);};
  processes.runProcess=(/** @type {string} */ command,/** @type {readonly string[]} */ args,/** @type {[import('../../out/services/process').ProcessOptions]} */ ...rest)=>{if(args.length===1&&args[0]==='--version')sdkChecks++;return runProcess(command,args,...rest);};
- const engine=new TestEngine({roots:[root],storage:path.join(temp,'state'),tools:path.join(temp,'tools'),analyzer,configuration:()=>config,
+ const engine=new TestEngine({roots:[root],storage:path.join(temp,'state'),tools:toolsDirectory(temp),analyzer,configuration:()=>config,
   events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result(){},started(){},coverage(){},invalidated(){}}});
  t.after(async()=>{control.abort();projectGraph.evaluateProjects=evaluate;projectBuild.restoreProjects=restore;processes.runProcess=runProcess;await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
  return{temp,root,project,source,payload,imported,marker,failure,analyzer,config,engine,output,signal,

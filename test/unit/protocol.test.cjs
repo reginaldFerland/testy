@@ -158,7 +158,7 @@ test('unresolved runtime and ambiguous row identities expand to fresh containing
  /** @type {Record<string, any>} */ const exports={};
  let sent=/** @type {readonly Node[] | undefined} */ (undefined),expanded=/** @type {readonly TestFile[] | undefined} */ (undefined);
  const mtp=realRequire('./mtp');
- vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:(/** @type {string} */ name)=>name==='./mtp'?{...mtp,requestTests:async(/** @type {unknown} */ _options,/** @type {unknown} */ _operation,/** @type {readonly Node[]} */ nodes)=>{
+ vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,AbortController,require:(/** @type {string} */ name)=>name==='./mtp'?{...mtp,requestTests:async(/** @type {unknown} */ _options,/** @type {unknown} */ _operation,/** @type {readonly Node[]} */ nodes)=>{
   sent=nodes;return nodes.map(node=>({...node,'execution-state':'passed'}));
  }}:realRequire(name)});
  const nodes=[{uid:'one','display-name':'duplicate'},{uid:'two','display-name':'duplicate'},{uid:'other','display-name':'other'}];
@@ -188,7 +188,7 @@ test('Windows fallback cancellation waits for taskkill completion before releasi
   const child=new EventEmitter();Object.assign(child,{pid:100,stdout:new PassThrough(),stderr:new PassThrough(),kill:()=>{}});
   processes.push({command,args,child});return child;
  }
- vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:(/** @type {string} */ name)=>name==='node:child_process'?{spawn}:createRequire(file)(name),__dirname:path.dirname(file),process:{platform:'win32',env:{}},setTimeout,clearTimeout});
+ vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,AbortController,require:(/** @type {string} */ name)=>name==='node:child_process'?{spawn}:createRequire(file)(name),__dirname:path.dirname(file),process:{platform:'win32',env:{}},setTimeout,clearTimeout});
  const abort=new AbortController(), owned=exports.startProcess('dotnet',['test'],{cwd:'.',signal:abort.signal});
  let settled=false;const done=owned.done.catch((/** @type {Error} */ error)=>{settled=true;assert.equal(error.name,'AbortError');});
  abort.abort();assert.equal(processes[1].command,'taskkill');assert.ok(processes[1].args.includes('/T'));
@@ -205,7 +205,7 @@ test('Windows owned processes receive cancellation through the job host before f
   const child=new EventEmitter();const stdin=new EventEmitter();Object.assign(stdin,{writable:true,write:(/** @type {string} */ value)=>writes.push(value)});
   Object.assign(child,{pid:100,stdin,stdout:new PassThrough(),stderr:new PassThrough(),kill(){}});processes.push({command,args,child});return child;
  }
- vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:(/** @type {string} */ name)=>name==='node:child_process'?{spawn}:createRequire(file)(name),__dirname:path.dirname(file),process:{platform:'win32',env:{}},setTimeout,clearTimeout});
+ vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,AbortController,require:(/** @type {string} */ name)=>name==='node:child_process'?{spawn}:createRequire(file)(name),__dirname:path.dirname(file),process:{platform:'win32',env:{}},setTimeout,clearTimeout});
  const abort=new AbortController(),owned=exports.startProcess('a tool.exe',['argument with spaces'],{cwd:'.',signal:abort.signal,dotnetHost:'custom-dotnet.exe'});
  assert.equal(processes[0].command,'custom-dotnet.exe');assert.match(processes[0].args[0],/Testy.ProcessHost.dll$/);
  assert.deepEqual([...processes[0].args.slice(1)],['a tool.exe','argument with spaces']);
@@ -291,7 +291,7 @@ test('runtime fallback honors explicit exclusions and rejects unselectable runti
  /** @type {Record<string, any>} */ const exports={};
  let sent=/** @type {readonly Node[] | undefined} */ (undefined);
  const nodes=[{uid:'parent','display-name':'Theory'},{uid:'excluded','display-name':'Other'}];
- vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:(/** @type {string} */ name)=>name==='./mtp'?{...mtp,requestTests:async(/** @type {unknown} */ _options,/** @type {unknown} */ _operation,/** @type {readonly Node[] | undefined} */ selected)=>{
+ vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,AbortController,require:(/** @type {string} */ name)=>name==='./mtp'?{...mtp,requestTests:async(/** @type {unknown} */ _options,/** @type {unknown} */ _operation,/** @type {readonly Node[] | undefined} */ selected)=>{
   sent=selected??nodes;return sent.map(node=>({...node,'execution-state':'passed'}));
  }}:realRequire(name)});
  const group={id:'g',project:'/Tests.csproj',assembly:'/Tests.dll',framework:'net10.0',file:'/Tests.cs',tests:nodes.map(mtp.discoveredTest)};
@@ -345,4 +345,23 @@ test('editor coverage refresh yields during shared-file aggregation and never fa
  store.markStale(live);calls.length=0;context.engine.coverage={summarizeAsync:async(/** @type {unknown} */ _hashes,/** @type {AbortSignal} */ signal)=>{await new Promise(resolve=>setImmediate(resolve));signal.throwIfAborted();return[];}};
  const pending=proto.decorate.call(context,[editor]);host.disposed=true;host.lifetime.abort();
  await assert.rejects(pending,{name:'AbortError'});assert.equal(calls.length,0,'disposing must prevent late editor writes');
+});
+
+test('an MTP session serves several runs in one host, and a failed or overlong run closes it',async()=>{
+ const {MtpSession}=require('../../out/services/mtp');
+ const options={dotnet:process.execPath,assembly:path.resolve('test/fixtures/mtp-peer.cjs'),cwd:process.cwd(),timeoutMs:5000};
+ const updates=[{uid:'row','execution-state':'passed','location.type':'T','location.method':'M'}];
+ const session=await MtpSession.open({...options,env:{TESTY_UPDATES:JSON.stringify(updates)}});
+ /** @type {string[]} */ const seen=[];
+ for(let index=0;index<3;index++){
+  const nodes=await session.run([{uid:'row'}],{onNode:node=>seen.push(node.uid)});
+  assert.equal(resultOf(/** @type {Node} */ (nodes[0])).outcome,'passed');
+ }
+ assert.deepEqual(seen,['row','row','row']);assert.equal(session.alive,true);
+ await session.close();await session.close();assert.equal(session.alive,false);
+ await assert.rejects(session.run(undefined),/closed/);
+ const hanging=await MtpSession.open({...options,timeoutMs:300,env:{TESTY_HANG:'1'}});
+ await assert.rejects(hanging.run(undefined),/exceeded its time limit of 0 seconds/);assert.equal(hanging.alive,false);
+ const exiting=await MtpSession.open({...options,env:{TESTY_EXIT_DURING:'41'}});
+ await assert.rejects(exiting.run(undefined),/exit 41/);assert.equal(exiting.alive,false);
 });

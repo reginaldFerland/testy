@@ -1,4 +1,5 @@
 const {test}=require('node:test');
+const {toolsDirectory}=require('./support/tools.cjs');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises');
 const path=require('node:path');
@@ -17,7 +18,7 @@ test('reopening after a baseline runs only what changed while closed, detects fi
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:60000,coverageTool:process.env.TESTY_COVERAGE_TOOL};
  /** @type {Selection|undefined} */ let selection;
  /** @type {string[]} */ const output=[];
- const create=()=>new TestEngine({roots:[root],storage:path.join(directory,'state'),tools:path.join(directory,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
+ const create=()=>new TestEngine({roots:[root],storage:path.join(directory,'state'),tools:toolsDirectory(directory),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
   events:{output:text=>output.push(text),phase(){},discovered(){},selected:value=>{selection=value;},result(){},started(){},coverage(){},invalidated(){}}});
  let engine=create();
  t.after(async()=>{control.abort();try{await engine.dispose();}finally{await fs.rm(directory,{recursive:true,force:true});}});
@@ -67,7 +68,7 @@ async function reopenable(t){
  /** @type {import('../../out/core/model').EngineConfiguration} */
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:60000,coverageTool:process.env.TESTY_COVERAGE_TOOL};
  /** @type {{selection: Selection|undefined, output: string[]}} */ const state={selection:undefined,output:[]};
- const create=()=>new TestEngine({roots:[root],storage:path.join(directory,'state'),tools:path.join(directory,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
+ const create=()=>new TestEngine({roots:[root],storage:path.join(directory,'state'),tools:toolsDirectory(directory),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
   events:{output:text=>state.output.push(text),phase(){},discovered(){},selected:value=>{state.selection=value;},result(){},started(){},coverage(){},invalidated(){}}});
  const f={root,data,signal,state,engine:create(),
   /** Close the window and open it again, as startup does: restore, then the full request startup always makes. */

@@ -1,4 +1,5 @@
 const {test}=require('node:test');
+const {toolsDirectory}=require('./support/tools.cjs');
 // Patch the defining modules: `projects` only re-exports them through read-only bindings.
 const projectGraph=require('../../out/services/projectGraph'),projectBuild=require('../../out/services/projectBuild');
 const assert=require('node:assert/strict');
@@ -16,7 +17,7 @@ async function fixture(t){
  const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:false,excludes:[],testArguments:[],timeout:60000,maxParallelProjects:2,maxParallelTestFiles:2};
  const output=/** @type {string[]} */ ([]);let evaluations=0;const evaluate=projectGraph.evaluateProjects;
  projectGraph.evaluateProjects=async(...args)=>{evaluations++;return evaluate(...args);};
- const engine=new TestEngine({roots:[root],storage:path.join(temp,'state'),tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
+ const engine=new TestEngine({roots:[root],storage:path.join(temp,'state'),tools:toolsDirectory(temp),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
   events:{output:text=>output.push(text),phase:()=>{},discovered:()=>{},selected:()=>{},result:()=>{},started:()=>{},coverage:()=>{},invalidated:()=>{}}});
  t.after(async()=>{projectGraph.evaluateProjects=evaluate;await engine.dispose();await fs.rm(temp,{recursive:true,force:true});});
  return{temp,root,project,source,config,engine,output,evaluations:()=>evaluations,

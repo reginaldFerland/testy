@@ -1,4 +1,6 @@
+import type { QueueEntry } from '../../core/queue';
 import { EngineConfiguration, Project, TestFile, TestResult } from '../../core/model';
+import type { SchedulingPriority } from '../../core/runPolicy';
 import { ProjectIndex, Selection } from '../../core/selection';
 import { ProcessOptions } from '../process';
 import { RunnerSession } from '../runner';
@@ -19,6 +21,8 @@ export interface RunPhase {
     /** Baseline progress: test files learned so far, out of `learnedTotal`. */
     readonly learned?: number;
     readonly learnedTotal?: number;
+    /** Testing: the expected milliseconds left, from the files' learned run times; absent while none is known. */
+    readonly remaining?: number;
 }
 /** English names of the run stages in `Testy timing:` output lines. */
 export const phaseTimingNames: Readonly<Record<RunPhase['kind'], string>> = {
@@ -41,6 +45,8 @@ export interface EngineEvents {
     readonly coverageUnavailable?: (reason: string) => void;
     /** Attach a debugger to a waiting test host; required for debug runs. */
     readonly debug?: (processId: number) => Promise<void>;
+    /** The test batches of the testing run and their states, whenever one starts or finishes (see core/queue). */
+    readonly queue?: (entries: readonly QueueEntry[]) => void;
 }
 export interface EngineOptions {
     readonly roots: readonly string[];
@@ -113,10 +119,15 @@ export interface RunContext {
     readonly rootSnapshot: readonly string[];
     readonly processOptions: ProcessOptions;
     readonly changes: readonly string[];
+    /** The user asked to run what these changes affect (see ChangeBatch): every file whose coverage reached them runs. */
+    readonly explicit?: boolean;
     /** Versions of the untracked files a restart compares (see engine/untracked), taken before the build; set once structure is known. */
     readonly untracked?: ReadonlyMap<string, string> | undefined;
     readonly previousIndex: ProjectIndex;
     readonly structural: boolean;
+    /** Aborts, with a Superseded reason, when newer changes supersede this automatic run (see Scheduler): before testing the run
+     * stops at once; while testing it starts no further batch, finishes those the changes cannot affect, and ends cancelled. */
+    readonly superseded?: AbortSignal | undefined;
     phase(kind: RunPhase['kind']): void;
     finishPhase(): void;
 }
@@ -128,6 +139,8 @@ export interface BuildPlan {
     readonly sharedOutputs: ReadonlySet<string>;
     /** Resolves build output paths without synchronous file system calls; prepared once per plan. */
     readonly normalize?: (file: string) => string;
+    /** Only the test targets of the anticipated selection build (see engine/plan); the run checks that the selection agrees. */
+    readonly narrowed?: boolean;
 }
 export interface BuildResult {
     readonly revision: number;
@@ -136,6 +149,14 @@ export interface BuildResult {
     readonly before: ReadonlyMap<string, string>;
     readonly snapshots: ReadonlyMap<string, string>;
     readonly sdkByFile: ReadonlyMap<string, string>;
+}
+/** What a run's stages hand back for its cleanup: the runner session, and whether it may be kept for the next run (see
+ * TestEngine.takeSession) under its key. */
+export interface RunState {
+    sessions?: RunnerSession;
+    retentionKey?: string;
+    retain?: boolean;
+    analyzing?: Promise<ReadonlyMap<string, string | null>>;
 }
 export interface PreparedTests {
     readonly coverageTool?: string | undefined;
@@ -146,9 +167,16 @@ export interface PreparedTests {
 }
 export interface SelectedRun {
     readonly selection: Selection;
+    /** What the order of `selection.groups` favours; a throughput run also keeps a fast lane (see executeSelection). */
+    readonly priority?: SchedulingPriority;
     readonly currentShapes: ReadonlyMap<string, string | null>;
     /** Baseline files to learn again, and the versions the remaining checkpoints now describe. */
     readonly checkpoint?: { readonly invalidated: readonly string[]; readonly shapes: ReadonlyMap<string, string | null>; readonly inputs: ReadonlyMap<string, string> } | undefined;
+    /** Selected files narrowed to the tests their own coverage links to the changes (see core/testCoverage narrowTests): the tests
+     * that run, by group ID. The others are moved to the built versions when the run commits. */
+    readonly narrowed?: ReadonlyMap<string, ReadonlySet<string>> | undefined;
+    /** Unselected files whose traces provably did not execute the edits of these changed files, by group ID (see engine/rebase). */
+    readonly unaffected?: ReadonlyMap<string, ReadonlySet<string>> | undefined;
 }
 export interface TestedRun { readonly results: readonly TestResult[]; readonly executedFiles: ReadonlySet<string>; readonly available: boolean; readonly failedBatches: number; }
 

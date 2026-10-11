@@ -85,3 +85,19 @@ test('a folder-scoped solution limits only the entry points inside its folder',a
  assert.deepEqual(filtered.entryPoints,[found[0],found[2]]);
  assert.deepEqual(filtered.inputs,[normalizePath(path.join(a,'A.sln'))]);
 });
+
+test('saves start quickly unless the debounce is set, while file-system bursts wait longer',()=>{
+ const root=path.resolve('/repo');
+ assert.equal(configurationFor([root]).debounce,50);
+ assert.equal(configurationFor([root],{workspace:{trigger:'fileSystem'}}).debounce,500);
+ assert.equal(configurationFor([root],{workspace:{debounceTime:250}}).debounce,250);
+ assert.equal(configurationFor([root],{workspace:{trigger:'fileSystem',debounceTime:0}}).debounce,0);
+ assert.equal(configurationFor([root]).granularity,'method');
+ assert.equal(configurationFor([root],{workspace:{selectionGranularity:'file'}}).granularity,'file');
+});
+
+test('excluded traits are trimmed and empty entries dropped',()=>{
+ const root=path.resolve('/repo');
+ assert.deepEqual(plain(configurationFor([root],{workspace:{excludeTraits:[' Integration ','','Category=Slow']}}).excludeTraits),['Integration','Category=Slow']);
+ assert.deepEqual(plain(configurationFor([root]).excludeTraits),[]);
+});

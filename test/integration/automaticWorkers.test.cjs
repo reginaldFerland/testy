@@ -1,4 +1,5 @@
 const {test}=require('node:test');
+const {toolsDirectory}=require('./support/tools.cjs');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {setTimeout:delay}=require('node:timers/promises');
@@ -72,7 +73,7 @@ using System.Diagnostics;
   probe.activeRequests++;
   try{return await original.requestTests(options,operation,...args);}finally{probe.activeRequests--;}
  };
- engine=new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
+ engine=new TestEngine({roots:[root],storage,tools:toolsDirectory(temp),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
   events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result(){},started(){},coverage(){},invalidated(){}}});
  /** @param {AbortSignal} [abortSignal] */
  const run=(abortSignal=signal)=>{

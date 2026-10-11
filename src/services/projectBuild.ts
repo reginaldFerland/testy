@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { Project } from '../core/model';
 import { pathNormalizer, preparePathNormalizer, testTargetKey } from '../core/paths';
-import { ProcessOptions, requireSuccess, runProcess } from './process';
+import { ProcessOptions, ProcessResult, requireSuccess, runProcess } from './process';
 import { buildContexts, contextId, escapeMsbuild, parallelism, xml } from './projectGraph';
 
 /** Visit context-specific project edges and explicit workspace binary producers. */
@@ -40,12 +40,27 @@ export function buildOrder(projects: readonly Project[], selected: ReadonlySet<s
 
 async function runProjectBatch(dotnet: string, body: string, target: string, options: ProcessOptions, concurrency: number, description: string, properties: readonly string[] = []): Promise<void> {
     options.signal?.throwIfAborted();
+    const ended = options.track?.(description, 'build', { target });
+    try {await runProjectBatchNow(dotnet, body, target, options, concurrency, description, properties); ended?.({ succeeded: true });}
+    catch (error) {ended?.({ succeeded: false }); throw error;}
+}
+
+async function runProjectBatchNow(dotnet: string, body: string, target: string, options: ProcessOptions, concurrency: number, description: string, properties: readonly string[]): Promise<void> {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'testy-msbuild-'));
     try {
         const query = path.join(directory, 'batch.proj');
         await fs.writeFile(query, `<Project>${body}</Project>`);
-        requireSuccess(await runProcess(dotnet, ['msbuild', query, '-nologo', `-target:${target}`, `-maxcpucount:${parallelism(concurrency)}`,
-            '-property:NuGetInteractive=false', ...properties], options), description);
+        const build = (env: ProcessOptions['env']): Promise<ProcessResult> => runProcess(dotnet, ['msbuild', query, '-nologo', `-target:${target}`,
+            `-maxcpucount:${parallelism(concurrency)}`, '-property:NuGetInteractive=false', ...properties], { ...options, env });
+        let result = await build(options.env);
+        // A failure that reports no diagnostic can come from the MSBuild server itself, for example when it is busy or exits
+        // mid-build; the same build without it is authoritative. Build errors are reported as they are.
+        if (result.code !== 0 && options.env?.DOTNET_CLI_USE_MSBUILD_SERVER === '1' && !/\b(?:error|warning) [A-Z]+\d+/i.test(result.stdout + result.stderr)) {
+            options.signal?.throwIfAborted();
+            options.output?.('The MSBuild server build failed without a diagnostic; building again without the server.\n');
+            result = await build({ ...options.env, DOTNET_CLI_USE_MSBUILD_SERVER: '0' });
+        }
+        requireSuccess(result, description);
     } finally {await fs.rm(directory, { recursive: true, force: true });}
 }
 
@@ -61,12 +76,21 @@ export async function restoreProjects(dotnet: string, files: readonly string[], 
 export async function buildProjects(dotnet: string, projects: readonly Project[], configuration: string, options: ProcessOptions, concurrency = 1): Promise<void> {
     if (!projects.length) {return;}
     const items = projects.map(project => {
-        const properties = { Configuration: configuration, TargetFramework: project.framework, ...project.properties };
+        // A graph context's global properties are exactly those MSBuild builds it with when another project references it; they name a
+        // TargetFramework only for a multi-targeting project's inner build. Adding one to a single-targeting project would make a second
+        // instance of it in this session, building into the same outputs in parallel with the referenced one.
+        const properties = project.properties ? { Configuration: configuration, ...project.properties } : { Configuration: configuration, TargetFramework: project.framework };
         const values = Object.entries(properties).map(([key, value]) => `${key}=${escapeMsbuild(value)}`).join(';');
         return `<_TestyBuild Include="${xml(escapeMsbuild(project.file))}"><AdditionalProperties>${xml(values)}</AdditionalProperties></_TestyBuild>`;
     }).join('');
     await runProjectBatch(dotnet, `<ItemGroup>${items}</ItemGroup><Target Name="Build"><MSBuild Projects="@(_TestyBuild)" Targets="Build" BuildInParallel="true" StopOnFirstFailure="true"/></Target>`,
-        'Build', options, concurrency, `Building ${projects.length} project${projects.length === 1 ? '' : 's'}`);
+        'Build', { ...options, env: buildServerEnvironment(options.env) }, concurrency, `Building ${projects.length} project${projects.length === 1 ? '' : 's'}`);
+}
+
+/** Every save builds again, so builds keep MSBuild's entry node alive between them (the MSBuild server), the way the compiler
+ * server already is: an incremental build then skips process start and warms nothing up again. A value the user set wins. */
+export function buildServerEnvironment(env: NodeJS.ProcessEnv | undefined, inherited: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+    return env?.DOTNET_CLI_USE_MSBUILD_SERVER !== undefined || inherited.DOTNET_CLI_USE_MSBUILD_SERVER !== undefined ? { ...env } : { ...env, DOTNET_CLI_USE_MSBUILD_SERVER: '1' };
 }
 
 /** MSBuild follows exact project contexts; binary producers need explicit builds. */

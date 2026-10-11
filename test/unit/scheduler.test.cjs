@@ -68,3 +68,71 @@ test('removing cancelled queued jobs preserves remaining manual FIFO order',asyn
  abort.abort();await rejection;wait.resolve();await Promise.all([first,second,third]);
  assert.deepEqual(order,['second','third']);s.scheduler.dispose();
 });
+test('an idle job starts after a quiet period, and changes, manual runs and pauses cancel it until the next one',async()=>{
+ const s=setup();
+ /** @type {AbortSignal[]} */
+ const idle=[];
+ let release=gate();
+ s.scheduler.setIdle(signal=>{idle.push(signal);return release.promise;},2000);
+ await s.tick();assert.equal(idle.length,1,'nothing was pending, so it starts after its delay');
+ s.scheduler.request(['a']);assert.equal(idle[0].aborted,true,'a change cancels it like an automatic run');
+ await s.tick();assert.equal(s.runs.length,0,'the change waits for the cancelled job to exit');
+ release.resolve();await flush();assert.equal(s.runs.length,1);
+ release=gate();s.runs[0].resolve();await flush();
+ await s.tick();assert.equal(idle.length,2,'the cancelled job waits for the next quiet period');
+ const manual=s.scheduler.runManual(async()=>{});assert.equal(idle[1].aborted,true,'a manual run cancels it too');
+ release.resolve();await manual;await flush();
+ release=gate();s.scheduler.setPaused(true);await s.tick();assert.equal(idle.length,2,'paused: it does not start');
+ s.scheduler.setPaused(false);await s.tick();assert.equal(idle.length,3);
+ release.resolve();await flush();await s.tick();assert.equal(idle.length,3,'a completed job does not run again');
+ s.scheduler.setIdle(async()=>{throw new Error('broken');});await s.tick();assert.equal(s.errors.length,1,'its errors are reported');
+ s.scheduler.setIdle(async()=>{idle.push(new AbortController().signal);});s.scheduler.setIdle(undefined);await s.tick();assert.equal(idle.length,3,'undefined removes it');
+ s.scheduler.dispose();
+});
+
+/** A scheduler whose timers fire only when a test runs them, by delay. @param {number} grace */
+function timedSetup(grace){
+ /** @type {{fn:()=>void,delay:number}[]} */
+ const timers=[];
+ /** @type {(Run & {superseded:AbortSignal})[]} */
+ const runs=[];
+ const scheduler=new Scheduler({debounce:100,schedule:(fn,delay)=>{const timer={fn,delay};timers.push(timer);return ()=>{const index=timers.indexOf(timer);if(index!==-1)timers.splice(index,1);};},
+  run:(batch,signal,superseded)=>{const wait=gate();runs.push({batch,signal,superseded,...wait});return wait.promise;}});
+ scheduler.setGrace(grace);
+ const fire=async(/** @type {number} */ delay)=>{for(const timer of timers.filter(item=>item.delay===delay)){timers.splice(timers.indexOf(timer),1);timer.fn();}await flush();};
+ return {scheduler,runs,timers,fire};
+}
+
+test('a save supersedes an automatic run instead of aborting it, and aborts it once the grace period passes',async()=>{
+ const {Superseded}=require('../../out/core/scheduler');
+ const s=timedSetup(5000);s.scheduler.request(['a']);await s.fire(100);
+ const run=s.runs[0];s.scheduler.request(['b']);
+ assert.equal(run.signal.aborted,false);assert.equal(run.superseded.aborted,true);
+ assert.ok(run.superseded.reason instanceof Superseded);assert.deepEqual(run.superseded.reason.files,['b']);
+ /** @type {string[][]} */ const later=[];run.superseded.reason.onChange(files=>later.push([...files]));
+ s.scheduler.request(['c']);assert.deepEqual(later,[['c']]);assert.deepEqual(run.superseded.reason.files,['b','c']);
+ await s.fire(100);assert.equal(s.runs.length,1,'the next run waits for the superseded one');
+ await s.fire(5000);assert.equal(run.signal.aborted,true);
+ run.resolve();await flush();assert.equal(s.runs.length,2);
+ assert.deepEqual(s.runs[1].batch.files,['a','b','c'],'a superseded run consumes none of its changes, even when it resolves');
+ s.runs[1].resolve();await flush();s.scheduler.dispose();
+});
+
+test('a superseded run that ends within the grace period starts the next run without aborting',async()=>{
+ const s=timedSetup(5000);s.scheduler.request(['a']);await s.fire(100);
+ const run=s.runs[0];s.scheduler.request(['b']);await s.fire(100);
+ run.reject(new (require('../../out/core/errors').Cancelled)());await flush();
+ assert.equal(run.signal.aborted,false);assert.equal(s.runs.length,2);assert.equal(s.timers.some(timer=>timer.delay===5000),false,'the deadline is cleared');
+ s.runs[1].resolve();await flush();s.scheduler.dispose();
+});
+
+test('full refreshes, pauses, manual runs and a zero grace period still abort an automatic run at once',async()=>{
+ for(const action of ['full','pause','manual','zero']){
+  const s=timedSetup(action==='zero'?0:5000);s.scheduler.request(['a']);await s.fire(100);const run=s.runs[0];
+  if(action==='full')s.scheduler.request([],true);
+  else if(action==='pause')s.scheduler.setPaused(true);
+  else if(action==='manual')void s.scheduler.runManual(async()=>{}).catch(()=>{});
+  else s.scheduler.request(['b']);
+  assert.equal(run.signal.aborted,true,action);run.resolve();await flush();s.scheduler.dispose();
+ }
+});

@@ -100,11 +100,14 @@ export function validCheckpoint(value: unknown): value is CheckpointRecord {
         && (checkpoint.untracked === undefined || Array.isArray(checkpoint.untracked) && checkpoint.untracked.every((pair: unknown) => strings(pair) && pair.length === 2));
 }
 
-/** A file's latest test outcomes; caches written before outcomes were saved have none. */
+/** A file's latest test outcomes and run time; caches written before outcomes were saved have none, before run times were saved no `elapsed`, and before test durations were saved no `durations`. */
 export function validOutcomes(value: unknown): value is StoredOutcomes {
     const outcomes = record(value);
     return !!outcomes && typeof outcomes.groupId === 'string'
-        && Object.entries(outcomes).every(([key, ids]) => key === 'groupId' || key === 'format' || ['passed', 'failed', 'errored', 'skipped'].includes(key) && strings(ids));
+        && Object.entries(outcomes).every(([key, value]) => key === 'groupId' || key === 'format'
+            || key === 'elapsed' && typeof value === 'number' && Number.isFinite(value) && value >= 0
+            || key === 'durations' && !!record(value) && Object.values(value as object).every(time => typeof time === 'number' && Number.isFinite(time) && time >= 0)
+            || ['passed', 'failed', 'errored', 'skipped'].includes(key) && strings(value));
 }
 
 /** Bounds on what one restore loads; the oldest traces beyond them are discarded. Saves sweep the cache every

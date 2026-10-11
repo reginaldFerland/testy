@@ -6,7 +6,7 @@ const siblings=new Set(['./runnerLanes','./runnerPreparation']);
 
 /** @param {Record<string, unknown>} modules replacements by require specifier @param {Record<string, unknown>} globals */
 function loadRunner(modules={},globals={}){
- const context=vm.createContext({...globals}),loaded=new Map();
+ const context=vm.createContext({AbortController,...globals}),loaded=new Map();
  /** @param {string} file @returns {any} */
  const load=file=>{
   if(loaded.has(file))return loaded.get(file);

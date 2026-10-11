@@ -21,13 +21,19 @@ export class RuntimeObservation {
             directory, normalizePath(assembly), modules, new Set(instrumented.map(normalizePath)));
     }
 
-    async dependencies(signal?: AbortSignal): Promise<{ files: readonly string[]; projects: readonly string[] }> {
+    /** The workspace sources and projects the observed processes loaded outside the instrumented copies. `live`: the test host is
+     * still running (a reused host, see RunnerOptions.reuseHosts), so its log has no completion record yet; every whole line so far
+     * counts, which is everything it loaded up to now. */
+    async dependencies(signal?: AbortSignal, live = false): Promise<{ files: readonly string[]; projects: readonly string[] }> {
         const normalize = pathNormalizer(), byName = new Map<string, RuntimeModule[]>();
         for (const module of this.modules) {
             const name = module.name.toLowerCase(), modules = byName.get(name) ?? [];
             modules.push(module); byName.set(name, modules);
         }
         let host = false;
+        const hostEntry = (first: string): boolean => {
+            try {return normalize(decodeText(first.slice('ready\t'.length))) === this.assembly;} catch {return false;}
+        };
         const dependencies = new Set<string>();
         const projects = new Set<string>();
         for (const file of await fs.readdir(this.directory)) {
@@ -35,29 +41,27 @@ export class RuntimeObservation {
             if (!file.endsWith('.log')) {continue;}
             const report = path.join(this.directory, file);
             if ((await fs.stat(report)).size > 8 * 1024 * 1024) {throw new Error('Runtime observation exceeded its report limit.');}
-            const lines = (await fs.readFile(report, { encoding: 'utf8', signal })).trimEnd().split(/\r?\n/);
-            const decode = (value: string): string => {
-                const bytes = Buffer.from(value, 'base64'), text = bytes.toString('utf8');
-                if (bytes.toString('base64') !== value || !Buffer.from(text).equals(bytes)) {throw new Error('Invalid runtime observation text.');}
-                return text;
-            };
-            if (lines.at(-1) !== 'complete\ttrue' || !lines[0]?.startsWith('ready\t')) {
+            const text = await fs.readFile(report, { encoding: 'utf8', signal });
+            // A live writer may be in the middle of a line; only whole lines count.
+            const lines = (live && !text.endsWith('\n') ? text.slice(0, text.lastIndexOf('\n') + 1) : text).trimEnd().split(/\r?\n/);
+            const liveHost = live && lines.at(-1)?.startsWith('complete\t') !== true && lines[0]?.startsWith('ready\t') === true && hostEntry(lines[0]);
+            if (!liveHost && (lines.at(-1) !== 'complete\ttrue' || !lines[0]?.startsWith('ready\t'))) {
                 // Other .NET processes in the owned tree (the collector, MSBuild nodes,
                 // compiler servers) write logs too, and may be killed before completing.
                 // Only the test host's log must be whole; the host check below covers its absence.
                 let entry: string | undefined;
-                try {entry = decode(lines[0]?.slice('ready\t'.length) ?? '');} catch { /* Not a readable log. */ }
+                try {entry = decodeText(lines[0]?.slice('ready\t'.length) ?? '');} catch { /* Not a readable log. */ }
                 if (lines[0]?.startsWith('ready\t') && entry !== undefined && normalize(entry) === this.assembly) {throw new Error('A runtime observation was incomplete.');}
                 continue;
             }
-            const entry = decode(lines[0].slice('ready\t'.length));
+            const entry = decodeText(lines[0]!.slice('ready\t'.length));
             host ||= !!entry && normalize(entry) === this.assembly;
-            for (const line of lines.slice(1, -1)) {
+            for (const line of lines.slice(1, liveHost ? undefined : -1)) {
                 const [kind, name, location] = line.split('\t');
                 if (kind !== 'module' || name === undefined || location === undefined) {throw new Error('Invalid runtime observation.');}
-                const modules = byName.get(decode(name).toLowerCase());
+                const modules = byName.get(decodeText(name).toLowerCase());
                 if (!modules) {throw new Error('Unknown module in runtime observation.');}
-                const loaded = decode(location);
+                const loaded = decodeText(location);
                 if (loaded && this.instrumented.has(normalize(loaded))) {continue;}
                 for (const module of modules) {
                     for (const source of module.sources) {dependencies.add(source);}
@@ -68,4 +72,11 @@ export class RuntimeObservation {
         if (!host) {throw new Error('The test host did not provide a runtime observation.');}
         return { files: [...dependencies], projects: [...projects] };
     }
+}
+
+/** A base64 field of an observation log, which must round-trip exactly. */
+function decodeText(value: string): string {
+    const bytes = Buffer.from(value, 'base64'), text = bytes.toString('utf8');
+    if (bytes.toString('base64') !== value || !Buffer.from(text).equals(bytes)) {throw new Error('Invalid runtime observation text.');}
+    return text;
 }

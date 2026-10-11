@@ -1,25 +1,31 @@
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { CoverageStore } from '../core/coverage';
+import { eligibleGroups } from '../core/traits';
 import { DiscoveredTest, EngineConfiguration, Project, TestFile, TestResult, Trace } from '../core/model';
 import { ChangeBatch } from '../core/scheduler';
+import { Timeline } from '../core/timeline';
+import { TestCoverageStore } from '../core/testCoverage';
 import { ProjectIndex, selectTests, Selection } from '../core/selection';
-import { defaultExcludes, isConfigurationFile, isExcluded, isToolingFile, normalizePath, normalizePathsAsync, sourceVersion } from '../core/paths';
-import { consumesChanges, FailingTests, isStructuralChange, needsSourceSweep, TestOutcome, TestOutcomes, traceIsCurrent } from '../core/runPolicy';
-import { ProcessOptions, Shutdown } from './process';
+import { defaultExcludes, isConfigurationFile, isExcluded, isToolingFile, normalizePath, normalizePathsAsync, sourceVersion, testTargetKey } from '../core/paths';
+import { consumesChanges, FailingTests, isStructuralChange, needsSourceSweep, shareElapsed, TestOutcome, TestOutcomes, traceIsCurrent } from '../core/runPolicy';
+import { Cancelled, ProcessOptions, Shutdown } from './process';
 import { projectCoverageId, RunnerSession } from './runner';
-import { SourceShape } from './analysis';
+import { coverageSuppressions, SourceShape, suppressionMarker } from './analysis';
+import { mapConcurrent } from '../core/concurrency';
+import * as fs from 'node:fs/promises';
 import { AnalyzerServers } from './analyzerServer';
 import { SourceTracker } from './sources';
+import { MemberLayouts } from '../core/memberImpact';
 import { RuntimeInventory } from './runtimeInventory';
 import { CoverageCache, SavedCheckpoint } from './cache';
 import { discoveredTest } from './mtp';
-import { claimRunOutputs, reclaimRunOutputs } from './runOutputs';
-import { PreparedOutputCache } from './preparedOutputCache';
+import { claimRunOutputs, reclaimRunOutputs, RunOutputLease } from './runOutputs';
+import { outputManifest, PreparedOutputCache } from './preparedOutputCache';
 import { ProjectEvaluationCache } from './projectEvaluationCache';
 import { resolveConcurrency, resolveTestFileConcurrency, SerialQueue, untilAborted } from '../core/concurrency';
 import { EnvironmentError, isAbortError } from '../core/errors';
-import type { EngineHost } from './engine/host';
+import type { EngineHost, RanAgainst } from './engine/host';
 import { Baseline } from './engine/baseline';
 import { SdkChecks } from './engine/sdk';
 import { planBuild } from './engine/plan';
@@ -28,10 +34,11 @@ import { build } from './engine/build';
 import { prepareTests } from './engine/prepare';
 import { selectRun } from './engine/select';
 import { executeSelection } from './engine/execute';
+import { rebaseUnaffected } from './engine/rebase';
 import { coverageIdentity, settingsIdentity } from './engine/identity';
 import { changedVersions, fileStamps } from './engine/untracked';
 import { HashMemo } from './hashMemo';
-import { AnalysisState, EngineEvents, EngineOptions, EngineServices, ManualSelection, phaseTimingNames, RunContext, RunPhase, RunScope, RunSummary, SelectedRun, StructureState } from './engine/types';
+import { AnalysisState, BuildPlan, EngineEvents, EngineOptions, EngineServices, ManualSelection, phaseTimingNames, RunContext, RunPhase, RunScope, RunState, RunSummary, SelectedRun, StructureState } from './engine/types';
 import type { RunnerOptions } from './runnerTypes';
 export { selectManual } from './engine/selectManual';
 export type { EngineEvents, EngineOptions, EngineServices, ManualSelection, RunPhase, RunScope, RunSummary };
@@ -40,10 +47,18 @@ export type { EngineConfiguration };
 
 /** Members that are not private are shared with the run stages in ./engine through EngineHost, a read-only view:
  * stages return their results, pass them to the `apply` methods below, or call the named methods that own each write. */
+/** How often a run samples the extension host's event-loop delay for the timeline. */
+const eventLoopSampleMs = 250;
+/** A kept session (see TestEngine.takeSession) whose hosts no run has used for this long is released. */
+const retainedSessionIdleMs = 10 * 60 * 1000;
+
 export class TestEngine implements EngineHost {
     readonly coverage = new CoverageStore();
     readonly sources = new SourceTracker();
     projects: readonly Project[] = [];
+    /** Every discovered test file; Test Explorer and manual runs use these. */
+    discovered: readonly TestFile[] = [];
+    /** The discovered files without tests that `testy.excludeTraits` names (see eligibleGroups); automatic runs use these. */
     groups: readonly TestFile[] = [];
     buildGraph: readonly Project[] = [];
     private roots: readonly string[];
@@ -55,6 +70,8 @@ export class TestEngine implements EngineHost {
     shapes: ReadonlyMap<string, string | null> = new Map();
     analyses: ReadonlyMap<string, SourceShape | null> = new Map();
     analyzedHashes: ReadonlyMap<string, string> = new Map();
+    readonly members = new MemberLayouts();
+    narrowBuilds = true;
     analysisContext: string | undefined;
     aliasStamp: string | undefined;
     excludedAliases: readonly string[] = [];
@@ -63,6 +80,19 @@ export class TestEngine implements EngineHost {
     readonly runtime = new RuntimeInventory();
     /** The latest outcome of every test, saved with the coverage cache. */
     readonly lastOutcomes = new TestOutcomes();
+    readonly timeline = new Timeline();
+    readonly testCoverage = new TestCoverageStore();
+    readonly ranAgainst = new Map<string, RanAgainst>();
+    /** The session of the latest complete run, kept for the next one with its reused hosts (see takeSession). */
+    private retained: { readonly session: RunnerSession; readonly key: string; readonly manifests: ReadonlyMap<string, string>; readonly timer: NodeJS.Timeout } | undefined;
+    /** The run output lease a kept session's private outputs live in, held between runs; the next run takes it over. */
+    private idleLease: RunOutputLease | undefined;
+    /** What the last look at each C# source found of `// testy: no coverage` (see coverageSuppressions), by its version. */
+    private suppressions = new Map<string, { readonly hash: string; readonly patterns: readonly string[] | undefined }>();
+    /** Hashes of build outputs a kept session was prepared from, remembered by file metadata (see outputManifest). */
+    private readonly retentionHashes = new HashMemo(16_384);
+    /** Pinned test items (see EngineHost.pinned); set by the extension, which stores them per workspace. */
+    pinned: RunScope | undefined;
     private readonly cache: CoverageCache;
     readonly identity = randomUUID();
     readonly preparedOutputs: PreparedOutputCache;
@@ -126,10 +156,20 @@ export class TestEngine implements EngineHost {
     get failing(): FailingTests { return this.lastOutcomes.failing; }
     /** The latest outcome of every test by the `group:test` id the tree uses, including outcomes restored from the cache. */
     get outcomes(): ReadonlyMap<string, TestOutcome> { return this.lastOutcomes.byTest; }
+    /** How long each test file's latest complete runs took, in milliseconds, including times restored from the cache. */
+    get elapsedByFile(): ReadonlyMap<string, number> { return this.lastOutcomes.elapsedByFile; }
+    elapsed(groupId: string): number | undefined { return this.lastOutcomes.elapsed(groupId); }
+    /** How long one test took in its latest runs by the framework's measure, in milliseconds (see TestOutcomes.duration). */
+    testDuration(groupId: string, testId: string): number | undefined { return this.lastOutcomes.duration(groupId, testId); }
+    /** The tests with the longest known durations, longest first. */
+    slowestTests(limit?: number): ReturnType<TestOutcomes['slowestTests']> { return this.lastOutcomes.slowestTests(limit); }
+    recordElapsed(groups: readonly TestFile[], elapsed: number): void {
+        for (const [id, time] of shareElapsed(groups, elapsed)) {this.lastOutcomes.recordElapsed(id, time);}
+    }
     get inputVersion(): number { return this.inputTopology; }
     get knownFiles(): readonly string[] { return this.inputs; }
     get directories(): readonly string[] { return this.inputDirectories; }
-    get displayGroups(): readonly TestFile[] { return this.runtime.containers.size ? [...this.groups, ...this.runtime.containers.values()] : this.groups; }
+    get displayGroups(): readonly TestFile[] { return this.runtime.containers.size ? [...this.discovered, ...this.runtime.containers.values()] : this.discovered; }
     get baselineProgress(): { completed: number; total: number } | undefined {
         return this.baseline ? { completed: this.baseline.completed.size, total: this.groups.length } : undefined;
     }
@@ -139,6 +179,13 @@ export class TestEngine implements EngineHost {
     setRoots(roots: readonly string[]): void {
         this.roots = roots.map(normalizePath); this.topology++; this.structureDirty = true;
         this.sources.mark([]); this.coverage.markStale(new Set(this.coverage.traces.keys()));
+    }
+
+    /** The test files a safety-net run checks after an affected run of `changes` (see `testy.safetyNet`): every file of the test
+     * projects the changes affect (`related`) or every file (`all`), except those that ran. */
+    safetyNetFiles(changes: readonly string[], scope: 'related' | 'all', ran: ReadonlySet<string>): string[] {
+        const projects = scope === 'related' ? this.index.affected(changes) : undefined;
+        return this.groups.filter(group => !ran.has(group.id) && !group.runtimeOnly && (!projects || projects.has(group.project))).map(group => group.id);
     }
 
     select(files: readonly string[], conservative = false): Selection {
@@ -205,16 +252,20 @@ export class TestEngine implements EngineHost {
         return !!this.learned && settingsIdentity(this.options.configuration(), this.roots) !== this.learned.settings;
     }
 
-    async run(batch: ChangeBatch, signal: AbortSignal, manual?: ManualSelection, manualOperation = false, scope?: RunScope, coverage?: boolean): Promise<RunSummary> {
+    async run(batch: ChangeBatch, signal: AbortSignal, manual?: ManualSelection, manualOperation = false, scope?: RunScope, coverage?: boolean, superseded?: AbortSignal): Promise<RunSummary> {
         if (this.disposed) {throw new Error('The test engine has been disposed.');}
         signal.throwIfAborted();
         const controller = new AbortController();
         const abort = (): void => controller.abort(signal.reason);
         signal.addEventListener('abort', abort, { once: true });
-        const operation = this.runBatch(batch, controller, manual, manualOperation, scope, coverage);
+        const operation = this.runBatch(batch, controller, manual, manualOperation, scope, coverage, manual ? undefined : superseded);
         this.operations.set(controller, operation);
+        // How late the extension host's timers fire while the run works: its event-loop delay, a counter on the timeline.
+        let expected = Date.now() + eventLoopSampleMs;
+        const sampler = setInterval(() => {const now = Date.now(); this.timeline.count('Event-loop delay', Math.max(0, now - expected), now); expected = now + eventLoopSampleMs;}, eventLoopSampleMs);
+        sampler.unref();
         try {return await operation;}
-        finally {this.operations.delete(controller); signal.removeEventListener('abort', abort);}
+        finally {clearInterval(sampler); this.operations.delete(controller); signal.removeEventListener('abort', abort);}
     }
 
     /** Forget learned coverage, test outcomes, saved evaluations, analyses and idle prepared outputs.
@@ -222,17 +273,80 @@ export class TestEngine implements EngineHost {
     async reset(signal?: AbortSignal): Promise<void> {
         if (this.disposed) {throw new Error('The test engine has been disposed.');}
         if (this.operations.size) {throw new Error('Testy cannot reset while a run is active.');}
+        await this.releaseSession();
         this.coverage.replace([], new Set());
         await this.projectEvaluations.clear(signal);
         await this.preparedOutputs.evictIdle(signal);
         this.initialized = false; this.baseline = undefined; this.structureDirty = true;
         this.learned = undefined; this.settled = new Map(); this.settledUntracked = new Map(); this.learnedToolchain = undefined;
-        this.shapes = new Map(); this.analyses = new Map(); this.analyzedHashes = new Map();
+        this.shapes = new Map(); this.analyses = new Map(); this.analyzedHashes = new Map(); this.members.clear();
         this.analysisContext = undefined; this.aliasStamp = undefined;
         await this.sdk.stop();
-        this.restored.clear(); this.toolIdentities.clear(); this.lastOutcomes.clear();
+        this.restored.clear(); this.toolIdentities.clear(); this.lastOutcomes.clear(); this.testCoverage.clear(); this.ranAgainst.clear();
         await this.publishCoverage(signal); await this.save(signal);
         this.options.events.output('Testy caches were reset; the next run establishes a new baseline.\n');
+    }
+
+    /** Keep a complete run's session for the next run, with the key it was prepared under and the build outputs it was prepared
+     * from, fingerprinted now (see takeSession). False when it cannot be kept. Its private outputs stay in the run output lease,
+     * which the engine then keeps for the next run (see idleLease). */
+    private async retainSession(session: RunnerSession, key: string): Promise<boolean> {
+        if (this.disposed || !session.reusable) {return false;}
+        const manifests = new Map<string, string>();
+        try {for (const source of session.sources) {manifests.set(source, (await outputManifest(source, undefined, true, this.retentionHashes)).hash);}}
+        catch {return false;}
+        if (this.retained && this.retained.session !== session) {await this.releaseSession(false);}
+        const timer = setTimeout(() => {if (!this.operations.size) {void this.releaseSession().catch(() => undefined);}}, retainedSessionIdleMs);
+        timer.unref();
+        this.retained = { session, key, manifests, timer };
+        return true;
+    }
+
+    async takeSession(key: string, options: RunnerOptions, signal: AbortSignal): Promise<RunnerSession | undefined> {
+        const retained = this.retained;
+        if (!retained) {return undefined;}
+        let unchanged = retained.key === key && retained.session.reusable;
+        try {
+            for (const [source, hash] of unchanged ? retained.manifests : []) {
+                if ((await outputManifest(source, signal, true, this.retentionHashes)).hash !== hash) {unchanged = false; break;}
+            }
+        } catch (error) {signal.throwIfAborted(); unchanged = false; void error;}
+        // The run holds the output lease now (see runBatch); only the session goes.
+        if (!unchanged || this.retained !== retained) {await this.releaseSession(false); return undefined;}
+        clearTimeout(retained.timer); this.retained = undefined;
+        try {await retained.session.rebind(options);}
+        catch (error) {await retained.session.dispose(); signal.throwIfAborted(); void error; return undefined;}
+        return retained.session;
+    }
+
+    async coverageSuppressions(signal: AbortSignal): Promise<readonly string[]> {
+        const hashes = this.hashes, files = this.sources.files.filter(file => /\.cs$/i.test(file) && hashes.has(file));
+        const known = this.suppressions, next = new Map<string, { readonly hash: string; readonly patterns: readonly string[] | undefined }>();
+        // Only files whose version changed since the last look are read again; only those that mention the marker are parsed.
+        const marked: string[] = [];
+        await mapConcurrent(files, 16, signal, async file => {
+            const hash = hashes.get(file)!, previous = known.get(file);
+            if (previous?.hash === hash) {next.set(file, previous); return;}
+            let text = '';
+            try {text = await fs.readFile(file, { encoding: 'utf8', signal });} catch (error) {signal.throwIfAborted(); void error;}
+            const mentions = suppressionMarker.test(text);
+            next.set(file, { hash, patterns: mentions ? undefined : [] });
+            if (mentions) {marked.push(file);}
+        });
+        if (marked.length) {
+            const found = await coverageSuppressions(this.options.configuration().dotnet, this.options.analyzer, marked, path.join(this.options.storage, 'analysis'),
+                { cwd: this.roots[0] ?? this.options.storage, signal, analyzerServers: this.analyzerServers });
+            for (const file of marked) {next.set(file, { hash: hashes.get(file)!, patterns: found.get(file) ?? [] });}
+        }
+        this.suppressions = next;
+        return [...new Set([...next.values()].flatMap(entry => entry.patterns ?? []))].sort();
+    }
+
+    async releaseSession(withLease = true): Promise<void> {
+        const retained = this.retained, lease = withLease ? this.idleLease : undefined;
+        this.retained = undefined; if (withLease) {this.idleLease = undefined;}
+        if (retained) {clearTimeout(retained.timer);}
+        try {await retained?.session.dispose();} finally {await lease?.dispose();}
     }
 
     /** Stop admitting work, drain owned processes, then remove retained preparations. */
@@ -248,7 +362,7 @@ export class TestEngine implements EngineHost {
                 try {await this.flushSaves();} finally {clearTimeout(stop);}
                 // Every step runs even if an earlier one fails: the evaluation snapshot is saved and prepared containers are removed.
                 const failures: unknown[] = [];
-                for (const step of [() => this.sdk.stop(), () => this.analyzerServers.dispose(), () => this.projectEvaluations.dispose(), () => this.preparedOutputs.dispose()]) {
+                for (const step of [() => this.releaseSession(), () => this.sdk.stop(), () => this.analyzerServers.dispose(), () => this.projectEvaluations.dispose(), () => this.preparedOutputs.dispose()]) {
                     try {await step();}
                     catch (error) {failures.push(error); this.options.events.output(`Testy shutdown cleanup failed: ${String(error)}\n`);}
                 }
@@ -259,9 +373,14 @@ export class TestEngine implements EngineHost {
         return this.disposal;
     }
 
-    private async runBatch(batch: ChangeBatch, controller: AbortController, manual?: ManualSelection, manualOperation = false, scope?: RunScope, coverage?: boolean): Promise<RunSummary> {
-        let run = { ...await this.startRun(batch, controller, manual, manualOperation, coverage), scope: manual ? undefined : scope };
-        const state: { sessions?: RunnerSession; analyzing?: Promise<ReadonlyMap<string, string | null>> } = {};
+    private async runBatch(batch: ChangeBatch, controller: AbortController, manual?: ManualSelection, manualOperation = false, scope?: RunScope, coverage?: boolean, superseded?: AbortSignal): Promise<RunSummary> {
+        // Superseded before it tests, a run has nothing to finish: it stops at once (executeSelection handles the rest).
+        let testing = false;
+        const supersede = (): void => {if (!testing) {controller.abort(new Cancelled());}};
+        let run = { ...await this.startRun(batch, controller, manual, manualOperation, coverage), scope: manual ? undefined : scope, superseded };
+        superseded?.addEventListener('abort', supersede, { once: true });
+        if (superseded?.aborted) {supersede();}
+        const state: RunState = {};
         try {
             if (run.structural) {
                 run.phase('preparingProjects');
@@ -273,7 +392,9 @@ export class TestEngine implements EngineHost {
             const beforeBuild = this.hashes;
             await this.publishCoverage(run.signal);
             const plan = await planBuild(this, run);
-            const outputLease = await claimRunOutputs(path.join(this.options.storage, 'runs'), this.identity, run.signal, this.options.events.output);
+            // One run output lease at a time: a kept session's lease passes to this run (see takeSession).
+            const outputLease = this.idleLease ?? await claimRunOutputs(path.join(this.options.storage, 'runs'), this.identity, run.signal, this.options.events.output);
+            this.idleLease = undefined;
             try {
                 run.phase('building');
                 const built = await build(this, run, plan, outputLease, beforeBuild);
@@ -281,11 +402,18 @@ export class TestEngine implements EngineHost {
                 const prepared = await prepareTests(this, run, plan, built, outputLease, state);
                 if (run.discoverAll) {this.inventoried = true;}
                 const selected = await selectRun(this, run, built, prepared);
+                if (plan.narrowed) {this.checkNarrowedBuild(run, plan, selected);} else {this.narrowBuilds = true;}
                 await this.adoptSelection(run, selected);
-                run.phase('testing');
+                run.phase('testing'); testing = true;
                 const tested = await executeSelection(this, run, built, prepared, selected);
                 run.signal.throwIfAborted();
+                if (consumesChanges({ manual: !!run.manual, scoped: !!run.scope, baseline: !!run.baseline })) {
+                    const rebased = await rebaseUnaffected(this, run, built, selected, prepared.liveIds);
+                    if (rebased) {this.options.events.output(`Kept the coverage of ${rebased} unaffected test file${rebased === 1 ? '' : 's'} current.\n`);}
+                }
                 this.finishRun(run, selected, built.before);
+                // A complete run may keep its session for the next one (see takeSession).
+                state.retain = !!run.config.reuseTestHosts && !run.manual?.debug && !built.snapshots.size;
                 await this.publishCoverage(run.signal); await this.save(run.signal);
                 const results = tested.results;
                 return { files: tested.executedFiles.size, tests: results.length, passed: results.filter(result => result.outcome === 'passed').length,
@@ -298,15 +426,35 @@ export class TestEngine implements EngineHost {
             } finally {
                 run.finishPhase();
                 if (state.analyzing) {await Promise.allSettled([state.analyzing]);}
-                try {await state.sessions?.dispose();} finally {await outputLease.dispose();}
+                let kept = false;
+                try {
+                    if (state.retain && state.sessions && state.retentionKey && !controller.signal.aborted) {kept = await this.retainSession(state.sessions, state.retentionKey);}
+                    if (!kept) {await state.sessions?.dispose();}
+                } finally {
+                    // A kept session, or one this run never reached, keeps its private outputs in the lease for the next run.
+                    if (kept || this.retained) {this.idleLease = outputLease;} else {await outputLease.dispose();}
+                }
             }
         } catch (error) {controller.abort(error); throw error;}
         finally {
+            superseded?.removeEventListener('abort', supersede);
             run.finishPhase();
+            this.timeline.record({ name: run.manual ? 'Manual run' : run.baseline ? 'Baseline' : 'Affected run', category: 'run', lane: 0, start: run.began, end: Date.now(),
+                details: { changes: run.changes.length, cancelled: run.signal.aborted, superseded: !!superseded?.aborted } });
             // A cancelled run still persists what it committed, including a delta its own aborted save left pending,
             // without waiting for another window's lock; disposal waits for this flush, bounded.
             void this.flushSaves();
         }
+    }
+
+    /** A narrowed plan built only the test targets it anticipated. Should the selection need another target whose outputs the
+     * changes made stale, the run starts again with every affected target. */
+    private checkNarrowedBuild(run: RunContext, plan: BuildPlan, selected: SelectedRun): void {
+        const built = new Set(plan.testBuilds.map(project => testTargetKey(project.file, project.framework))), affected = this.index.affected(run.changes);
+        if (selected.selection.groups.every(group => !affected.has(group.project) || built.has(testTargetKey(group.project, group.framework)))) {return;}
+        this.narrowBuilds = false;
+        this.options.events.output('The selection needs a test project the narrowed build left out; building every affected project.\n');
+        this.options.events.invalidated(run.changes); throw new Cancelled();
     }
 
     /** Consume the changes and declaration shapes a completed run executed, and close a finished baseline. The versions the run
@@ -315,7 +463,7 @@ export class TestEngine implements EngineHost {
         if (!consumesChanges({ manual: !!run.manual, scoped: !!run.scope, baseline: !!run.baseline })) {return;}
         this.shapes = selected.currentShapes;
         if (!run.baseline || this.groups.every(group => run.baseline!.completed.has(group.id))) {
-            this.initialized = true; this.baseline = undefined;
+            this.initialized = true; this.baseline = undefined; this.ranAgainst.clear();
             for (const file of run.changes) {this.pendingChanges.delete(file);}
             this.pendingRevision++;
             const settled = new Map(before), untracked = new Map(run.untracked);
@@ -416,6 +564,12 @@ export class TestEngine implements EngineHost {
     applyAnalysis(next: AnalysisState): void {
         this.analyses = next.analyses; this.analyzedHashes = next.analyzedHashes; this.analysisContext = next.analysisContext;
         this.aliasStamp = next.aliasStamp; this.excludedAliases = next.excludedAliases;
+        // Versions no trace refers to any more are dropped; the current ones stay for the next edit to compare with.
+        this.members.retain(next.analyzedHashes, (file, hash) => this.coverage.hasVersion(file, hash));
+        for (const [file, shape] of next.analyses) {
+            const hash = next.analyzedHashes.get(file);
+            if (shape?.members && hash) {this.members.set(file, hash, { signature: shape.signature, members: shape.members, ...shape.gaps ? { gaps: shape.gaps } : {} });}
+        }
     }
 
     /** Resolve configuration, the baseline generation and accumulated changes. */
@@ -435,7 +589,11 @@ export class TestEngine implements EngineHost {
         events.output(`Testy concurrency: projects=${projectLimit}, test files=${testLimit}.\n`);
         let phaseName: string | undefined, phaseBegan = began;
         const finishPhase = (): void => {
-            if (phaseName) {events.output(`Testy timing: ${phaseName} ${Date.now() - phaseBegan}ms\n`); phaseName = undefined;}
+            if (!phaseName) {return;}
+            const ended = Date.now();
+            events.output(`Testy timing: ${phaseName} ${ended - phaseBegan}ms\n`);
+            this.timeline.record({ name: phaseName, category: 'phase', lane: 0, start: phaseBegan, end: ended });
+            phaseName = undefined;
         };
         const phase = (kind: RunPhase['kind']): void => {finishPhase(); phaseName = phaseTimingNames[kind]; phaseBegan = Date.now(); events.phase({ kind });};
         const reserved = ['--server', '--client-port', '--client-host', '--list-tests', '--filter-uid', '--filter', '--treenode-filter', '--results-directory', '--ignore-exit-code', '--help', '--info'];
@@ -461,7 +619,7 @@ export class TestEngine implements EngineHost {
         const runIdentity = settingsIdentity(config, this.roots) === settings ? identity : await coverageIdentity(config, this.roots, this.toolIdentities, signal);
         const rootSnapshot = this.roots;
         const processOptions: ProcessOptions = { cwd: rootSnapshot[0] ?? this.options.storage, signal, output: events.output,
-            timeoutMs: config.timeout, dotnetHost: config.dotnet, cleanupDescendants: false };
+            timeoutMs: config.timeout, dotnetHost: config.dotnet, cleanupDescendants: false, track: (name, category, details) => this.timeline.begin(name, category, details) };
         // Excluded files (build output, editor state such as .vscode) never trigger runs, whoever reports them.
         const excludes = [...defaultExcludes, ...config.excludes];
         const requested = (await normalizePathsAsync(batch.files, signal)).filter(file => !isExcluded(file, excludes, rootSnapshot));
@@ -472,7 +630,7 @@ export class TestEngine implements EngineHost {
         const changes = [...this.pendingChanges];
         const structural = !!manual || this.structureDirty || newBaseline || changes.some(file => isStructuralChange(file, this.index, this.hashes));
         return { controller, signal, began, topology, configured, config, projectLimit, testLimit, manual, manualOperation, full, newBaseline, baseline,
-            discoverAll: newBaseline || !this.inventoried, identity: runIdentity, rootSnapshot, processOptions, changes, previousIndex: this.index, structural, phase, finishPhase };
+            discoverAll: newBaseline || !this.inventoried, explicit: !!batch.explicit, identity: runIdentity, rootSnapshot, processOptions, changes, previousIndex: this.index, structural, phase, finishPhase };
     }
 
     setInputs(files: Iterable<string>): void {
@@ -485,17 +643,21 @@ export class TestEngine implements EngineHost {
     }
 
     async reconcileGroups(next: readonly TestFile[], baseline?: Baseline): Promise<Set<string>> {
+        // Coverage describes the eligible tests of a file: a change to those, including to which are excluded, learns it again.
+        const eligible = eligibleGroups(next, this.options.configuration().excludeTraits);
         const oldGroups = new Map(this.groups.map(group => [group.id, group]));
-        const identitiesChanged = new Set(next.filter(group => {
+        const identitiesChanged = new Set(eligible.filter(group => {
             const previous = oldGroups.get(group.id);
             return previous && previous.tests.map(test => test.id).sort().join('\0') !== group.tests.map(test => test.id).sort().join('\0');
         }).map(group => group.id));
         baseline?.invalidate(identitiesChanged);
-        this.coverage.invalidate(identitiesChanged); this.groups = next;
+        this.coverage.invalidate(identitiesChanged); this.discovered = next; this.groups = eligible;
+        for (const id of identitiesChanged) {this.testCoverage.delete(id);}
         this.runtime.reconcile(next, identitiesChanged);
         // Rediscovered files keep the outcomes of tests they still have, their runtime rows included.
         for (const group of next) {if (identitiesChanged.has(group.id)) {this.lastOutcomes.settle(group.id, new Set(this.knownTests(group).map(test => test.id)));}}
-        const groupIds = new Set(next.map(group => group.id));
+        const groupIds = new Set(eligible.map(group => group.id));
+        this.testCoverage.retain(groupIds);
         baseline?.invalidate([...baseline.completed, ...baseline.runtimeResults.keys()].filter(id => !groupIds.has(id)));
         const liveIds = new Set([...next.map(group => group.id), ...next.map(projectCoverageId)]);
         this.lastOutcomes.retain(new Set(this.displayGroups.map(group => group.id)));

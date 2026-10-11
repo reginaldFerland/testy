@@ -1,6 +1,7 @@
 import { ChildProcess, spawn } from 'node:child_process';
 import { helperPath, scriptPath } from './assets';
 import { randomUUID } from 'node:crypto';
+import { constants, setPriority } from 'node:os';
 import { cleanupPosixOwner } from './posixProcesses';
 import { OutputTail } from '../core/outputTail';
 import { Cancelled, EnvironmentError } from '../core/errors';
@@ -18,6 +19,15 @@ export class Shutdown extends Cancelled {}
 /** After a child error (for example a failed signal) its tree is force-killed; completion
  * waits this long for it to close before reporting the error anyway. */
 export const processTiming = { errorCloseMs: 5_000 };
+
+/** Whether owned commands start below normal priority (see setProcessPriority). */
+let belowNormal = false;
+/** POSIX nice value for below-normal priority. */
+const belowNormalNice = 10;
+
+/** Start later owned commands (builds, instrumentation, test hosts) below normal priority, so a busy run leaves the editor
+ * responsive, or at normal priority. Descendants inherit it. Already running processes keep theirs. */
+export function setProcessPriority(priority: 'belowNormal' | 'normal'): void { belowNormal = priority === 'belowNormal'; }
 
 /** The tail of each stream kept in a ProcessResult. */
 const capturedOutputChars = 1024 * 1024;
@@ -37,6 +47,11 @@ export interface ProcessOptions {
     readonly dotnetHost?: string;
     /** Build commands may leave shared compiler servers; test processes may not. */
     readonly cleanupDescendants?: boolean;
+    /** A short-lived tool that starts no processes of its own, such as a coverage snapshot: spawned directly, without the process
+     * owner (whose start-up would cost more than the tool), in its own process group, and killed directly on cancellation or timeout. */
+    readonly direct?: boolean;
+    /** Record a stretch of preparation work on the run timeline (see Timeline.begin); call the result when it ends. */
+    readonly track?: ((name: string, category: 'build' | 'discovery' | 'instrumentation', details?: Readonly<Record<string, string | number | boolean>>) => (more?: Readonly<Record<string, string | number | boolean>>) => void) | undefined;
 }
 
 export interface OwnedProcess {
@@ -60,19 +75,23 @@ function hideFromOwner(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 /** Every subprocess tree has an owner. Never use global process-name cancellation. */
 export function startProcess(command: string, args: readonly string[], options: ProcessOptions): OwnedProcess {
     options.signal?.throwIfAborted();
-    const windowsOwner = process.platform === 'win32' && options.cleanupDescendants !== false;
-    const posixOwner = process.platform !== 'win32';
+    const windowsOwner = process.platform === 'win32' && options.cleanupDescendants !== false && !options.direct;
+    const posixOwner = process.platform !== 'win32' && !options.direct;
     const owner = randomUUID();
     const started = Date.now();
     const env: NodeJS.ProcessEnv = { ...process.env, DOTNET_CLI_TELEMETRY_OPTOUT: '1', TESTINGPLATFORM_TELEMETRY_OPTOUT: '1', DOTNET_NOLOGO: '1', ...options.env, TESTY_PROCESS_OWNER: owner };
+    const lowered = belowNormal;
     const executable = windowsOwner ? options.dotnetHost ?? 'dotnet' : posixOwner ? process.execPath : command;
     const arguments_ = windowsOwner ? [helperPath('processhost', 'Testy.ProcessHost.dll'), command, ...args]
         : posixOwner ? [scriptPath('posixOwner')] : [...args];
     const child = spawn(executable, arguments_, {
         cwd: options.cwd, shell: false, detached: process.platform !== 'win32',
         windowsHide: true, stdio: [windowsOwner || posixOwner ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-        env: posixOwner ? { ...env, TESTY_PROCESS_OWNER: undefined, ELECTRON_RUN_AS_NODE: '1' } : windowsOwner ? hideFromOwner(env) : env
+        env: posixOwner ? { ...env, TESTY_PROCESS_OWNER: undefined, ELECTRON_RUN_AS_NODE: '1' }
+            : windowsOwner ? { ...hideFromOwner(env), ...lowered ? { TESTY_PROCESS_PRIORITY: 'belowNormal' } : {} } : env
     });
+    // An unowned Windows command (one that may leave shared servers) is lowered directly; owners lower the command themselves.
+    if (lowered && !windowsOwner && !posixOwner && child.pid) {try {setPriority(child.pid, constants.priority.PRIORITY_BELOW_NORMAL);} catch { /* unchanged */ }}
     let cancelled = false;
     let timedOut = false;
     let closed = false;
@@ -92,7 +111,8 @@ export function startProcess(command: string, args: readonly string[], options: 
     let windowsKillStarted = false;
     child.stdin?.on('error', () => undefined);
     if (posixOwner) {
-        child.stdin!.write(JSON.stringify({ command, args, owner, cleanupDescendants: options.cleanupDescendants !== false, electronRunAsNode: env.ELECTRON_RUN_AS_NODE }) + '\n');
+        child.stdin!.write(JSON.stringify({ command, args, owner, cleanupDescendants: options.cleanupDescendants !== false, electronRunAsNode: env.ELECTRON_RUN_AS_NODE,
+            ...lowered ? { priority: belowNormalNice } : {} }) + '\n');
     }
     const killTree = (force: boolean): void => {
         if (!child.pid) {return;}
@@ -191,7 +211,7 @@ export function startProcess(command: string, args: readonly string[], options: 
 export async function runProcess(command: string, args: readonly string[], options: ProcessOptions): Promise<ProcessResult> {
     // startProcess is synchronous, so the Windows owner's bare host name is resolved from
     // absolute PATH entries here; libuv would otherwise search the workspace first.
-    if (process.platform === 'win32' && options.cleanupDescendants !== false) {
+    if (process.platform === 'win32' && options.cleanupDescendants !== false && !options.direct) {
         const dotnetHost = await resolveOwnedCommand(options.dotnetHost ?? 'dotnet', options.env, options.cwd);
         return startProcess(command, args, { ...options, dotnetHost }).done;
     }

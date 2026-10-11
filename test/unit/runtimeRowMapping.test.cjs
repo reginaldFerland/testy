@@ -22,7 +22,7 @@ function runner(t,updates){
  const groups=['Calculator','Greeting'].map((name,i)=>({id:name,project,assembly:path.join(path.dirname(project),'Tests.dll'),framework:'net10.0',
   file:normalizePath(path.join(path.dirname(project),`${name}Tests.cs`)),tests:[mtp.discoveredTest({uid:`parent${i}`,'display-name':name,'location.type':`Class${i}`,'location.method':'Theory'})]}));
  const nodes=/** @type {Node[]} */ (groups.flatMap(group=>group.tests.map(test=>test.node))); // discovered rows always carry a uid
- vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,require:(/** @type {string} */ name)=>name==='./mtp'?{...mtp,requestTests:async(/** @type {any} */ options,/** @type {any} */ operation,/** @type {readonly Node[] | undefined} */ selected)=>{
+ vm.runInNewContext(fs.readFileSync(file,'utf8'),{exports,AbortController,require:(/** @type {string} */ name)=>name==='./mtp'?{...mtp,requestTests:async(/** @type {any} */ options,/** @type {any} */ operation,/** @type {readonly Node[] | undefined} */ selected)=>{
   const requested=selected??nodes;sent.push(Array.from(requested,node=>node.uid));
   return mtp.requestTests({...options,dotnet:process.execPath,assembly:path.resolve('test/fixtures/mtp-peer.cjs'),cwd:process.cwd(),
    timeoutMs:5000,env:{TESTY_UPDATES:JSON.stringify(updates(requested,groups))}},operation,selected);

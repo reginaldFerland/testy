@@ -1,4 +1,5 @@
 const {test}=require('node:test');
+const {toolsDirectory}=require('./support/tools.cjs');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os');
 const {createHash}=require('node:crypto');
@@ -81,7 +82,7 @@ async function fixture(t,limit){
    if(primary&&firstPrimary){firstPrimary=false;release.resolve();}
   }
  };
- const engine=new TestEngine({roots:[root],storage,tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
+ const engine=new TestEngine({roots:[root],storage,tools:toolsDirectory(temp),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,
   events:{output:text=>{output.push(text);if(/Testy timing: Source analysis \d+ms/.test(text))analyzed.resolve();},phase:text=>{state.phase=text;},async discovered(){
    if(!state.callback)return;
    let started=false;const extra=state.callback(signal,async()=>{started=true;});await extra;

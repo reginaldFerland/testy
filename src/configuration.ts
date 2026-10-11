@@ -19,11 +19,21 @@ export interface Configuration extends EngineConfiguration {
     readonly buildDiagnostics: BuildDiagnosticsMode;
     /** Extra build configurations offered as manual Run and Coverage profiles. */
     readonly additionalConfigurations: readonly string[];
+    /** After an affected run, which unselected test files to run once the editor is quiet (`testy.safetyNet`). */
+    readonly safetyNet: 'off' | 'related' | 'all';
+    /** Priority of the processes Testy starts (`testy.processPriority`). */
+    readonly processPriority: 'belowNormal' | 'normal';
+    /** Milliseconds an automatic run that a save supersedes may take to finish the test processes the save cannot affect
+     * (`testy.finishRunningTests`, in seconds); 0 cancels it at once. */
+    readonly finishRunningTests: number;
     /** Resource-scoped settings whose folder-level values differ; one engine applies the workspace value. */
     readonly folderConflicts: readonly string[];
 }
 
 export { defaultWatcherPattern };
+
+/** Default `testy.debounceTime` for each trigger, when it is not set. */
+export const saveDebounce = 50, fileSystemDebounce = 500;
 
 interface Folder { readonly root: string; readonly name: string; readonly settings: vscode.WorkspaceConfiguration }
 
@@ -69,19 +79,30 @@ export function configuration(): Configuration {
     const base = settings.get<string>('solution', '');
     const scopedSolutions = folders.some(folder => own(folder, 'solution') !== undefined);
     const buildConfiguration = uniform('buildConfiguration', 'Debug');
+    const trigger = settings.get<'save' | 'fileSystem'>('trigger', 'save'), debounce = settings.inspect<number>('debounceTime');
+    const traitList = (key: string): string[] => settings.get<string[]>(key, []).map(trait => trait.trim()).filter(Boolean);
     return {
-        enabled: settings.get('autoRun', true), trigger: settings.get('trigger', 'save'),
-        debounce: Math.max(0, settings.get('debounceTime', 500)),
+        enabled: settings.get('autoRun', true), trigger,
+        // A save is deliberate, and Save All writes its files together; file-system events arrive in bursts.
+        debounce: Math.max(0, debounce?.workspaceValue ?? debounce?.globalValue ?? (trigger === 'fileSystem' ? fileSystemDebounce : saveDebounce)),
         pattern: settings.get('fileWatcherPattern', defaultWatcherPattern),
         showCoverage: settings.get('showCoverage', false), inlineResults: settings.get<InlineResultsMode>('inlineResults', 'gutterAndHover'),
         buildDiagnostics: settings.get<BuildDiagnosticsMode>('problems.publishBuildDiagnostics', 'auto'),
+        safetyNet: settings.get<'off' | 'related' | 'all'>('safetyNet', 'off'),
+        finishRunningTests: Math.max(0, settings.get<number>('finishRunningTests', 5)) * 1000,
+        processPriority: settings.get<'belowNormal' | 'normal'>('processPriority', 'belowNormal') === 'normal' ? 'normal' : 'belowNormal',
         additionalConfigurations: additionalConfigurations(settings.get<string[]>('additionalConfigurations', []), buildConfiguration),
         dotnet: settings.get('dotnetPath', 'dotnet'), configuration: buildConfiguration,
-        mode: settings.get('runMode', 'affected'), coverage: settings.get('runWithCoverage', true),
+        mode: settings.get('runMode', 'affected'), granularity: settings.get('selectionGranularity', 'method'), excludeTraits: traitList('excludeTraits'), coverage: settings.get('runWithCoverage', true),
+        exclusiveTraits: traitList('exclusiveTraits'), serialTraits: traitList('serialTraits'), isolatedTraits: traitList('isolatedTraits'),
+        inclusiveTraits: traitList('inclusiveTraits'), workerTraits: settings.get<Record<string, number>>('workerTraits', {}),
+        testProcessMemoryLimit: Math.max(0, settings.get<number>('testProcessMemoryLimit', 0)) * 1024 * 1024,
+        alwaysRunFailing: settings.get('alwaysRunFailing', false), reuseTestHosts: settings.get('reuseTestHosts', true), splitLongTestFiles: settings.get('splitLongTestFiles', true),
         maxParallelProjects: settings.get('maxParallelProjects', 0),
         maxParallelTestFiles: settings.get('maxParallelTestFiles', 0),
         excludes: [...defaultExcludes, ...additive('exclude')],
         testArguments: uniform<string[]>('testArguments', []), timeout: Math.max(10, settings.get('timeoutSeconds', 600)) * 1000,
+        testTimeout: Math.max(0, settings.get<number>('testTimeoutSeconds', 120)) * 1000,
         coverageTool: settings.get<string>('coverageToolPath') || undefined,
         solution: scopedSolutions ? undefined : resolveSolution(base),
         solutions: scopedSolutions ? folders.flatMap(folder => {

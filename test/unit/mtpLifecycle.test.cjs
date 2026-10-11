@@ -75,3 +75,16 @@ test('commands are resolved once each and the connect allowance starts only afte
   assert.deepEqual(resolved,[process.execPath]);
  }finally{/** @type {any} */ (executable).resolveOwnedCommand=original;}
 });
+
+test('the test watchdog stops the host once a started test exceeds the limit, and ignores tests that finish in time',async()=>{
+ const {TestWatchdog}=require('../../out/services/mtp');
+ let stops=0;const watchdog=new TestWatchdog(40,()=>stops++);
+ watchdog.observe({uid:'fast','node-type':'action','display-name':'Fast','execution-state':'in-progress'});
+ watchdog.observe({uid:'fast','node-type':'action','display-name':'Fast','execution-state':'passed'});
+ await new Promise(resolve=>setTimeout(resolve,80));assert.equal(stops,0);assert.equal(watchdog.expired,undefined);
+ watchdog.observe({uid:'slow','node-type':'action','display-name':'Slow','execution-state':'in-progress'});
+ await new Promise(resolve=>setTimeout(resolve,80));
+ assert.equal(stops,1);assert.match(String(/** @type {Error|undefined} */ (watchdog.expired)?.message),/The test Slow ran longer than the per-test time limit/);
+ const off=new TestWatchdog(0,()=>stops++);off.observe({uid:'x','node-type':'action','display-name':'X','execution-state':'in-progress'});
+ await new Promise(resolve=>setTimeout(resolve,20));assert.equal(stops,1);watchdog.dispose();off.dispose();
+});

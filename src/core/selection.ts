@@ -13,7 +13,7 @@ export interface Selection {
 /** Why a group was selected: `covers` (a coverage trace links the changed files to it), `edited` (its own
  * file changed), `fallback` (conservative project selection, see `reason`), or a run-wide cause. */
 export interface SelectionCause {
-    readonly kind: 'covers' | 'edited' | 'fallback' | 'baseline' | 'manual' | 'all';
+    readonly kind: 'covers' | 'edited' | 'fallback' | 'baseline' | 'manual' | 'all' | 'pinned' | 'failing';
     /** The first few triggering files; `more` counts the rest, so large selections stay cheap. */
     readonly files: readonly string[];
     readonly more: number;
@@ -22,7 +22,7 @@ export interface SelectionCause {
 export type FallbackReason = 'configuration' | 'unanalyzed' | 'unmapped' | 'untraced' | 'unobserved';
 
 const maxCauseFiles = 3;
-const causePriority: Readonly<Record<SelectionCause['kind'], number>> = { covers: 0, edited: 1, fallback: 2, baseline: 3, manual: 3, all: 3 };
+const causePriority: Readonly<Record<SelectionCause['kind'], number>> = { covers: 0, edited: 1, fallback: 2, baseline: 3, manual: 3, all: 3, pinned: 3, failing: 3 };
 
 /** The same cause for every group, for run-wide reasons such as a baseline or a manual run. */
 export function uniformCauses(groups: readonly TestFile[], kind: SelectionCause['kind']): Map<string, SelectionCause> {
@@ -243,7 +243,8 @@ export function selectTests(
     groups: readonly TestFile[], projects: readonly Project[], traces: ReadonlyMap<string, Trace>,
     changes: readonly string[], mode: 'affected' | 'all', force = false,
     conservativeChanges: ReadonlySet<string> = new Set(), index = new ProjectIndex(projects),
-    dependencies?: (file: string) => ReadonlySet<string>, modules?: (project: string) => ReadonlySet<string>
+    dependencies?: (file: string) => ReadonlySet<string>, modules?: (project: string) => ReadonlySet<string>,
+    unaffected?: (change: string, groupId: string) => boolean
 ): Selection {
     if (force || mode === 'all') {return { groups: [...groups], reason: force ? 'Full baseline' : 'Run all mode', fallback: false, causes: uniformCauses(groups, force ? 'baseline' : 'all') };}
     if (!changes.length) {return { groups: [], reason: 'No pending changes', fallback: false, causes: new Map() };}
@@ -260,13 +261,16 @@ export function selectTests(
             if (!ids) {ids = modules?.(project) ?? files.moduleGroups(project); moduleGroups.set(project, ids);}
             for (const id of ids) {coarse.add(id);}
         }
-        const mapped = files.matching(change, coarse, observed ?? files.dependents(change));
+        const configuration = index.isConfiguration(change);
+        // A narrow edit selects only the files whose coverage reached a changed body; the others still count as mapped.
+        const reached = [...observed ?? files.dependents(change)];
+        const covering = unaffected && !configuration && !conservativeChanges.has(change) ? reached.filter(id => !unaffected(change, id)) : reached;
+        const mapped = files.matching(change, coarse, covering);
         if (coarse.size) {fallback = true;}
         for (const group of mapped) {projectsForChange.add(group.project);}
         // Non-.NET tooling configuration outside every project directory (see isToolingFile) cannot change a build or a trace.
         if (!mapped.length && !projectsForChange.size) {continue;}
-        const configuration = index.isConfiguration(change);
-        const broad = configuration || conservativeChanges.has(change) || mapped.length === 0;
+        const broad = configuration || conservativeChanges.has(change) || (mapped.length === 0 && covering.length === reached.length);
         const broadReason: FallbackReason = configuration ? 'configuration' : conservativeChanges.has(change) ? 'unanalyzed' : 'unmapped';
         if (broad) {fallback = true;}
         for (const group of mapped) {log.add(group, (group.file ?? group.project) === change ? 'edited' : 'covers', change, order);}

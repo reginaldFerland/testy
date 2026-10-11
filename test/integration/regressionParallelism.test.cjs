@@ -1,5 +1,6 @@
 // Regression scenarios: parallel workers, cancellation, collectors and private run outputs. Fixtures are shared through support/regressions.cjs.
 const {test}=require('node:test');
+const {toolsDirectory}=require('./support/tools.cjs');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises');
 const path=require('node:path');
@@ -82,7 +83,7 @@ test('real collector cleans detached children after completion, cancellation and
   /** @type {Promise<import('../../out/services/engine').RunSummary> | undefined} */ let pending;
   /** @type {Promise<unknown[]> | undefined} */ let exit;
   if(mode==='host-death'){
-   const script=`const {TestEngine}=require(${JSON.stringify(path.resolve('out/services/engine'))});const engine=new TestEngine({roots:[${JSON.stringify(f.root)}],storage:${JSON.stringify(path.join(f.temp,'crash-state'))},tools:${JSON.stringify(path.join(f.temp,'tools'))},analyzer:${JSON.stringify(path.resolve('dist/analyzer/Testy.Analysis.dll'))},configuration:()=>(${JSON.stringify(f.config)}),events:{output(){},phase(){},discovered(){},selected(){},result(){},started(){},coverage(){},invalidated(){}}});engine.run({files:[],full:true},new AbortController().signal).catch(()=>process.exitCode=1);`;
+   const script=`const {TestEngine}=require(${JSON.stringify(path.resolve('out/services/engine'))});const engine=new TestEngine({roots:[${JSON.stringify(f.root)}],storage:${JSON.stringify(path.join(f.temp,'crash-state'))},tools:${JSON.stringify(toolsDirectory(f.temp))},analyzer:${JSON.stringify(path.resolve('dist/analyzer/Testy.Analysis.dll'))},configuration:()=>(${JSON.stringify(f.config)}),events:{output(){},phase(){},discovered(){},selected(){},result(){},started(){},coverage(){},invalidated(){}}});engine.run({files:[],full:true},new AbortController().signal).catch(()=>process.exitCode=1);`;
    host=spawn(process.execPath,['-e',script],{stdio:'ignore'});pids.add(/** @type {number} */ (host.pid));exit=once(host,'exit');
   }else{pending=f.engine.run({files:[],full:true},abort.signal);void pending.catch(()=>{});}
   try{
@@ -136,7 +137,7 @@ test('a fresh engine reclaims private MTP output after its previous host dies',{
  const source=f.file('ImpactDemo/Arithmetic.cs'),ready=path.join(f.temp,'started'),storage=path.join(f.temp,'state');
  await fs.writeFile(source,(await fs.readFile(source,'utf8')).replace('=> a + b;',
   '{ if (System.Environment.GetEnvironmentVariable("TESTY_CRASH_SLOW") == "1") System.Threading.Thread.Sleep(30000); return a + b; }'));
- const script=`const fs=require('node:fs');const {TestEngine}=require(${JSON.stringify(path.resolve('out/services/engine.js'))});const engine=new TestEngine({roots:[${JSON.stringify(f.root)}],storage:${JSON.stringify(storage)},tools:${JSON.stringify(path.join(f.temp,'tools'))},analyzer:${JSON.stringify(path.resolve('dist/analyzer/Testy.Analysis.dll'))},configuration:()=>(${JSON.stringify(f.config)}),events:{output:()=>{},phase:()=>{},discovered:()=>{},selected:()=>{},result:()=>{},coverage:()=>{},invalidated:()=>{},started:()=>fs.writeFileSync(${JSON.stringify(ready)},'started')}});engine.run({files:[],full:true},new AbortController().signal).catch(error=>{console.error(error);process.exitCode=1;});`;
+ const script=`const fs=require('node:fs');const {TestEngine}=require(${JSON.stringify(path.resolve('out/services/engine.js'))});const engine=new TestEngine({roots:[${JSON.stringify(f.root)}],storage:${JSON.stringify(storage)},tools:${JSON.stringify(toolsDirectory(f.temp))},analyzer:${JSON.stringify(path.resolve('dist/analyzer/Testy.Analysis.dll'))},configuration:()=>(${JSON.stringify(f.config)}),events:{output:()=>{},phase:()=>{},discovered:()=>{},selected:()=>{},result:()=>{},coverage:()=>{},invalidated:()=>{},started:()=>fs.writeFileSync(${JSON.stringify(ready)},'started')}});engine.run({files:[],full:true},new AbortController().signal).catch(error=>{console.error(error);process.exitCode=1;});`;
  const child=spawn(process.execPath,['-e',script],{stdio:['ignore','ignore','pipe'],env:{...process.env,TESTY_CRASH_SLOW:'1'}});
  let error='';child.stderr.on('data',text=>error+=text);const closed=new Promise(resolve=>child.once('close',resolve));
  try {

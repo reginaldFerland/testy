@@ -97,8 +97,8 @@ export async function refreshStructure(host: EngineHost, run: RunContext): Promi
     host.setInputs([...host.sources.files, ...filter.inputs, ...host.projects.map(project => project.file)]);
     await host.sources.refresh(host.sources.files, signal);
     const eligible = new Set(host.projects.filter(isTestTarget).map(project => testTargetKey(project.file, project.framework)));
-    const retained = host.groups.filter(group => eligible.has(testTargetKey(group.project, group.framework)));
-    if (retained.length !== host.groups.length || [...host.runtime.containers.values()].some(group => !eligible.has(testTargetKey(group.project, group.framework)))) {
+    const retained = host.discovered.filter(group => eligible.has(testTargetKey(group.project, group.framework)));
+    if (retained.length !== host.discovered.length || [...host.runtime.containers.values()].some(group => !eligible.has(testTargetKey(group.project, group.framework)))) {
         // A library/reference can remain in the build graph without
         // remaining a test target. Retire it even if the next build fails.
         await host.reconcileGroups(retained, baseline);

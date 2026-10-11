@@ -13,7 +13,7 @@ const {ProjectIndex,selectTests}=require('../../out/core/selection');
 // The per-change selection before test files were indexed by project, kept verbatim as the oracle.
 const maxCauseFiles=3;
 /** @type {Readonly<Record<SelectionCause['kind'],number>>} */
-const causePriority={covers:0,edited:1,fallback:2,baseline:3,manual:3,all:3};
+const causePriority={covers:0,edited:1,fallback:2,baseline:3,manual:3,all:3,pinned:3,failing:3};
 class CauseLog {
  constructor(){/** @type {Map<string,Map<string,CauseEntry>>} */ this.entries=new Map();}
  /** @param {TestFile} group @param {SelectionCause['kind']} kind @param {string} change @param {FallbackReason} [reason] */

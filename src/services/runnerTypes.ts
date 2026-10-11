@@ -1,4 +1,4 @@
-import { DiscoveredTest, TestFile, TestResult, Trace } from '../core/model';
+import { DiscoveredTest, FileCoverage, TestFile, TestResult, Trace } from '../core/model';
 import { PreparedOutputCache } from './preparedOutputCache';
 import type { AnalysisOptions } from './analysis';
 import { RuntimeModule } from './runtimeObservation';
@@ -8,6 +8,15 @@ export interface RunnerOptions extends AnalysisOptions {
     readonly dotnet: string;
     readonly storage: string;
     readonly testArguments: readonly string[];
+    /** Collector settings for instrumentation (`dotnet-coverage instrument --settings`): the functions `// testy: no coverage`
+     * leaves uninstrumented (see analysis suppressionSettings). Part of every preparation context, so cached outputs follow it. */
+    readonly coverageSettings?: string | undefined;
+    /** Traits whose test files never share a reused test host (`testy.isolatedTraits`): they run in a process of their own. */
+    readonly isolatedTraits?: readonly string[] | undefined;
+    /** Bytes a reused test host's process tree may use after a batch before it is replaced (`testy.testProcessMemoryLimit`). */
+    readonly testProcessMemoryLimit?: number | undefined;
+    /** Per-test time limit in milliseconds (see TestWatchdog); none while debugging. */
+    readonly testTimeoutMs?: number | undefined;
     readonly coverageTool?: string | undefined;
     /** The pinned collector receives a stable instrumentation environment across editor launches. */
     readonly managedCoverageTool?: boolean;
@@ -40,10 +49,21 @@ export interface RunnerOptions extends AnalysisOptions {
     readonly onExpanded?: (groups: readonly TestFile[]) => void;
     /** Attach a debugger to each test host before it runs. */
     readonly debug?: ((processId: number) => Promise<void>) | undefined;
+    /** Keep one test host per prepared output for the whole session and run each batch in it (`testy.reuseTestHosts`): batches skip
+     * the host's start-up, and collector snapshots split the coverage between them (see MtpSession). Never while debugging. */
+    readonly reuseHosts?: boolean | undefined;
+    /** Which one-file batches run their tests one request at a time and record each test's own coverage (`testy.selectionGranularity:
+     * test`), by file ID; the file's coverage is their sum. Only with coverage, never while debugging. */
+    readonly perTestCoverage?: ((groupId: string) => boolean) | undefined;
 }
 export interface FileRun {
     readonly results: readonly TestResult[];
     readonly trace: Trace;
     readonly coverageAvailable: boolean;
     readonly executedGroups: readonly TestFile[];
+    /** Milliseconds from starting the test process to reading its coverage: what running these files again costs, without
+     * preparing outputs. Absent from runs that did not measure it. */
+    readonly elapsed?: number;
+    /** Each requested test's own coverage, by test ID, when the run recorded it (see RunnerOptions.perTestCoverage). */
+    readonly testCoverage?: ReadonlyMap<string, readonly FileCoverage[]>;
 }

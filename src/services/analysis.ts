@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { contentHash, preparePathNormalizer } from '../core/paths';
 import { Project } from '../core/model';
+import type { MemberBody } from '../core/memberImpact';
 import { EnvironmentError } from '../core/errors';
 import { ProcessOptions, requireSuccess, runProcess } from './process';
 import { AnalyzerRequestFailed, AnalyzerServers, AnalyzerServerUnavailable } from './analyzerServer';
@@ -55,6 +56,23 @@ async function analyze(dotnet: string, analyzer: string, storage: string, prefix
     } finally {await fs.rm(directory, { recursive: true, force: true });}
 }
 
+/** The marker of in-code coverage suppression (see backend CoverageSuppression), searched for before asking the analyzer. */
+export const suppressionMarker = /testy:\s*no coverage/i;
+
+/** The collector's function-exclusion patterns of each file's `// testy: no coverage` members (see backend CoverageSuppression). */
+export async function coverageSuppressions(dotnet: string, analyzer: string, files: readonly string[], storage: string, options: AnalysisOptions): Promise<ReadonlyMap<string, readonly string[]>> {
+    if (!files.length) {return new Map();}
+    const value: unknown = JSON.parse(await analyze(dotnet, analyzer, storage, 'suppressions-', JSON.stringify({ suppressions: files }), 'Reading coverage suppressions', options));
+    if (!value || typeof value !== 'object') {throw new Error('Unexpected coverage suppression response.');}
+    return new Map(Object.entries(value).map(([file, patterns]) => [file, Array.isArray(patterns) ? patterns.filter((pattern): pattern is string => typeof pattern === 'string') : []]));
+}
+
+/** Collector settings that leave the matching functions uninstrumented (`dotnet-coverage instrument --settings`). */
+export function suppressionSettings(patterns: readonly string[]): string {
+    const escape = (text: string): string => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return `<?xml version="1.0" encoding="utf-8"?>\n<Configuration><CodeCoverage><Functions><Exclude>${patterns.map(pattern => `<Function>${escape(pattern)}</Function>`).join('')}</Exclude></Functions></CodeCoverage></Configuration>\n`;
+}
+
 export async function sourceLocations(dotnet: string, analyzer: string, assembly: string, storage: string, options: AnalysisOptions): Promise<ReadonlyMap<string, { file: string; line: number }>> {
     const output = await analyze(dotnet, analyzer, storage, 'symbols-', JSON.stringify({ assembly }), 'Reading portable symbols', options);
     const values = JSON.parse(output) as Record<string, { file?: string; line?: number } | null>;
@@ -69,6 +87,9 @@ export interface SourceShape {
     readonly body: string;
     readonly partialTypes: readonly string[];
     readonly excludedTypes: readonly string[];
+    /** Executable bodies in document order and the fingerprints of the text around them (see core/memberImpact). */
+    readonly members?: readonly MemberBody[];
+    readonly gaps?: readonly string[];
 }
 
 const workers = (concurrency: number): number => Number.isFinite(concurrency) ? Math.max(1, Math.floor(concurrency)) : 1;
@@ -80,7 +101,13 @@ const aliasesEqual = (left: readonly string[], right: readonly string[]): boolea
 function sourceShape(value: unknown): value is SourceShape {
     const hash = (value: unknown): value is string => typeof value === 'string' && /^[A-F0-9]{64}$/.test(value);
     const shape = value as Partial<SourceShape> | null;
-    return !!shape && hash(shape.signature) && hash(shape.body) && names(shape.partialTypes) && names(shape.excludedTypes);
+    return !!shape && hash(shape.signature) && hash(shape.body) && names(shape.partialTypes) && names(shape.excludedTypes)
+        && (shape.members === undefined || (Array.isArray(shape.members) && shape.members.every(member => memberBody(member, hash))))
+        && (shape.gaps === undefined || (Array.isArray(shape.gaps) && shape.gaps.every(gap => hash(gap))));
+}
+function memberBody(value: unknown, hash: (value: unknown) => value is string): value is MemberBody {
+    const member = value as Partial<MemberBody> | null;
+    return !!member && Number.isSafeInteger(member.start) && Number.isSafeInteger(member.end) && member.start! > 0 && member.end! >= member.start! && hash(member.hash);
 }
 
 export interface SourceAnalysisBatch {

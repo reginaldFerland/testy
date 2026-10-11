@@ -27,6 +27,31 @@ export interface MtpOptions extends ProcessOptions {
     readonly expectedTests?: readonly TestNode[];
     /** Run under a debugger: the host waits until this attaches to the reported process. */
     readonly debug?: ((processId: number) => Promise<void>) | undefined;
+    /** How long one test may run after the framework reports it in progress before the host is stopped (see TestWatchdog). */
+    readonly testTimeoutMs?: number | undefined;
+}
+
+/** Stops a test host once a test has been in progress for longer than the limit, and says which test it was. Frameworks that
+ * report no in-progress update leave only the run's own time limit. */
+export class TestWatchdog {
+    private readonly timers = new Map<string, NodeJS.Timeout>();
+    /** Why the host was stopped, once a test exceeded the limit. */
+    expired: Error | undefined;
+    constructor(private readonly limitMs: number | undefined, private readonly stop: () => void) {}
+
+    observe(node: TestNode): void {
+        if (!this.limitMs || node['node-type'] === 'group') {return;}
+        if (node['execution-state'] === 'in-progress') {
+            if (this.timers.has(node.uid) || this.expired) {return;}
+            const timer = setTimeout(() => {
+                this.expired ??= new Error(`The test ${nodeName(node)} ran longer than the per-test time limit of ${Math.round(this.limitMs! / 1000)} seconds (testy.testTimeoutSeconds); Testy stopped its test process.`);
+                this.stop();
+            }, this.limitMs);
+            timer.unref(); this.timers.set(node.uid, timer);
+        } else if (isTerminal(node)) {clearTimeout(this.timers.get(node.uid)); this.timers.delete(node.uid);}
+    }
+
+    dispose(): void { for (const timer of this.timers.values()) {clearTimeout(timer);} this.timers.clear(); }
 }
 
 /** After a complete result stream, how long the host may take to exit. A coverage
@@ -86,8 +111,24 @@ export function connectionClosed(error: unknown): boolean {
     return ['EPIPE', 'ECONNRESET', 'ERR_STREAM_DESTROYED', 'ERR_STREAM_WRITE_AFTER_END'].includes((error as NodeJS.ErrnoException | undefined)?.code ?? '');
 }
 
-/** MTP's IDE protocol, transported over a loopback socket using Content-Length framing. */
-export async function requestTests(options: MtpOptions, operation: 'discover' | 'run', tests?: readonly TestNode[]): Promise<readonly TestNode[]> {
+/** A test host connected to Testy over MTP's IDE protocol and initialized. Updates and attachments are routed by run ID. */
+interface HostConnection {
+    readonly process: OwnedProcess;
+    readonly rpc: MessageConnection;
+    readonly initialized: InitializeResult;
+    /** Rejects when a second connection shows that one of them was not the test host. */
+    readonly intrusion: Promise<never>;
+    /** A request that fails with the host's exit diagnostic, or the intrusion, instead of a transport error. */
+    request<T>(method: string, parameters: object): Promise<T>;
+    /** Route a run's test updates; `changes: null` ends it. Returns the unsubscribe function. */
+    observe(runId: string, updates: (update: TestUpdates) => void): () => void;
+    /** Stop the host and release the transport; always called once. */
+    dispose(): Promise<void>;
+}
+
+/** Start the test host (wrapped by a coverage collector when given) with `--server`, accept its single connection and initialize
+ * it. `operation` names what the host is started for in its exit diagnostics. A failure stops the host before rejecting. */
+async function connectHost(options: MtpOptions, operation: string, debugging: ((processId: number) => Promise<void>) | undefined): Promise<HostConnection> {
     options.signal?.throwIfAborted();
     const server = net.createServer();
     let socket: net.Socket | undefined;
@@ -95,7 +136,16 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
     let process: OwnedProcess | undefined;
     let connectionTimer: NodeJS.Timeout | undefined;
     let closeTimer: NodeJS.Timeout | undefined;
-    let lingering = false;
+    const runs = new Map<string, (update: TestUpdates) => void>();
+    const dispose = async (): Promise<void> => {
+        clearTimeout(connectionTimer);
+        clearTimeout(closeTimer);
+        rpc?.dispose();
+        socket?.destroy();
+        server.close();
+        process?.stop();
+        await process?.done.catch(() => undefined);
+    };
     try {
         await new Promise<void>((resolve, reject) => {
             server.once('error', reject);
@@ -106,7 +156,6 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
         // rendezvous, so a local process could connect first and impersonate the
         // test host. The real host always connects exactly once, so any second
         // connection means one of them was not ours and the results are discarded.
-        const debugging = operation === 'run' ? options.debug : undefined;
         let rejectIntrusion: (error: Error) => void = () => undefined;
         const intrusion = new Promise<never>((_resolve, reject) => {rejectIntrusion = reject;});
         void intrusion.catch(() => undefined);
@@ -157,7 +206,7 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
             encode: message => Promise.resolve(Buffer.from(JSON.stringify(message).replace(/[\u007f-\uffff]/g,
                 character => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`), 'utf8'))
         } });
-        rpc = createMessageConnection(new StreamMessageReader(peer), writer);
+        const connection = rpc = createMessageConnection(new StreamMessageReader(peer), writer);
         // Closing a transport does not itself reject vscode-jsonrpc's pending
         // requests. Disposal is essential when a cancelled/crashed runner exits.
         // Give process exit/timeout its diagnostic before RPC disposal rejects
@@ -165,8 +214,8 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
         // until the exit is observed (it can lag the socket under load), bounded
         // for a host that closes the connection but keeps running.
         const host = process;
-        rpc.onClose(() => {
-            const dispose = (delay: number): void => {clearTimeout(closeTimer); closeTimer = setTimeout(() => rpc?.dispose(), delay);};
+        connection.onClose(() => {
+            const dispose = (delay: number): void => {clearTimeout(closeTimer); closeTimer = setTimeout(() => connection.dispose(), delay);};
             dispose(mtpTiming.closeGraceMs);
             void host.done.then(() => dispose(0), () => dispose(0));
         });
@@ -174,55 +223,77 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
             throw new Error(`The test application exited during ${operation} (exit ${result.code}).\n${result.stderr || result.stdout}`);
         });
         void exited.catch(() => undefined);
-        const request = <T>(method: string, parameters: object): Promise<T> => Promise.race([rpc!.sendRequest<T>(method, parameters), exited, intrusion]);
-        const nodes = new Map<string, TestNode>();
-        const pendingOutput = new Map<string, { stdout: string[]; stderr: string[] }>();
-        const runId = randomUUID();
-        // Set by the update notification; `as boolean` keeps the read after the requests from narrowing to false.
-        let completed = false as boolean;
-        rpc.onNotification('testing/testUpdates/tests', (update: TestUpdates) => {
-            if (update.runId !== runId) {return;}
-            if (update.changes === null) { completed = true; return; }
-            for (const { node } of update.changes ?? []) {
-                const previous = nodes.get(node.uid);
-                const merged = operation === 'run' ? mergeTestUpdate(previous, node) : { ...previous, ...node };
-                nodes.set(node.uid, merged);
-                if (merged === previous) {continue;} // An older retry update.
-                const output = pendingOutput.get(node.uid) ?? { stdout: [], stderr: [] };
-                if (typeof node.standardOutput === 'string') {output.stdout.push(node.standardOutput);}
-                if (typeof node.standardError === 'string') {output.stderr.push(node.standardError);}
-                pendingOutput.set(node.uid, output);
-                const terminal = isTerminal(merged);
-                // Keep complete snapshots for result accounting, but publish
-                // output only once. Preserve output received before completion.
-                options.onNode?.({ ...merged, standardOutput: terminal ? output.stdout.join('') : undefined,
-                    standardError: terminal ? output.stderr.join('') : undefined });
-                if (terminal) {pendingOutput.delete(node.uid);}
-            }
-        });
-        rpc.onNotification('client/log', (message: { level?: string | number; message?: string }) => {
+        const request = <T>(method: string, parameters: object): Promise<T> => Promise.race([connection.sendRequest<T>(method, parameters), exited, intrusion]);
+        connection.onNotification('testing/testUpdates/tests', (update: TestUpdates) => {runs.get(update.runId)?.(update);});
+        connection.onNotification('client/log', (message: { level?: string | number; message?: string }) => {
             if (message.level === 'Error' || message.level === 'Warning' || (typeof message.level === 'number' && message.level >= 3)) {options.output?.(`${message.message ?? ''}\n`);}
         });
-        rpc.onNotification('telemetry/update', () => undefined);
-        rpc.onNotification('testing/testUpdates/attachments', (update: AttachmentUpdates) => {
-            if (update.runId !== runId) {return;}
+        connection.onNotification('telemetry/update', () => undefined);
+        connection.onNotification('testing/testUpdates/attachments', (update: AttachmentUpdates) => {
+            if (!runs.has(update.runId)) {return;}
             for (const line of attachmentLines(update.attachments)) {options.output?.(`${line}\n`);}
         });
-        rpc.listen();
+        connection.listen();
         const initialized = await request<InitializeResult>('initialize', {
             processId: global.process.pid,
             clientInfo: { name: 'Testy', version: extensionVersion() },
             capabilities: { testing: { debuggerProvider: false, isStateful: true } }
         });
-        if (!initialized.capabilities?.testing?.supportsDiscovery && operation === 'discover') {throw new Error('This MTP test framework does not support discovery.');}
-        await request(operation === 'discover' ? 'testing/discoverTests' : 'testing/runTests', { runId, ...(tests ? { tests } : {}) });
-        if (!completed) {throw new Error('The test runner ended without a complete test update stream.');}
+        return { process, rpc: connection, initialized, intrusion, request, dispose,
+            observe: (runId, updates) => {runs.set(runId, updates); return () => {runs.delete(runId);};} };
+    } catch (error) {
+        const interruption = process?.interruption;
+        await dispose();
+        throw interruption ?? error;
+    }
+}
+
+/** Collects one run's updates the way Testy reports them: retries merged, output published once with the terminal update. */
+function collectUpdates(operation: 'discover' | 'run', onNode: ((node: TestNode) => void) | undefined): { readonly nodes: Map<string, TestNode>; completed: boolean; readonly handle: (update: TestUpdates) => void } {
+    const nodes = new Map<string, TestNode>();
+    const pendingOutput = new Map<string, { stdout: string[]; stderr: string[] }>();
+    const state = { nodes, completed: false, handle: (update: TestUpdates): void => {
+        if (update.changes === null) { state.completed = true; return; }
+        for (const { node } of update.changes ?? []) {
+            const previous = nodes.get(node.uid);
+            const merged = operation === 'run' ? mergeTestUpdate(previous, node) : { ...previous, ...node };
+            nodes.set(node.uid, merged);
+            if (merged === previous) {continue;} // An older retry update.
+            const output = pendingOutput.get(node.uid) ?? { stdout: [], stderr: [] };
+            if (typeof node.standardOutput === 'string') {output.stdout.push(node.standardOutput);}
+            if (typeof node.standardError === 'string') {output.stderr.push(node.standardError);}
+            pendingOutput.set(node.uid, output);
+            const terminal = isTerminal(merged);
+            // Keep complete snapshots for result accounting, but publish
+            // output only once. Preserve output received before completion.
+            onNode?.({ ...merged, standardOutput: terminal ? output.stdout.join('') : undefined,
+                standardError: terminal ? output.stderr.join('') : undefined });
+            if (terminal) {pendingOutput.delete(node.uid);}
+        }
+    } };
+    return state;
+}
+
+/** MTP's IDE protocol, transported over a loopback socket using Content-Length framing. */
+export async function requestTests(options: MtpOptions, operation: 'discover' | 'run', tests?: readonly TestNode[]): Promise<readonly TestNode[]> {
+    const host = await connectHost(options, operation, operation === 'run' ? options.debug : undefined);
+    const { process } = host;
+    let lingering = false, stopWatchdog = (): void => undefined, expired = (): Error | undefined => undefined;
+    try {
+        if (!host.initialized.capabilities?.testing?.supportsDiscovery && operation === 'discover') {throw new Error('This MTP test framework does not support discovery.');}
+        const watchdog = operation === 'run' && !options.debug ? new TestWatchdog(options.testTimeoutMs, () => process.stop()) : undefined;
+        const runId = randomUUID(), updates = collectUpdates(operation, watchdog ? node => {watchdog.observe(node); options.onNode?.(node);} : options.onNode);
+        stopWatchdog = () => watchdog?.dispose(); expired = () => watchdog?.expired;
+        host.observe(runId, updates.handle);
+        await host.request(operation === 'discover' ? 'testing/discoverTests' : 'testing/runTests', { runId, ...(tests ? { tests } : {}) });
+        if (!updates.completed) {throw new Error('The test runner ended without a complete test update stream.');}
+        const nodes = updates.nodes;
         // A host that already closed the connection after its final update still produced a complete run.
-        try {await rpc.sendNotification('exit', {});}
+        try {await host.rpc.sendNotification('exit', {});}
         catch (error) {if (!connectionClosed(error)) {throw error;}}
         // Every result has arrived. A host kept alive by a lingering foreground
         // thread must not hold the batch until the run timeout and lose them.
-        const result = await Promise.race([exitWithin(process, options.wrapper ? mtpTiming.wrappedExitGraceMs : mtpTiming.exitGraceMs), intrusion]);
+        const result = await Promise.race([exitWithin(process, options.wrapper ? mtpTiming.wrappedExitGraceMs : mtpTiming.exitGraceMs), host.intrusion]);
         if (!result) {
             lingering = true;
             options.output?.(`The test application did not exit after completing ${operation}; it was stopped and its results were kept.\n`);
@@ -245,16 +316,99 @@ export async function requestTests(options: MtpOptions, operation: 'discover' | 
         options.signal?.throwIfAborted();
         return [...nodes.values()].filter(node => node['node-type'] !== 'group');
     } catch (error) {
-        if (process?.interruption && !lingering) {throw process.interruption;}
+        const timedOut = expired();
+        if (timedOut) {throw timedOut;}
+        if (process.interruption && !lingering) {throw process.interruption;}
         throw error;
     } finally {
-        clearTimeout(connectionTimer);
-        clearTimeout(closeTimer);
-        rpc?.dispose();
-        socket?.destroy();
-        server.close();
-        process?.stop();
-        await process?.done.catch(() => undefined);
+        stopWatchdog();
+        await host.dispose();
+    }
+}
+
+/** The longest timer Node supports; a session's host is bounded per run instead (see MtpSession.run). */
+const unbounded = 2_147_483_647;
+
+/** What one run of a session reports, besides its updates. */
+export interface SessionRun {
+    readonly expectedTests?: readonly TestNode[] | undefined;
+    readonly onNode?: ((node: TestNode) => void) | undefined;
+}
+
+/**
+ * A test host that stays up for several run requests, one at a time, so that consecutive test files or tests share one process:
+ * MTP's server mode accepts any number of `testing/runTests` requests before `exit`. Each run is bounded by `timeoutMs`; a run
+ * that fails, times out or is cancelled stops the host, and the session is then closed. The exit code only arrives at `close`,
+ * so a run reports what its updates say (see requestTests for the single-request checks).
+ */
+export class MtpSession {
+    private closing: Promise<void> | undefined;
+    private failure: Error | undefined;
+    private constructor(private readonly host: HostConnection, private readonly options: MtpOptions) {
+        void host.process.done.then(result => {this.failure ??= new Error(`The test application exited (exit ${result.code}).\n${result.stderr || result.stdout}`);}, () => undefined);
+    }
+
+    /** Start and initialize a host for several runs. `options.timeoutMs` bounds each run, not the host's lifetime. */
+    static async open(options: MtpOptions): Promise<MtpSession> {
+        const host = await connectHost({ ...options, timeoutMs: unbounded }, 'a test run', undefined);
+        return new MtpSession(host, options);
+    }
+
+    /** Whether the host can take another run. */
+    get alive(): boolean { return !this.closing && !this.failure; }
+
+    /** The process that owns the host's tree (see services/process). */
+    get processId(): number | undefined { return this.host.process.child.pid; }
+
+    /** Run tests (every test when `tests` is undefined) and return their terminal leaf nodes. Rejects, and closes the session,
+     * when the host fails, the stream is incomplete, a group fails, or the run exceeds the time limit. */
+    async run(tests: readonly TestNode[] | undefined, run: SessionRun = {}): Promise<readonly TestNode[]> {
+        if (this.closing) {throw new Error('The test host session is closed.');}
+        if (this.failure) {throw this.failure;}
+        this.options.signal?.throwIfAborted();
+        const watchdog = new TestWatchdog(this.options.testTimeoutMs, () => this.host.process.stop());
+        const runId = randomUUID(), updates = collectUpdates('run', node => {watchdog.observe(node); run.onNode?.(node);});
+        const unsubscribe = this.host.observe(runId, updates.handle);
+        // Set by the timer; `as boolean` keeps the read after the await from narrowing to false.
+        let timer: NodeJS.Timeout | undefined, timedOut = false as boolean;
+        const limit = new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => {
+                timedOut = true; this.host.process.stop();
+                reject(new Error(`The test run exceeded its time limit of ${Math.round((this.options.timeoutMs ?? 600_000) / 1000)} seconds.`));
+            }, this.options.timeoutMs ?? 600_000);
+        });
+        void limit.catch(() => undefined);
+        try {
+            await Promise.race([this.host.request('testing/runTests', { runId, ...(tests ? { tests } : {}) }), limit]);
+            if (!updates.completed) {throw new Error('The test runner ended without a complete test update stream.');}
+            const nodes = [...updates.nodes.values()];
+            const failedGroup = nodes.find(node => node['node-type'] === 'group' && ['failed', 'errored'].includes(testResult(node)?.outcome ?? ''));
+            if (failedGroup) {throw new Error(`The test group failed: ${nodeName(failedGroup)}. ${nodeText(failedGroup, 'error.message')}`);}
+            const leaves = nodes.filter(node => node['node-type'] !== 'group');
+            if (leaves.length) {assertComplete(nodes, run.expectedTests ?? tests ?? [], run.onNode);}
+            this.options.signal?.throwIfAborted();
+            return leaves;
+        } catch (error) {
+            const reason = watchdog.expired ?? (timedOut ? error : this.host.process.interruption ?? error);
+            this.failure ??= reason instanceof Error ? reason : new Error(String(reason));
+            await this.close();
+            throw reason;
+        } finally {clearTimeout(timer); unsubscribe(); watchdog.dispose();}
+    }
+
+    /** Say goodbye and wait for the host (and a wrapping collector) to exit, stopping it when it lingers. Idempotent. */
+    close(): Promise<void> {
+        return this.closing ??= (async () => {
+            try {
+                if (!this.failure) {
+                    try {await this.host.rpc.sendNotification('exit', {});}
+                    catch (error) {if (!connectionClosed(error)) {throw error;}}
+                    const result = await exitWithin(this.host.process, this.options.wrapper ? mtpTiming.wrappedExitGraceMs : mtpTiming.exitGraceMs);
+                    if (!result) {this.options.output?.('A reused test host did not exit after its last run; it was stopped and its results were kept.\n');}
+                }
+            } catch { /* The host is stopped below either way. */ }
+            finally {await this.host.dispose();}
+        })();
     }
 }
 

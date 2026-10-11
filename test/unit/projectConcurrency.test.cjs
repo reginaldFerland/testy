@@ -126,3 +126,21 @@ test('a slow directory delays only its own subtree, not the rest of its level',a
   assert.ok(reachedDeep);assert.deepEqual(projects.map(file=>path.basename(file)),['F.csproj','S.csproj']);
  }finally{fs.readdir=read;release();}
 });
+
+test('a root that another root references builds once, as the same instance its reference builds',{timeout:90000},async t=>{
+ const root=await temporary(t),counter=path.join(root,'compiled.txt'),files=[];
+ for(const [name,references] of Object.entries({Tests:[],Consumer:['Tests']})){
+  const directory=path.join(root,name);await fs.mkdir(directory);const file=normalizePath(path.join(directory,`${name}.csproj`));files.push(file);
+  await fs.writeFile(file,`<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup><ItemGroup>${references.map(reference=>`<ProjectReference Include="../${reference}/${reference}.csproj"/>`).join('')}</ItemGroup></Project>`);
+  await fs.writeFile(path.join(directory,`${name}.cs`),`public class ${name} {}`);
+ }
+ // Runs once per project instance, even when the compilation itself is up to date.
+ await fs.writeFile(path.join(root,'Directory.Build.targets'),`<Project><Target Name="CountInstance" BeforeTargets="CoreCompile"><WriteLinesToFile File="${counter}" Lines="$(MSBuildProjectName)" Overwrite="false"/></Target></Project>`);
+ const options={cwd:root,signal:new AbortController().signal,timeoutMs:60000};
+ await restoreProjects('dotnet',files,'Debug',options,2);
+ const snapshots=await evaluateProjects('dotnet',files,'Debug',options,path.resolve('dist/analyzer/Testy.Analysis.dll'),2);
+ const projects=mergeProjects([...snapshots.values()].flat());
+ await buildProjects('dotnet',projects,'Debug',options,2);
+ const built=(await fs.readFile(counter,'utf8')).trim().split(/\r?\n/).sort();
+ assert.deepEqual(built,['Consumer','Tests'],'two instances of Tests would write its outputs in parallel');
+});

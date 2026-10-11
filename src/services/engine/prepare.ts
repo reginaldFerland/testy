@@ -4,15 +4,16 @@ import { EngineConfiguration, isTestTarget, TestFile } from '../../core/model';
 import { compareCodeUnits, contentHash, testTargetKey } from '../../core/paths';
 import { buildOrder } from '../projects';
 import { ProcessOptions } from '../process';
-import { RunnerOptions, RunnerSession } from '../runner';
-import { resolveShapes, sourceAnalysisBatch, SourceShape } from '../analysis';
+import { RunnerOptions } from '../runner';
+import { resolveShapes, sourceAnalysisBatch, SourceShape, suppressionSettings } from '../analysis';
 import { sourceAnalysisContext } from '../analysisContext';
 import { installCoverageTool } from '../coverageTool';
 import { RunOutputLease } from '../runOutputs';
 import { mapConcurrent, Semaphore } from '../../core/concurrency';
 import { EnvironmentError } from '../../core/errors';
+import { schedulingPriority } from '../../core/runPolicy';
 import type { EngineHost } from './host';
-import type { AnalysisState, BuildPlan, BuildResult, PreparedTests, RunContext } from './types';
+import type { AnalysisState, BuildPlan, BuildResult, PreparedTests, RunContext, RunState } from './types';
 
 /** Analyze sources, keeping only analyses whose parsed bytes match the current versions. The engine adopts the
  * returned state as soon as analysis settles, even if discovery later fails. */
@@ -64,7 +65,11 @@ export async function analyzeSources(host: EngineHost, run: RunContext, analysis
         nextAnalyses = new Map(failedFiles.map(file => [file, null]));
         for (const file of failedFiles) {nextHashes.delete(file);}
         if (uncertain) {analysisContext = undefined;}
-    } finally {events.output(`Testy timing: Source analysis ${Date.now() - started}ms (overlaps test preparation)\n`);}
+    } finally {
+        const ended = Date.now();
+        events.output(`Testy timing: Source analysis ${ended - started}ms (overlaps test preparation)\n`);
+        host.timeline.record({ name: 'Source analysis', category: 'analysis', lane: 0, start: started, end: ended, details: { files: allFiles.length } });
+    }
     const analyses = new Map([...host.analyses, ...nextAnalyses].filter(([file]) => analysisHashes.has(file)));
     const state: AnalysisState = { analyses, analyzedHashes: new Map([...nextHashes].filter(([file]) => analysisHashes.has(file))), analysisContext, aliasStamp, excludedAliases };
     return { state, shapes: resolveShapes(analyses, host.projects) };
@@ -72,8 +77,9 @@ export async function analyzeSources(host: EngineHost, run: RunContext, analysis
 
 /** Overlap source analysis with coverage setup, runner preparation and discovery. */
 export async function prepareTests(host: EngineHost, run: RunContext, plan: BuildPlan, built: BuildResult, outputLease: RunOutputLease,
-    state: { sessions?: RunnerSession; analyzing?: Promise<ReadonlyMap<string, string | null>> }): Promise<PreparedTests> {
+    state: RunState): Promise<PreparedTests> {
     const { config, signal, projectLimit, testLimit, processOptions, full, manual, rootSnapshot, controller } = run;
+    const throughput = schedulingPriority({ baseline: !!run.baseline && !manual, mode: config.mode, all: !!manual?.all }) === 'throughput';
     const { builds, testBuilds, anticipated } = plan;
     const events = host.options.events;
     // Each target may eventually use every file worker as other targets finish.
@@ -103,9 +109,19 @@ export async function prepareTests(host: EngineHost, run: RunContext, plan: Buil
     const anticipatedTargets = new Set(anticipated.groups.map(group => testTargetKey(group.project, group.framework)));
     const prepared: PreparedTests = { coverageTool, runtimeTreeChanged: false, liveIds: new Set(), currentShapes: new Map(), sessions: undefined! };
     let initialPreparation = true;
+    // `// testy: no coverage` members stay uninstrumented: their patterns become collector settings, part of each preparation context.
+    const suppressions = coverageTool ? await host.coverageSuppressions(signal) : [];
+    let coverageSettings: string | undefined;
+    if (suppressions.length) {
+        const settings = suppressionSettings(suppressions), directory = path.join(host.options.storage, 'coverage-settings');
+        coverageSettings = path.join(directory, `${contentHash(settings)}.xml`);
+        await fs.mkdir(directory, { recursive: true }); await fs.writeFile(coverageSettings, settings);
+        events.output(`Testy coverage: ${suppressions.length} function pattern${suppressions.length === 1 ? '' : 's'} from \`// testy: no coverage\` stay uninstrumented.\n`);
+    }
     const runnerOptions: RunnerOptions = {
         ...processOptions, dotnet: config.dotnet, storage: path.join(host.options.storage, 'runs'),
         testArguments: config.testArguments, coverageTool, managedCoverageTool: !config.coverageTool,
+        testTimeoutMs: manual?.debug ? undefined : config.testTimeout, isolatedTraits: config.isolatedTraits, testProcessMemoryLimit: config.testProcessMemoryLimit, coverageSettings,
         assemblies: host.projects.flatMap(project => project.assemblies ?? [project.assembly]), analyzer: host.options.analyzer, analyzerServers: host.analyzerServers, identity: host.identity,
         modules: host.projects.flatMap(project => (project.contexts ?? [project]).map(context => ({
             name: context.assemblyName ?? path.basename(context.assembly, path.extname(context.assembly)), project: project.file,
@@ -120,7 +136,7 @@ export async function prepareTests(host: EngineHost, run: RunContext, plan: Buil
         deferCoverage: !full && !manual && config.mode === 'affected'
             ? target => !anticipatedTargets.has(testTargetKey(target.project, target.framework)) : undefined,
         preparationContexts: new Map(testBuilds.map(project => [testTargetKey(project.file, project.framework), contentHash(JSON.stringify({
-            roots: rootSnapshot, configuration: config.configuration, excludes: config.excludes,
+            roots: rootSnapshot, configuration: config.configuration, excludes: config.excludes, ...suppressions.length ? { suppressions } : {},
             target: project.contextId, sdk: built.sdkByFile.get(project.file),
             contexts: buildOrder(host.buildGraph, new Set([project.file])).map(context => ({
                 id: context.contextId, file: context.file, framework: context.framework, assembly: context.assembly,
@@ -131,12 +147,25 @@ export async function prepareTests(host: EngineHost, run: RunContext, plan: Buil
             [...new Set(buildOrder(host.projects, new Set([project.file])).flatMap(input => [...input.inputs ?? []]))]])),
         onResult: (group, result, test) => {if (host.reportResult(group, result, test)) {prepared.runtimeTreeChanged = true;}}, onStarted: events.started, onPrepared: events.prepared,
         onExpanded: groups => events.selected({ groups, reason: 'Containing files for provider runtime identities', fallback: true }),
-        debug: manual?.debug ? events.debug : undefined
+        debug: manual?.debug ? events.debug : undefined,
+        reuseHosts: !!config.reuseTestHosts && !manual?.debug,
+        // Each test's own coverage costs a snapshot per test. It is learned lazily: by the runs that edits start, and in other runs
+        // only kept current for files that already have it, so a baseline or a run of everything stays fast.
+        perTestCoverage: config.granularity === 'test' && !!coverageTool && !manual?.debug
+            ? (throughput ? id => !!host.testCoverage.get(id) : () => true) : undefined
     };
-    const sessions = prepared.sessions = state.sessions = host.createSession(runnerOptions);
+    // A session the previous run kept carries its prepared outputs, discoveries and reused hosts over, when nothing it was prepared
+    // from changed (see TestEngine.takeSession); otherwise it is released before this run prepares its own.
+    const retentionKey = contentHash(JSON.stringify([run.identity, run.topology, config.configuration, config.coverage, coverageTool ?? null, config.testArguments,
+        config.testTimeout ?? null, config.isolatedTraits ?? [], config.testProcessMemoryLimit ?? 0, config.granularity ?? null, rootSnapshot, suppressions,
+        [...runnerOptions.preparationContexts ?? []].sort(([a], [b]) => compareCodeUnits(a, b))]));
+    const kept = !manual?.debug && config.reuseTestHosts && !built.snapshots.size ? await host.takeSession(retentionKey, runnerOptions, signal) : (await host.releaseSession(false), undefined);
+    const sessions = prepared.sessions = state.sessions = kept ?? host.createSession(runnerOptions);
+    state.retentionKey = retentionKey;
+    if (kept) {events.output('Reusing the test hosts, prepared outputs and discovery of the previous run: nothing they were prepared from changed.\n');}
     const rebuilt = new Set(testBuilds.map(project => testTargetKey(project.file, project.framework)));
     const targets = new Set(host.projects.filter(isTestTarget).map(project => testTargetKey(project.file, project.framework)));
-    const next = host.groups.filter(group => !rebuilt.has(testTargetKey(group.project, group.framework)) && targets.has(testTargetKey(group.project, group.framework)));
+    const next = host.discovered.filter(group => !rebuilt.has(testTargetKey(group.project, group.framework)) && targets.has(testTargetKey(group.project, group.framework)));
     let discoveredProjects = 0, activeDiscoveries = 0;
     const discoveryProgress = (): void => events.phase({ kind: 'preparingTests', completed: discoveredProjects, total: testBuilds.length, active: activeDiscoveries });
     let inventories: readonly (readonly TestFile[])[];

@@ -116,7 +116,8 @@ export class TestTree {
         for (const id of this.treeRoots) {const item = this.items.get(id); if (item && item.busy !== busy) {item.busy = busy;}}
     }
 
-    private namedSources(name: string): readonly string[] {
+    /** Known source files by lowercase file name, for deterministic stack-frame paths. */
+    namedSources(name: string): readonly string[] {
         const hashes = this.engine.hashes;
         if (this.sourceNames?.hashes !== hashes || this.sourceNames.size !== hashes.size) {
             const names = new Map<string, string[]>();

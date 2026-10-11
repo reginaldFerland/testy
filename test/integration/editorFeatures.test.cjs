@@ -1,4 +1,5 @@
 const {test} = require('node:test');
+const {toolsDirectory}=require('./support/tools.cjs');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
@@ -24,7 +25,7 @@ async function fixture(t, overrides={}) {
  /** @type {Selection[]} */ const selections=[];
  /** @type {string[]} */ const output=[];
  /** @type {{debug?: (processId: number) => Promise<void>}} */ const state={};
- const engine=new TestEngine({roots:[root],storage:path.join(directory,'state'),tools:path.join(directory,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,events:{
+ const engine=new TestEngine({roots:[root],storage:path.join(directory,'state'),tools:toolsDirectory(directory),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,events:{
   output:text=>output.push(text),phase:()=>{},discovered:()=>{},selected:value=>selections.push(value),result:(group,result)=>results.push({file:path.basename(group.file??''),...result}),
   started:()=>{},coverage:()=>{},invalidated:()=>{},debug:processId=>/** @type {Promise<void>} */ (state.debug?.(processId))
  }});

@@ -5,15 +5,18 @@ import { configuration, Configuration } from './configuration';
 import { TestFile } from './core/model';
 import { contentHash, isInside, normalizePath, normalizePathAsync } from './core/paths';
 import { ChangeBatch, Scheduler, SchedulerState } from './core/scheduler';
+import { slowest, traceEvents } from './core/timeline';
 import { Selection } from './core/selection';
 import { ManualSelection, RunPhase, RunScope, RunSummary, TestEngine } from './services/engine';
 import { ChangeWatcher } from './changeWatcher';
+import { setProcessPriority } from './services/process';
 import { BackgroundSweep } from './core/backgroundSweep';
 import { excludeProject, registerCommands } from './commands';
 import { DiagnosticsPublisher } from './diagnosticsPublisher';
 import { BaselineProgress } from './ui/baselineProgress';
 import { CoverageView } from './ui/coverage';
 import { InlineResults } from './ui/inlineResults';
+import { QueueView } from './ui/queueView';
 import { exportCoverageFile } from './ui/exportCoverage';
 import { EnvironmentErrorCode, errorMessage, isAbortError, isEnvironmentError } from './core/errors';
 import { explainItem } from './ui/selectionCause';
@@ -24,11 +27,15 @@ const csharpExtension = 'ms-dotnettools.csharp';
 const devKitExtension = 'ms-dotnettools.csdevkit';
 /** Workspace-local pause state. The `testy.autoRun` setting is only the default. */
 const pausedKey = 'testy.paused';
+/** Test Explorer item IDs pinned to automatic runs, per workspace. */
+const pinnedKey = 'testy.pinnedTests';
 const devKitNoticeKey = 'testy.devKitNotice.dismissed';
 /** Whether opening this workspace may build and run the baseline: `always`, `manual` (only after a save or manual run), or unset (ask). */
 const baselineConsentKey = 'testy.baselineConsent';
 /** The Settings editor filtered to Testy's settings. */
 const extensionSettings = '@ext:reginaldFerland.testy';
+/** How long the editor must be quiet before a safety-net run starts (see Testy.queueSafetyNet). */
+const safetyNetDelay = 2000;
 // Call sites use l10n.t(...) literally so `npm run l10n:export` can extract them.
 const l10n = vscode.l10n;
 
@@ -115,6 +122,12 @@ export class Testy implements vscode.Disposable {
     private readonly notified = new Set<string>();
     /** The latest selection, for "Why was this selected?". */
     private lastSelection: Selection | undefined;
+    /** The test batches of the current or latest run (see QueueView). */
+    private readonly queueView = new QueueView();
+    /** Test Explorer items pinned to automatic runs, by ID (see setPinned). */
+    private readonly pinned: Set<string>;
+    /** Test files a safety-net run still has to check (see queueSafetyNet). */
+    private readonly safetyPending = new Set<string>();
     /** The startup baseline waits for the user's answer, a save or a manual run; setting and folder changes do not start it. */
     private awaitingBaseline = true;
     /** Set once startup has restored state and applied the pause and consent; until then the scheduler only collects requests. */
@@ -137,7 +150,9 @@ export class Testy implements vscode.Disposable {
 
     constructor(private readonly context: vscode.ExtensionContext, public roots: readonly string[]) {
         this.config = configuration();
+        setProcessPriority(this.config.processPriority);
         this.pauseOverride = context.workspaceState.get<boolean>(pausedKey);
+        this.pinned = new Set(context.workspaceState.get<string[]>(pinnedKey) ?? []);
         const storage = context.storageUri?.fsPath ?? path.join(context.globalStorageUri.fsPath, contentHash(roots.join('\0')));
         this.engine = new TestEngine({
             roots, storage, tools: context.globalStorageUri.fsPath,
@@ -164,26 +179,35 @@ export class Testy implements vscode.Disposable {
                     for (const line of this.tree.explain(selection)) {this.output.info(line);}
                 },
                 started: (group, id) => this.tree.started(group, id),
-                result: (group, result) => {this.tree.publishResult(group, result); this.inline.refresh();},
+                result: (group, result) => {
+                    this.tree.publishResult(group, result); this.inline.refresh();
+                    const id = `${group.id}:${result.id}`, item = this.tree.items.get(id);
+                    void this.inline.exceptions.record(id, item?.label ?? result.name, result).catch((error: unknown) => this.reportError(error));
+                },
                 coverage: () => {this.coverage.publish(); this.inline.refresh();},
                 invalidated: files => this.scheduler.request(files),
                 // The engine continues without coverage when the collector cannot be installed or started.
                 coverageUnavailable: () => {if (!this.disposed) {this.coverageUnavailable();}},
+                queue: entries => this.queueView.update(entries),
                 debug: processId => this.attachDebugger(processId)
             }
         });
         this.scheduler = new Scheduler({
             debounce: this.config.debounce,
-            run: async (batch, signal) => {
+            run: async (batch, signal, superseded) => {
                 const fromSweep = this.sweep.runStarting(batch.files);
-                await this.execute(batch, signal, { scope: this.automaticScope() });
+                const scope = this.automaticScope();
+                this.engine.pinned = this.pinnedScope();
+                await this.execute(batch, signal, { scope, superseded });
+                if (!signal.aborted && !superseded.aborted && !scope) {this.queueSafetyNet(batch.files);}
                 // An incremental fileSystem run read only the reported files; sweep the rest in the background.
-                if (this.config.trigger === 'fileSystem' && !batch.full && !fromSweep && !signal.aborted) {this.sweep.start();}
+                if (this.config.trigger === 'fileSystem' && !batch.full && !fromSweep && !signal.aborted && !superseded.aborted) {this.sweep.start();}
             },
             // A background sweep must not delay the source refresh of any run, automatic or manual.
             state: state => { if (state === 'running') {this.sweep.stop();} this.scheduling = state; this.updateStatus(); }, error: error => this.reportError(error)
         });
         this.scheduler.setPaused(true);
+        this.scheduler.setGrace(this.config.finishRunningTests);
         this.runProfile = configureProfile(this.controller.createRunProfile(l10n.t('Run'), vscode.TestRunProfileKind.Run,
             (request, token) => this.manual(request, token, false), true, undefined, true), profileSettings.run);
         this.coverageProfile = configureProfile(this.controller.createRunProfile(l10n.t('Run with coverage'), vscode.TestRunProfileKind.Coverage,
@@ -191,6 +215,7 @@ export class Testy implements vscode.Disposable {
         this.debugProfile = configureProfile(this.controller.createRunProfile(l10n.t('Debug'), vscode.TestRunProfileKind.Debug,
             (request, token) => this.debug(request, token), true), profileSettings.debug);
         this.tree = new TestTree(this.controller, this.engine, this);
+        this.disposables.push(this.queueView, vscode.window.registerTreeDataProvider('testy.queue', this.queueView));
         this.coverage = new CoverageView(context.extensionUri, this.controller, this.coverageProfile, this.engine, this.tree.items, this);
         this.inline = new InlineResults(context.extensionUri, this.engine, this.coverage, this.tree, this);
         this.syncConfigurationProfiles();
@@ -205,12 +230,15 @@ export class Testy implements vscode.Disposable {
             this.output, this.diagnostics,
             ...registerCommands({
                 refreshTests: () => this.refreshAll(), toggleAutoRun: () => this.setPaused(!this.userPaused), pause: () => this.setPaused(true), resume: () => this.setPaused(false),
-                runAffected: () => this.runAffected(), cancelRun: () => this.scheduler.cancel(), clearCoverage: () => this.clearCoverage(), exportCoverage: () => this.exportCoverage(),
+                runAffected: () => this.runAffected(), cancelRun: () => this.scheduler.cancel(), clearCoverage: () => this.clearCoverage(), exportCoverage: () => this.exportCoverage(), exportTimeline: () => this.exportTimeline(), showSlowestTests: () => this.showSlowestTests(),
                 resetCaches: () => this.resetCaches(), showOutput: () => this.output.show(), showMenu: () => this.showMenu(() => this.refreshAll()),
-                explainSelection: item => this.explain(item), excludeProject: item => this.excludeProject(item), runCoveringTests: target => this.runCoveringTests(target),
-                showTest: id => this.showTest(id), runFile: uris => this.runFiles(uris)
+                explainSelection: item => this.explain(item), excludeProject: item => this.excludeProject(item), runCoveringTests: target => this.runCoveringTests(target), debugCoveringTests: target => this.debugCoveringTests(target),
+                showTest: id => this.showTest(id), runFile: uris => this.runFiles(uris),
+                pinTests: items => this.setPinned(items.map(item => item.id), true), unpinTests: items => this.setPinned(items.map(item => item.id), false),
+                unpinAllTests: () => this.setPinned([...this.pinned], false)
             }),
             vscode.workspace.onDidSaveTextDocument(document => {
+                this.inline.saved(document);
                 if (this.config.trigger === 'save') {void this.changes.changed(document.uri).catch((error: unknown) => this.reportError(error));}
             }),
             vscode.workspace.onDidDeleteFiles(event => { for (const uri of event.files) {void this.changes.changed(uri, undefined, true).catch((error: unknown) => this.reportError(error));} }),
@@ -219,17 +247,19 @@ export class Testy implements vscode.Disposable {
                 if (!event.affectsConfiguration('testy')) {return;}
                 try {
                     this.config = configuration();
+                    setProcessPriority(this.config.processPriority);
                     this.warnFolderConflicts();
                     this.syncConfigurationProfiles();
-                    this.scheduler.setDebounce(this.config.debounce);
+                    this.scheduler.setDebounce(this.config.debounce); this.scheduler.setGrace(this.config.finishRunningTests);
                     // Changing the setting is an explicit choice that replaces a local pause or resume.
                     if (event.affectsConfiguration('testy.autoRun')) {this.storePause(undefined);}
                     this.applyPause();
                     this.changes.watch(); this.coverage.queue(vscode.window.visibleTextEditors); this.inline.refresh();
                     if (event.affectsConfiguration('testy.problems') && !this.scheduler.isRunning) {this.diagnostics.publish();}
+                    if (this.config.safetyNet === 'off') {this.safetyPending.clear(); this.scheduler.setIdle(undefined);}
                     // Settings that choose what runs refresh discovery at once; the engine decides at run start whether
                     // learned coverage still applies or a new baseline starts.
-                    const structural = ['runMode', 'runWithCoverage', 'buildConfiguration', 'dotnetPath', 'testArguments', 'exclude', 'coverageToolPath', 'solution', 'projects']
+                    const structural = ['runMode', 'runWithCoverage', 'buildConfiguration', 'dotnetPath', 'testArguments', 'exclude', 'coverageToolPath', 'solution', 'projects', 'excludeTraits']
                         .some(key => event.affectsConfiguration(`testy.${key}`));
                     if ((structural || this.engine.configurationChanged()) && !this.awaitingBaseline) {this.scheduler.request([], true);}
                 } catch (error) { this.reportError(error, true); }
@@ -245,11 +275,12 @@ export class Testy implements vscode.Disposable {
             vscode.window.onDidChangeVisibleTextEditors(() => {this.coverage.queue(vscode.window.visibleTextEditors); this.inline.refresh();}),
             vscode.workspace.onDidChangeTextDocument(event => {
                 if (!event.contentChanges.length) {return;}
+                this.inline.track(event);
                 const editors = vscode.window.visibleTextEditors.filter(editor => editor.document === event.document);
                 this.coverage.queue(editors); this.inline.queue(editors);
             })
         );
-        setContext('testy.active', true);
+        setContext('testy.active', true); this.publishPinned();
         this.warnFolderConflicts();
     }
 
@@ -336,6 +367,22 @@ export class Testy implements vscode.Disposable {
     }
 
     /** Continuous runs of specific items limit automatic runs only while automation is paused. */
+    /** Pin Test Explorer items (by ID) to automatic runs, or unpin them; remembered per workspace. */
+    private setPinned(ids: readonly string[], pinned: boolean): void {
+        for (const id of ids) {if (pinned) {this.pinned.add(id);} else {this.pinned.delete(id);}}
+        void Promise.resolve(this.context.workspaceState.update(pinnedKey, [...this.pinned])).catch((error: unknown) => this.reportError(error));
+        this.publishPinned();
+        if (ids.length) {this.output.info(`${pinned ? 'Pinned' : 'Unpinned'} ${ids.length} Test Explorer item${ids.length === 1 ? '' : 's'}; ${this.pinned.size} pinned in all.`);}
+    }
+
+    private publishPinned(): void { setContext('testy.pinned', [...this.pinned]); setContext('testy.hasPinned', this.pinned.size > 0); }
+
+    /** The pinned items still in Test Explorer, as a selection every automatic run adds (see engine/select withAlwaysRun). */
+    private pinnedScope(): RunScope | undefined {
+        const items = [...this.pinned].flatMap(id => this.tree.items.get(id) ?? []);
+        return items.length ? requestScope(this.tree.testIds, new vscode.TestRunRequest(items)) : undefined;
+    }
+
     private automaticScope(): RunScope | undefined {
         if (!this.userPaused || !this.continuous.size) {return undefined;}
         const scopes = [...this.continuous.keys()];
@@ -366,7 +413,7 @@ export class Testy implements vscode.Disposable {
         if (!chosen.length) {return;}
         const files = [...new Set((await Promise.all(chosen.map(file => this.sourcesOf(file)))).flat())];
         if (!files.length) {void Promise.resolve(vscode.window.showInformationMessage(l10n.t('Testy knows no C# source files in {0}.', fileNames(chosen)))).catch(() => undefined); return;}
-        try { await this.scheduler.runManual(signal => this.execute({ files, full: false }, signal, { label: l10n.t('Testy · run file: {0}', fileNames(chosen)) })); }
+        try { await this.scheduler.runManual(signal => this.execute({ files, full: false, explicit: true }, signal, { label: l10n.t('Testy · run file: {0}', fileNames(chosen)) })); }
         catch (error) { this.reportError(error); }
     }
 
@@ -392,6 +439,74 @@ export class Testy implements vscode.Disposable {
         if (!groups.length) {void Promise.resolve(vscode.window.showInformationMessage(l10n.t('No retained test coverage hits this line.'))).catch(() => undefined); return;}
         try { await this.scheduler.runManual(signal => this.execute({ files: [], full: false }, signal, { manual: { groups: new Set(groups) }, label: l10n.t('Testy · run tests covering {0}:{1}', path.basename(uri.fsPath), line) })); }
         catch (error) { this.reportError(error); }
+    }
+
+    /** After an automatic affected run, queue the test files it did not select for a safety-net run (`testy.safetyNet`): the files of
+     * the test projects the changes affect, or every file. They run once the editor has been quiet for a while, and any change cancels
+     * them until the next quiet period, so they never delay feedback on a save. A file that ran meanwhile is no longer pending. */
+    private queueSafetyNet(changes: readonly string[]): void {
+        const scope = this.config.safetyNet, selection = this.lastSelection;
+        // A file narrowed to some of its tests (test granularity) did not run whole, so the rest of it stays queued.
+        const whole = new Map(this.engine.groups.map(group => [group.id, group.tests.length]));
+        const ran = new Set(selection?.groups.filter(group => group.tests.length >= (whole.get(group.id) ?? 0)).map(group => group.id));
+        for (const id of ran) {this.safetyPending.delete(id);}
+        const learning = [...selection?.causes?.values() ?? []].some(cause => cause.kind === 'baseline');
+        if (scope === 'off' || this.config.mode === 'all' || learning) {this.safetyPending.clear(); this.scheduler.setIdle(undefined); return;}
+        for (const id of this.engine.safetyNetFiles(changes, scope, ran)) {this.safetyPending.add(id);}
+        this.scheduler.setIdle(this.safetyPending.size ? signal => this.runSafetyNet(signal) : undefined, safetyNetDelay);
+    }
+
+    /** Run the pending safety-net files like an automatic run would (excluded traits stay out), and report each file that now fails
+     * although its latest results passed: a change broke it without selecting it, which selection should have caught. */
+    private async runSafetyNet(signal: AbortSignal): Promise<void> {
+        const groups = new Map(this.engine.groups.map(group => [group.id, group]));
+        const ids = [...this.safetyPending].filter(id => groups.has(id));
+        if (!ids.length) {this.safetyPending.clear(); return;}
+        const passing = new Set(ids.filter(id => !this.engine.failing.has(id)));
+        const tests = new Map(ids.flatMap(id => groups.get(id)!.excludedTestIds?.length ? [[id, new Set(groups.get(id)!.tests.map(test => test.id))] as const] : []));
+        this.output.info(`Safety net: running ${ids.length} test file${ids.length === 1 ? '' : 's'} the latest changes did not select.`);
+        await this.execute({ files: [], full: false }, signal, { manual: { groups: new Set(ids), ...tests.size ? { tests } : {} },
+            label: l10n.t('Testy · safety net: {0} test files', ids.length) });
+        signal.throwIfAborted();
+        for (const id of ids) {this.safetyPending.delete(id);}
+        const missed = ids.filter(id => passing.has(id) && this.engine.failing.has(id));
+        for (const id of missed) {
+            const group = groups.get(id)!;
+            this.output.warn(`Safety net: ${path.basename(group.file ?? group.project)} now fails, but no change selected it. Rerun it after related edits, or set testy.selectionGranularity to "file" if this repeats.`);
+        }
+        if (missed.length) {void Promise.resolve(vscode.window.showWarningMessage(l10n.t('Testy\'s safety net found {0} failing test files that the latest changes did not select. See Output for details.', missed.length), l10n.t('Show Output')))
+            .then(choice => {if (choice) {this.output.show();}}).catch(() => undefined);}
+    }
+
+    /** Debug one test file whose retained coverage hits a line (1-based), stopping on that line: a breakpoint is set there for the
+     * run unless one already exists, and removed when the run ends. With several covering files, failing ones are offered first. */
+    private async debugCoveringTests(target?: { readonly uri: vscode.Uri; readonly line: number }): Promise<void> {
+        const editor = vscode.window.activeTextEditor;
+        const { uri, line } = target ?? (editor ? { uri: editor.document.uri, line: editor.selection.active.line + 1 } : { uri: undefined, line: 0 });
+        if (uri?.scheme !== 'file') {return;}
+        const groups = this.coverage.covering(await normalizePathAsync(uri.fsPath), line).filter(id => this.tree.items.has(`file:${id}`));
+        if (!groups.length) {void Promise.resolve(vscode.window.showInformationMessage(l10n.t('No retained test coverage hits this line.'))).catch(() => undefined); return;}
+        const known = new Map(this.engine.displayGroups.map(group => [group.id, group]));
+        const ordered = [...groups].sort((a, b) => Number(this.engine.failing.has(b)) - Number(this.engine.failing.has(a)) || (this.engine.elapsed(a) ?? Infinity) - (this.engine.elapsed(b) ?? Infinity));
+        let chosen = ordered[0];
+        if (ordered.length > 1) {
+            const picked = await vscode.window.showQuickPick(ordered.map((id): vscode.QuickPickItem & { readonly id: string } => {
+                const group = known.get(id);
+                return { id, label: group ? path.basename(group.file ?? group.project) : id, ...group ? { description: group.framework } : {},
+                    ...this.engine.failing.has(id) ? { detail: l10n.t('Has failing tests') } : {} };
+            }), { title: l10n.t('Debug a test file covering {0}:{1}', path.basename(uri.fsPath), line) });
+            chosen = picked?.id;
+        }
+        const item = chosen ? this.tree.items.get(`file:${chosen}`) : undefined;
+        if (!item) {return;}
+        const location = new vscode.Location(uri, new vscode.Position(line - 1, 0));
+        const exists = vscode.debug.breakpoints.some(breakpoint => breakpoint instanceof vscode.SourceBreakpoint
+            && breakpoint.location.uri.toString() === uri.toString() && breakpoint.location.range.start.line === line - 1);
+        const added = exists ? undefined : new vscode.SourceBreakpoint(location);
+        if (added) {vscode.debug.addBreakpoints([added]);}
+        const cancellation = new vscode.CancellationTokenSource();
+        try {await this.debug(new vscode.TestRunRequest([item], undefined, this.debugProfile), cancellation.token);}
+        finally {if (added) {vscode.debug.removeBreakpoints([added]);} cancellation.dispose();}
     }
 
     /** Reveal a test, file or project in Test Explorer. */
@@ -421,6 +536,45 @@ export class Testy implements vscode.Disposable {
         catch (error) {this.reportError(error);}
     }
 
+    /** Write what Testy did in the last ten minutes as a Trace Event file, which Perfetto and chrome://tracing open. */
+    private async exportTimeline(): Promise<void> {
+        try {
+            const spans = this.engine.timeline.recent(), counters = this.engine.timeline.samples();
+            if (!spans.length) {void Promise.resolve(vscode.window.showInformationMessage(l10n.t('Testy has not run in the last 10 minutes; there is no timeline to export.'))).catch(() => undefined); return;}
+            const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
+            const target = await vscode.window.showSaveDialog({ title: l10n.t('Export Testy Timeline'), filters: { [l10n.t('Trace files')]: ['json'] },
+                ...folder ? { defaultUri: vscode.Uri.joinPath(folder, 'testy-timeline.json') } : {} });
+            if (!target) {return;}
+            await vscode.workspace.fs.writeFile(target, Buffer.from(JSON.stringify(traceEvents(spans, counters))));
+            this.output.info(`Exported ${spans.length} timeline entries to ${target.fsPath}.`);
+            const open = l10n.t('Open Perfetto');
+            const choice = await vscode.window.showInformationMessage(l10n.t('Exported the timeline to {0}. Open it in Perfetto (ui.perfetto.dev) or chrome://tracing.', path.basename(target.fsPath)), open);
+            if (choice === open) {await vscode.env.openExternal(vscode.Uri.parse('https://ui.perfetto.dev'));}
+        } catch (error) {this.reportError(error);}
+    }
+
+    /** The test files with the longest learned run times; choosing one reveals it in Test Explorer. */
+    private async showSlowestTests(): Promise<void> {
+        const files = slowest(this.engine.displayGroups, id => this.engine.elapsed(id), 25);
+        const known = new Map(this.engine.displayGroups.map(group => [group.id, group]));
+        const tests = this.engine.slowestTests(100).flatMap(row => {
+            const group = known.get(row.groupId), test = group?.tests.find(item => item.id === row.testId);
+            return group && test ? [{ ...row, group, test }] : [];
+        }).slice(0, 25);
+        if (!files.length && !tests.length) {void Promise.resolve(vscode.window.showInformationMessage(l10n.t('No test file has a learned run time yet. Run the tests first.'))).catch(() => undefined); return;}
+        type Row = vscode.QuickPickItem & { readonly id?: string };
+        const seconds = (milliseconds: number): string => l10n.t('{0}s', (milliseconds / 1000).toFixed(2));
+        const rows: Row[] = [
+            ...files.length ? [{ label: l10n.t('Test files'), kind: vscode.QuickPickItemKind.Separator }] : [],
+            ...files.map(({ group, elapsed }): Row => ({ id: `file:${group.id}`, label: path.basename(group.file ?? group.project), description: `${seconds(elapsed)} · ${group.framework}`, detail: path.basename(group.project) })),
+            ...tests.length ? [{ label: l10n.t('Tests'), kind: vscode.QuickPickItemKind.Separator }] : [],
+            ...tests.map(({ group, test, duration }): Row => ({ id: `${group.id}:${test.id}`, label: test.name, description: seconds(duration), detail: path.basename(group.file ?? group.project) }))
+        ];
+        const picked = await vscode.window.showQuickPick(rows, { title: l10n.t('Slowest test files and tests'),
+            placeHolder: l10n.t('Learned run time of each test file\'s test process, and each test\'s own duration; choose one to show it in Test Explorer') });
+        if (picked?.id) {await this.showTest(picked.id);}
+    }
+
     private async resetCaches(): Promise<void> {
         const reset = l10n.t('Reset');
         const choice = await vscode.window.showWarningMessage(l10n.t('Reset Testy caches?'), {
@@ -430,7 +584,7 @@ export class Testy implements vscode.Disposable {
         try {
             await this.scheduler.runManual(async signal => {
                 this.diagnostics.clear(); this.tree.clearBuildFailures();
-                await this.engine.reset(signal);
+                await this.engine.reset(signal); this.inline.exceptions.sites.clear();
             });
             this.inline.refresh();
             this.scheduler.request([], true);
@@ -440,7 +594,7 @@ export class Testy implements vscode.Disposable {
     private showMenu(refreshAll: () => Promise<void>): Promise<void> {
         return showMenu({ paused: this.paused, running: this.scheduler.isRunning, lastError: this.lastError, placeHolder: this.statusBar.tooltip, pauseSource: this.pauseSource }, {
             setPaused: paused => this.setPaused(paused), runAffected: () => this.runAffected(), refreshAll, cancel: () => this.scheduler.cancel(),
-            clearCoverage: () => this.clearCoverage(), exportCoverage: () => this.exportCoverage(), resetCaches: () => this.resetCaches(), showOutput: () => this.output.show(),
+            clearCoverage: () => this.clearCoverage(), exportCoverage: () => this.exportCoverage(), exportTimeline: () => this.exportTimeline(), showSlowestTests: () => this.showSlowestTests(), resetCaches: () => this.resetCaches(), showOutput: () => this.output.show(),
             openSettings: () => vscode.commands.executeCommand('workbench.action.openSettings', extensionSettings)
         });
     }
@@ -487,6 +641,8 @@ export class Testy implements vscode.Disposable {
         this.coverage.productionSources = new Set(this.engine.projects.filter(project => !project.isTestProject).flatMap(project => [...project.sourceFiles]));
         this.changes.watch();
         const owners = await this.tree.update(groups);
+        // Tests that no longer exist leave no exception markers behind.
+        this.inline.exceptions.sites.retain(id => this.tree.items.has(id)); this.inline.exceptions.refresh();
         if (!owners) {return;}
         this.coverage.owners = owners;
         this.updateStatus();
@@ -549,8 +705,10 @@ export class Testy implements vscode.Disposable {
         return this.config.trigger === 'save' ? l10n.t('Testy · on save: {0}', fileNames(batch.files)) : l10n.t('Testy · on change: {0}', fileNames(batch.files));
     }
 
-    private async execute(batch: ChangeBatch, signal: AbortSignal, { request, manual, manualOperation = false, scope, label }: {
+    private async execute(batch: ChangeBatch, signal: AbortSignal, { request, manual, manualOperation = false, scope, label, superseded }: {
         request?: vscode.TestRunRequest; manual?: ManualSelection; manualOperation?: boolean; scope?: RunScope | undefined; label?: string;
+        /** Newer changes supersede this automatic run (see Scheduler): it finishes the test processes they cannot affect, then ends. */
+        superseded?: AbortSignal;
     } = {}): Promise<void> {
         // File events are coalesced; mark them before the run reads sources.
         await this.changes.flush();
@@ -572,7 +730,7 @@ export class Testy implements vscode.Disposable {
         this.build = 'none'; this.diagnostics.begin(); this.baselineRun = !manual;
         this.discovering = !!manual?.discoverOnly; this.tree.setBusy(this.discovering);
         try {
-            this.lastSummary = await this.engine.run(batch, abort.signal, manual, manualOperation, scope, manual ? undefined : automaticCoverage);
+            this.lastSummary = await this.engine.run(batch, abort.signal, manual, manualOperation, scope, manual ? undefined : automaticCoverage, superseded);
             const { passed, failed, skipped, duration, failedBatches } = this.lastSummary;
             this.output.info(`${passed} passed, ${failed} failed, ${skipped} skipped in ${(duration / 1000).toFixed(1)}s.`);
             if (failedBatches) {this.output.warn(`${failedBatches} test batch${failedBatches === 1 ? '' : 'es'} could not run; their tests are reported as errored.`);}
@@ -604,7 +762,7 @@ export class Testy implements vscode.Disposable {
         this.statusBar.update({
             paused: this.paused, running: this.scheduler.isRunning, scheduling: this.scheduling, phase: this.phase,
             lastError: this.lastError, lastSummary: this.lastSummary, passed: this.tree.passed, failed: this.tree.failed,
-            hasTests: !!this.engine.groups.length, coverageSuffix: this.coverage.suffix, continuousOverride: !!this.continuous.size && this.userPaused,
+            hasTests: !!this.engine.discovered.length, coverageSuffix: this.coverage.suffix, continuousOverride: !!this.continuous.size && this.userPaused,
             pauseSource: this.pauseSource, autoRunSetting: this.config.enabled
         });
     }

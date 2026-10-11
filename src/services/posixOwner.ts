@@ -1,4 +1,5 @@
 import { spawn, ChildProcess } from 'node:child_process';
+import { setPriority } from 'node:os';
 import { createInterface } from 'node:readline';
 import { cleanupPosixOwner } from './posixProcesses';
 
@@ -8,6 +9,8 @@ interface Launch {
     readonly owner: string;
     readonly cleanupDescendants: boolean;
     readonly electronRunAsNode?: string;
+    /** A nice value for this supervisor before it starts the command, which the command and its descendants inherit. */
+    readonly priority?: number;
 }
 
 // This process outlives the extension host. Its stdin is held exclusively by
@@ -62,6 +65,8 @@ control.on('line', line => {
         const env: NodeJS.ProcessEnv = { ...process.env, TESTY_PROCESS_OWNER: launch.owner };
         if (launch.electronRunAsNode === undefined) {delete env.ELECTRON_RUN_AS_NODE;}
         else {env.ELECTRON_RUN_AS_NODE = launch.electronRunAsNode;}
+        // Best effort: a priority the system refuses leaves the command at normal priority.
+        if (launch.priority) {try {setPriority(launch.priority);} catch { /* unchanged */ }}
         launched = Date.now();
         child = spawn(launch.command, launch.args, { shell: false, detached: true, stdio: ['ignore', 'inherit', 'inherit'], env });
         child.once('error', error => {process.stderr.write(`${error.message}\n`); void finish(127);});

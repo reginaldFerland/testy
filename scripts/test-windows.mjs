@@ -32,7 +32,9 @@ if (!args.has('--dotnet-only')) {
         process.exit(1);
     }
     const escaped = marker.replace(/[[\]-]/g, '\\$&');
-    status ||= run(process.execPath, ['--test', `--test-name-pattern=^${escaped}`, ...files], root);
+    // Slow tests build real projects: install the coverage collector once for all of them (see test/integration/support/sharedTools.mjs).
+    const preload = slow ? ['--import', './test/integration/support/sharedTools.mjs'] : [];
+    status ||= run(process.execPath, ['--test', ...preload, `--test-name-pattern=^${escaped}`, ...files], root);
 }
 if (!args.has('--node-only') && !slow) {
     // The runner is Microsoft.Testing.Platform (xunit.v3); --filter-trait is xunit's own name=value filter.

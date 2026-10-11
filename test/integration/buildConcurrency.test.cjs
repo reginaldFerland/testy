@@ -1,5 +1,6 @@
 // @ts-check
 const {test}=require('node:test');
+const {toolsDirectory}=require('./support/tools.cjs');
 // Patch the defining modules: `projects` only re-exports them through read-only bindings.
 const projectBuild=require('../../out/services/projectBuild');
 const assert=require('node:assert/strict');
@@ -21,7 +22,7 @@ test('excluded production dependencies still serialize conflicting reference con
   await fs.writeFile(path.join(directory,'FlavorTests.cs'),`using Microsoft.VisualStudio.TestTools.UnitTesting; [TestClass] public class FlavorTests { [TestMethod] public void UsesOwnReferenceContext() => Assert.AreEqual(${value},Core.Value); }`);
  }
  const output=/** @type {string[]} */([]),results=/** @type {{project:string,outcome:string}[]} */([]);
- const engine=new TestEngine({roots:[root],storage:path.join(temp,'state'),tools:path.join(temp,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),
+ const engine=new TestEngine({roots:[root],storage:path.join(temp,'state'),tools:toolsDirectory(temp),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),
   configuration:()=>({dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:false,excludes:['**/Excluded/**'],testArguments:[],timeout:60000,maxParallelProjects:2,maxParallelTestFiles:2}),
   events:{output:text=>output.push(text),phase(){},discovered(){},selected(){},result:(group,result)=>results.push({project:group.project,...result}),started(){},coverage(){},invalidated(){}}});
  const build=projectBuild.buildProjects,batches=/** @type {string[][]} */([]);let active=0,peak=0;

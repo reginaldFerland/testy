@@ -116,6 +116,30 @@ export interface EngineConfiguration {
     readonly dotnet: string;
     readonly configuration: string;
     readonly mode: 'affected' | 'all';
+    /** `file`: an edit selects every test file whose coverage reached the file, not only those that reached an edited body. */
+    readonly granularity?: 'method' | 'file' | 'test';
+    /** `testy.alwaysRunFailing`: automatic runs also run every test file whose latest results include a failure. */
+    readonly alwaysRunFailing?: boolean;
+    /** `testy.inclusiveTraits`: traits naming a resource test files may share with each other, but not with exclusive users of it. */
+    readonly inclusiveTraits?: readonly string[];
+    /** `testy.workerTraits`: traits whose test files take several test-file workers, by pattern. */
+    readonly workerTraits?: Readonly<Record<string, number>>;
+    /** `testy.isolatedTraits`: traits whose test files never share a reused test host. */
+    readonly isolatedTraits?: readonly string[];
+    /** `testy.testProcessMemoryLimit` in bytes: a reused test host over it after a batch is replaced; 0 or undefined for no limit. */
+    readonly testProcessMemoryLimit?: number;
+    /** `testy.splitLongTestFiles`: a throughput run splits long test files into parts that run side by side (default true). */
+    readonly splitLongTestFiles?: boolean;
+    /** `testy.testTimeoutSeconds` in milliseconds: how long one test may run before its host is stopped; 0 or undefined for none. */
+    readonly testTimeout?: number;
+    /** `testy.reuseTestHosts`: run the test files of each prepared output in one long-lived test host (see RunnerOptions.reuseHosts). */
+    readonly reuseTestHosts?: boolean;
+    /** `testy.excludeTraits`: tests with these traits never run automatically (see core/traits eligibleGroups). */
+    readonly excludeTraits?: readonly string[];
+    /** `testy.exclusiveTraits`: test files whose tests match the same pattern never run at the same time (see core/traits batchResources). */
+    readonly exclusiveTraits?: readonly string[];
+    /** `testy.serialTraits`: test files whose tests match one of these run with no other test file at the same time. */
+    readonly serialTraits?: readonly string[];
     readonly coverage: boolean;
     readonly excludes: readonly string[];
     readonly testArguments: readonly string[];

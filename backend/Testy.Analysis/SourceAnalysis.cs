@@ -75,6 +75,10 @@ static class SourceAnalysis
             var names = await ResolveAliasesAsync(aliasSources.Deserialize(AnalysisJson.Default.StringArray)!, cancellationToken);
             return JsonSerializer.Serialize(names, AnalysisJson.Default.StringArray);
         }
+        if (request.TryGetProperty("suppressions", out var suppressionFiles))
+        {
+            return JsonSerializer.Serialize(await SuppressionsAsync(suppressionFiles.Deserialize(AnalysisJson.Default.StringArray) ?? [], cwd, cancellationToken), AnalysisJson.Default.DictionaryStringStringArray);
+        }
         if (request.TryGetProperty("assembly", out var assembly))
         {
             return JsonSerializer.Serialize(SourceLocations.Read(Path.GetFullPath(assembly.GetString()!, cwd), cancellationToken), AnalysisJson.Default.DictionaryStringLocation);
@@ -110,6 +114,22 @@ static class SourceAnalysis
             return JsonSerializer.Serialize(new SourceAnalysisProvenance(1, Convert.ToHexString(SHA256.HashData(requestBytes())), aliases, result, sourceHashes), AnalysisJson.Default.SourceAnalysisProvenance);
         }
         return combined ? JsonSerializer.Serialize(new CombinedAnalysis(aliases, result), AnalysisJson.Default.CombinedAnalysis) : JsonSerializer.Serialize(result, AnalysisJson.Default.DictionaryStringSourceShape);
+    }
+
+    /// <summary>The coverage-exclusion patterns of each file's `// testy: no coverage` members (see CoverageSuppression); a file that
+    /// cannot be read or parsed has none, since its edits already select conservatively.</summary>
+    static async Task<Dictionary<string, string[]>> SuppressionsAsync(string[] files, string cwd, CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<string, string[]>();
+        foreach (var file in files)
+        {
+            string text;
+            try { text = Decode(await File.ReadAllBytesAsync(Path.GetFullPath(file, cwd), cancellationToken)); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException) { result[file] = []; continue; }
+            result[file] = CoverageSuppression.Mentions(text)
+                ? CoverageSuppression.Patterns(await CSharpSyntaxTree.ParseText(text, cancellationToken: cancellationToken).GetRootAsync(cancellationToken)) : [];
+        }
+        return result;
     }
 
     static async Task<AnalyzedSource> AnalyzeSource(string file, string[] aliases, CancellationToken cancellationToken)
@@ -177,15 +197,17 @@ static class SourceAnalysis
                 wholeAssembly = HasExcludedName(text) || excludedAliases.Any(alias => text.Contains(alias, StringComparison.Ordinal));
             }
         }
-        var blind = attributes.Length > 0 || localAliases.Length > 0 || lineMapped;
-        var (signature, body) = Fingerprint.Compute(root, blind, directives);
+        // Code left uninstrumented by `// testy: no coverage` shows no hits either, like an excluded attribute.
+        var suppressed = root.DescendantTrivia(descendIntoTrivia: true).Any(trivia => trivia.IsKind(SyntaxKind.SingleLineCommentTrivia) && CoverageSuppression.Mentions(trivia.ToString()));
+        var blind = attributes.Length > 0 || localAliases.Length > 0 || lineMapped || suppressed;
+        var (signature, body, members, gaps) = Fingerprint.Compute(root, blind, directives);
         var partialTypes = types.Where(type => type.Modifiers.Any(SyntaxKind.PartialKeyword)).Select(TypeKey).Distinct().ToArray();
         // Attributes on a partial member's defining declaration also affect its
         // implementation in another file. Track the containing type in that case.
         var excludedTypes = attributes.Select(attribute => attribute.FirstAncestorOrSelf<TypeDeclarationSyntax>())
             .OfType<TypeDeclarationSyntax>().Select(TypeKey).ToHashSet(StringComparer.Ordinal);
         if (wholeAssembly) { excludedTypes.Add("*"); }
-        return new(new SourceShape(signature, body, partialTypes, [.. excludedTypes]), sourceHash);
+        return new(new SourceShape(signature, body, partialTypes, [.. excludedTypes], members, gaps), sourceHash);
     }
 
     // Same result as a StreamReader with BOM detection, without the stream and
@@ -287,5 +309,5 @@ static class SourceAnalysis
     }
 }
 
-sealed record SourceShape(string Signature, string Body, string[] PartialTypes, string[] ExcludedTypes);
+sealed record SourceShape(string Signature, string Body, string[] PartialTypes, string[] ExcludedTypes, MemberBody[] Members, string[] Gaps);
 sealed record AnalyzedSource(SourceShape? Shape, string? SourceHash);

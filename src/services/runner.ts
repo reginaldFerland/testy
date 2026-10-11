@@ -5,7 +5,8 @@ import { DiscoveredTest, FileCoverage, Project, TestFile, TestResult } from '../
 import { preparePathNormalizer, sourceVersion, testFileId, testTargetKey } from '../core/paths';
 import { projectCoverageId } from '../core/coverage';
 import { isReliableTrace } from '../core/traceReliability';
-import { requestTests, testConverter, TestNode, testResult } from './mtp';
+import { MtpSession, requestTests, testConverter, TestNode, testResult } from './mtp';
+import { requireSuccess, runProcess } from './process';
 import { CoverageReader } from './coverageReader';
 import { removeOutput } from './output';
 import { claimRunOutputs, RunOutputLease } from './runOutputs';
@@ -13,10 +14,27 @@ import { RuntimeObservation } from './runtimeObservation';
 
 import { discover, locationFiles, methodKey, nodeKey } from './runnerDiscovery';
 import { matchesFile, RunnerLanes } from './runnerLanes';
+import { treeMemory } from './processMemory';
+import { hasExcludedTrait } from '../core/traits';
 import { Preparation, RunnerPreparations } from './runnerPreparation';
 import type { FileRun, RunnerOptions } from './runnerTypes';
 
 export { discover, projectCoverageId };
+
+/** A test host kept for several batches (see RunnerSession.openHost); `close` is idempotent and removes its private files. */
+interface LiveHost { readonly session: MtpSession; readonly observation: RuntimeObservation | undefined; close(): Promise<void> }
+
+/** The sum of several coverage reports of the same versions: per test, a whole file's coverage. */
+export function mergeCoverage(reports: readonly (readonly FileCoverage[])[]): FileCoverage[] {
+    const merged = new Map<string, { readonly entry: FileCoverage; readonly lines: Map<number, number> }>();
+    for (const report of reports) {for (const entry of report) {
+        const key = `${entry.file}\0${entry.hash}`;
+        let target = merged.get(key);
+        if (!target) {target = { entry, lines: new Map() }; merged.set(key, target);}
+        for (const line of entry.lines) {target.lines.set(line.line, (target.lines.get(line.line) ?? 0) + line.hits);}
+    }}
+    return [...merged.values()].map(({ entry, lines }) => ({ ...entry, lines: [...lines].sort(([a], [b]) => a - b).map(([line, hits]) => ({ line, hits })) }));
+}
 export type { FileRun, RunnerOptions };
 
 export class RunnerSession {
@@ -29,16 +47,59 @@ export class RunnerSession {
     private readonly queues = new Map<string, Promise<void>>();
     private readonly running = new Set<Promise<FileRun>>();
     private readonly coverageReader = new CoverageReader();
+    /** Test hosts kept for later batches of their prepared output (see RunnerOptions.reuseHosts). */
+    private readonly liveHosts = new Map<Preparation, LiveHost>();
+    private hostSequence = 0;
     private outputLease?: RunOutputLease;
     private lease: Promise<RunOutputLease> | undefined;
     private disposed = false;
     private disposal?: Promise<void>;
-    constructor(private readonly options: RunnerOptions) {
+    private options: RunnerOptions;
+    /** Aborts reused test hosts: with the signal of the run the session serves (see rebind), or at disposal. */
+    private readonly hostLifetime = new AbortController();
+    private unlink: (() => void) | undefined;
+    /** What each lane overrides in the options it shares with this session. */
+    private readonly laneOptions = new Map<RunnerSession, Partial<RunnerOptions>>();
+    constructor(options: RunnerOptions) {
+        this.options = options; this.link(options.signal);
         const preparer = this.preparer = new RunnerPreparations(options, () => this.outputRoot(), this.projects);
         this.prepared = preparer.prepared;
-        this.lanes = new RunnerLanes((number, slot) => this.outputRoot().then(root => new RunnerSession({ ...this.options,
-            outputRoot: path.join(root, 'lanes', String(number)), preparationLane: slot, preparationTools: preparer.toolContexts,
-            preparationToolIdentities: preparer.toolIdentities, deferCoverage: undefined, onPrepared: undefined, tryInstrumentation: undefined })));
+        this.lanes = new RunnerLanes((number, slot) => this.outputRoot().then(root => {
+            const own: Partial<RunnerOptions> = { outputRoot: path.join(root, 'lanes', String(number)), preparationLane: slot, preparationTools: preparer.toolContexts,
+                preparationToolIdentities: preparer.toolIdentities, deferCoverage: undefined, onPrepared: undefined, tryInstrumentation: undefined };
+            const lane = new RunnerSession({ ...this.options, ...own });
+            this.laneOptions.set(lane, own);
+            return lane;
+        }));
+    }
+
+    private link(signal: AbortSignal | undefined): void {
+        this.unlink?.(); this.unlink = undefined;
+        if (!signal) {return;}
+        const abort = (): void => this.hostLifetime.abort(signal.reason);
+        if (signal.aborted) {abort(); return;}
+        signal.addEventListener('abort', abort, { once: true });
+        this.unlink = () => signal.removeEventListener('abort', abort);
+    }
+
+    /** Whether the session can serve another run (see rebind): open, and its hosts not stopped by a cancelled run. */
+    get reusable(): boolean { return !this.disposed && !this.hostLifetime.signal.aborted; }
+
+    /** The build outputs its targets were prepared from, which a later run must find unchanged to reuse the session. */
+    get sources(): readonly string[] { return [...new Set([...this.prepared.values()].flatMap(preparation => preparation.source ?? []))]; }
+
+    /** Serve a later run whose builds left every prepared output unchanged (see engine/prepare): its signal, callbacks and settings
+     * replace this run's, while prepared outputs, discoveries and reused test hosts carry over. The private outputs stay where they
+     * are. Cancelling the new run stops the hosts. */
+    async rebind(options: RunnerOptions): Promise<void> {
+        this.assertOpen();
+        if (!this.reusable) {throw new Error('The test runner session cannot serve another run.');}
+        const { outputRoot, preparationLane, preparationTools, preparationToolIdentities } = this.options;
+        this.options = { ...options, ...outputRoot === undefined ? {} : { outputRoot }, ...preparationLane === undefined ? {} : { preparationLane },
+            ...preparationTools ? { preparationTools } : {}, ...preparationToolIdentities ? { preparationToolIdentities } : {} };
+        this.link(options.signal); this.preparer.rebind(this.options);
+        const lanes = await Promise.allSettled(this.lanes.sessions());
+        for (const lane of lanes) {if (lane.status === 'fulfilled') {await lane.value.rebind({ ...this.options, ...this.laneOptions.get(lane.value) });}}
     }
 
     async discover(project: Project): Promise<readonly TestFile[]> {
@@ -55,8 +116,11 @@ export class RunnerSession {
     private async discoverProject(project: Project): Promise<readonly TestFile[]> {
         const preparation = await this.preparer.prepare({ id: testFileId(project.file, project.framework), project: project.file,
             assembly: project.assembly, framework: project.framework, tests: [] });
-        const groups = (await discover({ ...project, assembly: path.join(preparation.output.directory, path.basename(project.assembly)) }, this.options, preparation.nodes))
-            .map(group => ({ ...group, assembly: project.assembly }));
+        const ended = this.options.track?.(`Discover ${path.basename(project.file)} (${project.framework})`, 'discovery');
+        let found: readonly TestFile[] | undefined;
+        try {found = await discover({ ...project, assembly: path.join(preparation.output.directory, path.basename(project.assembly)) }, this.options, preparation.nodes);}
+        finally {ended?.(found ? { files: found.length } : { completed: false });}
+        const groups = found.map(group => ({ ...group, assembly: project.assembly }));
         preparation.groups = groups;
         return groups;
     }
@@ -128,34 +192,37 @@ export class RunnerSession {
         return selected;
     }
 
-    /** Positive worker IDs may reuse an idle private lane; zero keeps canonical discovery. */
-    async run(groups: readonly TestFile[], hashes: ReadonlyMap<string, string>, workerIndex = 0): Promise<FileRun> {
+    /** Positive worker IDs may reuse an idle private lane; zero keeps canonical discovery. `part`: the batch is some of the tests
+     * of one file, split from it (see core/runPolicy splitLongFiles), and may run on a lane like the whole file. */
+    async run(groups: readonly TestFile[], hashes: ReadonlyMap<string, string>, workerIndex = 0, part = false): Promise<FileRun> {
         this.assertOpen();
-        const pending = this.runInLane(groups, hashes, workerIndex);
+        const pending = this.runInLane(groups, hashes, workerIndex, part);
         this.running.add(pending);
         try {return await pending;}
         finally {this.running.delete(pending);}
     }
 
-    /** Full ordinary source files can safely acquire another prepared output. */
-    canRunParallel(groups: readonly TestFile[]): boolean {
+    /** Full ordinary source files can safely acquire another prepared output. So can a part of one (`part`): the lane matches the
+     * whole file's identities before it runs (see matchesFile), and a part's tests resolve the same way. */
+    canRunParallel(groups: readonly TestFile[], part = false): boolean {
         const group = groups[0];
         if (!group || this.unsafeParallel.has(group.id)) {return false;}
         const key = testTargetKey(group.project, group.framework);
         const canonical = this.prepared.get(key)?.groups?.find(item => item.id === group.id);
         const requested = new Set(group.tests.map(test => test.id));
+        const canonicalIds = new Set(canonical?.tests.map(test => test.id));
         return groups.length === 1 && !!group.file && !group.runtimeOnly && !group.excludedTestIds?.length
-            && !!canonical && group.file === canonical.file && requested.size === group.tests.length && canonical.tests.length === requested.size
-            && canonical.tests.every(test => requested.has(test.id));
+            && !!canonical && group.file === canonical.file && requested.size === group.tests.length && requested.size > 0
+            && (part ? [...requested].every(id => canonicalIds.has(id)) : canonical.tests.length === requested.size && canonical.tests.every(test => requested.has(test.id)));
     }
 
-    private async runInLane(groups: readonly TestFile[], hashes: ReadonlyMap<string, string>, workerIndex: number): Promise<FileRun> {
+    private async runInLane(groups: readonly TestFile[], hashes: ReadonlyMap<string, string>, workerIndex: number, part = false): Promise<FileRun> {
         this.options.signal?.throwIfAborted();
         const group = groups[0];
         if (!group) {throw new Error('A test batch must belong to one project and target framework.');}
         const key = testTargetKey(group.project, group.framework);
         const primary = this.prepared.get(key), project = this.projects.get(key);
-        if (Number.isSafeInteger(workerIndex) && workerIndex > 0 && this.queues.has(key) && this.canRunParallel(groups) && primary && project) {
+        if (Number.isSafeInteger(workerIndex) && workerIndex > 0 && this.queues.has(key) && this.canRunParallel(groups, part) && primary && project) {
             const reserved = this.lanes.reserve(key);
             try {
                 const lane = await reserved.session;
@@ -193,7 +260,14 @@ export class RunnerSession {
         }
         const { preparation, selected, executedGroups, originals } = await this.resolve(groups);
         const options = this.projectOptions(group), single = executedGroups.length === 1 ? executedGroups[0] : undefined;
-        if (preparation.runs++) {await preparation.output.restore(options.signal);}
+        // A reused host keeps its output loaded, so the output is restored only before a new host starts (see RunnerOptions.reuseHosts).
+        // A file with an isolated trait runs in a process of its own: a live host of its output ends first, since the output is restored.
+        const isolated = !!options.isolatedTraits?.length && [...groups, ...executedGroups].some(item => item.tests.some(test => hasExcludedTrait(test.traits, options.isolatedTraits!)));
+        const reuse = !!options.reuseHosts && !options.debug && !isolated;
+        if (isolated) {const existing = this.liveHosts.get(preparation); if (existing) {this.liveHosts.delete(preparation); await existing.close();}}
+        const perTest = !!single && !!options.perTestCoverage?.(single.id) && preparation.coverage && !options.debug && executedGroups.length === 1;
+        const live = reuse ? this.liveHosts.get(preparation) : undefined;
+        if (preparation.runs++ && !live?.session.alive) {await preparation.output.restore(options.signal);}
         let work = 0;
         const originalNode = (node: TestNode): TestNode => {
             const original = originals.get(node.uid);
@@ -224,37 +298,82 @@ export class RunnerSession {
         // batch ends: a session lasts the whole run, and every test file adds a set.
         const report = path.join(preparation.root, `coverage-${preparation.runs}.xml`), modules = path.join(preparation.root, `modules-${preparation.runs}`);
         const resultsDirectory = path.join(preparation.root, `results-${preparation.runs}`);
+        let transient: LiveHost | undefined, kept: LiveHost | undefined;
         try {
-            let observation: RuntimeObservation | undefined;
-            if (preparation.coverage) {
+            let observation: RuntimeObservation | undefined, liveObservation = false;
+            const onNode = (native: TestNode): void => {
+                if (native['node-type'] === 'group') {return;}
+                const node = originalNode(native);
+                const test = convert(node), item = groupFor(test);
+                if (node['execution-state'] === 'in-progress') {options.onStarted?.(item, node.uid);}
+                const result = testResult(node); if (result) {options.onResult?.(item, result, test);}
+            };
+            const coverage: FileCoverage[] = [];
+            const testCoverage = perTest ? new Map<string, readonly FileCoverage[]>() : undefined;
+            let available = preparation.coverage, started = Date.now(), nodes: readonly TestNode[];
+            if (reuse || perTest) {
+                const host = await this.openHost(preparation, group, assembly, hashes, reuse);
+                // A host for this batch only: its observer log is read below, after it exits, and removed with it at the end.
+                if (!reuse) {transient = host;}
+                observation = host.observation; liveObservation = reuse; started = Date.now();
+                /** Without a snapshot, coverage is lost for this batch, as when a report cannot be read below, and the hits the session
+                 * still holds would belong to the next batch: the host is not reused. Test results are kept. */
+                const uncollected = (error: unknown): void => {
+                    options.signal?.throwIfAborted();
+                    if (available) {options.output?.(`Coverage unavailable for ${path.basename(group.project)}; test results are retained. ${String(error)}\n`);}
+                    available = false; preparation.collectorInterrupted = true; this.liveHosts.delete(preparation); transient ??= host;
+                };
                 try {
-                    observation = await RuntimeObservation.start(modules, assembly,
-                        options.modules ?? (options.assemblies ?? [group.assembly]).map(file => ({ name: path.basename(file, path.extname(file)), sources: [...hashes.keys()] })),
-                        preparation.instrumented ?? [], options.env);
-                } catch (error) {options.signal?.throwIfAborted(); options.output?.(`Runtime observation unavailable; retaining conservative dependencies. ${String(error)}\n`);}
-            }
-            const collected = (work: Promise<readonly TestNode[]>): Promise<readonly TestNode[]> => preparation.coverage
-                ? work.catch((error: unknown) => {preparation.collectorInterrupted = true; throw error;}) : work;
-            const nodes = await collected(requestTests({
-                ...options, env: observation?.env ?? options.env, expectedTests: selected, assembly,
-                args: ['--results-directory', resultsDirectory, ...options.testArguments],
-                wrapper: preparation.coverage ? {
-                    command: options.coverageTool!, args: ['collect', '--nologo', '--session-id', preparation.session, '-f', 'cobertura', '-o', report]
-                } : undefined,
-                onNode: native => {
-                    if (native['node-type'] === 'group') {return;}
-                    const node = originalNode(native);
-                    const test = convert(node), item = groupFor(test);
-                    if (node['execution-state'] === 'in-progress') {options.onStarted?.(item, node.uid);}
-                    const result = testResult(node); if (result) {options.onResult?.(item, result, test);}
+                    if (perTest) {
+                        // One request per test, each followed by a snapshot that resets the session: every test's own coverage.
+                        const collected: TestNode[] = [];
+                        for (const [index, node] of selected.entries()) {
+                            collected.push(...await host.session.run([node], { expectedTests: [node], onNode }));
+                            if (!available) {continue;}
+                            const testReport = path.join(preparation.root, `coverage-${preparation.runs}-${index}.xml`);
+                            try {
+                                await this.snapshot(preparation.session, testReport);
+                                testCoverage!.set(originalNode(node).uid, await this.coverageReader.read(testReport, options.cwd, hashes, options.signal));
+                            } catch (error) {uncollected(error);}
+                            finally {await fs.rm(testReport, { force: true }).catch(() => undefined);}
+                        }
+                        nodes = collected;
+                        if (available) {coverage.push(...mergeCoverage([...testCoverage!.values()]));}
+                    } else {
+                        nodes = await host.session.run(completeProject ? undefined : selected, { expectedTests: selected, onNode });
+                        if (preparation.coverage) {try {await this.snapshot(preparation.session, report);} catch (error) {uncollected(error);}}
+                    }
+                } catch (error) {
+                    // The host is unusable; its collector stopped with it, and hits it held belong to no file.
+                    if (preparation.coverage) {preparation.collectorInterrupted = true;}
+                    this.liveHosts.delete(preparation); await host.close();
+                    throw error;
+                } finally {if (transient) {await host.session.close();}}
+                if (!transient) {kept = host;}
+            } else {
+                if (preparation.coverage) {
+                    try {
+                        observation = await RuntimeObservation.start(modules, assembly,
+                            options.modules ?? (options.assemblies ?? [group.assembly]).map(file => ({ name: path.basename(file, path.extname(file)), sources: [...hashes.keys()] })),
+                            preparation.instrumented ?? [], options.env);
+                    } catch (error) {options.signal?.throwIfAborted(); options.output?.(`Runtime observation unavailable; retaining conservative dependencies. ${String(error)}\n`);}
                 }
-            }, 'run', completeProject ? undefined : selected));
+                started = Date.now();
+                const collected = (work: Promise<readonly TestNode[]>): Promise<readonly TestNode[]> => preparation.coverage
+                    ? work.catch((error: unknown) => {preparation.collectorInterrupted = true; throw error;}) : work;
+                nodes = await collected(requestTests({
+                    ...options, env: observation?.env ?? options.env, expectedTests: selected, assembly,
+                    args: ['--results-directory', resultsDirectory, ...options.testArguments],
+                    wrapper: preparation.coverage ? {
+                        command: options.coverageTool!, args: ['collect', '--nologo', '--session-id', preparation.session, '-f', 'cobertura', '-o', report]
+                    } : undefined,
+                    onNode
+                }, 'run', completeProject ? undefined : selected));
+            }
             options.signal?.throwIfAborted();
             const results = nodes.map(originalNode).map(testResult).filter((result): result is TestResult => !!result);
             if (!results.length) {throw new Error(`No test results were received for ${group.file ?? group.project}.`);}
-            const coverage: FileCoverage[] = [];
-            let available = preparation.coverage;
-            if (available) {
+            if (available && !perTest) {
                 try {
                     coverage.push(...await this.coverageReader.read(report, options.cwd, hashes, options.signal));
                 } catch (error) {
@@ -262,11 +381,12 @@ export class RunnerSession {
                     options.output?.(`Coverage unavailable for ${path.basename(group.project)}; test results are retained. ${String(error)}\n`);
                 }
             }
+            const elapsed = Date.now() - started;
             let runtimeDependencies: readonly string[] = [], moduleProjects: readonly string[] = [], observed = !preparation.coverage;
             if (preparation.coverage) {
                 try {
                     if (!observation) {throw new Error('No runtime observer was available.');}
-                    const dependencies = await observation.dependencies(options.signal);
+                    const dependencies = await observation.dependencies(options.signal, liveObservation);
                     runtimeDependencies = dependencies.files; moduleProjects = dependencies.projects; observed = true;
                 } catch (error) {
                     options.signal?.throwIfAborted(); runtimeDependencies = [...hashes.keys()];
@@ -279,7 +399,7 @@ export class RunnerSession {
                 ...executedGroups.map(item => item.file).filter((file): file is string => !!file)])];
             const reliable = isReliableTrace({ file: single, coverageAvailable: available, observed, coverage, results });
             return {
-                results, coverageAvailable: available, executedGroups,
+                results, coverageAvailable: available, executedGroups, elapsed, ...testCoverage && available ? { testCoverage } : {},
                 trace: {
                     groupId: single?.id ?? projectCoverageId(group), dependencies, moduleProjects, coverage, reliable, timestamp: Date.now(),
                     inputs: Object.fromEntries(dependencies.map(file => [file, sourceVersion(hashes, file)]))
@@ -287,15 +407,73 @@ export class RunnerSession {
             };
         } finally {
             // The results directory keeps attachments MTP reported (and logged) while it has any.
-            const artifacts = [...preparation.coverage ? [fs.rm(report, { force: true }), removeOutput(modules)] : [], fs.rmdir(resultsDirectory)];
+            const artifacts = [...preparation.coverage ? [fs.rm(report, { force: true }), removeOutput(modules)] : [], fs.rmdir(resultsDirectory), ...transient ? [transient.close()] : []];
             await Promise.all(artifacts.map(cleanup => cleanup.catch(() => undefined)));
+            // After the batch has read the host's observer log: a replaced host takes it along.
+            if (kept) {await this.recycleOverLimit(preparation, kept).catch((error: unknown) => {if (!this.options.signal?.aborted) {this.options.output?.(`Could not measure a reused test host's memory: ${String(error)}\n`);}});}
         }
+    }
+
+    /** The live host of a prepared output, or a new one. `keep`: later batches reuse it until the session ends; otherwise the caller
+     * closes it after its batch. Its collector reports nothing itself: the batches take snapshots (see snapshot). */
+    private async openHost(preparation: Preparation, group: TestFile, assembly: string, hashes: ReadonlyMap<string, string>, keep: boolean): Promise<LiveHost> {
+        const existing = this.liveHosts.get(preparation);
+        if (existing?.session.alive) {return existing;}
+        if (existing) {this.liveHosts.delete(preparation); await existing.close();}
+        const options = this.projectOptions(group), number = ++this.hostSequence;
+        const modules = path.join(preparation.root, `modules-host-${number}`), results = path.join(preparation.root, `results-host-${number}`);
+        const report = path.join(preparation.root, `coverage-host-${number}.xml`);
+        let observation: RuntimeObservation | undefined;
+        if (preparation.coverage) {
+            try {
+                observation = await RuntimeObservation.start(modules, assembly,
+                    options.modules ?? (options.assemblies ?? [group.assembly]).map(file => ({ name: path.basename(file, path.extname(file)), sources: [...hashes.keys()] })),
+                    preparation.instrumented ?? [], options.env);
+            } catch (error) {options.signal?.throwIfAborted(); options.output?.(`Runtime observation unavailable; retaining conservative dependencies. ${String(error)}\n`);}
+        }
+        const cleanup = (): Promise<void> => Promise.all([fs.rm(report, { force: true }), removeOutput(modules), fs.rmdir(results)].map(work => work.catch(() => undefined))).then(() => undefined);
+        let session: MtpSession;
+        try {
+            // A reused host may outlive this run (see rebind), so it stops with the session's host lifetime rather than the run.
+            session = await MtpSession.open({ ...options, signal: this.hostLifetime.signal, env: observation?.env ?? options.env, assembly, args: ['--results-directory', results, ...options.testArguments],
+                wrapper: preparation.coverage ? { command: options.coverageTool!, args: ['collect', '--nologo', '--session-id', preparation.session, '-f', 'cobertura', '-o', report] } : undefined });
+        } catch (error) {
+            if (preparation.coverage) {preparation.collectorInterrupted = true;}
+            await cleanup(); throw error;
+        }
+        let closing: Promise<void> | undefined;
+        const host: LiveHost = { session, observation, close: () => closing ??= session.close().then(cleanup) };
+        if (keep) {this.liveHosts.set(preparation, host);}
+        return host;
+    }
+
+    /** Replace a reused host whose process tree grew past `testy.testProcessMemoryLimit` after a batch: the next batch starts a new
+     * one. A tree whose memory the system cannot report is kept. */
+    private async recycleOverLimit(preparation: Preparation, host: LiveHost): Promise<void> {
+        const limit = this.options.testProcessMemoryLimit, pid = host.session.processId;
+        if (!limit || pid === undefined || this.liveHosts.get(preparation) !== host) {return;}
+        const used = await treeMemory(pid, this.options.signal);
+        this.options.signal?.throwIfAborted();
+        if (used === undefined || used <= limit) {return;}
+        this.options.output?.(`A reused test host used ${Math.round(used / 1048576)} MiB, more than testy.testProcessMemoryLimit (${Math.round(limit / 1048576)} MiB); the next test file starts a new one.\n`);
+        this.liveHosts.delete(preparation); await host.close();
+    }
+
+    /** Write the coverage the session collected since its previous snapshot to `report`, and reset it. */
+    private async snapshot(session: string, report: string): Promise<void> {
+        // One snapshot per test file, or per test with test granularity: the collector's command-line client is its only interface,
+        // so it runs without the process owner, whose start-up would roughly double its cost (see ProcessOptions.direct).
+        requireSuccess(await runProcess(this.options.coverageTool!, ['snapshot', session, '--reset', '--nologo', '-o', report],
+            { ...this.options, direct: true, timeoutMs: Math.min(this.options.timeoutMs ?? 600_000, 120_000) }), 'Taking a coverage snapshot');
     }
 
     dispose(): Promise<void> {
         this.disposed = true;
         return this.disposal ??= (async () => {
             await Promise.allSettled([...this.running, ...this.discoveries.values(), ...this.preparer.pending()]);
+            // Hosts hold their outputs open; they exit before any output is removed.
+            await Promise.allSettled([...this.liveHosts.values()].map(host => host.close())); this.liveHosts.clear();
+            this.unlink?.(); this.hostLifetime.abort();
             const lanes = await Promise.allSettled(this.lanes.sessions());
             const actions = [() => this.coverageReader.dispose(), ...lanes.filter((lane): lane is PromiseFulfilledResult<RunnerSession> => lane.status === 'fulfilled')
                 .map(lane => () => lane.value.dispose()), ...this.preparer.releases()];

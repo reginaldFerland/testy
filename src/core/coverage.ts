@@ -2,6 +2,7 @@ import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { CoveredLine, Declaration, TestFile, Trace } from './model';
 import { contentHash, sourceVersion, testFileId } from './paths';
 import { finish, finishAsync, sortedUnion } from './work';
+import type { FileHits } from './memberImpact';
 
 export interface CoverageSummary {
     readonly file: string;
@@ -118,6 +119,22 @@ export class CoverageStore {
     }
 
     dependentProjects(projects: readonly string[]): Set<string> { return this.dependentGroups(projects.map(moduleKey)); }
+
+    /** What a reliable trace recorded in a file: the version it ran against, its positive hits there and that version's
+     * instrumentable lines. Undefined when the trace cannot narrow, or reached the file without executing a line of it. */
+    fileHits(groupId: string, file: string): FileHits | undefined {
+        const trace = this.records.get(groupId);
+        if (!trace?.reliable || trace.historical) {return undefined;}
+        const entry = trace.coverage.find(coverage => coverage.file === file);
+        const source = entry && this.sources.get(contentHash(`${file}\0${entry.hash}`))?.source;
+        return entry && source ? { hash: entry.hash, hits: entry.lines, lines: source.lines } : undefined;
+    }
+
+    /** Whether some trace's coverage refers to this version of a file. */
+    hasVersion(file: string, hash: string): boolean { return this.sources.has(contentHash(`${file}\0${hash}`)); }
+
+    /** The instrumentable lines and method spans of a version of a file, when some trace's coverage refers to it. */
+    versionGeometry(file: string, hash: string): CoverageSource | undefined { return this.sources.get(contentHash(`${file}\0${hash}`))?.source; }
 
     invalidate(groupIds: ReadonlySet<string>, stale = true): void {
         let changed = false;

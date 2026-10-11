@@ -51,63 +51,132 @@ export async function mapConcurrent<T, R>(
     } finally {signal?.removeEventListener('abort', abort);}
 }
 
+/** Shared resources an item needs (see mapConcurrentByKey): items naming the same `exclusive` resource never run together,
+ * and a `serial` item runs with nothing else at all. */
+/** What an item needs besides a worker: resources no other item may hold (`exclusive`), resources it shares with other inclusive
+ * holders but not with an exclusive one (`inclusive`), no other item at all (`serial`), or several worker slots (`workers`). */
+export interface ItemResources {
+    readonly exclusive: readonly string[];
+    readonly serial: boolean;
+    readonly inclusive?: readonly string[] | undefined;
+    readonly workers?: number | undefined;
+}
+
+export interface KeyedScheduling<T> {
+    /** Called once, with the first worker failure, before draining. */
+    readonly onFailure?: ((error: unknown) => void) | undefined;
+    /** Whether the item may run beside other items of its target; checked again at each admission. */
+    readonly parallelEligible?: ((item: T, index: number) => boolean) | undefined;
+    /** Worker 0 takes items from the end of the queue: items ordered longest first then report early results from the short
+     * end while the other workers start the long ones. */
+    readonly fastLane?: boolean | undefined;
+    /** The shared resources each item needs; read once per item. */
+    readonly resources?: ((item: T, index: number) => ItemResources | undefined) | undefined;
+    /** Once aborted, no further item starts: admitted items finish, and the call resolves without results for the others. */
+    readonly drain?: AbortSignal | undefined;
+    /** A worker was idle from `start` to `end` (epoch milliseconds) while items were still queued: their resources or targets were busy. */
+    readonly onWait?: ((worker: number, start: number, end: number) => void) | undefined;
+}
+
 /**
- * Prefer idle targets, then share spare workers between active targets. Each
- * target retains input order, and a nonparallel item owns its target exclusively.
- * Eligibility is checked again at admission so newly learned restrictions apply
- * to queued items. Workers waiting for an exclusive target remain available to
- * other targets. Results retain input order, regardless of admission order.
+ * Prefer idle targets, then share spare workers between active targets; between
+ * equally busy targets, the earliest queued item goes first. Each target retains
+ * input order, and a nonparallel item owns its target exclusively. Eligibility is
+ * checked again at admission so newly learned restrictions apply to queued items.
+ * Workers waiting for an exclusive target remain available to other targets.
+ * An item whose resources are in use waits, and later items of its target may
+ * start before it. Results retain input order, regardless of admission order.
  */
 export async function mapConcurrentByKey<T, R>(
     items: readonly T[], limit: number, signal: AbortSignal | undefined,
     key: (item: T) => string,
     work: (item: T, index: number, signal: AbortSignal, worker: number) => Promise<R>,
-    onFailure?: (error: unknown) => void,
-    parallelEligible: (item: T, index: number) => boolean = () => true
+    scheduling: KeyedScheduling<T> = {}
 ): Promise<R[]> {
     if (!Number.isSafeInteger(limit) || limit < 1) {throw new Error('Worker limit must be a positive integer.');}
     signal?.throwIfAborted();
-    type Target = { indices: number[]; next: number; active: number; exclusive: boolean };
+    const { onFailure, parallelEligible = () => true, fastLane = false, drain } = scheduling;
+    const needs = scheduling.resources ? items.map((item, index) => scheduling.resources!(item, index)) : [];
+    /** A target's queued item indices, in order. */
+    type Target = { queue: number[]; active: number; exclusive: boolean };
     const targets = new Map<string, Target>();
     for (const [index, item] of items.entries()) {
         const id = key(item);
         let target = targets.get(id);
-        if (!target) {target = { indices: [], next: 0, active: 0, exclusive: false }; targets.set(id, target);}
-        target.indices.push(index);
+        if (!target) {target = { queue: [], active: 0, exclusive: false }; targets.set(id, target);}
+        target.queue.push(index);
     }
+    /** Active items by the exclusive and inclusive resources they hold, worker slots in use, and whether a serial item runs. */
+    const held = new Map<string, number>(), shared = new Map<string, number>();
+    let running = 0, serial = false, slots = 0;
+    /** Worker slots an item takes: more for one that needs several, never more than the limit. */
+    const weight = (index: number): number => Math.max(1, Math.min(limit, Math.floor(needs[index]?.workers ?? 1)));
+    const available = (index: number): boolean => {
+        const need = needs[index];
+        if (!need) {return slots < limit;}
+        if (need.serial) {return !running;}
+        return need.exclusive.every(resource => !held.has(resource) && !shared.has(resource)) && (need.inclusive ?? []).every(resource => !held.has(resource))
+            && (!running || slots + weight(index) <= limit);
+    };
     const controller = new AbortController();
     const waiting = new Set<() => void>();
     const wake = (): void => {const callbacks = [...waiting]; waiting.clear(); for (const callback of callbacks) {callback();}};
     const abort = (): void => controller.abort(signal?.reason);
     signal?.addEventListener('abort', abort, { once: true });
     controller.signal.addEventListener('abort', wake, { once: true });
+    drain?.addEventListener('abort', wake, { once: true });
     const results = new Array<R>(items.length);
     // Workers set failed; `as boolean` keeps reads after the awaits from narrowing to false.
     let admitted = 0, failed = false as boolean, failure: unknown;
-    const take = (): { target: Target; index: number } | undefined => {
-        let chosen: Target | undefined, exclusive = false;
+    /** The target's next item whose resources are free, from the front or the end. */
+    const candidate = (target: Target, fromEnd: boolean): number | undefined => {
+        const { queue } = target;
+        for (let step = 0; step < queue.length; step++) {
+            const position = fromEnd ? queue.length - 1 - step : step;
+            if (available(queue[position]!)) {return position;}
+        }
+        return undefined;
+    };
+    const take = (fromEnd: boolean): { target: Target; index: number } | undefined => {
+        if (serial) {return undefined;}
+        let chosen: Target | undefined, chosenPosition = 0, chosenIndex = 0, exclusive = false;
         for (const target of targets.values()) {
-            if (target.next === target.indices.length || target.exclusive || (chosen && target.active >= chosen.active)) {continue;}
-            // target.next < target.indices.length, and every index came from items.
-            const index = target.indices[target.next]!, parallel = parallelEligible(items[index] as T, index);
+            if (!target.queue.length || target.exclusive || (chosen && target.active > chosen.active)) {continue;}
+            const position = candidate(target, fromEnd);
+            if (position === undefined) {continue;}
+            const index = target.queue[position]!;
+            if (chosen && target.active === chosen.active && (fromEnd ? index < chosenIndex : index > chosenIndex)) {continue;}
+            const parallel = parallelEligible(items[index] as T, index);
             if (target.active && !parallel) {continue;}
-            chosen = target; exclusive = !parallel;
-            if (!target.active) {break;}
+            chosen = target; chosenPosition = position; chosenIndex = index; exclusive = !parallel;
         }
         if (!chosen) {return undefined;}
-        const index = chosen.indices[chosen.next++]!;
+        chosen.queue.splice(chosenPosition, 1);
         chosen.active++; chosen.exclusive = exclusive; admitted++;
-        return { target: chosen, index };
+        const need = needs[chosenIndex];
+        running++; serial = !!need?.serial; slots += weight(chosenIndex);
+        for (const resource of need?.exclusive ?? []) {held.set(resource, (held.get(resource) ?? 0) + 1);}
+        for (const resource of need?.inclusive ?? []) {shared.set(resource, (shared.get(resource) ?? 0) + 1);}
+        return { target: chosen, index: chosenIndex };
+    };
+    const unhold = (map: Map<string, number>, resource: string): void => {const count = (map.get(resource) ?? 1) - 1; if (count) {map.set(resource, count);} else {map.delete(resource);}};
+    const release = (index: number): void => {
+        const need = needs[index];
+        running--; slots -= weight(index); if (need?.serial) {serial = false;}
+        for (const resource of need?.exclusive ?? []) {unhold(held, resource);}
+        for (const resource of need?.inclusive ?? []) {unhold(shared, resource);}
     };
     try {
         await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async (_, worker) => {
             while (!controller.signal.aborted) {
                 let selected: ReturnType<typeof take>;
                 try {
-                    selected = take();
+                    selected = drain?.aborted ? undefined : take(fastLane && worker === 0);
                     if (!selected) {
-                        if (admitted === items.length) {return;}
+                        if (admitted === items.length || drain?.aborted) {return;}
+                        const idle = Date.now();
                         await new Promise<void>(resolve => waiting.add(resolve));
+                        scheduling.onWait?.(worker, idle, Date.now());
                         continue;
                     }
                     results[selected.index] = await work(items[selected.index] as T, selected.index, controller.signal, worker);
@@ -119,7 +188,7 @@ export async function mapConcurrentByKey<T, R>(
                     }
                     return;
                 } finally {
-                    if (selected) {selected.target.active--; selected.target.exclusive = false; wake();}
+                    if (selected) {selected.target.active--; selected.target.exclusive = false; release(selected.index); wake();}
                 }
             }
         }));
@@ -129,6 +198,7 @@ export async function mapConcurrentByKey<T, R>(
     } finally {
         signal?.removeEventListener('abort', abort);
         controller.signal.removeEventListener('abort', wake);
+        drain?.removeEventListener('abort', wake);
     }
 }
 

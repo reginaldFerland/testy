@@ -17,6 +17,7 @@ namespace Testy.Analysis;
 [JsonSerializable(typeof(CombinedAnalysis))]
 [JsonSerializable(typeof(SourceAnalysisProvenance))]
 [JsonSerializable(typeof(Dictionary<string, SourceLocations.Location?>))]
+[JsonSerializable(typeof(Dictionary<string, string[]>))]
 internal sealed partial class AnalysisJson : JsonSerializerContext;
 
 // What the project graph task, which MSBuild loads, writes and reads.

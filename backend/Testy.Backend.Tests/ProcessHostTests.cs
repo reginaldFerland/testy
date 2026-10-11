@@ -59,6 +59,20 @@ public sealed class ProcessHostTests : IDisposable
 
     [Fact]
     [Trait("Platform", "Windows")]
+    public async Task BelowNormalPriorityReachesTheCommandButTheRequestDoesNot()
+    {
+        Assert.SkipUnless(OperatingSystem.IsWindows(), "The process host requires Windows.");
+        var environment = new Dictionary<string, string?> { ["TESTY_PROCESS_PRIORITY"] = "belowNormal" };
+        var (exitCode, output, _) = await HelperProcess.Run("Testy.ProcessHost.dll",
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "(Get-Process -Id $PID).PriorityClass; \"[$env:TESTY_PROCESS_PRIORITY]\""], environment);
+        Assert.Equal(0, exitCode);
+        Assert.Equal(["BelowNormal", "[]"], output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        var (_, normal, _) = await HelperProcess.Run("Testy.ProcessHost.dll", ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "(Get-Process -Id $PID).PriorityClass"]);
+        Assert.Equal("Normal", normal.Trim());
+    }
+
+    [Fact]
+    [Trait("Platform", "Windows")]
     public async Task RestoredVariablesReachTheCommand()
     {
         Assert.SkipUnless(OperatingSystem.IsWindows(), "The process host requires Windows.");

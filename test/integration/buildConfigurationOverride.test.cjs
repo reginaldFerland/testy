@@ -1,4 +1,5 @@
 const {test} = require('node:test');
+const {toolsDirectory}=require('./support/tools.cjs');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
@@ -17,7 +18,7 @@ test('a manual run can build with another configuration without affecting automa
  /** @type {Required<import('../../out/core/selection').Selection>} */ let selection=/** @type {any} */ (undefined); // assigned by the selected event
  /** @type {string[]} */ const output=[];
  /** @type {import('../../out/core/model').EngineConfiguration} */ const config={dotnet:'dotnet',configuration:'Debug',mode:'affected',coverage:true,excludes:[],testArguments:[],timeout:120000,coverageTool:process.env.TESTY_COVERAGE_TOOL};
- engine=new TestEngine({roots:[root],storage:path.join(directory,'state'),tools:path.join(directory,'tools'),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,events:{
+ engine=new TestEngine({roots:[root],storage:path.join(directory,'state'),tools:toolsDirectory(directory),analyzer:path.resolve('dist/analyzer/Testy.Analysis.dll'),configuration:()=>config,events:{
   output:(/** @type {string} */ text)=>output.push(text),phase:()=>{},discovered:()=>{},selected:(/** @type {import('../../out/core/selection').Selection} */ value)=>{selection=/** @type {typeof selection} */ (value);},result:()=>{},started:()=>{},coverage:()=>{},invalidated:()=>{}
  }});
  const tests=path.join(root,'ImpactDemo.Tests');

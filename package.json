@@ -147,10 +147,42 @@
         "category": "Testy"
       },
       {
+        "command": "testy.exportTimeline",
+        "title": "%command.exportTimeline%",
+        "category": "Testy"
+      },
+      {
+        "command": "testy.showSlowestTests",
+        "title": "%command.showSlowestTests%",
+        "category": "Testy"
+      },
+      {
+        "command": "testy.debugCoveringTests",
+        "title": "%command.debugCoveringTests%",
+        "category": "Testy"
+      },
+      {
         "command": "testy.showTest",
         "title": "%command.showTest%",
         "category": "Testy",
         "icon": "$(go-to-file)"
+      },
+      {
+        "command": "testy.pinTests",
+        "title": "%command.pinTests%",
+        "category": "Testy",
+        "icon": "$(pin)"
+      },
+      {
+        "command": "testy.unpinTests",
+        "title": "%command.unpinTests%",
+        "category": "Testy",
+        "icon": "$(pinned)"
+      },
+      {
+        "command": "testy.unpinAllTests",
+        "title": "%command.unpinAllTests%",
+        "category": "Testy"
       }
     ],
     "menus": {
@@ -225,6 +257,14 @@
           "when": "testy.active"
         },
         {
+          "command": "testy.exportTimeline",
+          "when": "testy.active"
+        },
+        {
+          "command": "testy.showSlowestTests",
+          "when": "testy.active"
+        },
+        {
           "command": "testy.resetCaches",
           "when": "testy.active"
         },
@@ -257,8 +297,24 @@
           "when": "testy.active && editorLangId == csharp"
         },
         {
+          "command": "testy.debugCoveringTests",
+          "when": "testy.active && editorLangId == csharp"
+        },
+        {
           "command": "testy.showTest",
           "when": "false"
+        },
+        {
+          "command": "testy.pinTests",
+          "when": "false"
+        },
+        {
+          "command": "testy.unpinTests",
+          "when": "false"
+        },
+        {
+          "command": "testy.unpinAllTests",
+          "when": "testy.active && testy.hasPinned"
         }
       ],
       "testing/item/context": [
@@ -271,6 +327,16 @@
           "command": "testy.excludeProject",
           "when": "controllerId == testy && testy.active && testId =~ /^project:/",
           "group": "testy@2"
+        },
+        {
+          "command": "testy.pinTests",
+          "when": "controllerId == testy && testy.active && !(testId in testy.pinned)",
+          "group": "testy@3"
+        },
+        {
+          "command": "testy.unpinTests",
+          "when": "controllerId == testy && testy.active && testId in testy.pinned",
+          "group": "testy@3"
         }
       ],
       "testing/message/context": [
@@ -285,6 +351,11 @@
           "command": "testy.runCoveringTests",
           "when": "testy.active && resourceScheme == file && resourceExtname == .cs",
           "group": "testy@2"
+        },
+        {
+          "command": "testy.debugCoveringTests",
+          "when": "testy.active && resourceScheme == file && resourceExtname == .cs",
+          "group": "testy@3"
         },
         {
           "command": "testy.runFile",
@@ -331,6 +402,16 @@
         "when": "testy.active && testy.running"
       }
     ],
+    "views": {
+      "test": [
+        {
+          "id": "testy.queue",
+          "name": "%view.queue%",
+          "when": "testy.active",
+          "visibility": "collapsed"
+        }
+      ]
+    },
     "viewsWelcome": [
       {
         "view": "workbench.view.testing",
@@ -363,6 +444,59 @@
           "scope": "window",
           "order": 1
         },
+        "testy.selectionGranularity": {
+          "type": "string",
+          "default": "method",
+          "enum": [
+            "method",
+            "file",
+            "test"
+          ],
+          "enumDescriptions": [
+            "%config.selectionGranularity.method%",
+            "%config.selectionGranularity.file%",
+            "%config.selectionGranularity.test%"
+          ],
+          "markdownDescription": "%config.selectionGranularity%",
+          "scope": "window",
+          "order": 2
+        },
+        "testy.safetyNet": {
+          "type": "string",
+          "default": "off",
+          "enum": [
+            "off",
+            "related",
+            "all"
+          ],
+          "enumDescriptions": [
+            "%config.safetyNet.off%",
+            "%config.safetyNet.related%",
+            "%config.safetyNet.all%"
+          ],
+          "markdownDescription": "%config.safetyNet%",
+          "scope": "window",
+          "order": 3
+        },
+        "testy.alwaysRunFailing": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "markdownDescription": "%config.alwaysRunFailing%",
+          "order": 4
+        },
+        "testy.excludeTraits": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "default": [],
+          "markdownDescription": "%config.excludeTraits%",
+          "scope": "window",
+          "order": 5
+        },
         "testy.trigger": {
           "type": "string",
           "default": "save",
@@ -376,33 +510,42 @@
           ],
           "markdownDescription": "%config.trigger%",
           "scope": "window",
-          "order": 2
+          "order": 6
         },
         "testy.debounceTime": {
           "type": "number",
-          "default": 500,
+          "default": 50,
           "minimum": 0,
           "maximum": 60000,
           "markdownDescription": "%config.debounceTime%",
           "scope": "window",
-          "order": 3,
+          "order": 7,
           "tags": [
             "advanced"
           ]
+        },
+        "testy.finishRunningTests": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0,
+          "maximum": 600,
+          "scope": "window",
+          "markdownDescription": "%config.finishRunningTests%",
+          "order": 8
         },
         "testy.runWithCoverage": {
           "type": "boolean",
           "default": true,
           "markdownDescription": "%config.runWithCoverage%",
           "scope": "window",
-          "order": 4
+          "order": 9
         },
         "testy.showCoverage": {
           "type": "boolean",
           "default": false,
           "markdownDescription": "%config.showCoverage%",
           "scope": "window",
-          "order": 5
+          "order": 10
         },
         "testy.inlineResults": {
           "type": "string",
@@ -419,14 +562,14 @@
           ],
           "markdownDescription": "%config.inlineResults%",
           "scope": "window",
-          "order": 6
+          "order": 11
         },
         "testy.solution": {
           "type": "string",
           "default": "",
           "markdownDescription": "%config.solution%",
           "scope": "resource",
-          "order": 7
+          "order": 12
         },
         "testy.projects.include": {
           "type": "array",
@@ -438,7 +581,7 @@
           "uniqueItems": true,
           "markdownDescription": "%config.projects.include%",
           "scope": "resource",
-          "order": 8
+          "order": 13
         },
         "testy.projects.exclude": {
           "type": "array",
@@ -450,7 +593,7 @@
           "uniqueItems": true,
           "markdownDescription": "%config.projects.exclude%",
           "scope": "resource",
-          "order": 9
+          "order": 14
         },
         "testy.fileWatcherPattern": {
           "type": "string",
@@ -458,7 +601,7 @@
           "minLength": 1,
           "markdownDescription": "%config.fileWatcherPattern%",
           "scope": "window",
-          "order": 10,
+          "order": 15,
           "tags": [
             "advanced"
           ]
@@ -473,7 +616,7 @@
           "uniqueItems": true,
           "markdownDescription": "%config.exclude%",
           "scope": "resource",
-          "order": 11
+          "order": 16
         },
         "testy.buildConfiguration": {
           "type": "string",
@@ -481,7 +624,7 @@
           "minLength": 1,
           "markdownDescription": "%config.buildConfiguration%",
           "scope": "window",
-          "order": 12
+          "order": 17
         },
         "testy.maxParallelProjects": {
           "type": "integer",
@@ -489,7 +632,7 @@
           "minimum": 0,
           "markdownDescription": "%config.maxParallelProjects%",
           "scope": "window",
-          "order": 13,
+          "order": 18,
           "tags": [
             "advanced"
           ]
@@ -500,10 +643,133 @@
           "minimum": 0,
           "markdownDescription": "%config.maxParallelTestFiles%",
           "scope": "window",
-          "order": 14,
+          "order": 19,
           "tags": [
             "advanced"
           ]
+        },
+        "testy.splitLongTestFiles": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "order": 20,
+          "tags": [
+            "advanced"
+          ],
+          "markdownDescription": "%config.splitLongTestFiles%"
+        },
+        "testy.processPriority": {
+          "type": "string",
+          "enum": [
+            "belowNormal",
+            "normal"
+          ],
+          "enumDescriptions": [
+            "%config.processPriority.belowNormal%",
+            "%config.processPriority.normal%"
+          ],
+          "default": "belowNormal",
+          "scope": "window",
+          "order": 21,
+          "tags": [
+            "advanced"
+          ],
+          "markdownDescription": "%config.processPriority%"
+        },
+        "testy.exclusiveTraits": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "default": [],
+          "markdownDescription": "%config.exclusiveTraits%",
+          "scope": "window",
+          "order": 22,
+          "tags": [
+            "advanced"
+          ]
+        },
+        "testy.inclusiveTraits": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "default": [],
+          "scope": "window",
+          "order": 23,
+          "tags": [
+            "advanced"
+          ],
+          "markdownDescription": "%config.inclusiveTraits%"
+        },
+        "testy.serialTraits": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "default": [],
+          "markdownDescription": "%config.serialTraits%",
+          "scope": "window",
+          "order": 24,
+          "tags": [
+            "advanced"
+          ]
+        },
+        "testy.workerTraits": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "default": {},
+          "scope": "window",
+          "order": 25,
+          "tags": [
+            "advanced"
+          ],
+          "markdownDescription": "%config.workerTraits%"
+        },
+        "testy.reuseTestHosts": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "%config.reuseTestHosts%",
+          "scope": "window",
+          "order": 26,
+          "tags": [
+            "advanced"
+          ]
+        },
+        "testy.isolatedTraits": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "default": [],
+          "scope": "window",
+          "order": 27,
+          "tags": [
+            "advanced"
+          ],
+          "markdownDescription": "%config.isolatedTraits%"
+        },
+        "testy.testProcessMemoryLimit": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "scope": "window",
+          "order": 28,
+          "tags": [
+            "advanced"
+          ],
+          "markdownDescription": "%config.testProcessMemoryLimit%"
         },
         "testy.dotnetPath": {
           "type": "string",
@@ -511,7 +777,7 @@
           "minLength": 1,
           "markdownDescription": "%config.dotnetPath%",
           "scope": "machine-overridable",
-          "order": 15
+          "order": 29
         },
         "testy.testArguments": {
           "type": "array",
@@ -521,7 +787,7 @@
           },
           "markdownDescription": "%config.testArguments%",
           "scope": "window",
-          "order": 16
+          "order": 30
         },
         "testy.timeoutSeconds": {
           "type": "number",
@@ -530,17 +796,28 @@
           "maximum": 86400,
           "markdownDescription": "%config.timeoutSeconds%",
           "scope": "window",
-          "order": 17,
+          "order": 31,
           "tags": [
             "advanced"
           ]
+        },
+        "testy.testTimeoutSeconds": {
+          "type": "number",
+          "default": 120,
+          "minimum": 0,
+          "scope": "window",
+          "order": 32,
+          "tags": [
+            "advanced"
+          ],
+          "markdownDescription": "%config.testTimeoutSeconds%"
         },
         "testy.coverageToolPath": {
           "type": "string",
           "default": "",
           "markdownDescription": "%config.coverageToolPath%",
           "scope": "machine-overridable",
-          "order": 18
+          "order": 33
         },
         "testy.additionalConfigurations": {
           "type": "array",
@@ -552,7 +829,7 @@
           "uniqueItems": true,
           "markdownDescription": "%config.additionalConfigurations%",
           "scope": "window",
-          "order": 19
+          "order": 34
         },
         "testy.debugConfiguration": {
           "type": "object",
@@ -636,7 +913,7 @@
           "additionalProperties": true,
           "markdownDescription": "%config.debugConfiguration%",
           "scope": "resource",
-          "order": 20
+          "order": 35
         },
         "testy.problems.publishBuildDiagnostics": {
           "type": "string",
@@ -653,7 +930,7 @@
           ],
           "markdownDescription": "%config.problems.publishBuildDiagnostics%",
           "scope": "window",
-          "order": 21
+          "order": 36
         }
       }
     },
@@ -734,8 +1011,8 @@
     "typecheck:tests": "tsc -p tsconfig.tests.json",
     "test": "npm run test:unit:only",
     "test:unit:only": "node --test --import ./test/unit/support/fastFsync.mjs test/unit/*.test.cjs",
-    "test:integration": "npm run compile && node --test test/integration/*.test.cjs",
-    "test:integration:only": "node --test test/integration/*.test.cjs",
+    "test:integration": "npm run compile && node --test --import ./test/integration/support/sharedTools.mjs test/integration/*.test.cjs",
+    "test:integration:only": "node --test --import ./test/integration/support/sharedTools.mjs test/integration/*.test.cjs",
     "test:windows": "node scripts/test-windows.mjs",
     "test:windows:slow": "node scripts/test-windows.mjs --slow",
     "test:dotnet": "cd backend && dotnet test --project Testy.Backend.Tests",

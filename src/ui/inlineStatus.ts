@@ -56,16 +56,18 @@ export function lineStatus(groups: readonly string[], statusOf: (group: string) 
 }
 
 /** 0-based lines per status for a file's covered lines (1-based keys of `covering`). An unsaved document, or coverage of
- * another version of the file, only marks the lines pending: their positions may no longer match. Lines past the end are dropped. */
+ * another version of the file, only marks the lines pending: their positions may no longer match. `map` moves the saved lines of
+ * an unsaved document to where its edits put them (see core/lineMap), dropping lines an edit touched. Lines past the end are dropped. */
 export function lineStatuses(covering: ReadonlyMap<number, readonly string[]>, statusOf: (group: string) => LineStatus,
-    options: { readonly pending: boolean; readonly lineCount: number }): Record<LineStatus, number[]> {
+    options: { readonly pending: boolean; readonly lineCount: number; readonly map?: ((line: number) => number | undefined) | undefined }): Record<LineStatus, number[]> {
     const result: Record<LineStatus, number[]> = { passed: [], failed: [], pending: [] };
     const memo = new Map<string, LineStatus>();
     const cached = (group: string): LineStatus => {let status = memo.get(group); if (!status) {status = statusOf(group); memo.set(group, status);} return status;};
     for (const [line, groups] of covering) {
-        if (line > options.lineCount || !groups.length) {continue;}
+        const target = options.map ? options.map(line - 1) : line - 1;
+        if (target === undefined || target >= options.lineCount || !groups.length) {continue;}
         const status = options.pending ? 'pending' : lineStatus(groups, cached);
-        if (status) {result[status].push(line - 1);}
+        if (status) {result[status].push(target);}
     }
     for (const lines of Object.values(result)) {lines.sort((a, b) => a - b);}
     return result;
@@ -81,4 +83,13 @@ export function summarizeLine(groups: readonly string[], statusOf: (group: strin
 /** Failing files first, then pending, then passed; the order within each status is kept. */
 export function orderByStatus(groups: readonly string[], statusOf: (group: string) => LineStatus): string[] {
     return [...groups].sort((a, b) => precedence.indexOf(statusOf(a)) - precedence.indexOf(statusOf(b)));
+}
+
+/** What the tests through a covered line cost: their total and the slowest, from the tests' own durations when each test's coverage
+ * says which tests ran the line, or else from the covering files' learned times. Undefined when no time is known. */
+export function lineCost(entries: readonly { readonly name: string; readonly milliseconds: number | undefined }[]): { readonly total: number; readonly slowest: { readonly name: string; readonly milliseconds: number }; readonly count: number } | undefined {
+    const known = entries.flatMap(entry => entry.milliseconds === undefined ? [] : [{ name: entry.name, milliseconds: entry.milliseconds }]);
+    if (!known.length) {return undefined;}
+    const slowest = known.reduce((most, entry) => entry.milliseconds > most.milliseconds ? entry : most);
+    return { total: known.reduce((sum, entry) => sum + entry.milliseconds, 0), slowest, count: known.length };
 }

@@ -93,7 +93,8 @@ static partial class ProcessOwner
             commandLine = Marshal.StringToHGlobalUni(command.ToString());
             environment = Marshal.StringToHGlobalUni(CommandEnvironment());
             Check(Native.CreateProcessW(ResolveApplication(arguments[0]), commandLine, IntPtr.Zero, IntPtr.Zero, true,
-                0x4 | 0x08000000 | 0x80000 | 0x400 /* SUSPENDED | NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | UNICODE_ENVIRONMENT */,
+                0x4 | 0x08000000 | 0x80000 | 0x400 /* SUSPENDED | NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | UNICODE_ENVIRONMENT */
+                    | (BelowNormal ? 0x4000u /* BELOW_NORMAL_PRIORITY_CLASS, which the command's descendants inherit */ : 0u),
                 environment, null, ref startup, out process));
             if (!Native.AssignProcessToJobObject(job, process.Process))
             {
@@ -183,12 +184,17 @@ static partial class ProcessOwner
     }
 
     /// <summary>The child's environment block: ours, with restored variables replacing their prefixed copies.</summary>
+    /** The extension host asks for test and build processes below normal priority, so the editor stays responsive. */
+    private static bool BelowNormal => Environment.GetEnvironmentVariable(PriorityVariable) == "belowNormal";
+    private const string PriorityVariable = "TESTY_PROCESS_PRIORITY";
+
     private static string CommandEnvironment()
     {
         var variables = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())
         {
             var name = (string)entry.Key;
+            if (string.Equals(name, PriorityVariable, StringComparison.OrdinalIgnoreCase)) { continue; }
             if (!name.StartsWith(RestoredPrefix, StringComparison.OrdinalIgnoreCase)) { variables.TryAdd(name, (string?)entry.Value ?? ""); }
         }
         foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())
