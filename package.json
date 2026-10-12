@@ -1030,7 +1030,7 @@
     "l10n:export": "npx --yes @vscode/l10n-dev@0.0.35 export --outDir ./l10n ./src"
   },
   "devDependencies": {
-    "@eslint/js": "^9.39.5",
+    "@eslint/js": "^10.0.1",
     "@types/node": "^24.19.2",
     "@types/vscode": "~1.140.0",
     "@vscode/test-electron": "^3.1.0",
