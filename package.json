@@ -31,7 +31,7 @@
     "mstest"
   ],
   "publisher": "reginaldFerland",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "icon": "testy.png",
   "engines": {
     "vscode": "^1.140.0"

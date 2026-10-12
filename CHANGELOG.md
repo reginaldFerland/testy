@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.4.0
+
 ### Added
 
 - **Discovery in the reused host:** with `testy.reuseTestHosts`, the test host that runs a project's tests also discovers them, so a save that runs tests starts one process fewer. On the save-loop benchmark an edit that runs one test file took about 250 ms (19%) less.
